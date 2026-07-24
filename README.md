@@ -1,6 +1,6 @@
 # Chronicle
 
-Chronicle is an early-stage, production-native network traffic capture and replay platform. Its target pipeline is `record → persist → transform → inspect → replay → verify`, with protocol-neutral eBPF capture, a local append-only WAL, canonical sessions, PostgreSQL metadata, and S3-compatible artifacts.
+Chronicle is an early-stage, production-native network traffic capture and replay platform. Its planned pipeline is `record → persist → transform → inspect → replay → verify`, with protocol-neutral eBPF capture, a local append-only WAL, canonical sessions, PostgreSQL metadata, and S3-compatible artifacts. Current code is an architecture scaffold; only the fake protocol vertical slice is functional.
 
 > **Safety:** production capture can contain credentials and personal data. Replay can execute writes and publish messages. Current replay policy defaults to dry-run and denies every operation. Never point replay at a recorded production destination.
 
@@ -11,14 +11,14 @@ This repository is an architecture scaffold, not a usable capture product. It cu
 - transport-neutral capture types and in-memory source;
 - a versioned, CRC32C-framed segmented local WAL with partial-tail detection;
 - bounded ordered socket-chunk session assembly;
-- compile-time protocol capability registry;
+- compile-time protocol capability registry (registration does not equal support; only fake has implementations);
 - versioned canonical session types and opaque payload preservation;
 - in-memory metadata/artifact adapters;
-- explicit target mapping, default-deny replay planning, and verification result types;
+- explicit target mapping, default-deny replay planning, and fake replay/verification types;
 - CLI command hierarchy; and
 - one functional fake-protocol end-to-end test.
 
-PostgreSQL, S3, real protocol codecs, eBPF programs, replay scheduling, and external connectivity checks are planned MVP work.
+PostgreSQL and S3 adapters, real protocol decoding and replay, eBPF programs, replay scheduling, and external connectivity checks are planned MVP work.
 
 ## Architecture
 
@@ -40,7 +40,7 @@ A generated registration is not support. Only fake scaffold protocol is function
 
 | Protocol | Detection | Decode | Canonicalize | Replay | Verify |
 |---|---:|---:|---:|---:|---:|
-| Fake (scaffold only) | Available | Available | Available | Available | Available |
+| Fake (functional scaffold) | Available | Available | Available | Available | Available |
 | HTTP/1.1 | Planned | Planned | Planned | Planned | Planned |
 | PostgreSQL | Planned | Planned | Planned | Planned | Planned |
 | MySQL | Planned | Planned | Planned | Planned | Planned |
@@ -63,13 +63,15 @@ MySQL and MariaDB share an explicit MySQL-family boundary. S3 API capture uses H
 
 ## Development
 
-Prerequisites: stable Rust. Linux is required only for future eBPF work; tests require no root access or external services.
+Prerequisites: Rust 1.88.0, selected by `rust-toolchain.toml`. Linux is required only for future eBPF work; tests require no root access or external services.
 
 ```bash
 cargo build --workspace
 cargo test --workspace --all-features
 cargo run -p chronicle-cli -- doctor
 ```
+
+`doctor` currently validates local configuration only; it does not probe external services.
 
 Required gates:
 
@@ -80,11 +82,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-Future Linux eBPF adapter build command:
-
-```bash
-cargo build -p chronicle-capture-ebpf --target x86_64-unknown-linux-gnu
-```
+`chronicle-capture-ebpf` is a scaffold-only crate. No eBPF build or capture implementation is part of the current development gates.
 
 No checked-in configuration should contain secrets. `postgres.connection_url_env` names an environment variable rather than storing credentials.
 

@@ -1,4 +1,22 @@
-/target
+# Rust build output
+/target/
+
+# Local environment files
 .env
+.env.*
+!.env.example
+
+# Chronicle runtime output
+/chronicle-wal/
+/chronicle-capture/
+/chronicle-replay/
 *.wal
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# IDE metadata
+.idea/
+.fleet/
+*.iml

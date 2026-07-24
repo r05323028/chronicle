@@ -392,4 +392,31 @@ mod tests {
         assert_eq!(registration.id.as_str(), "fake");
         assert!(registry.detect(&stream(b"opaque"), None).is_none());
     }
+
+    #[test]
+    fn registrations_only_advertise_implemented_capabilities() {
+        let registry = registry().unwrap();
+        for registration in registry.registrations() {
+            assert_eq!(
+                registration.capabilities.detection == CapabilityStatus::Available,
+                registration.detector.is_some()
+            );
+            assert_eq!(
+                registration.capabilities.decoding == CapabilityStatus::Available,
+                registration.decoder_factory.is_some()
+            );
+            assert_eq!(
+                registration.capabilities.canonicalization == CapabilityStatus::Available,
+                registration.canonicalizer.is_some()
+            );
+            assert_eq!(
+                registration.capabilities.replay == CapabilityStatus::Available,
+                registration.replay_adapter.is_some()
+            );
+            assert_eq!(
+                registration.capabilities.verification == CapabilityStatus::Available,
+                registration.verifier.is_some()
+            );
+        }
+    }
 }
