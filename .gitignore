@@ -20,3 +20,10 @@ Thumbs.db
 .idea/
 .fleet/
 *.iml
+
+# Agent
+.pi
+.codegraph
+**/graphify-out
+.ua
+.pi-subagents
