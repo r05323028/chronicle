@@ -1,0 +1,18 @@
+[package]
+name = "chronicle-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "chronicle"
+path = "src/main.rs"
+
+[dependencies]
+chronicle-application = { path = "../chronicle-application" }
+clap.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

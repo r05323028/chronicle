@@ -1,0 +1,29 @@
+[package]
+name = "chronicle-application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chronicle-wal = { path = "../chronicle-wal" }
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+chronicle-canonical = { path = "../chronicle-canonical" }
+chronicle-capture = { path = "../chronicle-capture" }
+chronicle-common = { path = "../chronicle-common" }
+chronicle-etl = { path = "../chronicle-etl" }
+chronicle-protocol = { path = "../chronicle-protocol" }
+chronicle-protocol-builtins = { path = "../chronicle-protocol-builtins" }
+chronicle-replay = { path = "../chronicle-replay" }
+chronicle-session = { path = "../chronicle-session" }
+chronicle-storage = { path = "../chronicle-storage" }
+time.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

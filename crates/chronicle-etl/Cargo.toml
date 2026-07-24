@@ -1,0 +1,19 @@
+[package]
+name = "chronicle-etl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chronicle-canonical = { path = "../chronicle-canonical" }
+chronicle-capture = { path = "../chronicle-capture" }
+chronicle-common = { path = "../chronicle-common" }
+chronicle-protocol = { path = "../chronicle-protocol" }
+chronicle-session = { path = "../chronicle-session" }
+chronicle-wal = { path = "../chronicle-wal" }
+thiserror.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true

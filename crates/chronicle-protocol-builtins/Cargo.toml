@@ -1,0 +1,14 @@
+[package]
+name = "chronicle-protocol-builtins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chronicle-canonical = { path = "../chronicle-canonical" }
+chronicle-common = { path = "../chronicle-common" }
+chronicle-protocol = { path = "../chronicle-protocol" }
+
+[lints]
+workspace = true

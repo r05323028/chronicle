@@ -1,0 +1,13 @@
+[package]
+name = "chronicle-capture-ebpf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chronicle-capture = { path = "../chronicle-capture" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
