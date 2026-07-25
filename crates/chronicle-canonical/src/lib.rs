@@ -4,7 +4,7 @@ use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId, SessionI
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const CANONICAL_SCHEMA_VERSION: u16 = 1;
+pub const CANONICAL_SCHEMA_VERSION: u16 = 2;
 pub type Attributes = BTreeMap<String, String>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -18,6 +18,12 @@ pub enum PayloadRef {
     },
     Object {
         bucket: String,
+        key: String,
+        checksum: String,
+        size: u64,
+        content_type: Option<String>,
+    },
+    Artifact {
         key: String,
         checksum: String,
         size: u64,
@@ -64,6 +70,12 @@ pub struct RedactionRecord {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalWarning {
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RedactionStage {
     RemoteArchive,
@@ -102,6 +114,8 @@ pub struct CanonicalOperation {
     pub incomplete: bool,
     pub truncated: bool,
     pub redactions: Vec<RedactionRecord>,
+    #[serde(default)]
+    pub warnings: Vec<CanonicalWarning>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +162,7 @@ impl Default for ReplayMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalSession {
+    #[serde(deserialize_with = "deserialize_schema_version")]
     pub schema_version: u16,
     pub id: SessionId,
     pub started_at: Timestamp,
@@ -156,6 +171,19 @@ pub struct CanonicalSession {
     pub connections: Vec<CanonicalConnection>,
     pub timeline: Vec<TimelineEntry>,
     pub replay: ReplayMetadata,
+}
+
+fn deserialize_schema_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = u16::deserialize(deserializer)?;
+    if version > CANONICAL_SCHEMA_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported canonical schema version {version}"
+        )));
+    }
+    Ok(version)
 }
 
 #[cfg(test)]
@@ -178,5 +206,69 @@ mod tests {
         let encoded = serde_json::to_vec(&session).unwrap();
         let decoded: CanonicalSession = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, session);
+
+        let mut v1: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        v1["schema_version"] = 1.into();
+        let decoded: CanonicalSession = serde_json::from_value(v1).unwrap();
+        assert_eq!(decoded.schema_version, 1);
+    }
+
+    #[test]
+    fn artifact_and_v1_operation_warning_defaults_round_trip() {
+        let artifact = PayloadRef::Artifact {
+            key: "sessions/example/payloads/deadbeef".into(),
+            checksum: "sha256:deadbeef".into(),
+            size: 4,
+            content_type: Some("application/octet-stream".into()),
+        };
+        assert_eq!(
+            serde_json::from_slice::<PayloadRef>(&serde_json::to_vec(&artifact).unwrap()).unwrap(),
+            artifact
+        );
+
+        let operation = CanonicalOperation {
+            id: OperationId::new(),
+            sequence: 1,
+            started_at_offset: RelativeTimeNanos(0),
+            completed_at_offset: None,
+            kind: OperationKind::Request,
+            effect: OperationEffect::Read,
+            request: artifact,
+            recorded_response: None,
+            attributes: Attributes::new(),
+            protocol_data: ProtocolData {
+                schema_version: 1,
+                media_type: None,
+                bytes: Vec::new(),
+            },
+            incomplete: false,
+            truncated: false,
+            redactions: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let mut v1 = serde_json::to_value(operation).unwrap();
+        v1.as_object_mut().unwrap().remove("warnings");
+        let decoded: CanonicalOperation = serde_json::from_value(v1).unwrap();
+        assert!(decoded.warnings.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_newer_schema_version() {
+        let error = serde_json::from_value::<CanonicalSession>(serde_json::json!({
+            "schema_version": CANONICAL_SCHEMA_VERSION + 1,
+            "id": SessionId::new(),
+            "started_at": OffsetDateTime::UNIX_EPOCH,
+            "ended_at": null,
+            "source": SourceMetadata::default(),
+            "connections": [],
+            "timeline": [],
+            "replay": ReplayMetadata::default(),
+        }))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported canonical schema version")
+        );
     }
 }

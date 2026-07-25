@@ -106,7 +106,7 @@ impl EtlPipeline {
 
         for stream in streams {
             let connection_id = ConnectionId::new();
-            let protocol_stream = protocol_stream(&stream);
+            let protocol_stream = protocol_stream(&stream, started_at);
             let (protocol, operations) =
                 if let Some((registration, _)) = registry.detect(&protocol_stream, None) {
                     match decode_and_canonicalize(registration, &protocol_stream) {
@@ -219,14 +219,16 @@ fn record_issue(
     Ok(())
 }
 
-fn protocol_stream(stream: &ConnectionStream) -> ProtocolStream<'_> {
+fn protocol_stream(stream: &ConnectionStream, started_at: OffsetDateTime) -> ProtocolStream<'_> {
     ProtocolStream {
+        started_at: Some(started_at),
         chunks: stream
             .chunks
             .iter()
             .map(|event| StreamChunk {
                 direction: event.direction,
                 sequence: event.monotonic_sequence,
+                timestamp: event.wall_time,
                 payload: &event.payload,
             })
             .collect(),
@@ -293,6 +295,7 @@ fn opaque_operation(stream: &ConnectionStream) -> CanonicalOperation {
         incomplete: true,
         truncated: stream.truncated,
         redactions: Vec::new(),
+        warnings: Vec::new(),
     }
 }
 

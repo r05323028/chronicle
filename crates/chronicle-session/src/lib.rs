@@ -207,4 +207,26 @@ mod tests {
             Err(SessionError::ChunkLimit { limit: 1 })
         ));
     }
+
+    #[test]
+    fn preserves_direction_order_and_truncation() {
+        let mut assembler = SessionAssembler::new(SessionLimits::default());
+        let mut response = event_for(2, "client", 1);
+        response.direction = Direction::ServerToClient;
+        response.truncated = true;
+        assembler.push(response).unwrap();
+        assembler.push(event_for(1, "client", 1)).unwrap();
+
+        let stream = assembler.finish().pop().unwrap();
+        assert_eq!(
+            stream
+                .chunks
+                .iter()
+                .map(|chunk| chunk.monotonic_sequence)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(stream.chunks[1].direction, Direction::ServerToClient);
+        assert!(stream.truncated);
+    }
 }

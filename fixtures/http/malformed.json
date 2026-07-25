@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "connections": [{"id":"bad","network_namespace":null,"client":{"host":"fixture-client","port":41004},"server":{"host":"recorded.invalid","port":8080},"transport":"tcp","process":null,"file_descriptor":7}],
+  "events": [
+    {"sequence":1,"timestamp":"2026-01-01T00:00:00Z","connection_id":"bad","direction":"client_to_server","payload_hex":"474554202f6d697373696e672d76657273696f6e0d0a0d0a","truncated":false,"flags":0}
+  ]
+}

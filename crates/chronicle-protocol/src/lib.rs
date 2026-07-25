@@ -1,7 +1,7 @@
 //! Compile-time protocol capability interfaces and registry.
 
 use chronicle_canonical::{CanonicalOperation, PayloadRef};
-use chronicle_common::{Direction, Endpoint, ProtocolId};
+use chronicle_common::{Direction, Endpoint, ProtocolId, Timestamp};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -63,11 +63,13 @@ impl DetectionResult {
 pub struct StreamChunk<'a> {
     pub direction: Direction,
     pub sequence: u64,
+    pub timestamp: Option<Timestamp>,
     pub payload: &'a [u8],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolStream<'a> {
+    pub started_at: Option<Timestamp>,
     pub chunks: Vec<StreamChunk<'a>>,
     pub truncated: bool,
 }

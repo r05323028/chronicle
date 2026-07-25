@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "connections": [{"id":"truncated","network_namespace":null,"client":{"host":"fixture-client","port":41005},"server":{"host":"recorded.invalid","port":8080},"transport":"tcp","process":null,"file_descriptor":7}],
+  "events": [
+    {"sequence":1,"timestamp":"2026-01-01T00:00:00Z","connection_id":"truncated","direction":"client_to_server","payload_hex":"504f5354202f7472756e636174656420485454502f312e310d0a486f73743a207265636f726465642e696e76616c69640d0a436f6e74656e742d4c656e6774683a20340d0a0d0a6162","truncated":true,"flags":0}
+  ]
+}

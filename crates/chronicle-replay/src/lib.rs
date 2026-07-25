@@ -317,6 +317,7 @@ mod tests {
                     incomplete: true,
                     truncated: false,
                     redactions: Vec::new(),
+                    warnings: Vec::new(),
                 }],
                 incomplete: false,
                 truncated: false,
