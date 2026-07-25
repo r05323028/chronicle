@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Recording-scoped ETL input
-ETL SHALL accept one recording WAL directory, recover and validate its metadata/segments, and process one stopped recording snapshot. It SHALL refuse actively locked recording, unsupported WAL/capture versions, corrupt durable prefix, contradictory metadata, or WAL changed after prior publication. It MAY process completed, interrupted, or failed recording whose durable prefix is valid and SHALL preserve source status in output.
+ETL SHALL accept one recording WAL directory, recover and validate metadata/segments, and process exactly recovered durable snapshot. It SHALL process `completed`, `failed`, and recovered `aborted` recordings when durable prefix is valid, preserving source status/reason; it SHALL reject active `starting`/`recording`, unsupported versions, corrupt durable prefix, contradictory metadata, or WAL digest conflict. Processing SHALL stop at durable watermark and SHALL NOT promote written-not-durable tail.
 
 #### Scenario: Completed recording input
 - **WHEN** valid stopped recording is supplied
@@ -11,9 +11,13 @@ ETL SHALL accept one recording WAL directory, recover and validate its metadata/
 - **WHEN** record writer still holds recording lock
 - **THEN** ETL fails without reading partial live state or publishing session
 
-#### Scenario: Incomplete recording input
-- **WHEN** recording ended interrupted but durable prefix is valid
-- **THEN** ETL may publish session marked with interrupted provenance and honest completeness
+#### Scenario: Aborted recording input
+- **WHEN** recovery finalized stale active recording as aborted and durable prefix is valid
+- **THEN** ETL SHALL publish deterministic session with aborted/crash provenance and honest durability-window completeness
+
+#### Scenario: Failed recording input
+- **WHEN** capture/WAL failure left valid durable prefix
+- **THEN** ETL SHALL process prefix and preserve failed status/reason without claiming full source completion
 
 ### Requirement: Generation-safe TCP reconstruction
 ETL SHALL group production payload by boot-scoped socket identity and connection generation, validate cgroup/tuple consistency, and maintain independent directional TCP sequence spaces. It SHALL NOT use file descriptor, PID, or tuple alone. Missing lifecycle SHALL create synthetic deterministic generation and incomplete state.
@@ -27,7 +31,7 @@ ETL SHALL group production payload by boot-scoped socket identity and connection
 - **THEN** ETL preserves payload under synthetic identity and marks connection incomplete
 
 ### Requirement: Deterministic directional ordering and deduplication
-ETL SHALL order bytes within each direction by wrap-aware TCP sequence position, use WAL provenance as deterministic tie-breaker, remove exact retransmitted overlap, and preserve direction. It SHALL also preserve deterministic cross-direction observation order by kernel monotonic timestamp then WAL sequence plus trusted termination/source-integrity state for protocol decoding. Conflicting overlap, missing interval, event-loss marker, or truncation SHALL produce explicit malformed/incomplete/truncated state rather than guessed bytes. Unattributed kernel drop SHALL taint whole recording and every overlapping production connection non-replayable. Fixture v1 events SHALL retain monotonic event ordering.
+ETL SHALL order bytes within each direction by wrap-aware TCP sequence position, use enclosing WAL provenance as deterministic tie-breaker, remove exact retransmitted overlap, and preserve direction. It SHALL preserve deterministic cross-direction observation order by kernel monotonic timestamp then WAL sequence plus derived termination/source-integrity state. It SHALL derive each loss window from previous/current loss-snapshot times, drop delta, epoch, and boot-scoped monotonic clock identity; compare only timestamps in same clock domain with connection activity intervals; retain complete eligibility for connections provably outside; degrade intersecting connections; and conservatively degrade unknown relationships. It SHALL NOT claim precise lost-connection attribution. Conflicting overlap, missing interval, truncation, or durability uncertainty SHALL produce explicit malformed/incomplete/truncated state. Fixture v1 events SHALL retain fixture ordering.
 
 #### Scenario: Split request and response
 - **WHEN** HTTP heads/bodies span multiple capture events in both directions
@@ -45,12 +49,24 @@ ETL SHALL order bytes within each direction by wrap-aware TCP sequence position,
 - **WHEN** TCP position gap remains at connection finalization
 - **THEN** affected message/connection is incomplete with source gap provenance
 
+#### Scenario: Connection outside loss window
+- **WHEN** connection activity interval ends before one loss window begins or starts after it ends
+- **THEN** that window SHALL NOT alone degrade connection/operations
+
+#### Scenario: Connection intersects loss window
+- **WHEN** connection activity overlaps conservative loss interval
+- **THEN** connection and affected operations become incomplete/uncertain and non-executable
+
+#### Scenario: Loss relationship unknown
+- **WHEN** lifecycle/timing evidence lacks matching clock identity/origin or cannot prove connection outside loss interval
+- **THEN** ETL SHALL conservatively degrade connection and retain explicit ambiguous-loss provenance
+
 #### Scenario: Sequential versus pipelined chronology
 - **WHEN** two captures have identical directional request/response bytes but different cross-direction completion interleavings
 - **THEN** ETL preserves distinct deterministic completion order so HTTP decoder distinguishes sequential from pipelined case
 
 ### Requirement: Bounded reconstruction
-ETL SHALL bound active connections, chunks, bytes per connection, idle event-time retention, HTTP body buffering, total operations, issue count, and read batch size as documented. Exceeded limits SHALL create typed skipped/incomplete/truncated/unsupported evidence or fail before unbounded allocation.
+ETL SHALL bound active connections to 1024, chunks per connection to 65,536, bytes per connection to 8 MiB, idle event-time retention to five minutes, HTTP body buffering to 8 MiB/operation, total canonical operations to 10,000, issue count to existing 1024, and read batch to 4096 records. Per-connection byte/chunk/idle limits SHALL finalize affected connection incomplete/truncated. Active-connection or total-operation overflow SHALL fail typed before publication rather than omit connections/operations. Recording hot path SHALL NOT parse HTTP to enforce operation count; duration/WAL limits bound input instead.
 
 #### Scenario: Connection memory limit
 - **WHEN** reconstructed connection exceeds 8 MiB bound
@@ -59,6 +75,14 @@ ETL SHALL bound active connections, chunks, bytes per connection, idle event-tim
 #### Scenario: Idle connection eviction
 - **WHEN** connection has no event for configured five-minute event-time window
 - **THEN** ETL finalizes it incomplete and releases reconstruction memory
+
+#### Scenario: Operation limit
+- **WHEN** decoding would produce operation 10,001
+- **THEN** ETL fails with exact limit/counter, publishes no partial session, and omits no operation silently
+
+#### Scenario: Active connection limit
+- **WHEN** input requires more than 1024 simultaneously active connections
+- **THEN** ETL fails bounded before publication with exact limit evidence
 
 #### Scenario: Batch processing
 - **WHEN** WAL contains more than 4096 records
@@ -90,8 +114,8 @@ P1 ETL SHALL group one stopped recording into one canonical session. Session, co
 - **WHEN** write/sync/rename fails before publication
 - **THEN** final session path is absent, checkpoint does not advance, and rerun is safe
 
-### Requirement: Checkpoint-after-publication idempotency
-Before publication, ETL SHALL atomically create recording-local output binding containing recording ID and canonical output-root identity; any different root SHALL be rejected even when post-publication checkpoint is missing. ETL SHALL then own versioned atomic checkpoint containing recording ID, bound output identity, input high-water segment/offset/next sequence, `wal_snapshot_sha256` over exact ordered verified segment bytes through high-water, recovery-report digest/scope, format/pipeline/canonical versions, session ID, published manifest checksum, status, and counters. Manifest SHALL contain high-water, pipeline version, WAL snapshot digest, and session ID but SHALL NOT contain checkpoint-file checksum. Checkpoint SHALL be written only after session publication. Interruption before publication SHALL restart from durable WAL beginning. Repeated run SHALL not create duplicate session or nondeterministically change output.
+### Requirement: Checkpoint-after-publication idempotency without output binding
+ETL SHALL derive deterministic session ID and `wal_snapshot_sha256` over exact ordered verified segment bytes through durable high-water before publication. In each requested output root it SHALL use existing atomic no-replace publication and verify any existing deterministic manifest/session/provenance/checksums before reporting `already_processed`; mismatch SHALL fail without overwrite. Recording-local `output-binding.json` SHALL NOT be created or required. Versioned atomic checkpoint SHALL contain recording ID, input high-water, WAL/recovery digests, format/pipeline/canonical versions, session ID, latest manifest checksum/output identity, status, and counters, but SHALL be advisory across roots and written only after publication. ETL SHALL permit same recording to materialize intentionally into another output root. Interruption before publication SHALL reread durable WAL; missing checkpoint after publication SHALL be repaired from verified requested-store manifest.
 
 #### Scenario: Second idempotent run
 - **WHEN** same unchanged recording is processed after matching publication/checkpoint
@@ -109,13 +133,13 @@ Before publication, ETL SHALL atomically create recording-local output binding c
 - **WHEN** verified WAL bytes change after publication while high-water coordinates and lengths remain same
 - **THEN** recomputed snapshot digest differs and ETL rejects already-processed/checkpoint repair
 
-#### Scenario: Changed output root after publication before checkpoint
-- **WHEN** session published to root A but checkpoint write failed and rerun requests root B
-- **THEN** recording-local binding rejects root B and no duplicate session is published
+#### Scenario: Different output root after publication before checkpoint
+- **WHEN** session published to root A, checkpoint write failed, and operator requests root B
+- **THEN** ETL SHALL publish same deterministic session to absent root-B path and SHALL verify/no-replace independently in each store
 
-#### Scenario: Changed output root with checkpoint
-- **WHEN** existing checkpoint is rerun with different canonical output root
-- **THEN** ETL rejects change instead of ambiguously reporting already processed
+#### Scenario: Different output root with checkpoint
+- **WHEN** existing checkpoint names root A and operator requests root B
+- **THEN** checkpoint SHALL NOT reject root B; ETL verifies/publishes deterministic session in requested store and updates advisory checkpoint after success
 
 #### Scenario: Conflicting prior publication
 - **WHEN** deterministic session path exists with different provenance/checksum
@@ -133,7 +157,7 @@ ETL SHALL process through repaired valid final-tail boundary but SHALL stop on c
 - **THEN** ETL publishes no session and returns corruption summary
 
 ### Requirement: Provenance and counters
-Canonical session and ETL summary SHALL include source recording ID/status, connection generation, capture time range, WAL segment/offset/sequence provenance, input/recovery checksums, schema versions, and counts for records processed/skipped, connections, decoded messages, and each completeness class. Default output SHALL omit payload/header values.
+Canonical session and ETL summary SHALL include source recording ID/status/shutdown reason, connection generation, capture time range, WAL segment/offset/sequence provenance, durable watermark and written-not-durable loss window, typed capture-loss windows/epochs/deltas, input/recovery checksums, schema versions, and counts for records processed/skipped, connections, decoded messages, and each completeness/replayability class. Default output SHALL omit payload/header values.
 
 #### Scenario: Inspectable provenance
 - **WHEN** ETL publishes session from recovered WAL

@@ -24,7 +24,7 @@ Doctor SHALL mark each probe required or optional and represent it as `supported
 - **THEN** aggregate is supported-with-warnings and doctor exits 0
 
 ### Requirement: Platform and eBPF probes
-Doctor SHALL check operating system, architecture, kernel version, cgroup v2, BTF, required eBPF hooks/helpers, effective privileges/capabilities, capture object/backend availability, and attach feasibility where safely testable. It SHALL NOT leave programs attached after probe.
+Doctor SHALL check operating system, architecture, kernel version, cgroup v2, BTF, required eBPF hooks/helpers, effective privileges/capabilities, capture object/backend availability, and attach feasibility where safely testable. When selector is supplied through record preflight, shared selector diagnostics SHALL reject root/known broad cgroups, show canonical path plus inode/ID/subtree, and verify PID has not moved immediately before attachment. Doctor/record SHALL NOT leave programs attached after probe failure.
 
 #### Scenario: Missing BTF
 - **WHEN** `/sys/kernel/btf/vmlinux` is unavailable or unusable
@@ -34,16 +34,28 @@ Doctor SHALL check operating system, architecture, kernel version, cgroup v2, BT
 - **WHEN** kernel supports capture but caller lacks attach/load privilege
 - **THEN** doctor reports privilege unsupported/not-checked separately from kernel support
 
+#### Scenario: Broad cgroup selector
+- **WHEN** selector preflight resolves root or known host-wide shared cgroup
+- **THEN** diagnostic reports unsupported broad-scope code and no attachment occurs
+
+#### Scenario: PID identity race
+- **WHEN** PID cgroup identity changes between initial and immediate pre-attach resolution
+- **THEN** diagnostic fails safely and reports expected/observed non-sensitive IDs
+
 #### Scenario: Non-Linux development host
 - **WHEN** doctor runs on macOS
 - **THEN** live capture is unsupported while portable ETL/inspect/replay checks still run
 
 ### Requirement: WAL and filesystem probes
-Doctor SHALL check requested/default WAL path creation/writability, private permission support, advisory locking, available space warning, file/data sync, and atomic no-replace session publication behavior using private temporary data. It SHALL remove probe artifacts best-effort and SHALL not overwrite user files.
+Doctor SHALL check supplied WAL/output path creation/writability, private permission support, advisory locking, available space warning, file/data sync, bounded group-commit prerequisites, and atomic no-replace publication using private temporary data. If path option is omitted, corresponding path probe SHALL be optional `not_checked` with remediation and SHALL NOT invent default path. It SHALL remove probe artifacts best-effort and SHALL NOT overwrite user files.
 
 #### Scenario: Writable private filesystem
 - **WHEN** directory supports required permissions, sync, lock, and atomic rename
 - **THEN** storage probe reports supported
+
+#### Scenario: Path omitted
+- **WHEN** doctor runs without WAL or output path
+- **THEN** corresponding path probe is optional `not_checked`, aggregate is at most supported-with-warnings, and no filesystem path is guessed
 
 #### Scenario: Low disk space
 - **WHEN** filesystem is writable but available bytes are below documented warning threshold

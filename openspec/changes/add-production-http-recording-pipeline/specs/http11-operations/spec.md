@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Stateful fixed-length HTTP decoding
-HTTP connection decoder SHALL consume reconstructed directional bytes plus deterministic cross-direction completion order, trusted termination, and source-integrity state. It SHALL parse request/status lines, ordered headers, no-body messages, exact `Content-Length` bodies, chunked response transfer coding, and valid response-to-close bodies across arbitrary capture/TCP chunk boundaries. Chunked requests SHALL be unsupported/non-replayable in P1. Decoder SHALL process persistent keep-alive and multiple sequential exchanges under fixed memory/header/body limits without assuming one capture event equals one message.
+HTTP connection decoder SHALL consume reconstructed directional bytes plus deterministic cross-direction completion order, userspace-derived termination, and source-integrity state. Capture-level lifecycle SHALL remain raw (`established`, `state_changed`, `closed`, `reset`, `unknown`); decoder SHALL use `clean_close`/`half_close` only when userspace can derive it from feasibility-proven evidence. It SHALL parse request/status lines, ordered headers, no-body messages, exact `Content-Length` bodies, chunked response transfer coding, and valid response-to-close bodies across arbitrary capture/TCP chunk boundaries. Chunked requests SHALL be unsupported/non-replayable in P1. Decoder SHALL process persistent keep-alive and multiple sequential exchanges under fixed memory/header/body limits without assuming one capture event equals one message.
 
 #### Scenario: Fragmented request head and body
 - **WHEN** valid request head and Content-Length body are split across several reconstructed chunks including head/body boundary
@@ -28,8 +28,12 @@ HTTP connection decoder SHALL consume reconstructed directional bytes plus deter
 - **THEN** decoder emits dechunked exact body and preserves bounded trailer metadata
 
 #### Scenario: Close-delimited response
-- **WHEN** response is validly framed by connection close and close lifecycle is observed
-- **THEN** decoder emits body at close with provenance and completeness derived from source integrity
+- **WHEN** response is validly framed by userspace-derived trusted clean close and source integrity is complete
+- **THEN** decoder emits body at close with provenance and complete state
+
+#### Scenario: Unproven directional half-close
+- **WHEN** capture provides only raw state change/unknown termination not proven by feasibility gate
+- **THEN** decoder SHALL NOT infer close-delimited completion or claim half-close support
 
 #### Scenario: Body limit exceeded
 - **WHEN** declared or decoded body exceeds configured 8 MiB operation limit
@@ -94,7 +98,7 @@ Decoder SHALL NOT silently claim support for chunked requests/request trailers, 
 - **THEN** decoder/canonicalizer marks affected operations unsupported and preserves complete prior non-pipelined operations
 
 ### Requirement: Typed canonical HTTP operation
-Each decoded exchange SHALL become `CanonicalOperation` with protocol `http/1.1`, request kind, classified effect, request/response body refs, offsets, endpoints at connection level, typed completeness, stable warnings, replay attributes, verification expectation, source recording/connection identity, and WAL provenance ranges. Essential HTTP semantics SHALL live in typed versioned HTTP protocol data, not solely string attributes. Incomplete, truncated, malformed, unmatched, and unsupported exchanges SHALL NOT be replay-ready.
+Each decoded exchange SHALL become `CanonicalOperation` with protocol `http/1.1`, request kind, classified effect, request/response body refs, offsets, endpoints at connection level, typed completeness, stable warnings, replay attributes, verification expectation, source recording/connection identity, WAL envelope provenance ranges, and intersecting/ambiguous loss-window provenance. Essential HTTP semantics SHALL live in typed versioned HTTP protocol data, not solely string attributes. Incomplete, truncated, malformed, unmatched, unsupported, and ambiguous-loss exchanges SHALL NOT be executable; complete supported operations outside loss windows SHALL remain executable even in partial session.
 
 #### Scenario: Canonical GET
 - **WHEN** complete GET exchange is canonicalized
@@ -111,6 +115,10 @@ Each decoded exchange SHALL become `CanonicalOperation` with protocol `http/1.1`
 #### Scenario: Unmatched operation
 - **WHEN** only request or only response is decoded
 - **THEN** canonical operation records unmatched state, missing peer, source provenance, and replay blocker
+
+#### Scenario: Mixed completeness
+- **WHEN** one complete supported operation is provably outside loss window and another operation intersects it
+- **THEN** first remains executable, second is non-executable with loss provenance, and session aggregates partial completeness
 
 #### Scenario: Timing conversion
 - **WHEN** event timestamps are nondecreasing

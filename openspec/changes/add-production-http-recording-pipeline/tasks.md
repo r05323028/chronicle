@@ -1,196 +1,293 @@
-## 0. Privileged kernel feasibility gate
+# Implementation Gates
 
-- [ ] 0.1 `[ebpf feasibility harness]` On supported Linux 6.1 host, prove Aya program types/helpers can propagate same socket cookie/generation across connect4/connect6, sock-ops lifecycle, and cgroup-skb ingress/egress for one real client flow; retain evidence for request, response, close, tuple, direction, TCP sequence, and loss counter; no persisted format work may start before pass.
-- [ ] 0.2 `[ebpf feasibility harness]` Prove IPv4/IPv6 normalization, selected host cgroup node-plus-descendants scope, host PID resolution, cgroup namespace ambiguity rejection, and cleanup after detach; document exact kernel/arch/capabilities; depends on 0.1.
-- [ ] 0.3 `[ebpf feasibility harness]` Exercise GSO/GRO and nonlinear skb payload visibility; confirm at-most-four 16 KiB continuation strategy reconstructs ordinary aggregates or amend OpenSpec/support matrix and re-run strict validation before task 1; depends on 0.1.
+Gates are dependency ordered and independently reviewable. Capture-specific contracts depend on Gate A. Kernel-independent primitives explicitly marked **parallel-safe before A** MAY proceed while feasibility runs. No gate may claim real eBPF coverage from fixture tests.
 
-## 1. Freeze P1 contracts and compatibility
+## Gate A — Kernel capture feasibility
 
-- [ ] 1.1 `[chronicle-common, chronicle-capture, chronicle-wal, chronicle-canonical]` After gate 0 passes, add version constants and typed IDs/enums for recording, capture event v2, WAL v2, manifest v2, canonical v3, completeness, lifecycle, provenance, and counters; preserve older artifacts and reject unknown newer versions; add serde/version unit tests; depends on 0; changes persisted/public types.
-- [ ] 1.2 `[chronicle-capture, chronicle-session]` Replace tuple/fd-only production identity with boot ID + socket cookie + generation contract while retaining fixture v1 normalization; verify descriptor/tuple/process-restart separation tests; depends on 1.1; changes capture/session public types.
-- [ ] 1.3 `[chronicle-replay, chronicle-application, chronicle-cli]` Define stable replay outcome, operation execution state, report JSON v2, and exit mapping before implementation; verify compile-time exhaustive matching and serde snapshots; depends on 1.1; changes replay/application/CLI API.
-- [ ] 1.4 `[workspace, docs]` Record P1 fixed bounds (16 KiB/event, four continuations/64 KiB observed payload, 8 MiB ring, 4096 queue/batch, 256 MiB segment, existing 8 MiB connection, 64 KiB/128 HTTP head, 8 MiB body, 10,000 operations) as owning-crate constants; assert design/spec values match tests; depends on 1.1.
-- [ ] 1.5 `[chronicle-capture, chronicle-canonical, chronicle-storage]` Implement explicit version-discriminated V1/V2/V3 wire DTO decode -> domain conversion -> invariant validation for capture envelopes, canonical sessions, and manifests instead of serde-defaulting one current struct; fixed compatibility/unknown-version tests; depends on 1.1.
+**Entry dependencies:** archived P0 vertical slice passes; supported Linux 6.1+ x86_64/aarch64 host/VM with cgroup v2, BTF, and required privilege is available.
 
-## 2. Isolate Linux eBPF build and dependencies
+**Runnable commands to establish:**
 
-- [ ] 2.1 `[Cargo.toml, crates/chronicle-capture-ebpf, chronicle-application, chronicle-cli, ebpf/]` Add target-specific optional Aya loader dependencies, explicit `linux-ebpf` feature chain CLI -> application -> adapter, only Tokio `signal` feature, and separate no-std eBPF package explicitly excluded from root workspace; prove macOS workspace needs no eBPF target/bpf-linker and feature-disabled Linux reports unavailable; depends on 1.1; changes dependency graph.
-- [ ] 2.2 `[ebpf/, build tooling]` Add explicit reproducible little-/big-endian eBPF object build command and loader embedding contract without general task framework/runtime path ambiguity; verify clean Linux release binary includes matching object; depends on 2.1.
-- [ ] 2.3 `[CI]` Add unprivileged Linux eBPF compile lane separate from ordinary locked workspace gates and label privileged runtime acceptance not checked; verify normal CI remains rootless; depends on 2.2.
-- [ ] 2.4 `[chronicle-capture-ebpf]` Replace constructible runtime `cfg!` scaffold with cfg-gated supported loader and typed non-Linux adapter; verify unsupported-platform/load-error tests and no direct unit-struct bypass; depends on 2.1.
+```bash
+cargo build --manifest-path ebpf-feasibility/Cargo.toml --target bpfel-unknown-none --release
+cargo test -p chronicle-capture-ebpf --test privileged_feasibility -- --ignored --nocapture
+```
 
-## 3. Extend capture event contracts and fixture sources
+**Acceptance scenario:** dedicated cgroup client performs real IPv4 and IPv6 plaintext HTTP/1.1 exchanges; harness observes request/response payload, stable candidate socket identity, tuple/direction/TCP positions, raw lifecycle state evidence, cumulative loss snapshots, and clean detach.
 
-- [ ] 3.1 `[chronicle-capture]` Implement capture event v2 fields for kernel time, PID/TGID/TID, cgroup/container hint, boot/socket/generation identity, tuple, lifecycle, TCP sequence, original payload length, truncation, flags, loss snapshot, and provenance-safe encoding; round-trip binary/non-UTF-8 tests; depends on 1.1-1.2.
-- [ ] 3.2 `[chronicle-capture]` Keep v1 fixture decoder/source and normalize events into reconstruction input without claiming TCP lifecycle/position; add fixture-v1 compatibility and newer-version rejection tests; depends on 3.1.
-- [ ] 3.3 `[chronicle-capture]` Add deterministic capture-event fixture source capable of lifecycle/TCP sequence/loss/truncation cases for non-eBPF tests; validate every event sequence/reference and ensure no HTTP/storage coupling; depends on 3.1.
-- [ ] 3.4 `[chronicle-capture]` Add capture counters snapshot/merge types with received bytes/events, dropped, truncated, and loss marker semantics; verify monotonic/saturating behavior; depends on 3.1.
+**Artifacts produced:** checked-in harness, captured ABI probe output, kernel/arch/helper/capability report, GSO/GRO/nonlinear-skb evidence, cgroup subtree evidence, and explicit supported/unsupported matrix proposal.
 
-## 4. Implement WAL v2 framing
+**Stop/go:** GO only when kernel-derived identity, lifecycle, payload visibility, loss-snapshot timing, and subtree assumptions are proven. STOP and revise/revalidate OpenSpec if any assumption fails. Capture Event v2 kernel fields, connection identity, eBPF/userspace ABI, helper matrix, lifecycle guarantees, and GSO/GRO claims MUST NOT freeze before GO. Generic WAL/recovery/metadata/replay/JSON/filesystem work below may proceed independently.
 
-- [ ] 4.1 `[chronicle-wal]` Add fixed checksummed segment header codec with format/header version, recording ID, ordinal, first sequence, and bounded metadata; test round trip, truncated header, wrong magic, checksum mismatch, recording mismatch, and unsupported version; depends on 1.1.
-- [ ] 4.2 `[chronicle-wal]` Extend record codec for declared capture schema/version while preserving WAL v1 reader; test record framing round trip, CRC mismatch, kind/version rejection, max-length rejection before allocation, and binary payload; depends on 4.1.
-- [ ] 4.3 `[chronicle-wal]` Add numeric segment discovery/order validation and deterministic path naming without scanning unrelated files; test missing/duplicate/overlap/out-of-order segment cases; depends on 4.1.
-- [ ] 4.4 `[chronicle-wal]` Add version-dispatch reader yielding segment/offset/sequence provenance and stable corruption errors; test P0 v1 read compatibility and P1 v2 multi-segment read; depends on 4.1-4.3.
+- [ ] A0 `[ebpf-feasibility/, chronicle-capture-ebpf tests]` Create disposable feasibility-only no-std eBPF package and privileged loader test command above without production feature chain or persisted ABI; verify clean build/run on supported host. This harness may be replaced after Gate A and SHALL NOT freeze production contract.
+- [ ] A1 `[ebpf feasibility harness]` Prove candidate Aya connect4/connect6, sock-ops, and cgroup-skb hooks correlate one real client flow across request/response; retain socket cookie/generation, tuple, direction, TCP sequence, and raw `established/state_changed/closed/reset/unknown` evidence; do not require directional half-close; privileged test; depends on A0.
+- [ ] A2 `[ebpf feasibility harness]` Prove IPv4/IPv6 normalization, exact selected cgroup node-plus-descendants scope, host PID resolution, stable cgroup inode/ID, namespace ambiguity rejection, and leak-free detach; test root and `/system.slice`/`/user.slice`/`/machine.slice` rejection plus PID movement race; depends on A1.
+- [ ] A3 `[ebpf feasibility harness]` Exercise GSO/GRO and nonlinear skb payload visibility and determine whether at-most-four 16 KiB continuations reconstruct ordinary aggregates; amend limits/support matrix rather than guess; depends on A1.
+- [ ] A4 `[ebpf feasibility harness]` Force ring reservation loss and prove cumulative per-CPU snapshots can provide previous/current monotonic sample times, drop delta, and loss epoch without claiming connection attribution; depends on A1.
+- [ ] A5 `[chronicle-capture-ebpf, docs test artifact]` Record exact kernel, architecture, Aya APIs, helpers, privileges, lifecycle evidence, payload limits, and unsupported cases in machine-readable feasibility report; compare report with spec constants; depends on A1-A4.
 
-## 5. Build durable WAL writer and bounded ingest
+**Gate A incremental test:** run commands above and retain one report showing real kernel-derived request/response/lifecycle/loss evidence. Fixture-only output is gate failure.
 
-- [ ] 5.1 `[chronicle-wal]` Refactor writer to create header in private temp file, file-sync, atomic rename, directory-sync, then append; rotate before configurable 16 MiB-4 GiB limit and use 0700/0600 modes; test rotation, crash before/after header publish, ignored temp, exact-boundary/oversized record, permissions; depends on 4.
-- [ ] 5.2 `[chronicle-wal]` Implement write-full + flush + `fdatasync` per record and durable acknowledgement only after sync; test graceful close and injected write/flush/sync failure preserving earlier durable prefix; depends on 5.1.
-- [ ] 5.3 `[chronicle-application, chronicle-wal]` Add bounded 4096-event ingest worker/channel that streams rather than buffering full source; queue saturation blocks and shutdown drains/joins; test bounded capacity, ordering, no userspace drop, and queued-versus-durable counters; depends on 3.4, 5.2.
-- [ ] 5.4 `[chronicle-application]` Map permission/disk-full/write/sync failure to stop-recording policy, failed metadata, observable loss/failure counters, and safe error; add fault-injection integration tests; depends on 5.3.
-- [ ] 5.5 `[chronicle-application]` Retain existing finite `write_capture_to_wal` behavior only for fixture compatibility or route fixture through streaming writer without changing P0 CLI outcome; regression-test checked-in fixture vertical slice; depends on 5.3.
+## Gate B — Durable raw recording
 
-## 6. Add WAL recovery and reopen
+**Entry dependencies:** B1.1-B1.4, B2.2, B3.1-B3.4, B4.1-B4.4, and B5.1-B5.5 are kernel-independent and parallel-safe before Gate A. B2.1/B2.3-B2.4, B4.5, B6, and B7 require Gate A GO or its frozen capture contract. P0 fixture/WAL artifacts remain compatibility fixtures.
 
-- [ ] 6.1 `[chronicle-wal]` Implement advisory recording lock with existing `rustix`, exclusive writer/recovery ownership, and crash-release semantics; test concurrent writer/recovery rejection and lock release; depends on 5.1.
-- [ ] 6.2 `[chronicle-wal, chronicle-application]` Implement deterministic recovery where verified final segment headers/records authoritatively derive segment list/next sequence/durable counters and recording metadata supplies immutable identity/selector plus last-known lifecycle; reconcile stale derived metadata/status, reject immutable mismatch, test metadata lag and repeated recovery; depends on 4.4, 6.1.
-- [ ] 6.3 `[chronicle-wal]` Repair only incomplete final record in final segment by truncating/syncing to verified boundary; test truncated fixed header, truncated payload/checksum, empty tail, and second recovery no-op; depends on 6.2.
-- [ ] 6.4 `[chronicle-wal]` Refuse/memoize truncated segment header, corrupted middle record, checksum mismatch, sequence gap, overlap, and recording mismatch without skipping/mutating evidence; test each stable segment/offset error and recovery report data; depends on 6.2.
-- [ ] 6.5 `[chronicle-wal]` Implement reopen-after-recovery append at next sequence with rotate-if-needed and no overwrite; test restart-and-append after clean and repaired WAL; depends on 6.3-6.4.
-- [ ] 6.6 `[chronicle-application]` Persist atomic body-safe `recovery-report.json` and surface repaired/corrupt/version counters; verify report serialization and no payload bytes; depends on 6.2-6.5.
+**Runnable commands to establish:**
 
-## 7. Implement Linux eBPF capture program
+```bash
+cargo test -p chronicle-wal
+cargo test -p chronicle-application --test recording_lifecycle
+chronicle --format json record --source ebpf --cgroup "$CGROUP" --wal-dir "$WAL" --duration-seconds 600 --max-wal-bytes 4294967296
+```
 
-- [ ] 7.1 `[ebpf/]` Add cgroup connect4/connect6 programs that filter effective cgroup, assign/store client socket attribution and generation, and emit bounded open evidence; verify map/key layout against userspace ABI and kernel compile; depends on 2.2, 3.1.
-- [ ] 7.2 `[ebpf/]` Add sock-ops lifecycle handling for active established, half-close, and close with boot/socket/generation identity and tuple consistency; verify deterministic synthetic test vectors/ABI decoding; depends on 7.1.
-- [ ] 7.3 `[ebpf/]` Add cgroup skb ingress/egress IPv4/IPv6 TCP parsing that emits only application payload as up to four ordered 16 KiB continuations (64 KiB ceiling), direction, TCP sequence/timestamps/truncation; exclude raw headers/HTTP parsing; verify options, empty/malformed, GSO/GRO/nonlinear skb, continuation and truncation vectors; depends on 7.1 and gate 0.
-- [ ] 7.4 `[ebpf/]` Add 8 MiB ring buffer and per-CPU received/bytes/drop/truncation counters; increment reservation failures and expose loss snapshot path; validate map capacity and counter ABI; depends on 7.3.
-- [ ] 7.5 `[chronicle-capture-ebpf]` Load/relocate eBPF object with kernel BTF, configure selected cgroup/maps, attach required links atomically, and detach all on partial/startup failure; test loader with mocked feature/attach failures and leak-free cleanup; depends on 2.4, 7.1-7.4.
-- [ ] 7.6 `[chronicle-capture-ebpf]` Poll ring buffer into `CaptureSource`/ingest events, decode ABI defensively, snapshot loss counters, drain on shutdown, and never fall back silently; add malformed-event, loss-marker, shutdown-drain, and unsupported-feature tests; depends on 7.5, 5.3.
+**Acceptance scenario:** selected workload streams Capture Event v2 into bounded queue and segmented WAL. Group commit occurs at 4 MiB or 10 ms and at rotation/explicit flush/shutdown. SIGINT/SIGTERM and duration/WAL limits finalize `completed`; capture/WAL failures finalize `failed`; crash leaves recoverable durable prefix and stale metadata for `aborted` recovery.
 
-## 8. Add recording metadata and lifecycle service
+**Artifacts produced:** Capture Event v2 and `WalRecordEnvelope` contracts, WAL v2 segments, `recording.json`, lock, safe record summary schema/example, recovery report, and rootless fault fixtures.
 
-- [ ] 8.1 `[chronicle-application]` Define versioned recording metadata/status/capability/selector/shutdown/counter models and atomic temp+sync+rename persistence with private modes; test transitions, serialization, interrupted stale-state recovery, and unknown version; depends on 1.1, 6.6.
-- [ ] 8.2 `[chronicle-application, chronicle-capture-ebpf]` Implement exactly-one host PID/cgroup selector, resolve/verify host unified cgroup inode/ID, attach selected node plus descendants, reject namespace ambiguity, and record effective scope; test missing/dead PID, ambiguous container PID, invalid path, conflicting selectors; depends on 7.5, 8.1.
-- [ ] 8.3 `[chronicle-application]` Implement preflight for Linux/kernel/architecture/BTF/object/hooks/capabilities/WAL destination/free-space warning before attach; test unsupported platform, insufficient privileges, unwritable WAL, and load failure with no successful recording; depends on 7.5, 8.1.
-- [ ] 8.4 `[chronicle-application]` Orchestrate metadata -> eBPF source -> bounded ingest -> WAL writer and stop on source/WAL failure; verify received/queued/durable/drop/truncation counters and failed durable prefix; depends on 5.3-5.4, 7.6, 8.3.
-- [ ] 8.5 `[chronicle-application]` Add SIGINT/SIGTERM adapter and one-shot graceful shutdown ordering (detach, drain, close queue, sync WAL, finalize metadata); subprocess-test both signals and second-signal best-effort behavior; depends on 8.4.
-- [ ] 8.6 `[chronicle-application]` Add stable body-safe human/JSON recording summaries plus checked-in JSON schema/example covering version, ID/status/reason/segments/counter names/order/errors; test no captured payload/header values; depends on 8.4-8.5.
+**Stop/go:** GO when durable watermark and counters exactly distinguish received, queued, written-not-durable, durable, dropped-before-persistence, and ETL-checkpointed; all group-commit fault tests recover only promised durable prefix; recording is bounded. STOP on silent loss, per-record-sync dependency, broad cgroup expansion, or ambiguous status/reason.
 
-## 9. Implement generation-safe TCP reconstruction
+### B1. Freeze kernel-independent compatibility and output contracts
 
-- [ ] 9.1 `[chronicle-session]` Extend assembler to group by production connection generation while retaining fixture `ConnectionKey` compatibility and documented 1024 connection/65,536 chunk limits; test fd reuse, tuple reuse, process restart, and separate generations; depends on 1.2, 3.2.
-- [ ] 9.2 `[chronicle-session]` Implement independent directional wrap-aware TCP sequence ordering with WAL provenance tie-breaker; test deterministic order, direction handling, sequence wrap, and event arrival permutations; depends on 9.1.
-- [ ] 9.3 `[chronicle-session]` Deduplicate exact retransmitted ranges and detect conflicting overlap without choosing bytes silently; test exact duplicate, partial identical overlap, conflicting overlap, and provenance retention; depends on 9.2.
-- [ ] 9.4 `[chronicle-session]` Detect missing intervals/lifecycle, clean/half/unknown termination, truncation, and recording-level unattributed loss; any kernel drop taints every overlapping production connection non-replayable; test missing open/payload, close, global loss, truncation; depends on 9.2-9.3.
-- [ ] 9.5 `[chronicle-session]` Enforce existing 8 MiB per-connection and five-minute event-time idle retention with explicit incomplete eviction; add memory-bound/idle/load-oriented tests proving no unbounded growth; depends on 9.4.
-- [ ] 9.6 `[chronicle-protocol, chronicle-etl]` Expose protocol-neutral input with per-direction TCP byte order, cross-direction completion order (kernel monotonic timestamp + WAL sequence), trusted termination/source-integrity, and WAL ranges; compile dependency audit plus identical-bytes/different-interleaving test; depends on 9.2-9.5.
+- [ ] B1.1 `[chronicle-common, chronicle-wal, chronicle-canonical]` **Parallel-safe before A.** Add version constants and explicit V1/V2/V3 wire-dispatch scaffolding for WAL envelopes, manifests, canonical data, metadata, counters, and unknown-version rejection; preserve P0 WAL v1/canonical v1-v2/manifest v1 fixtures; serde/compatibility tests.
+- [ ] B1.2 `[chronicle-replay, chronicle-application, chronicle-cli]` **Parallel-safe before A.** Define `ReplayOutcome`, operation execution state, replayability classification, and report JSON version on existing `ReplayExecution`; compile-time exhaustive match/serde snapshots; no duplicate executor abstraction.
+- [ ] B1.3 `[chronicle-application, chronicle-cli]` **Parallel-safe before A.** Add one bounded atomic JSON renderer: serialize complete result before stdout, checked `write_all`/flush, typed serialization versus CLI I/O errors, and no replay retry; shared record/ETL/inspect/replay/doctor fault tests.
+- [ ] B1.4 `[chronicle-storage]` **Parallel-safe before A.** Preserve staging, sync, manifest-last, atomic no-replace publication and private modes; expose reusable existing-manifest verification primitive; concurrent/failure tests.
 
-## 10. Extend HTTP/1.1 streaming decode
+### B2. Define capture and WAL ownership
 
-- [ ] 10.1 `[chronicle-protocol-builtins]` Adapt HTTP decoder input to reconstructed/provenance slices while preserving existing `httparse` 64 KiB/128-header bounds and P0 fixed-length tests; depends on 9.6.
-- [ ] 10.2 `[chronicle-protocol-builtins]` Implement Content-Length request/response and no-body response across arbitrary head/body/capture boundaries with exact byte/provenance consumption; test split request, split response, header boundary, body boundary, zero length, HEAD/204/304; depends on 10.1.
-- [ ] 10.3 `[chronicle-protocol-builtins]` Implement bounded chunked response decoding (extensions syntax only, exact chunks, zero terminator, bounded response trailers) and classify any chunked request/request trailer unsupported; test split response chunks, binary body/trailers/malformed/missing terminator and malicious chunked request; depends on 10.1.
-- [ ] 10.4 `[chronicle-protocol-builtins]` Implement valid response-to-close framing only when lifecycle close is trustworthy; test complete close-delimited response, missing close, loss/truncation before close; depends on 10.1, 9.4.
-- [ ] 10.5 `[chronicle-protocol-builtins]` Preserve multiple sequential keep-alive messages and independent directions without treating one capture event as message; test coalesced/split messages and more than one exchange on connection; depends on 10.2-10.4.
-- [ ] 10.6 `[chronicle-protocol-builtins]` Enforce 8 MiB body limit and return typed truncated/unsupported evidence without panic/allocation growth; test declared/chunked/close body overflow; depends on 10.2-10.4.
+- [ ] B2.1 `[chronicle-capture]` After A, define Capture Event v2 capture-domain fields only: kernel time, process/stable-cgroup identity, proven connection identity, raw lifecycle evidence, direction/TCP position/payload, truncation, and loss snapshots; no WAL sequence/segment/offset; binary round-trip tests; depends on A5, B1.1.
+- [ ] B2.2 `[chronicle-wal]` Define `WalRecordEnvelope` owning recording ID, WAL sequence, segment/offset provenance, schema kind/version, and capture payload; prove in-memory/fixture v2 events need no pre-persistence sequence; depends on B1.1.
+- [ ] B2.3 `[chronicle-capture]` Retain fixture v1 decoder/source and its fixture ordering while normalizing to v2 reconstruction input; P0 bytes/outcomes and newer-version rejection tests; depends on B2.1.
+- [ ] B2.4 `[chronicle-capture]` Add deterministic v2 fixture source for raw lifecycle, TCP position, truncation, and loss windows; no HTTP/storage coupling; reference/order validation tests; depends on B2.1.
 
-## 11. Pair HTTP messages and canonicalize completeness/provenance
+### B3. Implement WAL v2 framing, segmentation, and recovery primitives
 
-- [ ] 11.1 `[chronicle-protocol-builtins]` Keep method queue, HEAD/close framing, message completion chronology, FIFO final-response pairing, and pipelining detection inside connection decoder; canonicalizer maps completed exchanges; test unmatched peers and complete prior exchanges; depends on 10.5.
-- [ ] 11.2 `[chronicle-protocol-builtins]` Detect second request completed before first final response as pipelining and mark affected operations unsupported/non-replayable; test identical directional bytes with sequential versus pipelined WAL/timestamp interleavings plus complete prior exchange; depends on 11.1.
-- [ ] 11.3 `[chronicle-protocol-builtins]` Represent malformed request/status line, incomplete head/body, malformed chunks, 1xx, CONNECT, Upgrade/WebSocket, ambiguous framing, and non-HTTP/1.1 with stable completeness/warnings; test each and no panic; depends on 10, 11.1.
-- [ ] 11.4 `[chronicle-canonical, chronicle-protocol-builtins]` Emit canonical v3 typed completeness and recording/connection/WAL provenance for complete and degraded operations; test binary body refs, source ranges, operation order, and non-replayability; depends on 1.1, 11.1-11.3.
-- [ ] 11.5 `[chronicle-canonical]` Add v1/v2 compatibility mapping into v3 completeness/provenance defaults and reject v4+; round-trip checked-in P0 sessions/fixtures; depends on 11.4.
-- [ ] 11.6 `[chronicle-protocol-builtins]` Update HTTP capability registration integrity only after detector/decoder/canonicalizer/replay/verifier remain wired; assert no other protocol becomes Available; depends on 11.4.
+- [ ] B3.1 `[chronicle-wal]` **Parallel-safe before A.** Add checksummed segment header codec with recording ID/ordinal/first sequence and bounded metadata; round-trip, wrong magic/version/checksum/identity/truncated-header tests; depends on B1.1.
+- [ ] B3.2 `[chronicle-wal]` **Parallel-safe before A.** Add envelope codec and version-dispatch reader yielding segment/offset/WAL-sequence provenance while retaining v1 reader; max-length-before-allocation, CRC, binary payload, unknown kind/version tests; depends on B2.2, B3.1.
+- [ ] B3.3 `[chronicle-wal]` **Parallel-safe before A.** Add deterministic numeric segment discovery and temp-file exclusion; missing/duplicate/overlap/order tests; depends on B3.1.
+- [ ] B3.4 `[chronicle-wal]` **Parallel-safe before A.** Create segment header under private temp name, file-sync, rename, directory-sync, then append; default 256 MiB/configurable 16 MiB-4 GiB rotation; exact boundary/oversized/crash/permission tests; depends on B3.1-B3.3.
 
-## 12. Build recording-scoped ETL discovery and deterministic IDs
+### B4. Implement one bounded group-commit policy
 
-- [ ] 12.1 `[chronicle-etl]` Add recording-directory entry point that acquires read/recovery ownership, validates stopped metadata, discovers all segments, and rejects active/corrupt/unsupported inputs before publication; integration-test completed/interrupted/failed/active recordings; depends on 6, 8.1.
-- [ ] 12.2 `[chronicle-etl]` Read recovered WAL in 4096-record batches, decode v1/v2 events, feed reconstruction, and accumulate bounded safe issues/counters/provenance; test partially processed segment, unsupported event version, malformed event, and batch determinism; depends on 4.4, 9, 12.1.
-- [ ] 12.3 `[chronicle-etl]` Derive deterministic session/connection/operation UUIDs from SHA-256 domain separators, recording ID, pipeline version, provenance, and message order; add fixed vectors and collision-domain tests; depends on 11.4, 12.2.
-- [ ] 12.4 `[chronicle-etl]` Build exactly one canonical session per stopped recording with source status/time/counters and honest incomplete/malformed/unmatched/unsupported aggregation; test complete and incomplete recording outputs; depends on 11, 12.2-12.3.
-- [ ] 12.5 `[chronicle-etl]` Stop before output on WAL corruption/version/sequence/checkpoint contradiction while publishing bounded opaque evidence for trustworthy unsupported protocol/malformed traffic; test both fatal and publishable issue classes; depends on 12.1-12.4.
+- [ ] B4.1 `[chronicle-wal]` **Parallel-safe before A.** Implement complete-frame writes and group sync at 4 MiB unsynced, 10 ms elapsed with unsynced data, segment rotation, explicit internal flush, or shutdown; no durability CLI mode and no per-record sync default; deterministic fake-clock tests; depends on B3.4.
+- [ ] B4.2 `[chronicle-wal, chronicle-application]` **Parallel-safe before A.** Persist/checksum durable watermark after successful data sync and track received/queued/written-not-durable/durable/dropped/checkpointed record+byte counters; watermark-lag behavior MUST conservatively lose, never promote; round-trip/reconciliation tests; depends on B4.1.
+- [ ] B4.3 `[chronicle-wal tests]` Inject crash/failure immediately before/after byte threshold, time threshold, rotation sync, explicit flush, shutdown sync, and watermark persistence; assert exact recovered durable prefix, uncertain/lost window, and earlier-prefix readability; depends on B4.1-B4.2.
+- [ ] B4.4 `[chronicle-wal]` Enforce total WAL default/hard max 4 GiB over every byte under `segments/` including headers/frames/temp files; exclude metadata/lock/ETL reports; reserve/check header+frame before write; configurable lower >= segment size; boundary/temp/invalid-config tests; depends on B3.4.
+- [ ] B4.5 `[chronicle-application, chronicle-wal]` Add bounded 4096-event streaming ingest. Saturation blocks without userspace discard; written leaves queue but remains non-durable until group sync; ordering/capacity/shutdown-drain tests; depends on B2.4, B4.1-B4.2.
 
-## 13. Add ETL checkpointing and atomic idempotency
+### B5. Recovery and recording lifecycle
 
-- [ ] 13.1 `[chronicle-etl]` Define atomic pre-publication `output-binding.json` (recording + canonical output root) and post-publication checkpoint v1 with binding, high-water, exact verified-byte `wal_snapshot_sha256`, recovery digest/scope, pipeline/canonical/session, manifest checksum/status/counters; test atomic create/conflict, round trip, digest vector, torn temp, safe JSON; depends on 12.
-- [ ] 13.2 `[chronicle-application, chronicle-storage]` Persist output binding before deterministic `FilesystemSessionStore` publication and checkpoint only after publication; inject failures at binding/payload/session/manifest/sync/rename/checkpoint and assert binding/final/checkpoint order; depends on 13.1.
-- [ ] 13.3 `[chronicle-etl, chronicle-storage]` Recompute WAL snapshot before matching publication/checkpoint -> already processed or repair; reject checksum/provenance, same-length valid WAL mutation, changed root with/without checkpoint, including crash after root-A publication before checkpoint then root-B rerun; prove no overwrite/duplicate; depends on 13.2.
-- [ ] 13.4 `[chronicle-etl]` Implement restart after ETL interruption by deterministic reread from WAL start, not intermediate state; kill/fault after batches and prove identical single publication; depends on 13.2-13.3.
-- [ ] 13.5 `[chronicle-application]` Add safe ETL human/JSON renderer plus checked-in JSON schema/examples covering version, output identity, counters/checkpoint/completeness/order/error; test serialization failure/no payload values; depends on 13.1-13.4.
+- [ ] B5.1 `[chronicle-wal]` **Parallel-safe before A.** Implement advisory recording lock, deterministic scan, safe reopen, and authoritative durable watermark handling; concurrent writer/recovery and crash-release tests; depends on B3.1-B3.4 and B4.1-B4.4 only.
+- [ ] B5.2 `[chronicle-wal]` Repair only incomplete final record in final segment to verified durable boundary; sync repair; reject truncated segment header, middle/CRC corruption, sequence gap/overlap, identity mismatch without mutation; second-run determinism tests; depends on B5.1.
+- [ ] B5.3 `[chronicle-wal, chronicle-application]` Reconcile lagging metadata/counters; discard/report post-watermark complete frames as uncertain rather than durable; stale `starting/recording` -> `aborted` with crash/forced reason; immutable selector mismatch fails; depends on B5.1-B5.2.
+- [ ] B5.4 `[chronicle-application]` Persist body-safe atomic `recovery-report.json` with repaired-tail, post-watermark lost/uncertain, corruption, version, sequence, durable record/byte counters; shared JSON renderer tests; depends on B1.3, B5.2-B5.3.
+- [ ] B5.5 `[chronicle-wal]` Reopen only after successful recovery at next durable WAL sequence, never overwrite, rotate if required; clean/repaired restart-append tests; depends on B5.2-B5.3.
 
-## 14. Persist provenance and extend inspect
+### B6. Build isolated eBPF adapter
 
-- [ ] 14.1 `[chronicle-storage]` Add manifest v2 recording/status/time/WAL high-water/snapshot digest/pipeline/session/provenance/completeness/integrity fields, explicitly no checkpoint-file checksum; retain manifest v1 reader/unknown-version rejection; P0/P1 and one-way checksum tests; depends on 11.5, 13.1.
-- [ ] 14.2 `[chronicle-storage]` Keep staging + sync + manifest-last + atomic no-replace publication and 0700/0600 permissions for v3/provenance data; rerun concurrent/failure/private-permission tests; depends on 14.1.
-- [ ] 14.3 `[chronicle-storage, chronicle-application]` Extend inspect to verify manifest/session checksums and payload existence/size, expose recording/WAL provenance availability, schema/integrity/completeness/replay readiness, and never read bodies for summary; tests with WAL present/removed and corrupt artifacts; depends on 14.1.
-- [ ] 14.4 `[chronicle-application]` Update human inspect output with operation order, time range, completeness/malformed/unmatched counts, provenance/integrity/warnings; snapshot no secret/body/header values; depends on 14.3.
-- [ ] 14.5 `[chronicle-application, chronicle-cli]` Bump inspect JSON schema with stable deterministic structure and typed serialization failure/no partial stdout; CLI contract tests and schema docs fixture; depends on 14.3.
+- [ ] B6.1 `[Cargo.toml, chronicle-capture-ebpf, chronicle-application, chronicle-cli, ebpf/]` Add target-specific optional Aya loader, `linux-ebpf` feature chain, Tokio `signal` only, excluded no-std eBPF package, embedded endian-matched object; macOS/rootless builds need no bpf-linker; depends on A5.
+- [ ] B6.2 `[CI]` Add unprivileged eBPF compile lane separate from rootless workspace and label privileged runtime not checked; clean build tests; depends on B6.1.
+- [ ] B6.3 `[ebpf/]` Implement proven connect/lifecycle/payload programs and 8 MiB ring/per-CPU counters using Gate A ABI; lifecycle emits raw evidence only; no HTTP parsing/raw packet persistence; compile/vector tests; depends on A5, B2.1.
+- [ ] B6.4 `[chronicle-capture-ebpf]` Load/configure/attach links atomically, decode ABI defensively, sample typed loss windows, poll into capture source, drain/detach on shutdown, and never silently fall back; mocked verifier/partial-attach/malformed-event/loss/drain tests; depends on B6.1, B6.3, B4.5.
 
-## 15. Complete replay partial-execution model
+### B7. Harden cgroup selection and recording metadata
 
-- [ ] 15.1 `[chronicle-replay]` Extend existing `ReplayExecution` with `ReplayOutcome` and explicit operation state while retaining one result per planned operation; no duplicate executor type; unit-test exhaustive outcome/result accounting; depends on 1.3.
-- [ ] 15.2 `[chronicle-replay]` Convert expected connect/execute transport failures into failed result + stopped-transport outcome and populate all later unattempted results; test first and middle failure with prior results preserved; depends on 15.1.
-- [ ] 15.3 `[chronicle-replay, chronicle-application]` Preflight target/effect/session and registry capabilities before connection; implement precedence dry-run -> invalid-session/capability -> policy -> runtime; missing persisted capability yields invalid outcome, registry construction remains error; all zero-network outcomes include every result; depends on 15.1.
-- [ ] 15.4 `[chronicle-replay]` Stop on non-passing verification with stopped-verification outcome and explicit later unattempted results; test Passed then Failed/Inconclusive/Unsupported; depends on 15.1.
-- [ ] 15.5 `[chronicle-application]` Migrate replay callers from result-vector assumptions to outcome/result model, retain full report after partial execution, and reserve `ReplayError` for invariants/configuration; application tests; depends on 15.2-15.4.
-- [ ] 15.6 `[chronicle-cli]` Human replay prints plan before network then report; JSON validates plan before network and emits one final object containing plan/outcome/results; map completed/dry-run/policy/invalid/transport/verification exits and test no partial JSON; depends on 15.5.
+- [ ] B7.1 `[chronicle-application, chronicle-capture-ebpf]` Implement exactly-one PID/cgroup selector with canonical host path + inode/ID, exact node-plus-descendants scope, root/shared-root/recorder-cgroup rejection, namespace ambiguity rejection, and no container-ID selector; unit/integration tests; depends on A2, B6.4.
+- [ ] B7.2 `[chronicle-application]` Resolve PID during preflight, immediately before attach, and immediately after links attach; require same path/ID across all three and fail/detach on movement/death; race subprocess test; depends on B7.1.
+- [ ] B7.3 `[chronicle-application]` Define metadata status `starting/recording/completed/failed/aborted` separate from required shutdown reasons; atomic temp+sync+rename/private modes, unknown-version tests; depends on B1.1, B5.3.
+- [ ] B7.4 `[chronicle-application]` Preflight Linux/kernel/arch/BTF/object/hooks/capabilities/WAL path/free space/segment+total/duration bounds before attach; unsupported/unwritable/invalid-bound tests with no successful metadata; depends on B7.1, B7.3.
+- [ ] B7.5 `[chronicle-application]` Add duration default 600 seconds/max 3600 and total WAL default/hard max 4 GiB. First limit stops new capture immediately and allows fixed five-second detach/drain/final-sample/group-sync/finalization grace; success completed/exact reason, timeout/failure failed/durable prefix; fake-clock/exact-byte/hung-drain subprocess tests; depends on B4.4-B4.5, B7.3.
+- [ ] B7.6 `[chronicle-application]` Orchestrate metadata -> eBPF source -> bounded ingest -> WAL. Source/WAL failure stops as `failed` with capture/wal reason and durable prefix; tests cover all counters; depends on B4.5, B6.4, B7.4-B7.5.
+- [ ] B7.7 `[chronicle-application]` Handle SIGINT/SIGTERM as graceful `completed`/exit 0 after successful finalization; second signal may force exit and later recovery marks aborted; subprocess tests for both signals and failure paths; depends on B7.6.
+- [ ] B7.8 `[chronicle-cli, chronicle-application]` Wire production record grammar including bounds and safe summary schema through shared atomic renderer; preserve P0 fixture command/outcome; Clap/conflict/JSON/no-secret tests; depends on B1.3, B7.6-B7.7.
 
-## 16. Preserve controlled replay safety and bounds
+**Gate B incremental test:** before HTTP ETL exists, run fake-source/rootless recording and privileged real capture, inspect WAL with recovery scanner, crash recorder, and prove verified durable prefix plus honest aborted/loss metadata.
 
-- [ ] 16.1 `[chronicle-replay]` Re-run/extend target parser tests for explicit loopback IP literal, exact allow-host, no DNS/userinfo/path/query/fragment/HTTPS/wildcard/original fallback; depends on 15.1; no policy broadening.
-- [ ] 16.2 `[chronicle-replay, chronicle-protocol-builtins]` Ensure captured Host/authorization/cookie/forwarding/hop-by-hop/Connection-token/Transfer-Encoding fields cannot affect target/policy and target Host/Content-Length are rebuilt; test malicious recorded headers; depends on 11.4.
-- [ ] 16.3 `[chronicle-protocol-builtins]` Preserve one-request-per-connection, five-second timeout, no retry/proxy/TLS/redirect behavior and bound observed response body to 8 MiB; test redirect does not follow, refusal, timeout, incomplete response, oversized response; depends on 15.2.
-- [ ] 16.4 `[chronicle-replay]` Reject incomplete/truncated/malformed/unmatched/unsupported/pipelined operations before any network, while complete siblings remain represented; test mixed session preflight blocks all; depends on 11.4, 15.3.
-- [ ] 16.5 `[chronicle-application/tests]` Add target spy proving authorized override receives requests and original recorded destination never receives/connects, including redirect Location escape attempt; depends on 16.1-16.4.
+## Gate C — Recovery and ETL
 
-## 17. Produce structured verification reports
+**Entry dependencies:** Gate B GO. Gate A evidence already frozen into capture ABI. P0 protocol/canonical compatibility fixtures available.
 
-- [ ] 17.1 `[chronicle-protocol-builtins]` Preserve exact HTTP status, ordered selected headers with fixed ignore set, and body SHA-256/size comparison; add pass/status/header/body/missing expected/incomplete expected tests with value-safe details; depends on 11.4.
-- [ ] 17.2 `[chronicle-application]` Build replay report JSON v2 with outcome, aggregate attempted/completed/failed/unattempted and verification counts, and every operation result; verify aggregation equals entries after partial failure; depends on 15.5, 17.1.
-- [ ] 17.3 `[chronicle-application]` Update human report with same metadata-safe categories and no response/request body or arbitrary header values; snapshot all outcome classes; depends on 17.2.
-- [ ] 17.4 `[chronicle-application, chronicle-cli]` Handle final replay JSON serialization failure as exit 3 without pre-execution partial JSON, network retry, or loss of in-memory execution result; fault-injection/subprocess test; depends on 17.2.
-- [ ] 17.5 `[chronicle-cli]` Document and test exit 0/4/5/6 aggregation for dry-run/pass, policy/invalid, transport, and verification outcomes; depends on 15.6, 17.2.
+**Runnable commands to establish:**
 
-## 18. Implement doctor probes
+```bash
+cargo test -p chronicle-session -p chronicle-etl -p chronicle-protocol-builtins
+chronicle --format json etl --wal-dir "$WAL" --output "$ROOT"
+```
 
-- [ ] 18.1 `[chronicle-application]` Define required/optional diagnostic probes and aggregate precedence: required unsupported, required not-checked, warnings/optional failures, supported; stable codes/remediation/order and exact exit 4/4/0/0 tests; depends on 1.1.
-- [ ] 18.2 `[chronicle-capture-ebpf]` Implement non-destructive OS/arch/kernel/cgroup-v2/BTF/hook/helper/object/capability/attach probes with cleanup and safe distinction between unsupported and not-checkable; mocked tests plus privileged smoke; depends on 7.5, 18.1.
-- [ ] 18.3 `[chronicle-wal, chronicle-storage]` Implement private temp WAL path writability/space warning/lock/sync and atomic no-replace publication probes without overwriting user files; tests on supported and injected-unsupported filesystems; depends on 6.1, 14.2, 18.1.
-- [ ] 18.4 `[chronicle-protocol, chronicle-replay]` Probe protocol capability registry and replay policy shape without network; report HTTP available, other actual statuses, loopback/no-redirect policy, and missing per-command target as informational; tests; depends on 11.6, 16.1, 18.1.
-- [ ] 18.5 `[chronicle-application]` Compose independent probes, continue after failures, remove temporary artifacts/links, and emit body-safe human/JSON output; test no side effects and no environment credential values; depends on 18.2-18.4.
+**Acceptance scenario:** recover stopped bounded recording, scan only durable prefix, reconstruct connection generations and loss windows, decode supported HTTP, publish one deterministic session, rerun same root as already processed, and intentionally materialize same recording into another root without binding file.
 
-## 19. Wire application services and CLI
+**Artifacts produced:** deterministic canonical v3 session ID, manifest v2/session/payloads, advisory checkpoint, typed ETL/recovery summaries, loss-window provenance, and rootless deterministic fixtures.
 
-- [ ] 19.1 `[chronicle-application]` Replace generic `ChronicleApplication` record/ETL/inspect/replay/doctor scaffold branches with typed service entry points or remove unused facade without duplicating already-runnable functions; compile caller migration and scaffold regression removal; depends on 8, 13, 14, 15, 18.
-- [ ] 19.2 `[chronicle-cli]` Add production record arguments `--source ebpf (--pid|--cgroup) --wal-dir [--segment-bytes]` while preserving fixture command; Clap parse/conflict/help tests; depends on 8.6.
-- [ ] 19.3 `[chronicle-cli]` Make `etl --wal-dir --output` runnable with safe human/JSON summaries and exit 0/3; first/idempotent/corrupt CLI tests; depends on 13.5.
-- [ ] 19.4 `[chronicle-cli]` Make `doctor` runnable with optional paths/full human/JSON probes; exit 4 for required unsupported/not-checked and 0 for supported/warnings including optional not-checked; subprocess tests; depends on 18.5.
-- [ ] 19.5 `[chronicle-cli]` Preserve inspect/replay syntax and global format while wiring schema-v2 summaries/outcomes; dry-run/authorization/override/report/serialization tests; depends on 14.5, 15.6, 17.
-- [ ] 19.6 `[chronicle-cli/tests]` Add production-record signal harness with fake capture: successful SIGINT -> interrupted/exit 0, successful SIGTERM -> interrupted/exit 143, flush/finalization failure -> failed/exit 3; assert summary/metadata; depends on 8.5, 19.2.
+**Stop/go:** GO when unchanged WAL always yields byte-identical IDs/content, only verified final tail is repaired, middle corruption fails closed, loss windows degrade only intersecting/uncertain connections, and no operation is silently omitted. STOP on whole-recording loss degradation, cross-root binding, nondeterminism, or unbounded reconstruction.
 
-## 20. Standardize observability and safe output
+### C1. Generation-safe reconstruction and loss windows
 
-- [ ] 20.1 `[chronicle-application, owning crates]` Define shared summary field names and structured tracing events for required capture/WAL/ETL/HTTP/replay counters without adding metrics server; compile/render tests; depends on 3.4, 6.6, 12.4, 17.2.
-- [ ] 20.2 `[chronicle-application]` Ensure every fatal/partial boundary emits stable code, recording/session/checkpoint identity, and counters while excluding payload/header/environment values; snapshot redaction tests with seeded secrets; depends on 20.1.
-- [ ] 20.3 `[chronicle-session, chronicle-etl, chronicle-replay]` Add load-oriented bounded tests for queue, reconstruction memory/idle eviction, ETL batch, HTTP body, replay response, and report operation limits; assert explicit state/error and bounded allocation proxies, not throughput claims; depends on 5.3, 9.5, 10.6, 12.2, 16.3.
+- [ ] C1.1 `[chronicle-session]` Group production data by feasibility-proven boot/socket/generation identity while retaining fixture `ConnectionKey`; descriptor/tuple/process-restart separation and synthetic-missing-open tests; depends on B2.
+- [ ] C1.2 `[chronicle-session]` Implement independent wrap-aware TCP sequence ordering with WAL envelope provenance tie-breaker; direction/wrap/arrival-permutation tests; depends on C1.1.
+- [ ] C1.3 `[chronicle-session]` Deduplicate exact retransmitted ranges, detect conflicting overlap, and retain provenance without choosing bytes silently; exact/partial/conflict tests; depends on C1.2.
+- [ ] C1.4 `[chronicle-session]` Convert persisted loss snapshots into deterministic windows `(clock_id/origin,previous_time,current_time,delta,epoch)` and compare only matching boot-scoped monotonic clocks with connection activity. Outside remains eligible; intersecting/unknown/mismatched clock degrades; deterministic boundary/adjacency/unknown tests; depends on C1.2.
+- [ ] C1.5 `[chronicle-session]` Keep raw lifecycle evidence separate from derived `clean_close/half_close/reset/unknown_termination`; derive half-close only if Gate A proves directional evidence; missing/open/close/reset tests; depends on A5, C1.2.
+- [ ] C1.6 `[chronicle-session]` Enforce 1024 active connections, 65,536 chunks/connection, 8 MiB/connection, five-minute event-time idle bound. Byte/chunk/idle limits finalize affected connection; active overflow fails typed; load/bound tests; depends on C1.3-C1.5.
+- [ ] C1.7 `[chronicle-protocol, chronicle-etl]` Expose protocol-neutral directional bytes, cross-direction completion order, derived termination, source integrity/loss windows, and WAL ranges; dependency audit and chronology tests; depends on C1.2-C1.6.
 
-## 21. Complete recovery and pipeline integration tests
+### C2. Decode bounded HTTP/1.1 honestly
 
-- [ ] 21.1 `[chronicle-wal tests]` Consolidate required WAL matrix: framing, checksum, rotation, close, truncated final record/header, checksum/middle corruption, restart append, disk failure, bounded queue, drops, version rejection, deterministic recovery; ensure each uses production v2 path; depends on 4-6.
-- [ ] 21.2 `[chronicle-session tests]` Consolidate required reconstruction matrix: split request/response/head/body, multiple requests, close, fd/tuple reuse, missing lifecycle/payload, truncation, direction, duplication, deterministic ordering; depends on 9.
-- [ ] 21.3 `[chronicle-protocol-builtins tests]` Consolidate required HTTP matrix: Content-Length request/response, chunked, no-body, keep-alive, sequential exchanges, malformed lines, incomplete head/body, unmatched peers, upgrade, pipelining rejection; depends on 10-11.
-- [ ] 21.4 `[chronicle-etl, chronicle-storage tests]` Consolidate first run, second idempotent run, interruption restart, partial segment, corrupt/version input, incomplete recording, deterministic IDs, atomic publication, checkpoint repair, and no duplicates; depends on 12-14.
-- [ ] 21.5 `[chronicle-replay, chronicle-application, chronicle-cli tests]` Consolidate all-complete, first/middle transport failure, prior/failed/unattempted retention, mismatch, invalid operation, policy, original target, redirect, timeout, JSON, and exit behavior; depends on 15-19.
-- [ ] 21.6 `[chronicle-application/tests]` Add rootless full fixture-event v2 -> WAL recovery -> reconstruction -> HTTP -> deterministic session -> inspect -> authorized replay -> verification test; delete source fixture/WAL only after publication boundary assertions; depends on 21.1-21.5.
+- [ ] C2.1 `[chronicle-protocol-builtins]` Adapt existing `httparse` decoder to reconstructed/provenance slices while preserving 64 KiB/128-header and P0 fixed-length behavior; depends on C1.7.
+- [ ] C2.2 `[chronicle-protocol-builtins]` Decode Content-Length/no-body request/response across arbitrary boundaries with exact consumption/provenance; split/head/body/zero/HEAD/204/304 tests; depends on C2.1.
+- [ ] C2.3 `[chronicle-protocol-builtins]` Decode bounded chunked responses/trailers; keep chunked requests/trailers unsupported; binary/split/malformed/missing-terminator tests; depends on C2.1.
+- [ ] C2.4 `[chronicle-protocol-builtins]` Decode response-to-close only from trusted derived clean-close and intact source; raw unknown/state-changed/reset/loss cannot complete; tests; depends on C1.5, C2.1.
+- [ ] C2.5 `[chronicle-protocol-builtins]` Preserve keep-alive sequential exchanges, FIFO pairing, HEAD method queue, deterministic cross-direction chronology, and pipelining detection; complete prior operations remain; depends on C2.2-C2.4.
+- [ ] C2.6 `[chronicle-protocol-builtins]` Represent malformed/incomplete/truncated/unmatched/unsupported/1xx/CONNECT/Upgrade/ambiguous framing/non-HTTP with stable evidence and no panic; enforce 8 MiB body; matrix tests; depends on C2.2-C2.5.
 
-## 22. Add real privileged Linux acceptance harness
+### C3. Canonicalize and publish deterministic session
 
-- [ ] 22.1 `[tests/e2e or scripts/]` Build reproducible supported-Linux harness that creates dedicated cgroup, starts local HTTP upstream, launches production-like plaintext HTTP client workload, recorder, and separate replay target; no external Internet/database; depends on 7-8, 19.
-- [ ] 22.2 `[privileged acceptance]` Generate multiple headers/request bodies/responses, persistent sequential connection use, Content-Length, and chunked response; assert kernel eBPF events (not fixture source) and durable WAL counters/bytes; depends on 22.1.
-- [ ] 22.3 `[privileged acceptance]` Abruptly kill recorder during traffic, append truncated tail fixture only after kill if needed for deterministic boundary, restart recovery, assert verified-tail repair and separately inject checksum corruption detection/no silent skip; depends on 22.2, 6.
-- [ ] 22.4 `[privileged acceptance]` Run ETL twice and after injected interruption; assert deterministic one session, reconstructed chunks/messages/pairs, honest incomplete evidence, provenance, atomic publication, and no duplicates; depends on 22.3, 12-14.
-- [ ] 22.5 `[privileged acceptance]` Run inspect human/JSON then replay only to explicit local target; simulate middle transport failure and assert completed/failed/unattempted/outcome/verification report; instrument original destination to prove no replay contact; depends on 22.4, 15-17.
-- [ ] 22.6 `[CI/docs]` Publish separate opt-in privileged profile command/artifact retention and mark standard CI as fixture + eBPF compile only; document kernel/capability prerequisites and cleanup; depends on 22.1-22.5.
+- [ ] C3.1 `[chronicle-canonical, chronicle-protocol-builtins]` Emit canonical v3 typed completeness, source status/reason, connection/loss-window/WAL-envelope provenance, replay attributes, and operation order; complete outside-window operations remain complete in partial session; binary/provenance tests; depends on C1.4, C2.
+- [ ] C3.2 `[chronicle-canonical]` Read v1/v2 with deterministic compatibility defaults, retain `PayloadRef::Object`, reject v4+; checked-in P0 session tests; depends on C3.1.
+- [ ] C3.3 `[chronicle-etl]` Acquire stopped recording ownership; process completed/failed/aborted durable prefix; reject active/corrupt/unsupported/contradictory input; integration tests; depends on B5, B7.3.
+- [ ] C3.4 `[chronicle-etl]` Read in 4096-record batches, decode v1/v2 envelopes, feed reconstruction, and bound issues to existing 1024; malformed/version/batch determinism tests; depends on C1, C3.3.
+- [ ] C3.5 `[chronicle-etl]` Derive deterministic session/connection/operation IDs from domain separators, recording ID, pipeline version, WAL snapshot/provenance, and message order; fixed vectors; depends on C3.1, C3.4.
+- [ ] C3.6 `[chronicle-etl]` Build exactly one session per stopped recording. Fail before publication on operation 10,001 or active connection 1025; do not omit. Publish bounded opaque evidence only when durable WAL integrity is trustworthy; tests; depends on C2.6, C3.4-C3.5.
+- [ ] C3.7 `[chronicle-etl, chronicle-storage]` Publish deterministic ID via atomic no-replace in requested root without introducing a recording-to-root binding; verify existing manifest/session/provenance/checksums; same root already-processed, mismatch fail, second root allowed; crash/fault/concurrency tests; depends on B1.4, C3.5-C3.6.
+- [ ] C3.8 `[chronicle-etl]` Write advisory checkpoint only after publication with durable high-water, exact `wal_snapshot_sha256`, recovery digest, versions, session/manifest/latest-output identity, status/counters. Missing checkpoint repair and cross-root update tests; depends on C3.7.
+- [ ] C3.9 `[chronicle-application, chronicle-cli]` Wire `etl --wal-dir --output` and safe human/JSON summary through shared renderer; first/same-root/other-root/crash/corrupt CLI tests; depends on B1.3, C3.3-C3.8.
 
-## 23. Documentation and final validation
+**Gate C incremental test:** `chronicle etl` over crashed/recovered WAL publishes deterministic session, reruns unchanged in same root without duplicate, publishes into second root intentionally, and loss-window fixture proves outside operation complete while intersecting operation degraded.
 
-- [ ] 23.1 `[README.md, docs/architecture.md]` Document P1 scope, exact cgroup/PID semantics, Linux 6.1+/x86_64/aarch64/cgroup-v2/BTF/capabilities, Aya build isolation, crate flow, limits, and explicit TLS/protocol/platform exclusions; depends on implementation.
-- [ ] 23.2 `[docs/wal-format.md, new operations guide]` Document WAL v1/v2 layout, atomic segment-header publication/fsync order, permissions, sync-on-record, rotation/counters/failures/recovery, output-bound checkpoint/digests/idempotency, record/ETL JSON schemas/error examples, and runnable record-through-ETL example; depends on 4-13.
-- [ ] 23.3 `[docs/canonical-model.md, docs/replay-safety.md]` Document canonical v3 completeness/provenance/migration, stored sensitive-data warning/non-guarantees, inspect schemas, loopback authorization, no redirects/original target, replay outcome/report JSON v2 and exits; depends on 14-17.
-- [ ] 23.4 `[docs, CLI help]` Document `doctor` statuses/remediation, troubleshooting, local end-to-end demo, CI fixture/eBPF-compile versus privileged runtime acceptance, and known limitations; depends on 18-22.
-- [ ] 23.5 `[workspace]` Run `cargo fmt --all --check`, `cargo check --workspace --all-targets --locked`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, and `cargo test --workspace --all-features --locked`; fix only P1-caused failures; depends on all code/tests/docs.
-- [ ] 23.6 `[Linux eBPF profile]` Run isolated eBPF compile and privileged acceptance on supported kernel, record kernel/arch/capabilities/results, and do not claim runtime coverage when skipped; depends on 22, 23.5.
-- [ ] 23.7 `[openspec/changes/add-production-http-recording-pipeline]` Run `openspec validate add-production-http-recording-pipeline --strict`, compare implementation/tasks/specs, and perform independent recovery/replay/security review before archive; depends on 23.5-23.6.
+## Gate D — Canonical inspect pipeline
+
+**Entry dependencies:** Gate C GO and existing `FilesystemSessionStore` publication semantics.
+
+**Runnable commands to establish:**
+
+```bash
+cargo test -p chronicle-storage -p chronicle-application --test inspect
+chronicle --format json inspect "$SESSION_ID" --root "$ROOT"
+```
+
+**Acceptance scenario:** inspect published session after original WAL is absent/relocated. Report verifies manifest/session/payload metadata integrity, embedded provenance, completeness/loss windows, and fully/partially/not replayable classification without body or arbitrary header values.
+
+**Artifacts produced:** manifest v2 reader/writer, canonical v3 compatibility fixtures, safe inspect human/JSON schemas/examples, and integrity/replayability summaries.
+
+**Stop/go:** GO when P0 manifest/session remain readable, newer versions fail explicitly, inspect is payload-value-safe, and each operation's completeness/replayability is visible. STOP on live-WAL path assumptions, hidden invalid operations, or partial JSON.
+
+- [ ] D1 `[chronicle-storage]` Add manifest v2 recording status/reason, durable high-water/WAL digest, pipeline/session/provenance/loss/completeness/integrity/replayability fields; no checkpoint checksum/live WAL locator; v1 compatibility/v3 rejection/checksum tests; depends on C3.1-C3.2, C3.8.
+- [ ] D2 `[chronicle-storage]` Preserve private staging/sync/manifest-last/no-replace publication for v3 and session-qualified SHA-256 payload refs; rerun permission/concurrency/failure tests; depends on D1.
+- [ ] D3 `[chronicle-storage]` Inspect manifest/session checksum and payload existence/size without reading bodies; hydration verifies digest before replay. Separate size-vs-same-size-digest tests; depends on D1-D2.
+- [ ] D4 `[chronicle-application]` Compute operation/session completeness and `fully_replayable/partially_replayable/not_replayable`; show executable/non-executable counts, loss-window blockers, status/reason, provenance/integrity/warnings; deterministic tests; depends on C3.1, D3.
+- [ ] D5 `[chronicle-application]` Human inspect shows safe metadata/method/target/status/size only; seeded Authorization/Cookie/custom-secret/header/body redaction snapshots; depends on D4.
+- [ ] D6 `[chronicle-application, chronicle-cli]` Render inspect JSON through shared atomic boundary with stable order/schema and serialization/stdout fault coverage centralized in B1.3; CLI not-found/corruption/P0/P1 tests; depends on B1.3, D4-D5.
+- [ ] D7 `[chronicle-application tests]` Delete/relocate source fixture/WAL after publication and prove inspect succeeds solely from embedded provenance without claiming current WAL availability; depends on D6.
+
+**Gate D incremental test:** inspect one mixed-completeness session and prove complete/degraded counts, partial replayability, provenance, integrity, and safe output in human/JSON.
+
+## Gate E — Safe replay and verification
+
+**Entry dependencies:** Gate D GO; existing loopback target parser, policy, HTTP adapter, verifier, and `ReplayExecution` retained.
+
+**Runnable commands to establish:**
+
+```bash
+cargo test -p chronicle-replay -p chronicle-application --test replay
+chronicle --format json replay "$SESSION_ID" --root "$ROOT" --target http://127.0.0.1:"$PORT" --allow-host 127.0.0.1 --allow-read --allow-write --execute
+```
+
+**Acceptance scenario:** mixed session plans every operation. Complete supported operations execute only against authorized loopback target; degraded operations remain non-executable/not-attempted. Middle transport or verification failure preserves prior, current, skipped, and later results. Recorded destination receives no connection.
+
+**Artifacts produced:** extended existing `ReplayExecution`, exact `ReplayOutcome` JSON, operation result/report schemas, mixed-session planner, partial verification report, and target-spy tests.
+
+**Stop/go:** GO when result cardinality/order equals canonical operations for all outcomes and authorization rejection performs zero network. STOP on global rejection caused only by degraded siblings, omitted operation, recorded-target fallback, redirect, retry, or replay after render failure.
+
+- [ ] E1 `[chronicle-replay]` Extend existing `ReplayExecution` with exact outcomes `completed`, `completed_with_skips`, `dry_run`, `stopped_policy`, `stopped_invalid_session`, `stopped_transport`, `stopped_verification`; retain one ordered result/operation and no duplicate executor; depends on B1.2.
+- [ ] E2 `[chronicle-replay, chronicle-application]` Planner classifies every operation executable/non-executable and session full/partial/not replayable. Incomplete/truncated/malformed/unmatched/unsupported/pipelined/ambiguous-loss are not attempted but do not block complete siblings; matrix tests; depends on D4, E1.
+- [ ] E3 `[chronicle-replay, chronicle-application]` Preflight session integrity/capability, explicit loopback target, exact allow-host, execute, and effect gates before network. Authorization denial blocks all executable candidates while preserving non-executable reasons; adapter-connect spy tests; depends on E2.
+- [ ] E4 `[chronicle-replay]` Execute candidates sequentially in deterministic plan order, skip non-executable entries, convert first/middle transport failure to failed result, and mark later executable entries stopped-not-attempted; full cardinality/accounting tests; depends on E2-E3.
+- [ ] E5 `[chronicle-replay]` Stop on executed non-passing verification while retaining prior/invalid/later results; successful executable subset with invalid siblings -> `completed_with_skips`; tests; depends on E4.
+- [ ] E6 `[chronicle-protocol-builtins]` Preserve explicit loopback IP literal, no DNS/proxy/TLS/redirect/retry, one request/connection, five-second timeout, 8 MiB observed body; refusal/timeout/incomplete/overflow/3xx tests; depends on E4.
+- [ ] E7 `[chronicle-replay, chronicle-protocol-builtins]` Rebuild Host/Content-Length for target and strip captured Host/auth/cookie/forwarding/hop-by-hop/Connection-token/Transfer-Encoding from authorization influence; malicious-header tests; depends on C3.1, E3.
+- [ ] E8 `[chronicle-protocol-builtins]` Preserve exact status, body size/SHA-256, and selected ordered-header verifier with value-safe details; pass/status/header/body/missing/incomplete tests; depends on C3.1.
+- [ ] E9 `[chronicle-application]` Build report with plan, replayability, outcome, executable/non-executable/attempted/completed/failed/unattempted and verification counts; aggregate equals entries; depends on E1-E8.
+- [ ] E10 `[chronicle-application, chronicle-cli]` Render human report and one final JSON object via shared renderer. Exit 0 dry-run/completed/completed-with-skips; 4 policy/no-executable; 5 transport; 6 executed verification failure; render failure never retries; subprocess tests; depends on B1.3, E9.
+- [ ] E11 `[chronicle-application tests]` Instrument authorized target and original recorded destination, including redirect Location escape; assert only override receives requests; depends on E3, E6-E7.
+- [ ] E12 `[chronicle-replay]` Reject imported session >10,000 operations before network without truncating report/input silently; bounded test; depends on E2.
+
+**Gate E incremental test:** execute mixed session, force transport failure after success, and verify report contains completed operation, failed operation, all non-executable operations, later unattempted executable operations, aggregate outcome, and zero original-target traffic.
+
+## Gate F — Diagnostics and hardening
+
+**Entry dependencies:** Gates A-E GO. Rootless CI and separate privileged Linux environment available.
+
+**Runnable commands to establish:**
+
+```bash
+chronicle --format json doctor --wal-dir "$WAL_PARENT" --output "$ROOT"
+cargo fmt --all --check
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo build --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release
+./scripts/p1-privileged-acceptance.sh
+openspec validate add-production-http-recording-pipeline --strict
+```
+
+**Acceptance scenario:** privileged script SHALL run and retain this exact sequence:
+
+1. Start supported Linux host/VM with cgroup v2/eBPF prerequisites.
+2. Start dedicated cgroup with production-like client workload.
+3. Start Chronicle with bounded duration/WAL size.
+4. Generate multiple plaintext HTTP/1.1 exchanges.
+5. Verify capture events enter WAL through group commit.
+6. Verify received/queued/written-not-durable/durable/dropped/truncated metadata.
+7. Abruptly terminate recorder.
+8. Recover only verified final tail and mark stale recording aborted.
+9. Run ETL and publish deterministic canonical session.
+10. Prove loss windows degrade only potentially affected connections.
+11. Inspect complete/degraded operations, partial replayability, provenance, integrity.
+12. Start separate local replay target.
+13. Replay only complete supported operations.
+14. Verify degraded operations are non-executable/not-attempted.
+15. Cause transport failure after one or more successes.
+16. Verify completed/failed/non-executable/later-unattempted results and aggregate outcome.
+17. Verify original recorded destination is never contacted.
+18. Verify graceful SIGINT/SIGTERM produce completed status/exit 0.
+19. Verify duration and WAL limits stop cleanly with exact reasons.
+20. Run rootless tests, isolated eBPF compile, privileged acceptance, doctor, and strict OpenSpec validation.
+
+**Artifacts produced:** runnable doctor, operations/security docs, JSON schemas/examples, rootless/eBPF-compile/privileged test profiles, retained acceptance reports, and validated OpenSpec tasks.
+
+**Stop/go:** GO for archive only when every required probe/test passes or is honestly labeled not checked, privileged runtime evidence is retained, docs state bounded-window/non-goals, and independent recovery/replay/security review finds no blocker.
+
+### F1. Operational doctor
+
+- [ ] F1.1 `[chronicle-application]` Define required/optional probe statuses/aggregate precedence and stable code/remediation/order; exact exit 4/4/0/0 tests; depends on B1.1.
+- [ ] F1.2 `[chronicle-capture-ebpf]` Probe OS/arch/kernel/cgroup-v2/BTF/hooks/helpers/object/capability/attach non-destructively; cleanup links; distinguish unsupported/not-checked; mocked + privileged smoke; depends on B6.
+- [ ] F1.3 `[chronicle-application]` Reuse cgroup selector safety checks for root/broad scope and PID identity race diagnostics with path+ID-safe output; depends on B7.1-B7.2.
+- [ ] F1.4 `[chronicle-wal, chronicle-storage]` Probe supplied WAL/output paths for private create/write/space/lock/sync/group-commit prerequisites/no-replace publication. Omitted path -> optional not-checked; no guessed default/overwrite; depends on B4-B5, D2.
+- [ ] F1.5 `[chronicle-protocol, chronicle-replay]` Probe protocol capability and replay policy shape without network; missing per-command target informational; depends on E3, E6.
+- [ ] F1.6 `[chronicle-application, chronicle-cli]` Compose independent probes, cleanup temp artifacts, wire `doctor [--wal-dir] [--output]`, and render through shared JSON boundary; no environment values; subprocess tests; depends on B1.3, F1.1-F1.5.
+
+### F2. Consolidated integration and acceptance
+
+- [ ] F2.1 `[chronicle-wal tests]` Consolidate framing, envelope ownership, group thresholds/timer/rotation/shutdown, watermark, total limit, final-tail repair, middle corruption, reopen, disk/sync failure, queue, version, deterministic recovery tests; depends on Gate B.
+- [ ] F2.2 `[chronicle-session, chronicle-etl tests]` Consolidate generation/order/dedupe/gap/raw-vs-derived lifecycle/loss-window/bounds/deterministic ID/cross-root/checkpoint tests; depends on Gate C.
+- [ ] F2.3 `[chronicle-protocol-builtins tests]` Consolidate Content-Length/chunked/no-body/close-derived/keep-alive/sequential/malformed/incomplete/unmatched/upgrade/pipelining/body-bound tests; depends on Gate C.
+- [ ] F2.4 `[chronicle-storage, chronicle-application tests]` Consolidate P0/P1 compatibility, atomic publication, inspect integrity/safe output/partial replayability, WAL-absent behavior, and shared JSON failure tests; depends on Gate D.
+- [ ] F2.5 `[chronicle-replay, chronicle-application, chronicle-cli tests]` Consolidate full/mixed/not replayable, target/effect denial, first/middle transport, verification stop, all-result accounting, original-target/redirect/timeout/JSON/exit tests; depends on Gate E.
+- [ ] F2.6 `[chronicle-application tests]` Rootless fixture v2 -> WAL group commit/recovery -> reconstruction/loss windows -> HTTP -> deterministic session -> inspect -> authorized mixed replay -> verification; label as fixture, not eBPF; depends on F2.1-F2.5.
+- [ ] F2.7 `[scripts/p1-privileged-acceptance.sh, tests/e2e]` Add runnable privileged command listed above. Harness creates dedicated cgroup, local upstream/client/recorder/separate replay target and executes retained 20-step sequence; several Content-Length/chunked/sequential exchanges; no Internet/database; depends on Gates A-E.
+- [ ] F2.8 `[privileged acceptance]` Verify real events enter WAL via group commit; metadata distinguishes received/queued/written-not-durable/durable/dropped; abruptly terminate, recover final tail, mark aborted, inject separate middle corruption fail-closed case; depends on F2.7.
+- [ ] F2.9 `[privileged acceptance]` ETL twice and into second root; assert one deterministic session/store, scoped loss windows, complete/degraded operations, provenance/integrity/partial replayability; depends on F2.8.
+- [ ] F2.10 `[privileged acceptance]` Replay executable subset only to explicit local target, force middle transport failure, verify full result accounting and no original-destination contact; depends on F2.9.
+- [ ] F2.11 `[privileged acceptance]` Verify successful SIGINT/SIGTERM -> completed/exit 0, duration/WAL limits -> completed/exact reason, source/WAL failures -> failed, second-signal crash -> aborted on recovery; depends on F2.8.
+- [ ] F2.12 `[CI/docs]` Publish separate opt-in privileged command/artifacts and mark ordinary CI as rootless fixture + eBPF compile only; no skipped-runtime pass claim; depends on F2.7-F2.11.
+
+### F3. Documentation and final validation
+
+- [ ] F3.1 `[README.md, docs/architecture.md, new operations guide]` Document bounded P1 flow, 10-minute default/60-minute max, 4 GiB WAL ceiling, one group-commit mode, durable watermark/crash window, lifecycle status/reason, cgroup scope safety, and always-on/rotating/incremental deferrals; depends on Gates B-C.
+- [ ] F3.2 `[docs/wal-format.md]` Document WAL v1/v2, Capture Event versus `WalRecordEnvelope`, 4 MiB/10 ms group commit, segment/total limits, counters, final-tail-only repair, corruption fail-closed, and cross-root publication without recording-to-root binding; depends on Gates B-C.
+- [ ] F3.3 `[docs/canonical-model.md, docs/replay-safety.md]` Document canonical v3 loss/completeness/provenance, full/partial/not replayable, mixed execution, exact outcomes/exits, loopback authorization, no redirects/original target, and sensitive-data boundary; depends on Gates D-E.
+- [ ] F3.4 `[docs, CLI help, JSON schema/examples]` Document exact record/ETL/doctor grammar/defaults, shared atomic JSON semantics, remediation, local demo, test-profile labels, and exclusions; depends on F1-F2.
+- [ ] F3.5 `[workspace]` Run fmt/check/Clippy/tests commands above and isolated eBPF compile; fix only P1-caused failures; depends on F2-F3.4.
+- [ ] F3.6 `[Linux eBPF profile]` Run/retain privileged acceptance with kernel/arch/capabilities/results; do not claim runtime coverage when skipped; depends on F2.7-F2.12, F3.5.
+- [ ] F3.7 `[openspec/changes/add-production-http-recording-pipeline]` Run strict validation, stale-language audit, task/spec/implementation comparison, and independent recovery/replay/security review before archive; depends on F3.5-F3.6.
+
+**Gate F incremental test:** execute doctor plus full acceptance and validation commands. Archive only after reports prove all acceptance steps and unsupported/skipped areas are explicit.

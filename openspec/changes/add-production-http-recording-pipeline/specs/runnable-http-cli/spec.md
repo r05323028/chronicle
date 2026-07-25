@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Minimal record command
-CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROOT` and add production form `record --source ebpf (--pid PID | --cgroup PATH) --wal-dir DIR [--segment-bytes N]`. Source-specific required/conflicting options SHALL be validated by CLI/application. Production command SHALL perform preflight, create/finalize recording metadata, start eBPF source and bounded WAL writer, handle SIGINT/SIGTERM, and print safe summary; it SHALL NOT run ETL implicitly.
+CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROOT` and add production form `record --source ebpf (--pid PID | --cgroup PATH) --wal-dir DIR [--segment-bytes N] [--duration-seconds N] [--max-wal-bytes N]`. Duration SHALL default 600 seconds/max 3600; total WAL SHALL default/hard-cap 4 GiB and be at least segment size. Source-specific/conflicting options SHALL be validated. Production command SHALL show effective cgroup path/ID/subtree before attach, perform preflight, create/finalize metadata, run eBPF plus bounded group-commit WAL, handle limits/signals, and print safe summary; it SHALL NOT run ETL implicitly.
 
 #### Scenario: Fixture record compatibility
 - **WHEN** existing valid P0 fixture command runs
@@ -9,7 +9,7 @@ CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROO
 
 #### Scenario: Production record happy path
 - **WHEN** supported privileged Linux host records valid dedicated workload selector
-- **THEN** command writes durable WAL/metadata, stops gracefully, and outputs recording ID/status/counters
+- **THEN** command writes bounded group-committed WAL/metadata, stops gracefully, and outputs recording ID/status/reason/durable watermark/counters
 
 #### Scenario: Record argument validation
 - **WHEN** selector is missing/multiple or fixture/eBPF options are mixed
@@ -20,19 +20,31 @@ CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROO
 - **THEN** command exits non-success with stable safe diagnostic and no successful recording
 
 #### Scenario: Graceful SIGINT
-- **WHEN** SIGINT arrives during active production record
-- **THEN** command drains/detaches/flushes, marks interrupted, prints final summary, and preserves ETL-ready WAL
+- **WHEN** SIGINT arrives and detach/drain/group-sync/finalization succeed
+- **THEN** command marks `completed` with `user_interrupt`, prints final summary, preserves ETL-ready WAL, and exits 0
+
+#### Scenario: Graceful SIGTERM
+- **WHEN** SIGTERM arrives and detach/drain/group-sync/finalization succeed
+- **THEN** command marks `completed` with `termination_signal`, prints final summary, and exits 0
+
+#### Scenario: Duration or WAL limit
+- **WHEN** duration or total WAL limit is first reached
+- **THEN** command stops cleanly, completes with exact limit reason, and accepts no silent post-limit traffic
 
 ### Requirement: Minimal replay command
-CLI SHALL preserve `replay SESSION_ID --root ROOT --target ORIGIN --allow-host IP [--allow-read] [--allow-write] [--timing asap] [--execute]`. Defaults SHALL remain human output, immediate timing, dry-run, no effect authorization, no target default, and no network. Human/JSON output SHALL include explicit replay outcome, aggregate counts, and one result per operation.
+CLI SHALL preserve `replay SESSION_ID --root ROOT --target ORIGIN --allow-host IP [--allow-read] [--allow-write] [--timing asap] [--execute]`. Defaults SHALL remain human output, immediate timing, dry-run, no effect authorization, no target default, and no network. Human/JSON output SHALL include exact replay outcome, fully/partially/not replayable classification, aggregate executable/non-executable counts, and one result per operation.
 
 #### Scenario: Replay dry-run
 - **WHEN** valid session is replayed without execute
 - **THEN** command prints plan/report with dry-run outcome and zero network
 
 #### Scenario: Replay denied
-- **WHEN** target/effect/session preflight denies execution
-- **THEN** no request is sent, report includes every unattempted operation, and execution request exits 4
+- **WHEN** target/effect authorization or wholly invalid session preflight denies execution
+- **THEN** no request is sent, report includes every unattempted/non-executable operation, and execution exits 4
+
+#### Scenario: Mixed-session replay
+- **WHEN** partially replayable session has authorized complete operations and degraded operations
+- **THEN** only complete supported operations execute; degraded operations appear not attempted; successful subset yields `completed_with_skips`
 
 #### Scenario: Replay local success
 - **WHEN** complete operations are explicitly authorized for loopback target
@@ -47,7 +59,7 @@ CLI SHALL preserve `replay SESSION_ID --root ROOT --target ORIGIN --allow-host I
 - **THEN** JSON/human report retains all completed/failed/unattempted entries and exit is 5
 
 ### Requirement: Stable CLI exit and output contract
-CLI SHALL use exit 0 for successful record/ETL/inspect, doctor supported/warnings, graceful SIGINT with successful flush, replay dry-run, or completed replay with only Passed/Skipped; 2 for Clap usage; 3 for recording/WAL/ETL/session/storage/serialization/finalization data errors; 4 for replay safety/invalid-session denial, unsupported live platform preflight, or doctor required unsupported/not-checked; 5 for replay transport stop; 6 for completed verification Failed/Inconclusive/Unsupported; and 143 for gracefully handled SIGTERM after successful flush. Human success SHALL use stdout and errors stderr. JSON success/error SHALL be valid versioned JSON with stable code/message and no payload/header values. Commands SHALL not emit partial invalid JSON.
+CLI SHALL use exit 0 for successful completed record (including handled SIGINT/SIGTERM and clean limits), ETL/inspect, doctor supported/warnings, replay dry-run, `completed`, or `completed_with_skips`; 2 for Clap usage; 3 for recording/WAL/ETL/session/storage/serialization/finalization data errors; 4 for replay target/effect/no-executable invalid-session denial, unsupported live preflight, or doctor required unsupported/not-checked; 5 for replay transport stop; and 6 for executed verification failure. Non-executable unsupported/inconclusive operations in successful mixed replay SHALL NOT force exit 6. Human success SHALL use stdout and errors stderr. All JSON SHALL use shared atomic rendering boundary.
 
 #### Scenario: Clap usage error
 - **WHEN** required argument is missing/invalid
@@ -62,7 +74,7 @@ CLI SHALL use exit 0 for successful record/ETL/inspect, doctor supported/warning
 - **THEN** plan is validated before first connection and appears inside one final atomic JSON report rather than pre-execution partial JSON
 
 #### Scenario: Partial replay exit mapping
-- **WHEN** replay report outcome is stopped-by-transport after prior success
+- **WHEN** replay report outcome is `stopped_transport` after prior success
 - **THEN** full report is emitted and process exits 5
 
 #### Scenario: Doctor unresolved required probe
@@ -70,12 +82,27 @@ CLI SHALL use exit 0 for successful record/ETL/inspect, doctor supported/warning
 - **THEN** full diagnostic report is emitted and process exits 4
 
 #### Scenario: Recording signal exits
-- **WHEN** SIGINT or SIGTERM graceful flush succeeds
-- **THEN** interrupted summary is emitted and process exits 0 for SIGINT or 143 for SIGTERM
+- **WHEN** SIGINT or SIGTERM graceful group sync/finalization succeeds
+- **THEN** completed summary with distinct shutdown reason is emitted and process exits 0
 
 #### Scenario: Recording finalization failure
 - **WHEN** signal shutdown cannot flush WAL or finalize metadata
 - **THEN** safe failed summary is emitted and process exits 3
+
+### Requirement: Shared atomic JSON rendering
+Application SHALL serialize complete bounded versioned result before stdout for production record, ETL, inspect, replay, and doctor. CLI SHALL write serialized bytes through one checked output boundary. Serialization failure SHALL be typed data error before stdout; stdout write/flush failure SHALL be CLI I/O error. Replay SHALL NOT retry network because rendering failed. Per-command report bounds SHALL cap memory. Human renderers SHALL remain command-specific; implementation SHALL NOT add large generic framework.
+
+#### Scenario: Serialization failure
+- **WHEN** any command result cannot serialize
+- **THEN** stdout contains no partial JSON object and stderr reports typed data error
+
+#### Scenario: Stdout write failure
+- **WHEN** serialization succeeded but stdout write/flush fails
+- **THEN** CLI returns I/O error and does not relabel it serialization/data success
+
+#### Scenario: Replay render failure
+- **WHEN** network replay completed/partially completed but final JSON rendering/write fails
+- **THEN** Chronicle does not repeat any network operation and retains in-memory execution for error handling
 
 ### Requirement: CLI remains outer adapter
 HTTP/TCP parsing, canonicalization, capture attachment, WAL recovery, ETL checkpointing, storage, signal lifecycle, safety decisions, network execution, verification, and doctor probes SHALL live outside CLI crate. CLI SHALL parse arguments, map commands, render application results, and map typed outcomes/errors to exit codes only. `etl` and `doctor` SHALL be runnable application services rather than scaffold responses.
@@ -97,14 +124,14 @@ Rootless integration SHALL exercise fixture capture events through recoverable W
 
 #### Scenario: Real Linux eBPF acceptance
 - **WHEN** privileged acceptance profile runs on documented supported Linux host
-- **THEN** observed real HTTP traffic passes complete required end-to-end scenario and artifacts/reports are retained
+- **THEN** observed real HTTP traffic proves bounded recording, group commit/recovery, loss-window completeness, partial inspect/replay, and retained artifacts/reports
 
 #### Scenario: Coverage labeling
 - **WHEN** fixture-only CI passes but privileged profile did not run
 - **THEN** documentation/status reports eBPF acceptance not checked, not passed
 
 ### Requirement: Required test coverage
-Implementation SHALL include WAL framing/rotation/recovery/corruption/reopen/failure/queue tests; stream reconstruction split/order/reuse/gap/truncation/direction tests; HTTP framing/pairing/completeness tests; ETL first/idempotent/restart/corruption/publication tests; CLI record/ETL/inspect/doctor/replay/signal/JSON/exit tests; and replay complete/first-or-middle-failure/policy/target/redirect/timeout/verification tests. Tests SHALL assert no sensitive values in default output.
+Implementation SHALL include WAL framing/rotation/group-commit threshold/time/shutdown/fault/recovery/corruption/reopen/failure/queue tests; stream reconstruction split/order/reuse/gap/truncation/direction/loss-window/lifecycle-derivation tests; HTTP framing/pairing/completeness tests; ETL cross-root idempotency/restart/corruption/publication tests; CLI duration/WAL-limit/cgroup/signal/atomic-JSON/exit tests; and replay mixed-session/full-accounting/first-or-middle-failure/policy/target/redirect/timeout/verification tests. Tests SHALL assert no sensitive values in default output.
 
 #### Scenario: Unit and integration suites
 - **WHEN** rootless workspace tests run
@@ -132,7 +159,7 @@ README, architecture, canonical, replay safety, WAL format, capability matrix, a
 ## ADDED Requirements
 
 ### Requirement: Standalone ETL command
-CLI SHALL provide `etl --wal-dir DIR --output ROOT` with global human/JSON format. Application SHALL recover/validate recording, process deterministic stopped snapshot, atomically publish session, update checkpoint after publication, and output session/checkpoint/completeness/counters. Repeated run SHALL report already processed without duplicate.
+CLI SHALL provide `etl --wal-dir DIR --output ROOT` with global human/JSON format. Application SHALL recover/validate recording durable snapshot, atomically publish deterministic session to requested root, update advisory checkpoint after publication, and output session/checkpoint/completeness/counters. Repeated same-root run SHALL verify/report already processed; another root SHALL be allowed and protected by independent no-replace verification.
 
 #### Scenario: First ETL run
 - **WHEN** valid stopped recording WAL is processed
@@ -142,12 +169,16 @@ CLI SHALL provide `etl --wal-dir DIR --output ROOT` with global human/JSON forma
 - **WHEN** same unchanged WAL/output is processed again
 - **THEN** command reports already processed with same ID and no duplicate session
 
+#### Scenario: ETL into another root
+- **WHEN** same unchanged recording is intentionally processed into another output root
+- **THEN** command publishes/verifies same deterministic session there without `output-binding.json`
+
 #### Scenario: Corrupt WAL ETL
 - **WHEN** recovery identifies non-tail corruption or unsupported version
 - **THEN** command exits 3, publishes nothing, and emits safe recovery summary
 
 ### Requirement: Operational doctor command
-CLI SHALL provide `doctor` with optional WAL/output paths and global human/JSON format. It SHALL render all typed probes and aggregate result, continue independent checks after failures, and perform no recording/replay/repair side effects.
+CLI SHALL provide `doctor [--wal-dir DIR] [--output ROOT]` with global human/JSON format. When path omitted, corresponding destructive-capability probe SHALL be `not_checked` optional with remediation rather than guessing a default; platform/protocol/replay-policy probes still run. It SHALL render all typed probes/aggregate, continue independent checks after failures, and perform no recording/replay/repair side effects.
 
 #### Scenario: Doctor supported
 - **WHEN** supported environment passes all required probes
@@ -158,7 +189,7 @@ CLI SHALL provide `doctor` with optional WAL/output paths and global human/JSON 
 - **THEN** command emits full report, remediation, and exit 4; same exit applies when required probe is not-checked
 
 ### Requirement: Versioned command JSON contracts
-Production record, ETL, inspect, replay, and doctor success outputs SHALL each use documented versioned JSON object. Arrays SHALL follow deterministic operation/probe/provenance ordering and counters SHALL use stable names. Schema changes SHALL increment output version rather than silently change field meaning.
+Production record, ETL, inspect, replay, and doctor success outputs SHALL each use documented versioned JSON object via shared atomic renderer. Arrays SHALL follow deterministic operation/probe/provenance ordering and counters SHALL use stable names including received, queued, written-not-durable, durable, dropped-before-persistence, and ETL-checkpointed where applicable. Schema changes SHALL increment output version rather than silently change field meaning.
 
 #### Scenario: Automation parses outputs
 - **WHEN** commands run with `--format json`
