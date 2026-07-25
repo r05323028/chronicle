@@ -7,7 +7,7 @@ use chronicle_common::SessionId;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -214,6 +214,7 @@ impl FilesystemSessionStore {
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     fn publish_unix(&self, publish: PublishSession) -> Result<(), StorageError> {
         let id = publish.session.id;
+        create_private_dir_all(&self.root)?;
         let sessions = self.root.join("sessions");
         create_private_dir_all(&sessions)?;
         let directory = sessions.join(id.to_string());
@@ -257,6 +258,7 @@ impl FilesystemSessionStore {
         let mut session = publish.session;
         let mut count = 0;
         let mut total = 0;
+        let mut payloads = HashSet::new();
         for operation in session
             .connections
             .iter_mut()
@@ -268,9 +270,17 @@ impl FilesystemSessionStore {
                 &mut operation.request,
                 &mut count,
                 &mut total,
+                &mut payloads,
             )?;
             if let Some(response) = &mut operation.recorded_response {
-                Self::externalize(directory, id, response, &mut count, &mut total)?;
+                Self::externalize(
+                    directory,
+                    id,
+                    response,
+                    &mut count,
+                    &mut total,
+                    &mut payloads,
+                )?;
             }
         }
         let bytes =
@@ -305,6 +315,7 @@ impl FilesystemSessionStore {
         payload: &mut PayloadRef,
         count: &mut usize,
         total: &mut u64,
+        payloads: &mut HashSet<String>,
     ) -> Result<(), StorageError> {
         let PayloadRef::Inline {
             content_type,
@@ -319,9 +330,11 @@ impl FilesystemSessionStore {
         let checksum = digest(bytes);
         let name = checksum.strip_prefix("sha256:").unwrap();
         let size = bytes.len() as u64;
-        write_private_new(&directory.join("payloads").join(name), bytes)?;
-        *count += 1;
-        *total += size;
+        if payloads.insert(checksum.clone()) {
+            write_private_new(&directory.join("payloads").join(name), bytes)?;
+            *count += 1;
+            *total += size;
+        }
         *payload = PayloadRef::Artifact {
             key: format!("sessions/{id}/payloads/{name}"),
             checksum,
@@ -484,10 +497,9 @@ fn create_private_dir(path: &Path) -> Result<(), StorageError> {
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[allow(clippy::items_after_statements)]
 fn create_private_dir_all(path: &Path) -> Result<(), StorageError> {
-    if path.exists() {
-        return Ok(());
+    if !path.exists() {
+        std::fs::create_dir_all(path).map_err(io)?;
     }
-    std::fs::create_dir_all(path).map_err(io)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(io)
 }
@@ -661,6 +673,80 @@ mod tests {
         assert_eq!(*size, 11);
         assert_eq!(content_type.as_deref(), Some("application/custom"));
         assert_eq!(store.get(key).await.unwrap().bytes, b"custom-body");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_reuses_duplicate_payload_digest() {
+        let root = root();
+        let store = FilesystemSessionStore::new(&root);
+        let mut original = session(b"same-body".to_vec());
+        original.connections[0].operations[0].recorded_response = Some(PayloadRef::Inline {
+            content_type: None,
+            bytes: b"same-body".to_vec(),
+        });
+        let id = original.id;
+        store
+            .publish(PublishSession {
+                session: original,
+                checkpoint: None,
+                issues: vec![],
+                replayability: vec![],
+                complete: true,
+            })
+            .unwrap();
+        let loaded = store.load_session(id).await.unwrap();
+        let operation = &loaded.connections[0].operations[0];
+        let PayloadRef::Artifact {
+            key: request_key, ..
+        } = &operation.request
+        else {
+            panic!("request was not externalized")
+        };
+        let Some(PayloadRef::Artifact {
+            key: response_key, ..
+        }) = &operation.recorded_response
+        else {
+            panic!("response was not externalized")
+        };
+        assert_eq!(request_key, response_key);
+        assert_eq!(
+            std::fs::read_dir(root.join("sessions").join(id.to_string()).join("payloads"))
+                .unwrap()
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_makes_existing_root_and_sessions_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root();
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let store = FilesystemSessionStore::new(&root);
+        store
+            .publish(PublishSession {
+                session: session(b"payload".to_vec()),
+                checkpoint: None,
+                issues: vec![],
+                replayability: vec![],
+                complete: true,
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&sessions).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

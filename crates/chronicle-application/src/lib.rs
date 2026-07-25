@@ -2,7 +2,11 @@
 
 use chronicle_capture::{CaptureError, CaptureSource, FixtureCaptureSource, encode_event};
 use chronicle_etl::{EtlError, EtlIssue, EtlOutput, EtlPipeline};
-use chronicle_protocol::{ProtocolError, ProtocolRegistry};
+use chronicle_protocol::{ProtocolError, ProtocolRegistry, ReplayContext, SecretBytes};
+use chronicle_replay::{
+    LoopbackReplayOptions, ReplayError, ReplayExecutor, ReplayPlan, ReplayPlanner, ReplayPolicy,
+    ReplayTargetError, TargetMap, TimingMode,
+};
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
 use chronicle_wal::{
@@ -10,7 +14,8 @@ use chronicle_wal::{
     encode_record,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -93,6 +98,7 @@ pub struct ReplayConfig {
     pub allow_reads: bool,
     pub allow_writes: bool,
     pub allow_publication: bool,
+    pub authorization_env: Option<String>,
 }
 
 impl Default for ReplayConfig {
@@ -103,6 +109,7 @@ impl Default for ReplayConfig {
             allow_reads: false,
             allow_writes: false,
             allow_publication: false,
+            authorization_env: None,
         }
     }
 }
@@ -149,7 +156,15 @@ pub enum ApplicationError {
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
+    ReplayTarget(#[from] ReplayTargetError),
+    #[error(transparent)]
+    Replay(#[from] ReplayError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("runtime Authorization credential is missing from environment variable {environment}")]
+    MissingReplayCredential { environment: String },
+    #[error("runtime Authorization credential has invalid HTTP field-value bytes")]
+    InvalidReplayCredential,
     #[error("inspect JSON encoding failed: {0}")]
     InspectJson(#[from] serde_json::Error),
     #[error("encoded fixture WAL is {bytes} bytes; one-segment limit is {limit} bytes")]
@@ -233,6 +248,43 @@ pub fn process_single_wal(
     Ok((output, reader.checkpoint()))
 }
 
+/// Builds replay inputs solely from explicit command options; config cannot authorize execution.
+pub fn replay_command_inputs(
+    session: &chronicle_canonical::CanonicalSession,
+    options: &LoopbackReplayOptions,
+) -> Result<(TargetMap, ReplayPolicy), ApplicationError> {
+    Ok((options.target_map_for(session)?, options.policy()))
+}
+
+/// Loads optional runtime Authorization without letting config grant replay permissions.
+pub fn replay_context(config: &ReplayConfig) -> Result<ReplayContext, ApplicationError> {
+    replay_context_from(config, |environment| std::env::var(environment).ok())
+}
+
+fn replay_context_from(
+    config: &ReplayConfig,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> Result<ReplayContext, ApplicationError> {
+    let Some(environment) = config.authorization_env.as_deref() else {
+        return Ok(ReplayContext::default());
+    };
+    let value = lookup(environment).ok_or_else(|| ApplicationError::MissingReplayCredential {
+        environment: environment.into(),
+    })?;
+    if !value.bytes().all(valid_http_field_value_byte) {
+        return Err(ApplicationError::InvalidReplayCredential);
+    }
+    let mut context = ReplayContext::default();
+    context.credentials = [("authorization".into(), SecretBytes::new(value.into_bytes()))]
+        .into_iter()
+        .collect();
+    Ok(context)
+}
+
+fn valid_http_field_value_byte(byte: u8) -> bool {
+    byte == b'\t' || (0x20..=0x7e).contains(&byte) || byte >= 0x80
+}
+
 const MAX_RECORD_ISSUES: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,6 +298,9 @@ pub struct InspectOperationSummary {
     pub sequence: u64,
     pub kind: String,
     pub effect: String,
+    pub method: Option<String>,
+    pub target: Option<String>,
+    pub response_status: Option<String>,
     pub request_bytes: Option<u64>,
     pub response_bytes: Option<u64>,
     pub incomplete: bool,
@@ -320,6 +375,17 @@ pub fn record_fixture(
         replayability,
         complete,
     })
+}
+
+/// Opens fixture input and delegates all record work to the application service.
+pub fn record_fixture_file(
+    input: impl AsRef<Path>,
+    root: impl AsRef<Path>,
+    max_segment_bytes: u64,
+) -> Result<RecordFixtureResult, ApplicationError> {
+    let bytes = fs::read(input)?;
+    let mut source = FixtureCaptureSource::from_json(&bytes)?;
+    record_fixture(&mut source, root, max_segment_bytes)
 }
 
 fn issue_summaries(issues: &[EtlIssue]) -> Vec<RecordIssueSummary> {
@@ -433,6 +499,9 @@ pub fn inspect_session(
                     sequence: operation.sequence,
                     kind: format!("{:?}", operation.kind).to_lowercase(),
                     effect: format!("{:?}", operation.effect).to_lowercase(),
+                    method: operation.attributes.get("http.method").cloned(),
+                    target: operation.attributes.get("http.request_target").cloned(),
+                    response_status: operation.attributes.get("http.response_status").cloned(),
                     request_bytes: payload_size(&operation.request),
                     response_bytes: operation.recorded_response.as_ref().and_then(payload_size),
                     incomplete: operation.incomplete,
@@ -474,8 +543,9 @@ pub fn render_inspect_human(inspected: &InspectSessionResult) -> String {
         joined_or_none(&inspected.issue_codes),
     );
     for connection in &inspected.connections {
-        output.push_str(&format!(
-            "connection: {} {}:{} -> {}:{} incomplete={} truncated={}\n",
+        writeln!(
+            output,
+            "connection: {} {}:{} -> {}:{} incomplete={} truncated={}",
             connection.protocol,
             connection.client.host,
             connection.client.port,
@@ -483,19 +553,25 @@ pub fn render_inspect_human(inspected: &InspectSessionResult) -> String {
             connection.server.port,
             connection.incomplete,
             connection.truncated,
-        ));
+        )
+        .expect("writing into String cannot fail");
         for operation in &connection.operations {
-            output.push_str(&format!(
-                "operation: sequence={} kind={} effect={} request_bytes={} response_bytes={} incomplete={} truncated={} warnings={}\n",
+            writeln!(
+                output,
+                "operation: sequence={} kind={} effect={} method={} target={} response_status={} request_bytes={} response_bytes={} incomplete={} truncated={} warnings={}",
                 operation.sequence,
                 operation.kind,
                 operation.effect,
+                operation.method.as_deref().unwrap_or("none"),
+                operation.target.as_deref().unwrap_or("none"),
+                operation.response_status.as_deref().unwrap_or("none"),
                 optional_size(operation.request_bytes),
                 optional_size(operation.response_bytes),
                 operation.incomplete,
                 operation.truncated,
                 joined_or_none(&operation.warnings),
-            ));
+            )
+            .expect("writing into String cannot fail");
         }
     }
     output
@@ -529,6 +605,149 @@ fn payload_size(payload: &chronicle_canonical::PayloadRef) -> Option<u64> {
         chronicle_canonical::PayloadRef::Redacted { original_size, .. } => *original_size,
         chronicle_canonical::PayloadRef::Missing { .. } => None,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReplayOperationSummary {
+    pub operation_id: String,
+    pub decision: String,
+    pub attempted: bool,
+    pub verification: String,
+    pub category: String,
+    pub transport_error: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReplaySessionResult {
+    pub session_id: String,
+    pub dry_run: bool,
+    pub preflight_denied: bool,
+    pub transport_failed: bool,
+    pub operations: Vec<ReplayOperationSummary>,
+}
+
+/// Replays hydrated filesystem session through explicit loopback-only options.
+pub async fn replay_session(
+    root: impl AsRef<Path>,
+    session_id: &str,
+    config: &ReplayConfig,
+    options: &LoopbackReplayOptions,
+) -> Result<ReplaySessionResult, ApplicationError> {
+    replay_session_with_plan(root, session_id, config, options, |_| {}).await
+}
+
+/// Replays a session after exposing its complete plan, before any network I/O.
+pub async fn replay_session_with_plan<F>(
+    root: impl AsRef<Path>,
+    session_id: &str,
+    config: &ReplayConfig,
+    options: &LoopbackReplayOptions,
+    on_plan: F,
+) -> Result<ReplaySessionResult, ApplicationError>
+where
+    F: FnOnce(&ReplaySessionResult),
+{
+    let parsed = uuid::Uuid::parse_str(session_id)
+        .map(chronicle_common::SessionId)
+        .map_err(|_| ApplicationError::InvalidConfig("session ID must be a UUID".into()))?;
+    let session = FilesystemSessionStore::new(root.as_ref()).hydrate(parsed)?;
+    let (targets, policy) = replay_command_inputs(&session, options)?;
+    let plan = ReplayPlanner::plan(&session, &targets, &policy, TimingMode::Asap)?;
+    on_plan(&replay_plan_result(session.id.to_string(), &plan));
+    let mut context = ReplayContext::default();
+    if options.execute && plan.is_executable() {
+        context = replay_context(config)?;
+        context.authorize_execution_for(options.validate_target()?.endpoint().clone());
+    }
+    let contexts = BTreeMap::from([(chronicle_common::ProtocolId::new("http/1.1"), context)]);
+    let execution = ReplayExecutor::new(&chronicle_protocol_builtins::registry()?)
+        .execute(&plan, &contexts)
+        .await?;
+    Ok(ReplaySessionResult {
+        session_id: session.id.to_string(),
+        dry_run: plan.is_dry_run(),
+        preflight_denied: !plan.is_executable(),
+        transport_failed: execution
+            .results
+            .iter()
+            .any(|result| result.transport_error.is_some()),
+        operations: plan
+            .operations()
+            .iter()
+            .zip(execution.results)
+            .map(|(planned, result)| ReplayOperationSummary {
+                operation_id: result.operation_id.to_string(),
+                decision: format!("{:?}", planned.decision()).to_lowercase(),
+                attempted: result.attempted,
+                verification: result.verification.as_ref().map_or_else(
+                    || "not_run".into(),
+                    |verification| format!("{:?}", verification.status).to_lowercase(),
+                ),
+                category: result
+                    .verification
+                    .as_ref()
+                    .and_then(|verification| verification.details.get("category"))
+                    .cloned()
+                    .unwrap_or_default(),
+                transport_error: result
+                    .transport_error
+                    .map(|category| format!("{category:?}").to_lowercase())
+                    .unwrap_or_default(),
+            })
+            .collect(),
+    })
+}
+
+fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> ReplaySessionResult {
+    ReplaySessionResult {
+        session_id,
+        dry_run: plan.is_dry_run(),
+        preflight_denied: !plan.is_executable(),
+        transport_failed: false,
+        operations: plan
+            .operations()
+            .iter()
+            .map(|planned| ReplayOperationSummary {
+                operation_id: planned.operation().id.to_string(),
+                decision: format!("{:?}", planned.decision()).to_lowercase(),
+                attempted: false,
+                verification: "not_run".into(),
+                category: String::new(),
+                transport_error: String::new(),
+            })
+            .collect(),
+    }
+}
+
+pub fn render_replay_human(result: &ReplaySessionResult) -> String {
+    let mut output = format!(
+        "session_id: {}\ndry_run: {}\npreflight_denied: {}\ntransport_failed: {}\n",
+        result.session_id, result.dry_run, result.preflight_denied, result.transport_failed
+    );
+    for operation in &result.operations {
+        writeln!(
+            output,
+            "operation: id={} decision={} attempted={} verification={} category={} transport_error={}",
+            operation.operation_id,
+            operation.decision,
+            operation.attempted,
+            operation.verification,
+            optional_text(&operation.category),
+            optional_text(&operation.transport_error),
+        )
+        .expect("writing into String cannot fail");
+    }
+    output
+}
+
+pub fn render_replay_json(result: &ReplaySessionResult) -> Result<String, ApplicationError> {
+    Ok(serde_json::to_string(
+        &serde_json::json!({ "version": 1, "result": result }),
+    )?)
+}
+
+fn optional_text(value: &str) -> &str {
+    if value.is_empty() { "none" } else { value }
 }
 
 pub struct ChronicleApplication {
@@ -589,6 +808,37 @@ mod tests {
             output,
             "configuration checks passed; external probes not implemented"
         );
+    }
+
+    #[test]
+    fn replay_context_loads_only_redacted_runtime_authorization() {
+        let config = ReplayConfig {
+            authorization_env: Some("CHRONICLE_TEST_AUTH".into()),
+            ..ReplayConfig::default()
+        };
+        let context =
+            replay_context_from(&config, |_| Some("Bearer runtime-secret".into())).unwrap();
+        assert_eq!(
+            context.credentials["authorization"].expose(),
+            b"Bearer runtime-secret"
+        );
+        assert!(!format!("{context:?}").contains("runtime-secret"));
+    }
+
+    #[test]
+    fn replay_context_rejects_missing_or_injected_authorization() {
+        let config = ReplayConfig {
+            authorization_env: Some("CHRONICLE_TEST_AUTH".into()),
+            ..ReplayConfig::default()
+        };
+        assert!(matches!(
+            replay_context_from(&config, |_| None),
+            Err(ApplicationError::MissingReplayCredential { .. })
+        ));
+        assert!(matches!(
+            replay_context_from(&config, |_| Some("Bearer good\r\nInjected: bad".into())),
+            Err(ApplicationError::InvalidReplayCredential)
+        ));
     }
 
     #[test]
@@ -812,6 +1062,57 @@ mod tests {
             matches!(reader.next_record().unwrap(), ReadOutcome::Record(record) if record.sequence == 1)
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn corrupt_wal_prevents_processing_before_session_publication() {
+        use chronicle_capture::{
+            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureFlags, InMemoryCaptureSource,
+        };
+        use chronicle_common::{ConnectionKey, Direction, Endpoint, SessionId, TransportProtocol};
+        use chronicle_wal::segment_file_name;
+
+        let root =
+            std::env::temp_dir().join(format!("chronicle-app-corrupt-{}", uuid::Uuid::new_v4()));
+        let wal_directory = root.join("wal");
+        let event = CaptureEvent {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            monotonic_sequence: 1,
+            wall_time: None,
+            connection: ConnectionKey::new(
+                Endpoint::new("fixture-client", 41000),
+                Endpoint::new("recorded.invalid", 8080),
+                TransportProtocol::Tcp,
+            ),
+            direction: Direction::ClientToServer,
+            payload: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            process: None,
+            container: None,
+            file_descriptor: None,
+            truncated: false,
+            flags: CaptureFlags::default(),
+        };
+        write_capture_to_wal(
+            &mut InMemoryCaptureSource::new([event]),
+            &wal_directory,
+            1024,
+        )
+        .unwrap();
+        let segment = wal_directory.join(segment_file_name(1));
+        let mut bytes = std::fs::read(&segment).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&segment, bytes).unwrap();
+        assert!(
+            process_single_wal(
+                segment,
+                1,
+                &chronicle_protocol_builtins::registry().unwrap(),
+                SessionId::new(),
+            )
+            .is_err()
+        );
+        assert!(!root.join("sessions").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Statically linked protocol registrations.
 //!
-//! Only `fake` is functional. Real protocol modules declare honest target status.
+//! `fake` and bounded plaintext HTTP/1.1 are functional. Other modules declare honest target status.
 
 use chronicle_common::ProtocolId;
 use chronicle_protocol::{
@@ -38,18 +38,29 @@ pub mod http {
         Attributes, CanonicalOperation, CanonicalWarning, OperationEffect, OperationKind,
         PayloadRef, ProtocolData, RelativeTimeNanos,
     };
-    use chronicle_common::{Direction, OperationId, ProtocolId};
+    use chronicle_common::{Direction, Endpoint, OperationId, ProtocolId};
     use chronicle_protocol::{
-        CapabilityStatus, DecodedFrame, DetectionInput, DetectionResult, ProtocolCanonicalizer,
-        ProtocolCapabilities, ProtocolDetector, ProtocolError, ProtocolStream,
+        BoxFuture, CapabilityStatus, DecodedFrame, DetectionInput, DetectionResult,
+        ObservedResponse, ProtocolCanonicalizer, ProtocolCapabilities, ProtocolDetector,
+        ProtocolError, ProtocolStream, ReplayAdapter, ReplayConnection, ReplayContext,
+        TransportErrorCategory, VerificationResult, VerificationStatus, Verifier,
     };
-    use std::collections::VecDeque;
+    use sha2::{Digest, Sha256};
+    use std::collections::{BTreeMap, VecDeque};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
 
     pub const MAX_HEAD_BYTES: usize = 64 * 1024;
     pub const MAX_HEADER_COUNT: usize = 128;
     pub const PROTOCOL_DATA_SCHEMA_VERSION: u16 = 1;
     pub const PROTOCOL_DATA_MEDIA_TYPE: &str =
         "application/vnd.chronicle.http-operation+json;version=1";
+    pub const OBSERVED_DATA_MEDIA_TYPE: &str =
+        "application/vnd.chronicle.http-observed-response+json;version=1";
+    const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+    const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum WarningCode {
@@ -268,6 +279,527 @@ pub mod http {
         pub verification: VerificationMetadataV1,
     }
 
+    /// Rewrites captured request headers for an outbound replay request.
+    ///
+    /// Header values are retained only for end-to-end fields; callers must not render them.
+    pub fn sanitize_request_headers(
+        request_headers: &[HeaderV1],
+        target: &Endpoint,
+        body_len: usize,
+    ) -> Vec<HeaderV1> {
+        let connection_tokens: Vec<String> = request_headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("connection"))
+            .flat_map(|header| header.value.split(|byte| *byte == b','))
+            .filter_map(|token| std::str::from_utf8(token.trim_ascii()).ok())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let mut headers = vec![HeaderV1 {
+            name: "host".into(),
+            value: target_authority(target).into_bytes(),
+        }];
+        headers.extend(request_headers.iter().filter_map(|header| {
+            let name = header.name.to_ascii_lowercase();
+            if is_stripped_replay_header(&name)
+                || connection_tokens.iter().any(|token| token == &name)
+            {
+                None
+            } else {
+                Some(HeaderV1 {
+                    name,
+                    value: header.value.clone(),
+                })
+            }
+        }));
+        headers.push(HeaderV1 {
+            name: "content-length".into(),
+            value: body_len.to_string().into_bytes(),
+        });
+        headers
+    }
+
+    fn target_authority(target: &Endpoint) -> String {
+        if target.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]:{}", target.host, target.port)
+        } else {
+            format!("{}:{}", target.host, target.port)
+        }
+    }
+
+    fn is_stripped_replay_header(name: &str) -> bool {
+        matches!(
+            name,
+            "host"
+                | "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "authorization"
+                | "proxy-authorization"
+                | "cookie"
+                | "forwarded"
+                | "expect"
+                | "content-length"
+        ) || name.starts_with("x-forwarded-")
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct HttpObservedResponseV1 {
+        pub status: u16,
+        pub headers: Vec<HeaderV1>,
+    }
+
+    impl HttpObservedResponseV1 {
+        fn to_protocol_data(&self) -> ProtocolData {
+            ProtocolData {
+                schema_version: PROTOCOL_DATA_SCHEMA_VERSION,
+                media_type: Some(OBSERVED_DATA_MEDIA_TYPE.into()),
+                bytes: serde_json::to_vec(self).expect("HTTP observed response must serialize"),
+            }
+        }
+
+        fn from_protocol_data(data: &ProtocolData) -> Result<Self, String> {
+            if data.schema_version != PROTOCOL_DATA_SCHEMA_VERSION
+                || data.media_type.as_deref() != Some(OBSERVED_DATA_MEDIA_TYPE)
+            {
+                return Err("unsupported HTTP observed response version".into());
+            }
+            serde_json::from_slice(&data.bytes).map_err(|error| error.to_string())
+        }
+    }
+
+    pub struct HttpVerifier {
+        id: ProtocolId,
+    }
+
+    impl HttpVerifier {
+        pub fn new() -> Self {
+            Self {
+                id: ProtocolId::new("http/1.1"),
+            }
+        }
+    }
+
+    impl Default for HttpVerifier {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Verifier for HttpVerifier {
+        fn protocol(&self) -> &ProtocolId {
+            &self.id
+        }
+
+        fn verify(
+            &self,
+            operation: &CanonicalOperation,
+            observed: &ObservedResponse,
+        ) -> VerificationResult {
+            let Ok(expected) = HttpOperationDataV1::from_protocol_data(&operation.protocol_data)
+            else {
+                return verification(
+                    VerificationStatus::Unsupported,
+                    "unsupported HTTP expectation",
+                );
+            };
+            let observed_body = &observed.payload;
+            let Some(protocol_data) = observed.protocol_data.as_ref() else {
+                return verification(
+                    VerificationStatus::Unsupported,
+                    "unsupported HTTP observed response",
+                );
+            };
+            let Ok(observed) = HttpObservedResponseV1::from_protocol_data(protocol_data) else {
+                return verification(
+                    VerificationStatus::Unsupported,
+                    "unsupported HTTP observed response",
+                );
+            };
+            let Some(expected_status) = expected.response_status else {
+                return verification(
+                    VerificationStatus::Inconclusive,
+                    "missing recorded HTTP response",
+                );
+            };
+            if expected_status != observed.status {
+                return verification_with(
+                    VerificationStatus::Failed,
+                    "HTTP status differed",
+                    [
+                        ("expected_status", expected_status.to_string()),
+                        ("observed_status", observed.status.to_string()),
+                    ],
+                );
+            }
+            let expected_headers = comparable_headers(&expected.response_headers);
+            let observed_headers = comparable_headers(&observed.headers);
+            if expected_headers != observed_headers {
+                let header = expected_headers
+                    .iter()
+                    .zip(&observed_headers)
+                    .find(|(expected, observed)| expected != observed)
+                    .map(|(header, _)| header.name.as_str())
+                    .or_else(|| {
+                        expected_headers
+                            .get(observed_headers.len())
+                            .map(|header| header.name.as_str())
+                    })
+                    .or_else(|| {
+                        observed_headers
+                            .get(expected_headers.len())
+                            .map(|header| header.name.as_str())
+                    })
+                    .unwrap_or("header_count");
+                return verification_with(
+                    VerificationStatus::Failed,
+                    "HTTP response headers differed",
+                    [
+                        ("header", header.to_owned()),
+                        ("expected_header_count", expected_headers.len().to_string()),
+                        ("observed_header_count", observed_headers.len().to_string()),
+                    ],
+                );
+            }
+            match (&operation.recorded_response, observed_body) {
+                (
+                    Some(PayloadRef::Inline {
+                        bytes: expected, ..
+                    }),
+                    Some(PayloadRef::Inline {
+                        bytes: observed, ..
+                    }),
+                ) if expected == observed => {
+                    verification(VerificationStatus::Passed, "HTTP response matched")
+                }
+                (
+                    Some(PayloadRef::Inline {
+                        bytes: expected, ..
+                    }),
+                    Some(PayloadRef::Inline {
+                        bytes: observed, ..
+                    }),
+                ) => verification_with(
+                    VerificationStatus::Failed,
+                    "HTTP response body differed",
+                    [
+                        ("expected_body_size", expected.len().to_string()),
+                        ("observed_body_size", observed.len().to_string()),
+                        ("expected_body_sha256", digest(expected)),
+                        ("observed_body_sha256", digest(observed)),
+                    ],
+                ),
+                _ => verification(
+                    VerificationStatus::Inconclusive,
+                    "HTTP response body unavailable",
+                ),
+            }
+        }
+    }
+
+    fn comparable_headers(headers: &[HeaderV1]) -> Vec<HeaderV1> {
+        headers
+            .iter()
+            .filter(|header| {
+                !matches!(
+                    header.name.to_ascii_lowercase().as_str(),
+                    "date"
+                        | "server"
+                        | "content-length"
+                        | "connection"
+                        | "transfer-encoding"
+                        | "keep-alive"
+                        | "set-cookie"
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        let mut output = String::from("sha256:");
+        for byte in Sha256::digest(bytes) {
+            use std::fmt::Write;
+            write!(output, "{byte:02x}").expect("writing into String cannot fail");
+        }
+        output
+    }
+
+    fn verification(status: VerificationStatus, summary: &str) -> VerificationResult {
+        verification_with(status, summary, [])
+    }
+
+    fn verification_with<const N: usize>(
+        status: VerificationStatus,
+        summary: &str,
+        details: [(&str, String); N],
+    ) -> VerificationResult {
+        VerificationResult {
+            status,
+            summary: summary.into(),
+            details: details
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect(),
+        }
+    }
+
+    pub struct HttpReplayAdapter {
+        id: ProtocolId,
+    }
+
+    impl HttpReplayAdapter {
+        pub fn new() -> Self {
+            Self {
+                id: ProtocolId::new("http/1.1"),
+            }
+        }
+    }
+
+    impl Default for HttpReplayAdapter {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl ReplayAdapter for HttpReplayAdapter {
+        fn protocol(&self) -> &ProtocolId {
+            &self.id
+        }
+
+        fn connect<'a>(
+            &'a self,
+            target: &'a Endpoint,
+            context: &'a ReplayContext,
+        ) -> BoxFuture<'a, Result<Box<dyn ReplayConnection>, ProtocolError>> {
+            Box::pin(async move {
+                if !context.authorizes_execution_for(target) {
+                    return Err(malformed("HTTP replay execution is not authorized"));
+                }
+                let address = target_address(target)?;
+                let stream = timeout(OPERATION_TIMEOUT, TcpStream::connect(address))
+                    .await
+                    .map_err(|_| transport(TransportErrorCategory::Timeout, "connect timed out"))?
+                    .map_err(|error| transport(transport_category(&error), "connect failed"))?;
+                Ok(Box::new(HttpReplayConnection {
+                    stream,
+                    target: target.clone(),
+                    context: context.clone(),
+                }) as Box<dyn ReplayConnection>)
+            })
+        }
+    }
+
+    struct HttpReplayConnection {
+        stream: TcpStream,
+        target: Endpoint,
+        context: ReplayContext,
+    }
+
+    impl ReplayConnection for HttpReplayConnection {
+        fn execute<'a>(
+            &'a mut self,
+            operation: &'a CanonicalOperation,
+        ) -> BoxFuture<'a, Result<ObservedResponse, ProtocolError>> {
+            Box::pin(async move {
+                timeout(
+                    OPERATION_TIMEOUT,
+                    execute_http(&mut self.stream, &self.target, &self.context, operation),
+                )
+                .await
+                .map_err(|_| {
+                    transport(TransportErrorCategory::Timeout, "HTTP operation timed out")
+                })?
+            })
+        }
+    }
+
+    async fn execute_http(
+        stream: &mut TcpStream,
+        target: &Endpoint,
+        context: &ReplayContext,
+        operation: &CanonicalOperation,
+    ) -> Result<ObservedResponse, ProtocolError> {
+        let data = HttpOperationDataV1::from_protocol_data(&operation.protocol_data)
+            .map_err(|_| malformed("invalid HTTP replay operation"))?;
+        let method = data
+            .method
+            .ok_or_else(|| malformed("missing HTTP method"))?;
+        let request_target = data
+            .target
+            .ok_or_else(|| malformed("missing HTTP request target"))?;
+        let body = match &operation.request {
+            PayloadRef::Inline { bytes, .. } => bytes.as_slice(),
+            _ => return Err(malformed("HTTP request payload was not hydrated")),
+        };
+        let mut headers = sanitize_request_headers(&data.request_headers, target, body.len());
+        if let Some(authorization) = context.credentials.get("authorization") {
+            if !authorization
+                .expose()
+                .iter()
+                .copied()
+                .all(valid_field_value_byte)
+            {
+                return Err(malformed("invalid runtime Authorization field value"));
+            }
+            headers.insert(
+                1,
+                HeaderV1 {
+                    name: "authorization".into(),
+                    value: authorization.expose().to_vec(),
+                },
+            );
+        }
+        headers.push(HeaderV1 {
+            name: "connection".into(),
+            value: b"close".to_vec(),
+        });
+        let mut wire = format!("{method} {request_target} HTTP/1.1\r\n").into_bytes();
+        for header in &headers {
+            wire.extend_from_slice(header.name.as_bytes());
+            wire.extend_from_slice(b": ");
+            wire.extend_from_slice(&header.value);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"\r\n");
+        wire.extend_from_slice(body);
+        stream
+            .write_all(&wire)
+            .await
+            .map_err(|error| transport(transport_category(&error), "request write failed"))?;
+        read_response(stream, &method).await
+    }
+
+    async fn read_response(
+        stream: &mut TcpStream,
+        method: &str,
+    ) -> Result<ObservedResponse, ProtocolError> {
+        let mut bytes = Vec::new();
+        loop {
+            let mut raw_headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
+            let mut response = httparse::Response::new(&mut raw_headers);
+            match response
+                .parse(&bytes)
+                .map_err(|_| malformed("malformed HTTP response"))?
+            {
+                httparse::Status::Partial => {
+                    if bytes.len() >= MAX_HEAD_BYTES {
+                        return Err(malformed("HTTP response head exceeds limit"));
+                    }
+                }
+                httparse::Status::Complete(head_len) => {
+                    let status = response
+                        .code
+                        .ok_or_else(|| malformed("missing HTTP status"))?;
+                    if (100..200).contains(&status) {
+                        return Err(transport(
+                            TransportErrorCategory::UnsupportedFraming,
+                            "informational response is unsupported",
+                        ));
+                    }
+                    let headers = normalize_headers(response.headers)?;
+                    reject_unsupported_headers(&headers).map_err(|_| {
+                        transport(
+                            TransportErrorCategory::UnsupportedFraming,
+                            "upgrade response is unsupported",
+                        )
+                    })?;
+                    let no_body = method == "HEAD" || matches!(status, 204 | 304);
+                    let body_len = if no_body {
+                        0
+                    } else if headers
+                        .iter()
+                        .any(|header| header.name == "transfer-encoding")
+                    {
+                        return Err(transport(
+                            TransportErrorCategory::UnsupportedFraming,
+                            "transfer encoding is unsupported",
+                        ));
+                    } else if headers.iter().any(|header| header.name == "content-length") {
+                        content_length(&headers)?
+                    } else {
+                        return Err(transport(
+                            TransportErrorCategory::UnsupportedFraming,
+                            "close-delimited response is unsupported",
+                        ));
+                    };
+                    if body_len > MAX_RESPONSE_BYTES
+                        || head_len.saturating_add(body_len) > MAX_RESPONSE_BYTES
+                    {
+                        return Err(transport(
+                            TransportErrorCategory::UnsupportedFraming,
+                            "response exceeds byte limit",
+                        ));
+                    }
+                    while bytes.len() < head_len + body_len {
+                        read_more(stream, &mut bytes).await?;
+                    }
+                    return Ok(ObservedResponse {
+                        payload: Some(PayloadRef::Inline {
+                            content_type: None,
+                            bytes: bytes[head_len..head_len + body_len].to_vec(),
+                        }),
+                        protocol_data: Some(
+                            HttpObservedResponseV1 { status, headers }.to_protocol_data(),
+                        ),
+                        attributes: BTreeMap::new(),
+                        error_category: None,
+                    });
+                }
+            }
+            read_more(stream, &mut bytes).await?;
+        }
+    }
+
+    async fn read_more(stream: &mut TcpStream, bytes: &mut Vec<u8>) -> Result<(), ProtocolError> {
+        let mut buffer = [0_u8; 4096];
+        let count = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|error| transport(transport_category(&error), "response read failed"))?;
+        if count == 0 {
+            return Err(transport(
+                TransportErrorCategory::Disconnect,
+                "response ended before complete framing",
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        Ok(())
+    }
+
+    fn valid_field_value_byte(byte: u8) -> bool {
+        byte == b'\t' || (0x20..=0x7e).contains(&byte) || byte >= 0x80
+    }
+
+    fn transport(category: TransportErrorCategory, message: &str) -> ProtocolError {
+        ProtocolError::Transport {
+            category,
+            message: message.into(),
+        }
+    }
+
+    fn transport_category(error: &std::io::Error) -> TransportErrorCategory {
+        if error.kind() == std::io::ErrorKind::ConnectionRefused {
+            TransportErrorCategory::Refused
+        } else {
+            TransportErrorCategory::Io
+        }
+    }
+
+    fn target_address(target: &Endpoint) -> Result<std::net::SocketAddr, ProtocolError> {
+        let ip = target
+            .host
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| malformed("HTTP replay target must be an IP literal"))?;
+        if !ip.is_loopback() {
+            return Err(malformed("HTTP replay target must be loopback"));
+        }
+        Ok(std::net::SocketAddr::new(ip, target.port))
+    }
+
     impl HttpOperationDataV1 {
         /// # Panics
         ///
@@ -366,6 +898,7 @@ pub mod http {
             }
         }
 
+        #[allow(clippy::too_many_lines)] // Canonical operation fields stay co-located for schema review.
         fn operation(
             stream: &ProtocolStream<'_>,
             request: MessageV1,
@@ -405,6 +938,16 @@ pub mod http {
                     .iter()
                     .any(|code| code == WarningCode::TruncatedMessage.as_str());
             let replayable = !incomplete && request.pipeline_depth <= 1 && request.method.is_some();
+            let captured_sensitive_headers = request
+                .headers
+                .iter()
+                .any(|header| matches!(header.name.as_str(), "authorization" | "cookie"));
+            let requires_runtime_authorization = request.headers.iter().any(|header| {
+                matches!(
+                    header.name.as_str(),
+                    "authorization" | "proxy-authorization"
+                )
+            });
             let protocol_data = HttpOperationDataV1 {
                 method: request.method.clone(),
                 target: request.target.clone(),
@@ -422,10 +965,7 @@ pub mod http {
                     } else {
                         TargetFormV1::Opaque
                     },
-                    captured_sensitive_headers: request
-                        .headers
-                        .iter()
-                        .any(|header| matches!(header.name.as_str(), "authorization" | "cookie")),
+                    captured_sensitive_headers,
                     replayable,
                 },
                 verification: VerificationMetadataV1 {
@@ -443,6 +983,13 @@ pub mod http {
             }
             if let Some(status) = response_status {
                 attributes.insert("http.response_status".into(), status.to_string());
+            }
+            attributes.insert("chronicle.replayable".into(), replayable.to_string());
+            if requires_runtime_authorization {
+                attributes.insert(
+                    "chronicle.replay.requires_runtime_authorization".into(),
+                    "true".into(),
+                );
             }
             CanonicalOperation {
                 id: OperationId::new(),
@@ -499,6 +1046,17 @@ pub mod http {
                     Direction::ServerToClient => {
                         if let Some(request) = pending.pop_front() {
                             operations.push(Self::operation(stream, request, Some(message)));
+                        } else {
+                            let mut opaque = message.clone();
+                            opaque.kind = MessageKindV1::Opaque;
+                            opaque.method = None;
+                            opaque.target = None;
+                            opaque.status = None;
+                            opaque.reason = None;
+                            opaque.headers.clear();
+                            opaque.body.clear();
+                            opaque.warnings.push("orphan_response".into());
+                            operations.push(Self::operation(stream, opaque, Some(message)));
                         }
                     }
                 }
@@ -553,28 +1111,27 @@ pub mod http {
                 }
                 Direction::ServerToClient => {
                     self.server.push(frame.sequence, &frame.payload);
-                    let head_response = self
-                        .pending_methods
-                        .front()
-                        .is_some_and(|method| method == "HEAD");
-                    self.server.decode(Direction::ServerToClient, head_response)
-                }
-            };
-            match frame.direction {
-                Direction::ClientToServer => {
-                    for message in &mut messages {
-                        if let Some(method) = &message.method {
-                            self.pending_methods.push_back(method.clone());
-                            message.pipeline_depth = self.pending_methods.len();
-                        }
-                    }
-                }
-                Direction::ServerToClient => {
-                    for message in &mut messages {
+                    let mut messages = Vec::new();
+                    while let Some(mut message) = self.server.decode_one(
+                        Direction::ServerToClient,
+                        self.pending_methods
+                            .front()
+                            .is_some_and(|method| method == "HEAD"),
+                    ) {
                         if message.kind == MessageKindV1::Response {
                             message.pipeline_depth = self.pending_methods.len();
                             message.orphan_response = self.pending_methods.pop_front().is_none();
                         }
+                        messages.push(message);
+                    }
+                    messages
+                }
+            };
+            if frame.direction == Direction::ClientToServer {
+                for message in &mut messages {
+                    if let Some(method) = &message.method {
+                        self.pending_methods.push_back(method.clone());
+                        message.pipeline_depth = self.pending_methods.len();
                     }
                 }
             }
@@ -612,25 +1169,24 @@ pub mod http {
 
         fn decode(&mut self, direction: Direction, head_response: bool) -> Vec<MessageV1> {
             let mut messages = Vec::new();
-            loop {
-                let sequence = self.start_sequence.unwrap_or_default();
-                match parse_message(&self.bytes, direction, sequence, head_response) {
-                    Ok(Some((consumed, mut message))) => {
-                        message.sequence = sequence;
-                        self.bytes.drain(..consumed);
-                        self.start_sequence = (!self.bytes.is_empty()).then_some(sequence);
-                        messages.push(message);
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        if let Some(message) = self.take_opaque(warning_for(&error)) {
-                            messages.push(message);
-                        }
-                        break;
-                    }
-                }
+            while let Some(message) = self.decode_one(direction, head_response) {
+                messages.push(message);
             }
             messages
+        }
+
+        fn decode_one(&mut self, direction: Direction, head_response: bool) -> Option<MessageV1> {
+            let sequence = self.start_sequence.unwrap_or_default();
+            match parse_message(&self.bytes, direction, sequence, head_response) {
+                Ok(Some((consumed, mut message))) => {
+                    message.sequence = sequence;
+                    self.bytes.drain(..consumed);
+                    self.start_sequence = (!self.bytes.is_empty()).then_some(sequence);
+                    Some(message)
+                }
+                Ok(None) => None,
+                Err(error) => self.take_opaque(warning_for(&error)),
+            }
         }
 
         fn take_opaque(&mut self, warning: WarningCode) -> Option<MessageV1> {
@@ -896,14 +1452,14 @@ pub mod http {
                 detection: CapabilityStatus::Available,
                 decoding: CapabilityStatus::Available,
                 canonicalization: CapabilityStatus::Available,
-                replay: CapabilityStatus::Planned,
-                verification: CapabilityStatus::Planned,
+                replay: CapabilityStatus::Available,
+                verification: CapabilityStatus::Available,
             },
             detector: Some(std::sync::Arc::new(Detector::new())),
             decoder_factory: Some(std::sync::Arc::new(DecoderFactory::new())),
             canonicalizer: Some(std::sync::Arc::new(Canonicalizer::new())),
-            replay_adapter: None,
-            verifier: None,
+            replay_adapter: Some(std::sync::Arc::new(HttpReplayAdapter::new())),
+            verifier: Some(std::sync::Arc::new(HttpVerifier::new())),
         }
     }
 
@@ -923,6 +1479,131 @@ pub mod http {
                 }],
                 truncated: false,
             }
+        }
+
+        fn verified_operation() -> CanonicalOperation {
+            CanonicalOperation {
+                id: OperationId::new(),
+                sequence: 1,
+                started_at_offset: RelativeTimeNanos(0),
+                completed_at_offset: Some(RelativeTimeNanos(1)),
+                kind: OperationKind::Request,
+                effect: OperationEffect::Read,
+                request: PayloadRef::Inline {
+                    content_type: None,
+                    bytes: Vec::new(),
+                },
+                recorded_response: Some(PayloadRef::Inline {
+                    content_type: None,
+                    bytes: b"expected-body".to_vec(),
+                }),
+                attributes: Attributes::new(),
+                protocol_data: HttpOperationDataV1 {
+                    method: Some("GET".into()),
+                    target: Some("/".into()),
+                    request_headers: Vec::new(),
+                    response_headers: vec![
+                        HeaderV1 {
+                            name: "date".into(),
+                            value: b"recorded-date".to_vec(),
+                        },
+                        HeaderV1 {
+                            name: "authorization".into(),
+                            value: b"recorded-secret".to_vec(),
+                        },
+                    ],
+                    response_status: Some(200),
+                    response_reason: Some(b"OK".to_vec()),
+                    request_sequence: 1,
+                    response_sequence: Some(2),
+                    pipeline_depth: 1,
+                    warnings: Vec::new(),
+                    replay: ReplayAttributesV1 {
+                        target_form: TargetFormV1::Origin,
+                        captured_sensitive_headers: true,
+                        replayable: true,
+                    },
+                    verification: VerificationMetadataV1 {
+                        expected_status: Some(200),
+                        expects_response: true,
+                    },
+                }
+                .into_protocol_data(),
+                incomplete: false,
+                truncated: false,
+                redactions: Vec::new(),
+                warnings: Vec::new(),
+            }
+        }
+
+        fn observed(status: u16, headers: Vec<HeaderV1>, body: &[u8]) -> ObservedResponse {
+            ObservedResponse {
+                payload: Some(PayloadRef::Inline {
+                    content_type: None,
+                    bytes: body.to_vec(),
+                }),
+                protocol_data: Some(HttpObservedResponseV1 { status, headers }.to_protocol_data()),
+                attributes: BTreeMap::new(),
+                error_category: None,
+            }
+        }
+
+        #[test]
+        fn verifier_compares_status_headers_and_body_without_values() {
+            let operation = verified_operation();
+            let verifier = HttpVerifier::new();
+            let passed = observed(
+                200,
+                vec![
+                    HeaderV1 {
+                        name: "date".into(),
+                        value: b"new-date".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "authorization".into(),
+                        value: b"recorded-secret".to_vec(),
+                    },
+                ],
+                b"expected-body",
+            );
+            assert_eq!(
+                verifier.verify(&operation, &passed).status,
+                VerificationStatus::Passed
+            );
+
+            let status = verifier.verify(&operation, &observed(201, Vec::new(), b"expected-body"));
+            assert_eq!(status.status, VerificationStatus::Failed);
+            assert_eq!(status.details["expected_status"], "200");
+
+            let headers = verifier.verify(
+                &operation,
+                &observed(
+                    200,
+                    vec![HeaderV1 {
+                        name: "authorization".into(),
+                        value: b"changed-secret".to_vec(),
+                    }],
+                    b"expected-body",
+                ),
+            );
+            assert_eq!(headers.status, VerificationStatus::Failed);
+            assert_eq!(headers.details["header"], "authorization");
+            assert!(!format!("{headers:?}").contains("secret"));
+
+            let body = verifier.verify(
+                &operation,
+                &observed(
+                    200,
+                    vec![HeaderV1 {
+                        name: "authorization".into(),
+                        value: b"recorded-secret".to_vec(),
+                    }],
+                    b"changed-body",
+                ),
+            );
+            assert_eq!(body.status, VerificationStatus::Failed);
+            assert!(body.details.contains_key("expected_body_sha256"));
+            assert!(!format!("{body:?}").contains("changed-body"));
         }
 
         #[test]
@@ -964,6 +1645,170 @@ pub mod http {
                 HttpOperationDataV1::from_protocol_data(&data.into_protocol_data()).unwrap(),
                 data
             );
+        }
+
+        #[tokio::test]
+        async fn replay_reader_finishes_at_fixed_length_boundary_without_eof() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+            let mut client = TcpStream::connect(address).await.unwrap();
+            let observed =
+                tokio::time::timeout(Duration::from_millis(50), read_response(&mut client, "GET"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                observed.payload,
+                Some(PayloadRef::Inline {
+                    content_type: None,
+                    bytes: b"OK".to_vec(),
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn replay_reader_rejects_informational_and_upgrade_responses() {
+            for response in [
+                b"HTTP/1.1 100 Continue\r\nContent-Length: 0\r\n\r\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nUpgrade: websocket\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let response = response.to_vec();
+                tokio::spawn(async move {
+                    let (mut peer, _) = listener.accept().await.unwrap();
+                    peer.write_all(&response).await.unwrap();
+                });
+                let mut client = TcpStream::connect(address).await.unwrap();
+                let error = read_response(&mut client, "GET").await.unwrap_err();
+                assert!(matches!(
+                    error,
+                    ProtocolError::Transport {
+                        category: TransportErrorCategory::UnsupportedFraming,
+                        ..
+                    }
+                ));
+            }
+        }
+
+        #[tokio::test]
+        async fn replay_adapter_requires_explicit_target_authorization() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let endpoint = Endpoint::new("127.0.0.1", address.port());
+            let adapter = HttpReplayAdapter::new();
+            assert!(
+                adapter
+                    .connect(&endpoint, &ReplayContext::default())
+                    .await
+                    .is_err()
+            );
+
+            let mut context = ReplayContext::default();
+            context.authorize_execution_for(endpoint.clone());
+            assert!(adapter.connect(&endpoint, &context).await.is_ok());
+        }
+
+        #[test]
+        fn replay_target_address_requires_loopback_and_supports_ipv6() {
+            assert_eq!(
+                target_address(&Endpoint::new("::1", 8080)).unwrap(),
+                "[::1]:8080".parse::<std::net::SocketAddr>().unwrap()
+            );
+            assert!(target_address(&Endpoint::new("127.0.0.1", 8080)).is_ok());
+            assert!(target_address(&Endpoint::new("192.0.2.1", 8080)).is_err());
+            assert!(target_address(&Endpoint::new("localhost", 8080)).is_err());
+        }
+
+        #[test]
+        fn sanitizer_replaces_host_and_strips_sensitive_hop_by_hop_headers() {
+            let headers = sanitize_request_headers(
+                &[
+                    HeaderV1 {
+                        name: "host".into(),
+                        value: b"recorded.invalid".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "host".into(),
+                        value: b"duplicate.invalid".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "connection".into(),
+                        value: b"x-remove, Keep-Alive".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "x-remove".into(),
+                        value: b"gone".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "authorization".into(),
+                        value: b"captured-secret".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "cookie".into(),
+                        value: b"captured-cookie".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "x-forwarded-for".into(),
+                        value: b"198.51.100.10".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "transfer-encoding".into(),
+                        value: b"chunked".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "content-length".into(),
+                        value: b"99".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "x-tag".into(),
+                        value: b"one".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "x-tag".into(),
+                        value: b"two".to_vec(),
+                    },
+                ],
+                &chronicle_common::Endpoint::new("127.0.0.1", 8080),
+                3,
+            );
+
+            assert_eq!(
+                headers,
+                vec![
+                    HeaderV1 {
+                        name: "host".into(),
+                        value: b"127.0.0.1:8080".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "x-tag".into(),
+                        value: b"one".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "x-tag".into(),
+                        value: b"two".to_vec(),
+                    },
+                    HeaderV1 {
+                        name: "content-length".into(),
+                        value: b"3".to_vec(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn sanitizer_brackets_ipv6_target_authority() {
+            let headers =
+                sanitize_request_headers(&[], &chronicle_common::Endpoint::new("::1", 8080), 0);
+            assert_eq!(headers[0].value, b"[::1]:8080");
+            assert_eq!(headers[1].value, b"0");
         }
 
         #[test]
@@ -1091,6 +1936,80 @@ pub mod http {
         }
 
         #[test]
+        fn canonicalizer_preserves_orphan_response_as_incomplete_evidence() {
+            let response = MessageV1 {
+                kind: MessageKindV1::Response,
+                sequence: 1,
+                method: None,
+                target: None,
+                status: Some(200),
+                reason: Some(b"OK".to_vec()),
+                headers: vec![HeaderV1 {
+                    name: "x-test".into(),
+                    value: b"value".to_vec(),
+                }],
+                body: b"response".to_vec(),
+                pipeline_depth: 0,
+                orphan_response: true,
+                warnings: Vec::new(),
+            };
+            let operations = Canonicalizer::new()
+                .canonicalize(
+                    &stream(Direction::ServerToClient, b""),
+                    vec![DecodedFrame {
+                        direction: Direction::ServerToClient,
+                        sequence: 1,
+                        payload: serde_json::to_vec(&response).unwrap(),
+                        attributes: Attributes::new(),
+                    }],
+                )
+                .unwrap();
+            assert_eq!(operations.len(), 1);
+            assert!(operations[0].incomplete);
+            assert!(
+                operations[0]
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "orphan_response")
+            );
+            assert!(matches!(
+                operations[0].recorded_response.as_ref(),
+                Some(PayloadRef::Inline { bytes, .. }) if bytes == b"response"
+            ));
+        }
+
+        #[test]
+        fn decoder_uses_each_queued_method_for_coalesced_responses() {
+            use chronicle_protocol::ProtocolDecoder;
+
+            let mut decoder = Decoder::new();
+            for (sequence, payload) in [
+                (1, b"HEAD /head HTTP/1.1\r\n\r\n".as_slice()),
+                (2, b"GET /get HTTP/1.1\r\n\r\n".as_slice()),
+            ] {
+                decoder
+                    .push(DecodedFrame {
+                        direction: Direction::ClientToServer,
+                        sequence,
+                        payload: payload.to_vec(),
+                        attributes: Attributes::new(),
+                    })
+                    .unwrap();
+            }
+            let responses = decoder
+                .push(DecodedFrame {
+                    direction: Direction::ServerToClient,
+                    sequence: 3,
+                    payload: b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
+                    attributes: Attributes::new(),
+                })
+                .unwrap();
+            assert_eq!(responses.len(), 2);
+            let second: MessageV1 = serde_json::from_slice(&responses[1].payload).unwrap();
+            assert_eq!(second.body, b"OK");
+        }
+
+        #[test]
         fn decoder_handles_fragmented_fixed_length_request_and_response() {
             use chronicle_protocol::{DecodedFrame, ProtocolDecoder};
 
@@ -1129,6 +2048,26 @@ pub mod http {
             let response: MessageV1 = serde_json::from_slice(&response[0].payload).unwrap();
             assert_eq!(response.status, Some(200));
             assert_eq!(response.body, b"OK");
+        }
+
+        #[test]
+        fn content_length_accepts_only_one_unsigned_decimal_field() {
+            let header = |value: &[u8]| HeaderV1 {
+                name: "content-length".into(),
+                value: value.to_vec(),
+            };
+            assert_eq!(content_length(&[header(b"12")]).unwrap(), 12);
+            assert!(content_length(&[header(b"1"), header(b"1")]).is_err());
+            for value in [
+                b"1, 1".as_slice(),
+                b"+1".as_slice(),
+                b"-1".as_slice(),
+                b"".as_slice(),
+                b"not-a-number".as_slice(),
+                b"999999999999999999999999999999999999999".as_slice(),
+            ] {
+                assert!(content_length(&[header(value)]).is_err(), "{value:?}");
+            }
         }
 
         #[test]
@@ -1623,6 +2562,7 @@ pub mod fake {
             Box::pin(async move {
                 Ok(ObservedResponse {
                     payload: operation.recorded_response.clone(),
+                    protocol_data: None,
                     attributes: BTreeMap::new(),
                     error_category: None,
                 })
@@ -1753,6 +2693,22 @@ mod tests {
             chronicle_canonical::RelativeTimeNanos(0)
         );
         assert_eq!(operations[0].warnings[0].code, "missing_timestamp");
+    }
+
+    #[test]
+    fn http_registers_all_completed_capabilities() {
+        let registry = registry().unwrap();
+        let registration = registry.get(&ProtocolId::new("http/1.1")).unwrap();
+        assert_eq!(
+            registration.capabilities,
+            ProtocolCapabilities {
+                detection: CapabilityStatus::Available,
+                decoding: CapabilityStatus::Available,
+                canonicalization: CapabilityStatus::Available,
+                replay: CapabilityStatus::Available,
+                verification: CapabilityStatus::Available,
+            }
+        );
     }
 
     #[test]

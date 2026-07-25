@@ -1,6 +1,6 @@
 //! Compile-time protocol capability interfaces and registry.
 
-use chronicle_canonical::{CanonicalOperation, PayloadRef};
+use chronicle_canonical::{CanonicalOperation, PayloadRef, ProtocolData};
 use chronicle_common::{Direction, Endpoint, ProtocolId, Timestamp};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -98,6 +98,11 @@ pub enum ProtocolError {
     CapabilityUnavailable(&'static str),
     #[error("protocol registry already contains {0}")]
     Duplicate(ProtocolId),
+    #[error("{category:?} transport error: {message}")]
+    Transport {
+        category: TransportErrorCategory,
+        message: String,
+    },
     #[error("protocol {0} is not registered")]
     NotRegistered(ProtocolId),
     #[error("protocol replay failed: {0}")]
@@ -152,11 +157,33 @@ impl fmt::Debug for SecretBytes {
 pub struct ReplayContext {
     pub credentials: BTreeMap<String, SecretBytes>,
     pub replacements: BTreeMap<String, String>,
+    execution_target: Option<Endpoint>,
+}
+
+impl ReplayContext {
+    /// Authorizes one explicit loopback target for this execution context.
+    pub fn authorize_execution_for(&mut self, target: Endpoint) {
+        self.execution_target = Some(target);
+    }
+
+    pub fn authorizes_execution_for(&self, target: &Endpoint) -> bool {
+        self.execution_target.as_ref() == Some(target)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportErrorCategory {
+    Refused,
+    Timeout,
+    Disconnect,
+    Io,
+    UnsupportedFraming,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedResponse {
     pub payload: Option<PayloadRef>,
+    pub protocol_data: Option<ProtocolData>,
     pub attributes: BTreeMap<String, String>,
     pub error_category: Option<String>,
 }

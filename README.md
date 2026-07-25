@@ -1,24 +1,16 @@
+![Banner](./docs/branding/banner.png)
+
 # Chronicle
 
-Chronicle is an early-stage, production-native network traffic capture and replay platform. Its planned pipeline is `record → persist → transform → inspect → replay → verify`, with protocol-neutral eBPF capture, a local append-only WAL, canonical sessions, PostgreSQL metadata, and S3-compatible artifacts. Current code is an architecture scaffold; only the fake protocol vertical slice is functional.
+Chronicle records versioned fixture socket-byte chunks through a local WAL, reconstructs bounded HTTP/1.1 sessions, persists them locally, inspects them safely, and replays only to an explicitly authorized loopback target. eBPF, PostgreSQL, S3, TLS, and protocols other than HTTP/1.1 remain planned.
 
 > **Safety:** production capture can contain credentials and personal data. Replay can execute writes and publish messages. Current replay policy defaults to dry-run and denies every operation. Never point replay at a recorded production destination.
 
 ## Current implementation
 
-This repository is an architecture scaffold, not a usable capture product. It currently provides:
+Current HTTP/1.1 slice provides fixture capture, CRC32C WAL, bounded ordered socket-chunk assembly, canonical schema v2, atomic filesystem sessions, safe inspect output, strict loopback replay, fixed-header verification, and `record`, `inspect`, and `replay` CLI commands. Fake remains available for boundary tests.
 
-- transport-neutral capture types and in-memory source;
-- a versioned, CRC32C-framed segmented local WAL with partial-tail detection;
-- bounded ordered socket-chunk session assembly;
-- compile-time protocol capability registry (registration does not equal support; only fake has implementations);
-- versioned canonical session types and opaque payload preservation;
-- in-memory metadata/artifact adapters;
-- explicit target mapping, default-deny replay planning, and fake replay/verification types;
-- CLI command hierarchy; and
-- one functional fake-protocol end-to-end test.
-
-PostgreSQL and S3 adapters, real protocol decoding and replay, eBPF programs, replay scheduling, and external connectivity checks are planned MVP work.
+HTTP support is deliberately narrow: plaintext HTTP/1.1, origin-form requests, fixed `Content-Length` framing, sequential exchanges, and immediate timing. Chunked/close-delimited messages, HTTP/2+, TLS, redirects, connection reuse, pipelined replay, and recorded credentials are unsupported.
 
 ## Architecture
 
@@ -36,12 +28,12 @@ Replay depends only on canonical sessions and protocol interfaces. It does not d
 
 ## Protocol target matrix
 
-A generated registration is not support. Only fake scaffold protocol is functional.
+A generated registration is not support. Fake and bounded HTTP/1.1 are functional.
 
 | Protocol | Detection | Decode | Canonicalize | Replay | Verify |
 |---|---:|---:|---:|---:|---:|
 | Fake (functional scaffold) | Available | Available | Available | Available | Available |
-| HTTP/1.1 | Planned | Planned | Planned | Planned | Planned |
+| HTTP/1.1 | Available | Available | Available | Available | Available |
 | PostgreSQL | Planned | Planned | Planned | Planned | Planned |
 | MySQL | Planned | Planned | Planned | Planned | Planned |
 | MariaDB | Planned | Planned | Planned | Planned | Planned |
@@ -57,9 +49,20 @@ MySQL and MariaDB share an explicit MySQL-family boundary. S3 API capture uses H
 - No eBPF program exists yet. Hook selection must determine whether Chronicle sees ordered socket chunks and where truncation can occur; current code never calls them packets or claims TCP reassembly.
 - Only plaintext is decodable. Arbitrary TLS ciphertext captured from TCP cannot be decoded. Future pre-encryption/post-decryption uprobes may add visibility without exporting production certificates. Encrypted and unknown bytes must remain opaque.
 - Oracle semantics are research-only because public protocol information and version behavior are incomplete.
-- Stateful authentication, prepared statements, multiplexing, compression, and replay-environment credential replacement are not implemented.
+- Stateful authentication, prepared statements, multiplexing, and compression are not implemented. Optional Authorization replacement comes only from configured environment-variable names; captured credentials are stripped.
 - WAL restart repair, retention, archival, and checkpoint persistence are deferred.
 - Preserve-timing scheduling is modeled, not executed.
+
+## Local HTTP demo
+
+Fixtures are safe, credential-free test input. Record then inspect without exposing bodies:
+
+```bash
+cargo run -p chronicle-cli -- record --source fixture --input fixtures/http/basic-session.json --root /tmp/chronicle-demo
+cargo run -p chronicle-cli -- inspect <session-id> --root /tmp/chronicle-demo
+```
+
+Replay stays dry-run unless `--execute` and matching loopback/effect gates are supplied. For manual verification, run `cargo run -p chronicle-application --example http_test_server -- 18080`, then replay the recorded session with `--target http://127.0.0.1:18080 --allow-host 127.0.0.1 --allow-read --execute`. Helper is test/demo-only; it is not production server.
 
 ## Development
 

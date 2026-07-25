@@ -124,8 +124,11 @@ async fn fake_capture_wal_etl_storage_replay_verify() {
         .execute(&plan, &contexts)
         .await
         .unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].verification.status, VerificationStatus::Passed);
+    assert_eq!(results.results.len(), 1);
+    assert_eq!(
+        results.results[0].verification.as_ref().unwrap().status,
+        VerificationStatus::Passed
+    );
     assert!(matches!(
         canonical_connection.operations[0].recorded_response,
         Some(PayloadRef::Inline { .. })

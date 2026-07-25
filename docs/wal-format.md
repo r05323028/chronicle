@@ -26,7 +26,7 @@ Checkpoint model records segment first sequence, byte offset after last valid re
 
 ## Recovery boundary
 
-Current reader safely identifies partial tails; it does not mutate or truncate them. Current writer creates new segments and does not resume an existing directory. Therefore crash restart repair is not implemented yet.
+Fixture recording accepts one complete configured segment, flushes before ETL readback, and records final `WalCheckpoint` in filesystem session manifest metadata. Current reader safely identifies partial tails; it does not mutate or truncate them. Current writer creates new segments and does not resume an existing directory. Therefore crash restart repair is not implemented yet.
 
 ## Planned MVP
 

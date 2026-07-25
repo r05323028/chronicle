@@ -8,11 +8,13 @@ Replay is primary capability and highest-risk boundary.
 - Recorded production destination is never a fallback.
 - Mapping back to recorded endpoint is blocked by default.
 - Policy defaults to dry-run with reads, writes, authentication, publication, and unknown operations denied.
-- Dry-run plans cannot execute.
+- CLI execution requires explicit `http://<loopback-ip>:<port>` target, matching repeated `--allow-host`, effect authorization, and `--execute`; configuration cannot supply these gates.
+- HTTP replay removes every captured Host and emits one target Host; removes Connection tokens, hop-by-hop fields, Authorization, Proxy-Authorization, Cookie, Forwarded, X-Forwarded-*, Expect, and Transfer-Encoding; then emits one recomputed Content-Length. It never follows redirects.
+- Optional Authorization comes only from configured environment-variable name; captured credentials are never fallback and control bytes are rejected.
 - Protocol adapters receive replay-environment `ReplayContext`; secret bytes render as `<redacted>` in debug output.
-- Verification distinguishes Passed, Failed, Skipped, Inconclusive, and Unsupported.
+- Verification compares status, body SHA-256/size, and ordered non-ignored headers, producing Passed, Failed, Skipped, Inconclusive, or Unsupported without body/header values in details.
 
-Enabling reads or writes in configuration is not wired to execution yet; CLI is a service skeleton. Tests opt into fake read replay against a distinct fake target.
+Only bounded plaintext HTTP/1.1 loopback replay is implemented. TLS, DNS targets, preserve timing, connection reuse, and pipelined replay remain unsupported.
 
 ## Planned MVP controls
 

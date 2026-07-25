@@ -4,8 +4,11 @@ use chronicle_canonical::{
     CanonicalOperation, CanonicalSession, OperationEffect, RelativeTimeNanos,
 };
 use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId};
-use chronicle_protocol::{ProtocolError, ProtocolRegistry, ReplayContext, VerificationResult};
+use chronicle_protocol::{
+    ProtocolError, ProtocolRegistry, ReplayContext, VerificationResult, VerificationStatus,
+};
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +74,8 @@ pub struct ReplayPolicy {
     pub allow_authentication: bool,
     pub allow_unknown: bool,
     pub block_recorded_destination: bool,
+    /// Explicit execution opt-in. HTTP adapters also require loopback IP targets.
+    pub execution_authorized: bool,
 }
 
 impl Default for ReplayPolicy {
@@ -83,6 +88,7 @@ impl Default for ReplayPolicy {
             allow_authentication: false,
             allow_unknown: false,
             block_recorded_destination: true,
+            execution_authorized: false,
         }
     }
 }
@@ -99,12 +105,140 @@ impl ReplayPolicy {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoopbackTarget {
+    endpoint: Endpoint,
+    ip: IpAddr,
+}
+
+impl LoopbackTarget {
+    pub fn parse(origin: &str) -> Result<Self, ReplayTargetError> {
+        let authority = origin
+            .strip_prefix("http://")
+            .ok_or(ReplayTargetError::PlainHttpRequired)?;
+        let authority = authority.strip_suffix('/').unwrap_or(authority);
+        let address: SocketAddr = authority
+            .parse()
+            .map_err(|_| ReplayTargetError::InvalidOrigin)?;
+        if !address.ip().is_loopback() {
+            return Err(ReplayTargetError::LoopbackRequired);
+        }
+        Ok(Self {
+            endpoint: Endpoint::new(address.ip().to_string(), address.port()),
+            ip: address.ip(),
+        })
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoopbackReplayOptions {
+    pub target: Option<String>,
+    pub allow_hosts: Vec<String>,
+    pub execute: bool,
+    pub allow_reads: bool,
+    pub allow_writes: bool,
+    pub timing: TimingMode,
+}
+
+impl LoopbackReplayOptions {
+    pub fn validate_target(&self) -> Result<LoopbackTarget, ReplayTargetError> {
+        if self.timing != TimingMode::Asap {
+            return Err(ReplayTargetError::ImmediateTimingRequired);
+        }
+        let target = LoopbackTarget::parse(
+            self.target
+                .as_deref()
+                .ok_or(ReplayTargetError::TargetRequired)?,
+        )?;
+        let allowed_hosts: Result<Vec<IpAddr>, _> = self
+            .allow_hosts
+            .iter()
+            .map(|host| host.parse::<IpAddr>())
+            .collect();
+        if !allowed_hosts
+            .map_err(|_| ReplayTargetError::InvalidAllowHost)?
+            .contains(&target.ip)
+        {
+            return Err(ReplayTargetError::AllowHostMismatch);
+        }
+        Ok(target)
+    }
+
+    pub fn target_map_for(
+        &self,
+        session: &CanonicalSession,
+    ) -> Result<TargetMap, ReplayTargetError> {
+        let target = self.validate_target()?;
+        Ok(TargetMap {
+            rules: session
+                .connections
+                .iter()
+                .map(|connection| TargetRule {
+                    protocol: None,
+                    host: None,
+                    port: None,
+                    connection_id: Some(connection.id),
+                    target: target.endpoint.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn policy(&self) -> ReplayPolicy {
+        ReplayPolicy {
+            dry_run: !self.execute,
+            allow_reads: self.allow_reads,
+            allow_writes: self.allow_writes,
+            execution_authorized: self.execute,
+            ..ReplayPolicy::default()
+        }
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReplayTargetError {
+    #[error("replay target is required")]
+    TargetRequired,
+    #[error("replay target must use plain http")]
+    PlainHttpRequired,
+    #[error("replay target must be an IP-literal origin with port")]
+    InvalidOrigin,
+    #[error("replay target must use a loopback IP address")]
+    LoopbackRequired,
+    #[error("--allow-host must be an IP literal")]
+    InvalidAllowHost,
+    #[error("--allow-host must exactly match replay target")]
+    AllowHostMismatch,
+    #[error("only immediate replay timing is supported")]
+    ImmediateTimingRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayDecision {
+    Allowed,
+    Denied(ReplayDenial),
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayDenial {
+    MissingTarget,
+    RecordedDestination,
+    ExecutionNotAuthorized,
+    EffectNotAllowed(OperationEffect),
+}
+
 #[derive(Clone, Debug)]
 pub struct PlannedOperation {
     connection_id: ConnectionId,
     protocol: ProtocolId,
-    target: Endpoint,
+    target: Option<Endpoint>,
     recorded_target: Endpoint,
+    decision: ReplayDecision,
     scheduled_offset: RelativeTimeNanos,
     operation: CanonicalOperation,
 }
@@ -118,8 +252,16 @@ impl PlannedOperation {
         &self.protocol
     }
 
-    pub fn target(&self) -> &Endpoint {
-        &self.target
+    pub fn target(&self) -> Option<&Endpoint> {
+        self.target.as_ref()
+    }
+
+    pub fn decision(&self) -> &ReplayDecision {
+        &self.decision
+    }
+
+    pub fn is_allowed(&self) -> bool {
+        self.decision == ReplayDecision::Allowed
     }
 
     pub fn recorded_target(&self) -> &Endpoint {
@@ -154,6 +296,10 @@ impl ReplayPlan {
     pub fn operations(&self) -> &[PlannedOperation] {
         &self.operations
     }
+
+    pub fn is_executable(&self) -> bool {
+        self.operations.iter().all(PlannedOperation::is_allowed)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -169,6 +315,8 @@ pub enum ReplayError {
     RecordedDestination { connection_id: ConnectionId },
     #[error("dry-run plans cannot execute")]
     DryRun,
+    #[error("replay plan contains denied or unsupported operations")]
+    PreflightDenied,
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 }
@@ -184,28 +332,60 @@ impl ReplayPlanner {
     ) -> Result<ReplayPlan, ReplayError> {
         let mut operations = Vec::new();
         for connection in &session.connections {
-            let target = targets
-                .resolve(&connection.protocol, &connection.server, connection.id)
-                .ok_or(ReplayError::MissingTarget {
-                    connection_id: connection.id,
-                })?;
-            if policy.block_recorded_destination && target == &connection.server {
-                return Err(ReplayError::RecordedDestination {
-                    connection_id: connection.id,
-                });
-            }
+            let (target, connection_decision) =
+                match targets.resolve(&connection.protocol, &connection.server, connection.id) {
+                    None => (
+                        None,
+                        Some(ReplayDecision::Denied(ReplayDenial::MissingTarget)),
+                    ),
+                    Some(target)
+                        if policy.block_recorded_destination && target == &connection.server =>
+                    {
+                        (
+                            Some(target.clone()),
+                            Some(ReplayDecision::Denied(ReplayDenial::RecordedDestination)),
+                        )
+                    }
+                    Some(target) => (Some(target.clone()), None),
+                };
             for operation in &connection.operations {
-                if !policy.allows(operation.effect) {
-                    return Err(ReplayError::PolicyDenied {
-                        operation_id: operation.id,
-                        effect: operation.effect,
-                    });
-                }
+                let decision = if connection.protocol.as_str() == "http/1.1"
+                    && !policy.execution_authorized
+                {
+                    ReplayDecision::Denied(ReplayDenial::ExecutionNotAuthorized)
+                } else if operation
+                    .attributes
+                    .get("chronicle.replay.requires_runtime_authorization")
+                    .is_some_and(|value| value == "true")
+                    && !policy.allow_authentication
+                {
+                    ReplayDecision::Denied(ReplayDenial::EffectNotAllowed(
+                        OperationEffect::Authentication,
+                    ))
+                } else if operation.incomplete
+                    || operation.truncated
+                    || operation.recorded_response.is_none()
+                    || operation
+                        .attributes
+                        .get("chronicle.replayable")
+                        .is_some_and(|value| value == "false")
+                {
+                    ReplayDecision::Unsupported
+                } else {
+                    connection_decision.clone().unwrap_or_else(|| {
+                        if policy.allows(operation.effect) {
+                            ReplayDecision::Allowed
+                        } else {
+                            ReplayDecision::Denied(ReplayDenial::EffectNotAllowed(operation.effect))
+                        }
+                    })
+                };
                 operations.push(PlannedOperation {
                     connection_id: connection.id,
                     protocol: connection.protocol.clone(),
                     target: target.clone(),
                     recorded_target: connection.server.clone(),
+                    decision,
                     scheduled_offset: match timing {
                         TimingMode::Preserve => operation.started_at_offset,
                         TimingMode::Asap => RelativeTimeNanos(0),
@@ -227,7 +407,14 @@ impl ReplayPlanner {
 #[derive(Clone, Debug)]
 pub struct OperationReplayResult {
     pub operation_id: OperationId,
-    pub verification: VerificationResult,
+    pub attempted: bool,
+    pub verification: Option<VerificationResult>,
+    pub transport_error: Option<chronicle_protocol::TransportErrorCategory>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplayExecution {
+    pub results: Vec<OperationReplayResult>,
 }
 
 pub struct ReplayExecutor<'a> {
@@ -243,12 +430,46 @@ impl<'a> ReplayExecutor<'a> {
         &self,
         plan: &ReplayPlan,
         contexts: &BTreeMap<ProtocolId, ReplayContext>,
-    ) -> Result<Vec<OperationReplayResult>, ReplayError> {
-        if plan.dry_run {
-            return Err(ReplayError::DryRun);
+    ) -> Result<ReplayExecution, ReplayError> {
+        if plan.dry_run || !plan.is_executable() {
+            return Ok(ReplayExecution {
+                results: plan
+                    .operations
+                    .iter()
+                    .map(|planned| no_run_result(planned, "dry_run_or_preflight_denied"))
+                    .collect(),
+            });
         }
         let mut results = Vec::with_capacity(plan.operations.len());
+        let mut stopped = false;
         for planned in &plan.operations {
+            if stopped {
+                results.push(no_run_result(
+                    planned,
+                    "unattempted_after_non_passing_verification",
+                ));
+                continue;
+            }
+            if planned.operation.incomplete
+                || planned.operation.truncated
+                || planned.operation.recorded_response.is_none()
+            {
+                results.push(OperationReplayResult {
+                    operation_id: planned.operation.id,
+                    attempted: false,
+                    verification: Some(verification(
+                        VerificationStatus::Inconclusive,
+                        "recorded response is incomplete or missing",
+                        "incomplete_expectation",
+                    )),
+                    transport_error: None,
+                });
+                stopped = true;
+                continue;
+            }
+            let target = planned.target.as_ref().ok_or(ReplayError::MissingTarget {
+                connection_id: planned.connection_id,
+            })?;
             let registration = self
                 .registry
                 .get(&planned.protocol)
@@ -262,14 +483,67 @@ impl<'a> ReplayExecutor<'a> {
                 .as_ref()
                 .ok_or(ProtocolError::CapabilityUnavailable("verification"))?;
             let context = contexts.get(&planned.protocol).cloned().unwrap_or_default();
-            let mut connection = adapter.connect(&planned.target, &context).await?;
-            let observed = connection.execute(&planned.operation).await?;
+            let mut connection = match adapter.connect(target, &context).await {
+                Ok(connection) => connection,
+                Err(ProtocolError::Transport { category, .. }) => {
+                    results.push(transport_result(planned, category));
+                    stopped = true;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let observed = match connection.execute(&planned.operation).await {
+                Ok(observed) => observed,
+                Err(ProtocolError::Transport { category, .. }) => {
+                    results.push(transport_result(planned, category));
+                    stopped = true;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let verification = verifier.verify(&planned.operation, &observed);
+            stopped = verification.status != VerificationStatus::Passed;
             results.push(OperationReplayResult {
                 operation_id: planned.operation.id,
-                verification: verifier.verify(&planned.operation, &observed),
+                attempted: true,
+                verification: Some(verification),
+                transport_error: None,
             });
         }
-        Ok(results)
+        Ok(ReplayExecution { results })
+    }
+}
+
+fn no_run_result(planned: &PlannedOperation, category: &str) -> OperationReplayResult {
+    OperationReplayResult {
+        operation_id: planned.operation.id,
+        attempted: false,
+        verification: Some(verification(
+            VerificationStatus::Skipped,
+            "verification was not run",
+            category,
+        )),
+        transport_error: None,
+    }
+}
+
+fn transport_result(
+    planned: &PlannedOperation,
+    category: chronicle_protocol::TransportErrorCategory,
+) -> OperationReplayResult {
+    OperationReplayResult {
+        operation_id: planned.operation.id,
+        attempted: true,
+        verification: None,
+        transport_error: Some(category),
+    }
+}
+
+fn verification(status: VerificationStatus, summary: &str, category: &str) -> VerificationResult {
+    VerificationResult {
+        status,
+        summary: summary.into(),
+        details: BTreeMap::from([("category".into(), category.into())]),
     }
 }
 
@@ -307,14 +581,17 @@ mod tests {
                     request: PayloadRef::Missing {
                         reason: "test".into(),
                     },
-                    recorded_response: None,
+                    recorded_response: Some(PayloadRef::Inline {
+                        content_type: None,
+                        bytes: Vec::new(),
+                    }),
                     attributes: Attributes::new(),
                     protocol_data: ProtocolData {
                         schema_version: 1,
                         media_type: None,
                         bytes: Vec::new(),
                     },
-                    incomplete: true,
+                    incomplete: false,
                     truncated: false,
                     redactions: Vec::new(),
                     warnings: Vec::new(),
@@ -329,14 +606,18 @@ mod tests {
 
     #[test]
     fn target_mapping_is_mandatory() {
-        let error = ReplayPlanner::plan(
+        let plan = ReplayPlanner::plan(
             &session(OperationEffect::Read),
             &TargetMap::default(),
             &ReplayPolicy::default(),
             TimingMode::Asap,
         )
-        .unwrap_err();
-        assert!(matches!(error, ReplayError::MissingTarget { .. }));
+        .unwrap();
+        assert_eq!(plan.operations()[0].target(), None);
+        assert_eq!(
+            plan.operations()[0].decision(),
+            &ReplayDecision::Denied(ReplayDenial::MissingTarget)
+        );
     }
 
     #[test]
@@ -352,14 +633,17 @@ mod tests {
                 target: Endpoint::new("test", 2),
             }],
         };
-        let error = ReplayPlanner::plan(
+        let plan = ReplayPlanner::plan(
             &session,
             &targets,
             &ReplayPolicy::default(),
             TimingMode::Asap,
         )
-        .unwrap_err();
-        assert!(matches!(error, ReplayError::PolicyDenied { .. }));
+        .unwrap();
+        assert_eq!(
+            plan.operations()[0].decision(),
+            &ReplayDecision::Denied(ReplayDenial::EffectNotAllowed(OperationEffect::Write))
+        );
     }
 
     #[tokio::test]
@@ -383,13 +667,260 @@ mod tests {
 
         assert!(plan.is_dry_run());
         assert_eq!(plan.timing(), TimingMode::Asap);
+        assert!(plan.is_executable());
         assert_eq!(plan.operations().len(), 1);
-        assert_eq!(plan.operations()[0].target(), &Endpoint::new("test", 2));
-        let error = ReplayExecutor::new(&ProtocolRegistry::new())
+        assert_eq!(
+            plan.operations()[0].target(),
+            Some(&Endpoint::new("test", 2))
+        );
+        let results = ReplayExecutor::new(&ProtocolRegistry::new())
             .execute(&plan, &BTreeMap::new())
             .await
-            .unwrap_err();
-        assert!(matches!(error, ReplayError::DryRun));
+            .unwrap();
+        assert_eq!(results.results.len(), 1);
+        assert!(!results.results[0].attempted);
+        assert_eq!(
+            results.results[0].verification.as_ref().unwrap().status,
+            VerificationStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn loopback_target_rejects_non_origin_and_non_loopback_inputs() {
+        let ipv4 = LoopbackTarget::parse("http://127.0.0.1:8080/").unwrap();
+        assert_eq!(ipv4.endpoint(), &Endpoint::new("127.0.0.1", 8080));
+        let ipv6 = LoopbackTarget::parse("http://[::1]:8080").unwrap();
+        assert_eq!(ipv6.endpoint(), &Endpoint::new("::1", 8080));
+
+        for origin in [
+            "https://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080/path",
+            "http://127.0.0.1:8080?query",
+            "http://127.0.0.1:8080#fragment",
+            "http://user@127.0.0.1:8080",
+            "http://127.0.0.1",
+            "http://0.0.0.0:8080",
+            "http://192.0.2.1:8080",
+            "http://224.0.0.1:8080",
+        ] {
+            assert!(LoopbackTarget::parse(origin).is_err(), "{origin}");
+        }
+    }
+
+    #[test]
+    fn loopback_options_require_matching_allow_host_and_asap_timing() {
+        let options = LoopbackReplayOptions {
+            target: Some("http://127.0.0.1:8080".into()),
+            allow_hosts: vec!["127.0.0.2".into()],
+            execute: false,
+            allow_reads: false,
+            allow_writes: false,
+            timing: TimingMode::Asap,
+        };
+        assert!(matches!(
+            options.validate_target(),
+            Err(ReplayTargetError::AllowHostMismatch)
+        ));
+
+        let preserve = LoopbackReplayOptions {
+            allow_hosts: vec!["127.0.0.1".into()],
+            timing: TimingMode::Preserve,
+            ..options
+        };
+        assert!(matches!(
+            preserve.validate_target(),
+            Err(ReplayTargetError::ImmediateTimingRequired)
+        ));
+
+        let dry_run = LoopbackReplayOptions {
+            target: Some("http://127.0.0.1:8080".into()),
+            allow_hosts: vec!["127.0.0.1".into()],
+            execute: false,
+            allow_reads: false,
+            allow_writes: false,
+            timing: TimingMode::Asap,
+        };
+        assert!(dry_run.policy().dry_run);
+        assert!(!dry_run.policy().allows(OperationEffect::Read));
+        let execute = LoopbackReplayOptions {
+            execute: true,
+            allow_reads: true,
+            ..dry_run
+        };
+        assert!(!execute.policy().dry_run);
+        assert!(execute.policy().allows(OperationEffect::Read));
+        assert!(!execute.policy().allows(OperationEffect::Write));
+    }
+
+    #[test]
+    fn plan_retains_read_write_and_unknown_decisions() {
+        let mut session = session(OperationEffect::Read);
+        let connection = &mut session.connections[0];
+        let mut write = connection.operations[0].clone();
+        write.id = OperationId::new();
+        write.sequence = 2;
+        write.effect = OperationEffect::Write;
+        let mut unknown = write.clone();
+        unknown.id = OperationId::new();
+        unknown.sequence = 3;
+        unknown.effect = OperationEffect::Unknown;
+        connection.operations.extend([write, unknown]);
+        let targets = TargetMap {
+            rules: vec![TargetRule {
+                protocol: None,
+                host: None,
+                port: None,
+                connection_id: Some(connection.id),
+                target: Endpoint::new("test", 2),
+            }],
+        };
+        let policy = ReplayPolicy {
+            dry_run: false,
+            allow_reads: true,
+            ..ReplayPolicy::default()
+        };
+
+        let plan = ReplayPlanner::plan(&session, &targets, &policy, TimingMode::Asap).unwrap();
+
+        assert_eq!(plan.operations().len(), 3);
+        assert_eq!(plan.operations()[0].decision(), &ReplayDecision::Allowed);
+        assert_eq!(
+            plan.operations()[1].decision(),
+            &ReplayDecision::Denied(ReplayDenial::EffectNotAllowed(OperationEffect::Write))
+        );
+        assert_eq!(
+            plan.operations()[2].decision(),
+            &ReplayDecision::Denied(ReplayDenial::EffectNotAllowed(OperationEffect::Unknown))
+        );
+        assert!(!plan.is_executable());
+    }
+
+    #[test]
+    fn plan_denies_operations_requiring_runtime_authorization() {
+        let mut session = session(OperationEffect::Read);
+        let connection = &mut session.connections[0];
+        connection.operations[0].attributes.insert(
+            "chronicle.replay.requires_runtime_authorization".into(),
+            "true".into(),
+        );
+        let targets = TargetMap {
+            rules: vec![TargetRule {
+                protocol: None,
+                host: None,
+                port: None,
+                connection_id: Some(connection.id),
+                target: Endpoint::new("127.0.0.1", 2),
+            }],
+        };
+        let policy = ReplayPolicy {
+            dry_run: false,
+            allow_reads: true,
+            execution_authorized: true,
+            ..ReplayPolicy::default()
+        };
+        let plan = ReplayPlanner::plan(&session, &targets, &policy, TimingMode::Asap).unwrap();
+        assert_eq!(
+            plan.operations()[0].decision(),
+            &ReplayDecision::Denied(ReplayDenial::EffectNotAllowed(
+                OperationEffect::Authentication
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_preflight_does_not_lookup_or_connect_an_adapter() {
+        let session = session(OperationEffect::Write);
+        let connection = &session.connections[0];
+        let targets = TargetMap {
+            rules: vec![TargetRule {
+                protocol: None,
+                host: None,
+                port: None,
+                connection_id: Some(connection.id),
+                target: Endpoint::new("test", 2),
+            }],
+        };
+        let policy = ReplayPolicy {
+            dry_run: false,
+            ..ReplayPolicy::default()
+        };
+        let plan = ReplayPlanner::plan(&session, &targets, &policy, TimingMode::Asap).unwrap();
+
+        let results = ReplayExecutor::new(&ProtocolRegistry::new())
+            .execute(&plan, &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(results.results.len(), 1);
+        assert!(!results.results[0].attempted);
+        assert_eq!(
+            results.results[0].verification.as_ref().unwrap().status,
+            VerificationStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn http_execution_requires_loopback_options_authorization() {
+        let mut session = session(OperationEffect::Read);
+        let connection = &mut session.connections[0];
+        connection.protocol = ProtocolId::new("http/1.1");
+        let targets = TargetMap {
+            rules: vec![TargetRule {
+                protocol: None,
+                host: None,
+                port: None,
+                connection_id: Some(connection.id),
+                target: Endpoint::new("127.0.0.1", 8080),
+            }],
+        };
+        let plan = ReplayPlanner::plan(
+            &session,
+            &targets,
+            &ReplayPolicy {
+                dry_run: false,
+                allow_reads: true,
+                ..ReplayPolicy::default()
+            },
+            TimingMode::Asap,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.operations()[0].decision(),
+            &ReplayDecision::Denied(ReplayDenial::ExecutionNotAuthorized)
+        );
+    }
+
+    #[test]
+    fn planner_rejects_non_replayable_operations_before_execution() {
+        let mut session = session(OperationEffect::Read);
+        let connection = &mut session.connections[0];
+        connection.operations[0]
+            .attributes
+            .insert("chronicle.replayable".into(), "false".into());
+        let targets = TargetMap {
+            rules: vec![TargetRule {
+                protocol: None,
+                host: None,
+                port: None,
+                connection_id: Some(connection.id),
+                target: Endpoint::new("test", 2),
+            }],
+        };
+        let plan = ReplayPlanner::plan(
+            &session,
+            &targets,
+            &ReplayPolicy {
+                dry_run: false,
+                allow_reads: true,
+                ..ReplayPolicy::default()
+            },
+            TimingMode::Asap,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.operations()[0].decision(),
+            &ReplayDecision::Unsupported
+        );
     }
 
     #[test]

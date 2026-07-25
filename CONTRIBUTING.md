@@ -9,4 +9,4 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-Protocol work belongs behind `chronicle-protocol` interfaces. Add fixtures containing no real credentials or production data. Keep replay examples dry-run and default-deny; reference environment variable names instead of embedding connection credentials. Only fake protocol is currently functional; eBPF capture, real protocol codecs, PostgreSQL/S3 adapters, and real replay remain planned.
+Protocol work belongs behind `chronicle-protocol` interfaces. Add fixtures containing no real credentials or production data. Keep replay examples dry-run and default-deny; reference environment variable names instead of embedding connection credentials. Bounded plaintext HTTP/1.1 fixture record/inspect/loopback replay is functional alongside fake; fixture capture is one configured WAL segment with no restart repair. eBPF capture, other real protocols, PostgreSQL/S3 adapters, TLS, chunked/close-delimited HTTP, and broad replay remain planned.

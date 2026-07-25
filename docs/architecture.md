@@ -18,7 +18,7 @@ chronicle-protocol-builtins -> chronicle-protocol + chronicle-canonical + chroni
 chronicle-storage -> chronicle-canonical
 chronicle-replay -> chronicle-canonical + chronicle-protocol
 chronicle-etl -> capture + WAL + session + protocol + canonical
-chronicle-application -> WAL (current command scaffold)
+chronicle-application -> capture + WAL + ETL + protocol + storage + replay
 chronicle-cli -> chronicle-application
 ```
 
@@ -28,7 +28,7 @@ Thirteen crates consolidate real protocol modules into `chronicle-protocol-built
 
 ## Current vertical slice
 
-`InMemoryCaptureSource` emits two ordered socket byte chunks. JSON capture envelopes are framed in WAL v1 records. ETL validates the envelope, applies bounded session assembly, asks registry detectors, decodes through fake protocol traits, and builds Canonical Session v1. In-memory repositories persist session and artifact. Replay requires explicit non-production target mapping and enabled read policy, then fake adapter and verifier produce `Passed`.
+`FixtureCaptureSource` emits ordered socket-byte chunks. JSON capture envelopes are framed in WAL v1 records, then ETL validates, assembles, detects, decodes, and canonicalizes bounded plaintext HTTP/1.1 traffic into Canonical Session v2. `FilesystemSessionStore` atomically writes a manifest, session JSON, and SHA-256-addressed payloads. Replay hydrates only persisted artifacts and requires explicit loopback target, matching allow-host, effect flag, and `--execute`; dry-run stays default. Fake protocol remains available for boundary tests.
 
 JSON is only current capture-envelope payload encoding; WAL framing does not depend on JSON and any replacement requires its own schema/version migration plan.
 
@@ -40,7 +40,7 @@ Capture owns event production. WAL append/flush is local durability boundary. ET
 
 Rust standard library does not provide derive-based wire serialization, UUIDs, wall-clock serialization, CRC32C, typed error derives, TOML parsing, CLI derivation, async test runtime, or structured diagnostics. Chronicle therefore uses `serde`/`serde_json`, `uuid`, `time`, `crc32c`, `thiserror`, `toml`, `clap`, `tokio`, and `tracing`. `tracing-subscriber` is confined to CLI setup. `tokio` is used only where async execution is exercised.
 
-`sqlx`, `object_store`, and `aya` are intentionally absent until PostgreSQL, S3, and eBPF adapters have real behavior. Adding clients now would increase compile surface without proving contracts. `bytes`, `blake3`, `anyhow`, plugin loaders, queues, and embedded databases are also unnecessary for current bounded fake slice.
+`httparse` provides bounded HTTP head parsing and `sha2` identifies filesystem payloads. `sqlx`, `object_store`, and `aya` remain absent until PostgreSQL, S3, and eBPF adapters have real behavior. `bytes`, `blake3`, `anyhow`, plugin loaders, queues, and embedded databases remain unnecessary.
 
 ## Planned implementations
 

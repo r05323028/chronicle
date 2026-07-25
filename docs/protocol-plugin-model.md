@@ -14,7 +14,7 @@ Small object-safe traits separate responsibilities:
 
 Core ETL/replay dispatches through registration capabilities and contains no protocol-specific `match` branches. Explicit user override bypasses heuristic detection only when registered.
 
-`chronicle-protocol-builtins` contains HTTP/1.1, PostgreSQL, MySQL-family, MySQL, MariaDB, Oracle, MongoDB, Kafka, NATS, and fake module boundaries. Only fake has available capabilities.
+`chronicle-protocol-builtins` contains HTTP/1.1, PostgreSQL, MySQL-family, MySQL, MariaDB, Oracle, MongoDB, Kafka, NATS, and fake module boundaries. Fake and bounded plaintext HTTP/1.1 have all five capabilities available; every other protocol retains its declared non-Available status.
 
 ## Planned MVP
 
