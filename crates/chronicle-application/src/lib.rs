@@ -830,12 +830,15 @@ pub fn write_capture_to_wal(
     let mut records = Vec::new();
     let mut encoded_bytes = 0_u64;
     while let Some(event) = source.next_event()? {
-        let flags = u16::try_from(event.flags.0)
-            .map_err(|_| ApplicationError::CaptureFlagsOutOfRange(event.flags.0))?;
+        let event_v1 = event
+            .as_v1()
+            .ok_or(CaptureError::UnsupportedSchema(event.schema_version()))?;
+        let flags = u16::try_from(event_v1.flags.0)
+            .map_err(|_| ApplicationError::CaptureFlagsOutOfRange(event_v1.flags.0))?;
         let record = WalRecord {
             kind: RecordKind::CaptureEvent,
             flags,
-            sequence: event.monotonic_sequence,
+            sequence: event_v1.monotonic_sequence,
             payload: encode_event(&event)?,
         };
         encoded_bytes = encoded_bytes
@@ -1683,7 +1686,7 @@ mod tests {
 
         let directory =
             std::env::temp_dir().join(format!("chronicle-app-wal-{}", uuid::Uuid::new_v4()));
-        let event = CaptureEvent {
+        let event = CaptureEvent::V1(chronicle_capture::CaptureEventV1 {
             schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
             monotonic_sequence: 1,
             wall_time: None,
@@ -1699,7 +1702,7 @@ mod tests {
             file_descriptor: Some(7),
             truncated: false,
             flags: CaptureFlags::default(),
-        };
+        });
         let mut source = InMemoryCaptureSource::new([event]);
         let recorded = write_capture_to_wal(&mut source, &directory, 1024).unwrap();
         assert_eq!(recorded.record_count, 1);
@@ -1724,7 +1727,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("chronicle-app-corrupt-{}", uuid::Uuid::new_v4()));
         let wal_directory = root.join("wal");
-        let event = CaptureEvent {
+        let event = CaptureEvent::V1(chronicle_capture::CaptureEventV1 {
             schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
             monotonic_sequence: 1,
             wall_time: None,
@@ -1740,7 +1743,7 @@ mod tests {
             file_descriptor: None,
             truncated: false,
             flags: CaptureFlags::default(),
-        };
+        });
         write_capture_to_wal(
             &mut InMemoryCaptureSource::new([event]),
             &wal_directory,
@@ -1773,7 +1776,7 @@ mod tests {
 
         let directory =
             std::env::temp_dir().join(format!("chronicle-app-wal-limit-{}", uuid::Uuid::new_v4()));
-        let event = CaptureEvent {
+        let event = CaptureEvent::V1(chronicle_capture::CaptureEventV1 {
             schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
             monotonic_sequence: 1,
             wall_time: None,
@@ -1789,7 +1792,7 @@ mod tests {
             file_descriptor: None,
             truncated: false,
             flags: CaptureFlags::default(),
-        };
+        });
         let mut source = InMemoryCaptureSource::new([event]);
         let error = write_capture_to_wal(&mut source, &directory, 64).unwrap_err();
         assert!(matches!(error, ApplicationError::FixtureWalTooLarge { .. }));
@@ -1806,7 +1809,7 @@ mod tests {
 
         let directory =
             std::env::temp_dir().join(format!("chronicle-app-etl-{}", uuid::Uuid::new_v4()));
-        let event = CaptureEvent {
+        let event = CaptureEvent::V1(chronicle_capture::CaptureEventV1 {
             schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
             monotonic_sequence: 1,
             wall_time: None,
@@ -1822,7 +1825,7 @@ mod tests {
             file_descriptor: None,
             truncated: false,
             flags: CaptureFlags::default(),
-        };
+        });
         let mut source = InMemoryCaptureSource::new([event]);
         write_capture_to_wal(&mut source, &directory, 1024).unwrap();
         let (output, checkpoint) = process_single_wal(

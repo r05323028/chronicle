@@ -1,7 +1,7 @@
 use chronicle_canonical::PayloadRef;
 use chronicle_capture::{
-    CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureFlags, CaptureSource, InMemoryCaptureSource,
-    encode_event,
+    CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureEventV1, CaptureFlags, CaptureSource,
+    InMemoryCaptureSource, encode_event,
 };
 use chronicle_common::{
     ConnectionKey, Direction, Endpoint, ProtocolId, SessionId, TransportProtocol,
@@ -30,7 +30,7 @@ fn capture_event(
     direction: Direction,
     payload: &[u8],
 ) -> CaptureEvent {
-    CaptureEvent {
+    CaptureEvent::V1(CaptureEventV1 {
         schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
         monotonic_sequence: sequence,
         wall_time: Some(
@@ -44,7 +44,7 @@ fn capture_event(
         file_descriptor: Some(7),
         truncated: false,
         flags: CaptureFlags::default(),
-    }
+    })
 }
 
 #[tokio::test]
@@ -61,11 +61,12 @@ async fn fake_capture_wal_etl_storage_replay_verify() {
     ]);
     let mut writer = SegmentedWalWriter::create(&directory, 1024 * 1024).unwrap();
     while let Some(event) = source.next_event().unwrap() {
+        let event_v1 = event.as_v1().unwrap();
         writer
             .append(&WalRecord {
                 kind: RecordKind::CaptureEvent,
-                flags: u16::try_from(event.flags.0).unwrap(),
-                sequence: event.monotonic_sequence,
+                flags: u16::try_from(event_v1.flags.0).unwrap(),
+                sequence: event_v1.monotonic_sequence,
                 payload: encode_event(&event).unwrap(),
             })
             .unwrap();

@@ -179,7 +179,7 @@ fn ingest_record(
     max_issues: usize,
 ) -> Result<(), EtlError> {
     match decode_event(&record.payload) {
-        Ok(event) if event.monotonic_sequence == record.sequence => {
+        Ok(event) if event.monotonic_sequence() == Some(record.sequence) => {
             assembler.push(event)?;
             Ok(())
         }
@@ -191,7 +191,8 @@ fn ingest_record(
                 kind: EtlIssueKind::CaptureSequenceMismatch,
                 message: format!(
                     "capture sequence {} does not match WAL sequence {}",
-                    event.monotonic_sequence, record.sequence
+                    event.monotonic_sequence().unwrap_or_default(),
+                    record.sequence
                 ),
             },
         ),
@@ -303,14 +304,14 @@ fn opaque_operation(stream: &ConnectionStream) -> CanonicalOperation {
 mod tests {
     use super::*;
     use chronicle_capture::{
-        CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureFlags, encode_event,
+        CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureEventV1, CaptureFlags, encode_event,
     };
     use chronicle_common::{ConnectionKey, Direction, Endpoint, TransportProtocol};
     use chronicle_wal::{RecordKind, WalRecord, encode_record};
     use std::io::Cursor;
 
     fn event(sequence: u64) -> CaptureEvent {
-        CaptureEvent {
+        CaptureEvent::V1(CaptureEventV1 {
             schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
             monotonic_sequence: sequence,
             wall_time: None,
@@ -326,7 +327,7 @@ mod tests {
             file_descriptor: None,
             truncated: true,
             flags: CaptureFlags::default(),
-        }
+        })
     }
 
     #[test]

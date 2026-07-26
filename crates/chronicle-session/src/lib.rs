@@ -1,6 +1,6 @@
 //! Bounded reconstruction of ordered bidirectional socket byte streams.
 
-use chronicle_capture::CaptureEvent;
+use chronicle_capture::{CaptureEvent, CaptureEventV1};
 use chronicle_common::ConnectionKey;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -25,7 +25,7 @@ impl Default for SessionLimits {
 #[derive(Clone, Debug)]
 pub struct ConnectionStream {
     pub key: ConnectionKey,
-    pub chunks: Vec<CaptureEvent>,
+    pub chunks: Vec<CaptureEventV1>,
     pub total_bytes: usize,
     pub truncated: bool,
 }
@@ -42,6 +42,8 @@ pub enum SessionError {
     ConnectionLimit { limit: usize },
     #[error("connection byte limit {limit} exceeded for {attempted} bytes")]
     ByteLimit { limit: usize, attempted: usize },
+    #[error("capture event schema {schema_version} cannot enter session assembly")]
+    UnsupportedCaptureEvent { schema_version: u16 },
     #[error("connection chunk limit {limit} exceeded")]
     ChunkLimit { limit: usize },
 }
@@ -60,6 +62,14 @@ impl SessionAssembler {
     }
 
     pub fn push(&mut self, event: CaptureEvent) -> Result<(), SessionError> {
+        let event = match event {
+            CaptureEvent::V1(event) => event,
+            event => {
+                return Err(SessionError::UnsupportedCaptureEvent {
+                    schema_version: event.schema_version(),
+                });
+            }
+        };
         let existing_bytes = self
             .streams
             .get(&event.connection)
@@ -115,7 +125,7 @@ impl SessionAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronicle_capture::{CAPTURE_EVENT_SCHEMA_VERSION, CaptureFlags};
+    use chronicle_capture::{CAPTURE_EVENT_SCHEMA_VERSION, CaptureEventV1, CaptureFlags};
     use chronicle_common::{Direction, Endpoint, TransportProtocol};
 
     fn event(sequence: u64) -> CaptureEvent {
@@ -123,7 +133,7 @@ mod tests {
     }
 
     fn event_for(sequence: u64, client: &str, payload_bytes: usize) -> CaptureEvent {
-        CaptureEvent {
+        CaptureEvent::V1(CaptureEventV1 {
             schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
             monotonic_sequence: sequence,
             wall_time: None,
@@ -139,7 +149,7 @@ mod tests {
             file_descriptor: None,
             truncated: false,
             flags: CaptureFlags::default(),
-        }
+        })
     }
 
     #[test]
@@ -212,8 +222,10 @@ mod tests {
     fn preserves_direction_order_and_truncation() {
         let mut assembler = SessionAssembler::new(SessionLimits::default());
         let mut response = event_for(2, "client", 1);
-        response.direction = Direction::ServerToClient;
-        response.truncated = true;
+        if let CaptureEvent::V1(event) = &mut response {
+            event.direction = Direction::ServerToClient;
+            event.truncated = true;
+        }
         assembler.push(response).unwrap();
         assembler.push(event_for(1, "client", 1)).unwrap();
 

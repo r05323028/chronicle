@@ -1,5 +1,70 @@
 {
-  "report_version": 1,
+  "report_version": 3,
+  "evidence_scope": "Gate A ProbeEvent feasibility harness; private ABI v1 adapter acceptance requires its own run",
+  "verified_environment": {
+    "status": "verified",
+    "distribution": {
+      "id": "ubuntu",
+      "version": "24.04",
+      "machine_readable": "ubuntu:24.04"
+    },
+    "kernel": "6.8.0-136-generic",
+    "architecture": "aarch64",
+    "cgroup_v2": true,
+    "btf": true
+  },
+  "hook_capabilities": [
+    { "hook": "cgroup/connect4", "result": "verified" },
+    { "hook": "cgroup/connect6", "result": "verified" },
+    { "hook": "sockops", "result": "verified" },
+    { "hook": "cgroup_skb/ingress", "result": "verified" },
+    { "hook": "cgroup_skb/egress", "result": "verified" }
+  ],
+  "target_compatibility_matrix": [
+    {
+      "distribution": "ubuntu:24.04",
+      "kernel": "6.8.0-136-generic",
+      "architecture": "aarch64",
+      "status": "verified"
+    },
+    {
+      "distribution": "ubuntu:24.04",
+      "kernel": "6.8.0-136-generic",
+      "architecture": "x86_64",
+      "status": "not_verified"
+    },
+    {
+      "distribution": "other",
+      "kernel": "other",
+      "architecture": "other",
+      "status": "not_verified"
+    }
+  ],
+  "capture_adapter_acceptance": {
+    "status": "verified",
+    "command": "sudo -n env HOME=/home/ubuntu CARGO_HOME=/home/ubuntu/.cargo RUSTUP_HOME=/home/ubuntu/.rustup PATH=/home/ubuntu/.cargo/bin:$PATH cargo test -p chronicle-capture-ebpf --test privileged_adapter -- --ignored",
+    "completed_at_utc": "2026-07-26T16:18:40Z",
+    "result": "2 passed; 0 failed",
+    "dedicated_cgroup": true,
+    "plaintext_tcp": true,
+    "ipv4": "verified",
+    "ipv6": "verified",
+    "socket_identity": "verified",
+    "monotonic_timestamps": "verified",
+    "payload_direction_and_fragments": "verified",
+    "max_payload_bytes": 64,
+    "continuation_splitting": false,
+    "loss_evidence": "verified",
+    "shutdown_lifecycle": [
+      "running",
+      "request_shutdown",
+      "final_loss_sample",
+      "drain",
+      "finalize"
+    ],
+    "cleanup_checked": ["programs", "links", "maps", "dedicated_cgroup"],
+    "unsupported_architecture_claim": false
+  },
   "disposable_harness": true,
   "kernel": "6.8.0-136-generic",
   "architecture": "aarch64",

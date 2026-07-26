@@ -39,8 +39,16 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Check workspace
-        run: cargo check --workspace --all-targets --locked
+      - name: Check rootless workspace
+        run: |
+          cargo check --workspace --all-targets --locked
+          echo "This rootless check does not prove privileged runtime hook behavior."
+
+      - name: Compile eBPF capture (unprivileged)
+        run: |
+          cd ebpf-capture
+          cargo check --locked
+          echo "Compile success does not prove privileged runtime hook behavior."
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

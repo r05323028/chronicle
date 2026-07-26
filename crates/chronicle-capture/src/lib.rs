@@ -7,6 +7,7 @@ use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 
 pub const CAPTURE_EVENT_SCHEMA_VERSION: u16 = 1;
+pub const CAPTURE_EVENT_V2_SCHEMA_VERSION: u16 = 2;
 pub const FIXTURE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,8 +26,9 @@ pub struct ContainerMetadata {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureFlags(pub u32);
 
+/// Capture Event v1. Retained for fixtures and existing WAL readers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CaptureEvent {
+pub struct CaptureEventV1 {
     pub schema_version: u16,
     pub monotonic_sequence: u64,
     pub wall_time: Option<Timestamp>,
@@ -40,16 +42,242 @@ pub struct CaptureEvent {
     pub flags: CaptureFlags,
 }
 
+/// Monotonic clock domain. Values from distinct boot identities are never correlated.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ClockIdentity {
+    pub boot_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MonotonicTimestamp {
+    pub clock: ClockIdentity,
+    pub nanoseconds: u64,
+}
+
+/// Kernel socket identity. PID, file descriptor, and five-tuple are evidence, not identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SocketIdentity {
+    pub socket_cookie: u64,
+    pub first_seen: MonotonicTimestamp,
+    pub network_namespace: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingScopeIdentity {
+    pub cgroup_id: u64,
+    pub canonical_path: String,
+    pub namespace: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketEvidence {
+    pub timestamp: MonotonicTimestamp,
+    pub socket: SocketIdentity,
+    pub recording_scope: RecordingScopeIdentity,
+    pub network_family: NetworkFamily,
+    pub process: Option<ProcessMetadata>,
+    pub observed_cgroup_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketStateChangeObserved {
+    pub socket: SocketEvidence,
+    pub raw_state: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayloadDirection {
+    Ingress,
+    Egress,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FragmentSequenceEvidence {
+    pub tcp_sequence: u32,
+    pub continuation_position: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TruncationState {
+    Complete,
+    Truncated,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncationMetadata {
+    pub captured_length: u32,
+    pub observed_length: Option<u32>,
+    pub state: TruncationState,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PayloadFragment {
+    pub timestamp: MonotonicTimestamp,
+    pub socket: SocketIdentity,
+    pub recording_scope: RecordingScopeIdentity,
+    pub network_family: NetworkFamily,
+    pub direction: PayloadDirection,
+    pub sequence: FragmentSequenceEvidence,
+    pub payload: Vec<u8>,
+    pub truncation: TruncationMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LossAmbiguity {
+    pub exact_drop_timing_unknown: bool,
+    pub affected_sockets_unknown: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LossWindowObserved {
+    pub start: MonotonicTimestamp,
+    pub end: MonotonicTimestamp,
+    pub drop_delta: Option<u64>,
+    pub loss_generation: Option<u64>,
+    pub ambiguity: LossAmbiguity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "evidence", rename_all = "snake_case")]
+pub enum CaptureEventKind {
+    SocketConnectObserved(SocketEvidence),
+    SocketConnected(SocketEvidence),
+    SocketClosedObserved(SocketEvidence),
+    SocketResetObserved(SocketEvidence),
+    SocketStateChangedObserved(SocketStateChangeObserved),
+    PayloadFragment(PayloadFragment),
+    LossWindowObserved(LossWindowObserved),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureEventV2 {
+    pub schema_version: u16,
+    #[serde(flatten)]
+    pub kind: CaptureEventKind,
+}
+
+/// Versioned capture stream. V1 serializes to its original flat JSON shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CaptureEvent {
+    V2(CaptureEventV2),
+    V1(CaptureEventV1),
+}
+
+impl CaptureEvent {
+    pub fn schema_version(&self) -> u16 {
+        match self {
+            Self::V1(event) => event.schema_version,
+            Self::V2(event) => event.schema_version,
+        }
+    }
+
+    pub fn as_v1(&self) -> Option<&CaptureEventV1> {
+        match self {
+            Self::V1(event) => Some(event),
+            Self::V2(_) => None,
+        }
+    }
+
+    pub fn monotonic_sequence(&self) -> Option<u64> {
+        self.as_v1().map(|event| event.monotonic_sequence)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("capture source failed: {0}")]
     Source(String),
+    #[error("capture source lifecycle action {action} is invalid while {state}")]
+    Lifecycle {
+        action: &'static str,
+        state: CaptureSourceState,
+    },
+    #[error("final capture loss sample failed: {0}")]
+    FinalLossSample(String),
+    #[error("capture drain failed: {0}")]
+    Drain(String),
+    #[error("capture cleanup failed: {0}")]
+    Cleanup(String),
     #[error("capture event encoding failed: {0}")]
     Codec(#[from] serde_json::Error),
     #[error("unsupported capture event schema {0}")]
     UnsupportedSchema(u16),
     #[error(transparent)]
     Fixture(#[from] FixtureError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureSourceState {
+    Created,
+    Running,
+    ShutdownRequested,
+    Draining,
+    Finalized,
+}
+
+impl std::fmt::Display for CaptureSourceState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl CaptureSourceState {
+    pub fn request_shutdown(&mut self) -> Result<(), CaptureError> {
+        match self {
+            Self::Running => *self = Self::ShutdownRequested,
+            Self::ShutdownRequested | Self::Draining => {}
+            state => {
+                return Err(CaptureError::Lifecycle {
+                    action: "request_shutdown",
+                    state: *state,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn begin_drain(&mut self) -> Result<(), CaptureError> {
+        match self {
+            Self::ShutdownRequested => *self = Self::Draining,
+            Self::Draining => {}
+            state => {
+                return Err(CaptureError::Lifecycle {
+                    action: "drain",
+                    state: *state,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finalize(&mut self, drain_complete: bool) -> Result<(), CaptureError> {
+        if *self != Self::Draining || !drain_complete {
+            return Err(CaptureError::Lifecycle {
+                action: "finalize",
+                state: *self,
+            });
+        }
+        *self = Self::Finalized;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureSourceSummary {
+    pub emitted_events: u64,
+    pub final_loss_events: u64,
+    pub final_loss_sample_failed: bool,
+    pub drain_failed: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -239,7 +467,7 @@ impl FixtureCaptureSource {
                     connection_id: event.connection_id.clone(),
                 }
             })?;
-            events.push_back(CaptureEvent {
+            events.push_back(CaptureEvent::V1(CaptureEventV1 {
                 schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
                 monotonic_sequence: event.sequence,
                 wall_time: Some(timestamp),
@@ -253,7 +481,7 @@ impl FixtureCaptureSource {
                 file_descriptor: state.file_descriptor,
                 truncated: event.truncated,
                 flags: CaptureFlags(event.flags),
-            });
+            }));
         }
         Ok(Self { events })
     }
@@ -286,7 +514,39 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// Ordered kernel-capture lifecycle.
+///
+/// `request_shutdown` freezes intake and makes final diagnostics eligible; `drain`
+/// emits events already accepted before that boundary; `finalize` releases source
+/// resources only after draining. Recording status, shutdown reason, WAL commits,
+/// and replay decisions remain outside this boundary.
 pub trait CaptureSource: Send {
+    /// Enter the running state. Sources returned already running may make this idempotent.
+    fn start(&mut self) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
+    /// Consume currently available normalized events. Never final-sample or release resources.
+    fn poll(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+        self.next_event()
+    }
+
+    /// Stop accepting new input and make final loss observation eligible.
+    fn request_shutdown(&mut self) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
+    /// Consume events accepted before shutdown, then final diagnostics.
+    fn drain(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+        self.poll()
+    }
+
+    /// Release source resources after drain and return source-local diagnostics.
+    fn finalize(&mut self) -> Result<CaptureSourceSummary, CaptureError> {
+        Ok(CaptureSourceSummary::default())
+    }
+
+    /// Compatibility alias for existing finite fixture sources and callers.
     fn next_event(&mut self) -> Result<Option<CaptureEvent>, CaptureError>;
 }
 
@@ -310,18 +570,22 @@ impl CaptureSource for InMemoryCaptureSource {
 }
 
 pub fn encode_event(event: &CaptureEvent) -> Result<Vec<u8>, CaptureError> {
-    if event.schema_version != CAPTURE_EVENT_SCHEMA_VERSION {
-        return Err(CaptureError::UnsupportedSchema(event.schema_version));
+    match event {
+        CaptureEvent::V1(event) if event.schema_version == CAPTURE_EVENT_SCHEMA_VERSION => {
+            Ok(serde_json::to_vec(event)?)
+        }
+        _ => Err(CaptureError::UnsupportedSchema(event.schema_version())),
     }
-    Ok(serde_json::to_vec(event)?)
 }
 
 pub fn decode_event(bytes: &[u8]) -> Result<CaptureEvent, CaptureError> {
     let event: CaptureEvent = serde_json::from_slice(bytes)?;
-    if event.schema_version != CAPTURE_EVENT_SCHEMA_VERSION {
-        return Err(CaptureError::UnsupportedSchema(event.schema_version));
+    match event {
+        CaptureEvent::V1(event) if event.schema_version == CAPTURE_EVENT_SCHEMA_VERSION => {
+            Ok(CaptureEvent::V1(event))
+        }
+        event => Err(CaptureError::UnsupportedSchema(event.schema_version())),
     }
-    Ok(event)
 }
 
 #[cfg(test)]
@@ -354,10 +618,59 @@ mod tests {
     fn fixture_source_preserves_binary_socket_chunk() {
         let mut source = FixtureCaptureSource::from_json(FIXTURE.as_bytes()).unwrap();
         let event = source.next_event().unwrap().unwrap();
+        let event = event.as_v1().unwrap();
         assert_eq!(event.payload, [0, 255]);
         assert_eq!(event.direction, Direction::ClientToServer);
         assert_eq!(event.connection.server.host, "recorded.invalid");
         assert!(source.next_event().unwrap().is_none());
+    }
+
+    #[test]
+    fn v1_bytes_stay_flat_while_v2_carries_explicit_evidence_version() {
+        let mut source = FixtureCaptureSource::from_json(FIXTURE.as_bytes()).unwrap();
+        let v1 = source.next_event().unwrap().unwrap();
+        let v1_bytes = encode_event(&v1).unwrap();
+        let v1_json: serde_json::Value = serde_json::from_slice(&v1_bytes).unwrap();
+        assert!(v1_json.get("kind").is_none());
+        assert!(matches!(
+            decode_event(&v1_bytes).unwrap(),
+            CaptureEvent::V1(_)
+        ));
+
+        let timestamp = MonotonicTimestamp {
+            clock: ClockIdentity {
+                boot_id: "boot-a".into(),
+            },
+            nanoseconds: 1,
+        };
+        let v2 = CaptureEvent::V2(CaptureEventV2 {
+            schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
+            kind: CaptureEventKind::SocketConnectObserved(SocketEvidence {
+                timestamp: timestamp.clone(),
+                socket: SocketIdentity {
+                    socket_cookie: 7,
+                    first_seen: timestamp,
+                    network_namespace: Some(9),
+                },
+                recording_scope: RecordingScopeIdentity {
+                    cgroup_id: 11,
+                    canonical_path: "/scope".into(),
+                    namespace: Some(9),
+                },
+                network_family: NetworkFamily::Ipv4,
+                process: None,
+                observed_cgroup_id: 12,
+            }),
+        });
+        let v2_json = serde_json::to_value(&v2).unwrap();
+        assert_eq!(v2_json["schema_version"], CAPTURE_EVENT_V2_SCHEMA_VERSION);
+        assert_eq!(v2_json["kind"], "socket_connect_observed");
+        assert!(matches!(
+            encode_event(&v2),
+            Err(CaptureError::UnsupportedSchema(
+                CAPTURE_EVENT_V2_SCHEMA_VERSION
+            ))
+        ));
     }
 
     #[test]
@@ -408,6 +721,146 @@ mod tests {
             let error = FixtureCaptureSource::from_json(input.as_bytes()).unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    struct LifecycleTestSource {
+        state: CaptureSourceState,
+        pending: std::collections::VecDeque<CaptureEvent>,
+        final_loss: Option<CaptureEvent>,
+        final_sample_fails: bool,
+        drain_fails: bool,
+        drain_complete: bool,
+        summary: CaptureSourceSummary,
+    }
+
+    impl CaptureSource for LifecycleTestSource {
+        fn poll(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+            if self.state != CaptureSourceState::Running {
+                return Err(CaptureError::Lifecycle {
+                    action: "poll",
+                    state: self.state,
+                });
+            }
+            Ok(self.pending.pop_front())
+        }
+
+        fn request_shutdown(&mut self) -> Result<(), CaptureError> {
+            self.state.request_shutdown()?;
+            if self.final_sample_fails {
+                return Err(CaptureError::FinalLossSample("counter read".into()));
+            }
+            Ok(())
+        }
+
+        fn drain(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+            self.state.begin_drain()?;
+            if self.drain_fails {
+                return Err(CaptureError::Drain("ring decode".into()));
+            }
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            if let Some(event) = self.final_loss.take() {
+                self.summary.final_loss_events += 1;
+                return Ok(Some(event));
+            }
+            self.drain_complete = true;
+            Ok(None)
+        }
+
+        fn finalize(&mut self) -> Result<CaptureSourceSummary, CaptureError> {
+            self.state.finalize(self.drain_complete)?;
+            Ok(self.summary)
+        }
+
+        fn next_event(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+            self.poll()
+        }
+    }
+
+    #[test]
+    fn capture_source_lifecycle_requires_shutdown_then_drain_before_finalize() {
+        let mut state = CaptureSourceState::Running;
+        assert!(matches!(
+            state.finalize(false),
+            Err(CaptureError::Lifecycle {
+                action: "finalize",
+                state: CaptureSourceState::Running,
+            })
+        ));
+        state.request_shutdown().unwrap();
+        state.request_shutdown().unwrap();
+        assert_eq!(state, CaptureSourceState::ShutdownRequested);
+        state.begin_drain().unwrap();
+        assert!(matches!(
+            state.finalize(false),
+            Err(CaptureError::Lifecycle {
+                action: "finalize",
+                state: CaptureSourceState::Draining,
+            })
+        ));
+        state.finalize(true).unwrap();
+        assert_eq!(state, CaptureSourceState::Finalized);
+    }
+
+    #[test]
+    fn lifecycle_drains_pending_events_before_final_loss_and_rejects_late_polling() {
+        let event = FixtureCaptureSource::from_json(FIXTURE.as_bytes())
+            .unwrap()
+            .next_event()
+            .unwrap()
+            .unwrap();
+        let mut source = LifecycleTestSource {
+            state: CaptureSourceState::Running,
+            pending: [event.clone()].into(),
+            final_loss: Some(event.clone()),
+            final_sample_fails: false,
+            drain_fails: false,
+            drain_complete: false,
+            summary: CaptureSourceSummary::default(),
+        };
+        assert!(matches!(
+            source.finalize(),
+            Err(CaptureError::Lifecycle { .. })
+        ));
+        source.request_shutdown().unwrap();
+        source.request_shutdown().unwrap();
+        assert!(matches!(source.poll(), Err(CaptureError::Lifecycle { .. })));
+        assert_eq!(source.drain().unwrap(), Some(event.clone()));
+        assert_eq!(source.drain().unwrap(), Some(event));
+        assert!(source.drain().unwrap().is_none());
+        assert_eq!(source.finalize().unwrap().final_loss_events, 1);
+    }
+
+    #[test]
+    fn lifecycle_exposes_final_sample_and_drain_failures() {
+        let mut final_sample = LifecycleTestSource {
+            state: CaptureSourceState::Running,
+            pending: Default::default(),
+            final_loss: None,
+            final_sample_fails: true,
+            drain_fails: false,
+            drain_complete: false,
+            summary: CaptureSourceSummary::default(),
+        };
+        assert!(matches!(
+            final_sample.request_shutdown(),
+            Err(CaptureError::FinalLossSample(_))
+        ));
+        final_sample.drain().unwrap();
+        final_sample.finalize().unwrap();
+
+        let mut drain = LifecycleTestSource {
+            state: CaptureSourceState::Running,
+            pending: Default::default(),
+            final_loss: None,
+            final_sample_fails: false,
+            drain_fails: true,
+            drain_complete: false,
+            summary: CaptureSourceSummary::default(),
+        };
+        drain.request_shutdown().unwrap();
+        assert!(matches!(drain.drain(), Err(CaptureError::Drain(_))));
     }
 
     #[test]

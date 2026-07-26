@@ -9,6 +9,12 @@ sudo -E cargo test -p chronicle-capture-ebpf --test privileged_feasibility -- --
 
 Retained machine evidence: `gate-a-ubuntu-24.04-kernel-6.8-aarch64.json`.
 
+## Verified matrix
+
+Only `ubuntu:24.04`, Linux `6.8.0-136-generic`, `aarch64`, cgroup v2, and BTF is verified. The report encodes this in `verified_environment` and marks every other target, including `x86_64`, `not_verified` in `target_compatibility_matrix`.
+
+Not verified: other distributions, kernel minor versions, cloud-provider kernels, physical NIC behavior, and production offload characteristics. This report does not claim Linux 6.1+ support.
+
 ## Proven
 
 - `cgroup/connect4`, `cgroup/connect6`, `sockops`, and cgroup-skb ingress/egress attach and detach cleanly.

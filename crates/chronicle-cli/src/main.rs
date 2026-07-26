@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -99,6 +100,61 @@ struct ReplayJson<'a> {
 struct DoctorJson<'a> {
     version: u8,
     status: &'a str,
+    capture: CaptureDoctor,
+}
+
+#[derive(Serialize)]
+struct CaptureDoctor {
+    architecture: &'static str,
+    kernel: Option<String>,
+    distribution: Option<String>,
+    cgroup_v2: bool,
+    btf: bool,
+    hook_capabilities: Vec<HookCapability>,
+}
+
+#[derive(Serialize)]
+struct HookCapability {
+    hook: &'static str,
+    result: &'static str,
+}
+
+fn capture_doctor() -> CaptureDoctor {
+    let kernel = ProcessCommand::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_owned());
+    let distribution = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|contents| {
+            contents
+                .lines()
+                .find_map(|line| line.strip_prefix("PRETTY_NAME="))
+                .map(|value| value.trim_matches('"').to_owned())
+        });
+    CaptureDoctor {
+        architecture: std::env::consts::ARCH,
+        kernel,
+        distribution,
+        cgroup_v2: std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").is_file(),
+        btf: std::path::Path::new("/sys/kernel/btf/vmlinux").is_file(),
+        hook_capabilities: [
+            "cgroup/connect4",
+            "cgroup/connect6",
+            "sockops",
+            "cgroup_skb/ingress",
+            "cgroup_skb/egress",
+        ]
+        .into_iter()
+        .map(|hook| HookCapability {
+            hook,
+            result: "not_probed",
+        })
+        .collect(),
+    }
 }
 
 #[derive(Serialize)]
@@ -238,11 +294,15 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
         }
         Command::Etl => Err(ApplicationError::NotImplemented("etl")),
         Command::Doctor => {
-            let status = "configuration checks passed; external probes not implemented";
+            let status = "configuration checks passed; capture attachment is not probed";
             Ok((
                 match cli.format {
                     Format::Human => status.into(),
-                    Format::Json => render_json(&DoctorJson { version: 1, status })?,
+                    Format::Json => render_json(&DoctorJson {
+                        version: 1,
+                        status,
+                        capture: capture_doctor(),
+                    })?,
                 },
                 0,
             ))
