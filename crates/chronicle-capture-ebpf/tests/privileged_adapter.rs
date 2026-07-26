@@ -135,6 +135,8 @@ fn ipv4_connect_and_active_establish_emit_capture_events() -> Result<(), Box<dyn
                 if window.start.nanoseconds > 0
                     && window.end.nanoseconds >= window.start.nanoseconds
                     && window.drop_delta.is_some_and(|delta| delta > 0)
+                    && window.ambiguity.exact_drop_timing_unknown
+                    && window.ambiguity.affected_sockets_unknown
         )
     )));
 
