@@ -1,10 +1,13 @@
 use chronicle_application::{
-    AppConfig, ApplicationError, inspect_session, record_fixture_file, render_inspect_human,
-    render_inspect_json, render_replay_human, render_replay_json, replay_session_with_plan,
+    AppConfig, ApplicationError, REPLAY_REPORT_VERSION, inspect_session, record_fixture_file,
+    render_inspect_human, render_inspect_json, render_json, render_replay_human,
+    replay_session_with_plan,
 };
 use chronicle_protocol::{ProtocolError, TransportErrorCategory};
-use chronicle_replay::{LoopbackReplayOptions, ReplayError, TimingMode};
+use chronicle_replay::{LoopbackReplayOptions, ReplayError, ReplayOutcome, TimingMode};
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -78,6 +81,32 @@ enum Timing {
     Asap,
 }
 
+#[derive(Serialize)]
+struct RecordJson {
+    version: u8,
+    session_id: String,
+    root: PathBuf,
+}
+
+#[derive(Serialize)]
+struct ReplayJson<'a> {
+    version: u16,
+    plan: &'a chronicle_application::ReplaySessionResult,
+    result: &'a chronicle_application::ReplaySessionResult,
+}
+
+#[derive(Serialize)]
+struct DoctorJson<'a> {
+    version: u8,
+    status: &'a str,
+}
+
+#[derive(Serialize)]
+struct ErrorJson {
+    code: i32,
+    message: String,
+}
+
 impl From<Timing> for TimingMode {
     fn from(value: Timing) -> Self {
         match value {
@@ -96,21 +125,38 @@ async fn main() {
     let format = cli.format;
     match run(cli).await {
         Ok((output, code)) => {
-            println!("{output}");
+            if let Err(error) = write_output(io::stdout().lock(), &output) {
+                let _ = write_output(
+                    io::stderr().lock(),
+                    &format!("CLI output I/O failed: {error}"),
+                );
+                std::process::exit(3);
+            }
             std::process::exit(code);
         }
         Err(error) => {
-            if matches!(format, Format::Json) {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"code": error_code(&error), "message": error.to_string()})
-                );
+            let code = error_code(&error);
+            let output = if matches!(format, Format::Json) {
+                render_json(&ErrorJson {
+                    code,
+                    message: error.to_string(),
+                })
+                .unwrap_or_else(|render_error| render_error.to_string())
             } else {
-                eprintln!("{error}");
-            }
-            std::process::exit(error_code(&error));
+                error.to_string()
+            };
+            let _ = write_output(io::stderr().lock(), &output);
+            std::process::exit(code);
         }
     }
+}
+
+fn write_output(mut writer: impl Write, output: &str) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(output.len() + 1);
+    bytes.extend_from_slice(output.as_bytes());
+    bytes.push(b'\n');
+    writer.write_all(&bytes)?;
+    writer.flush()
 }
 
 async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
@@ -126,8 +172,16 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
         } => {
             let result = record_fixture_file(input, &root, config.wal.segment_size_bytes)?;
             let output = match cli.format {
-                Format::Human => format!("session_id: {}\nroot: {}", result.session_id, root.display()),
-                Format::Json => serde_json::json!({"version": 1, "session_id": result.session_id.to_string(), "root": root}).to_string(),
+                Format::Human => format!(
+                    "session_id: {}\nroot: {}",
+                    result.session_id,
+                    root.display()
+                ),
+                Format::Json => render_json(&RecordJson {
+                    version: 1,
+                    session_id: result.session_id.to_string(),
+                    root,
+                })?,
             };
             Ok((output, 0))
         }
@@ -164,28 +218,35 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
                 &session_id,
                 &config.replay,
                 &options,
-                |next_plan| match cli.format {
-                    Format::Human => println!("plan:\n{}", render_replay_human(next_plan)),
-                    Format::Json => plan = Some(next_plan.clone()),
-                },
+                |next_plan| plan = Some(next_plan.clone()),
             )
             .await?;
+            let plan = plan.expect("replay plan callback must run");
             let output = match cli.format {
-                Format::Human => render_replay_human(&result),
-                Format::Json => serde_json::json!({
-                    "version": 1,
-                    "plan": plan.expect("replay plan callback must run"),
-                    "result": serde_json::from_str::<serde_json::Value>(&render_replay_json(&result)?)?,
-                })
-                .to_string(),
+                Format::Human => format!(
+                    "plan:\n{}\nresult:\n{}",
+                    render_replay_human(&plan),
+                    render_replay_human(&result)
+                ),
+                Format::Json => render_json(&ReplayJson {
+                    version: REPLAY_REPORT_VERSION,
+                    plan: &plan,
+                    result: &result,
+                })?,
             };
             Ok((output, replay_exit_code(&result)))
         }
         Command::Etl => Err(ApplicationError::NotImplemented("etl")),
-        Command::Doctor => Ok((
-            "configuration checks passed; external probes not implemented".into(),
-            0,
-        )),
+        Command::Doctor => {
+            let status = "configuration checks passed; external probes not implemented";
+            Ok((
+                match cli.format {
+                    Format::Human => status.into(),
+                    Format::Json => render_json(&DoctorJson { version: 1, status })?,
+                },
+                0,
+            ))
+        }
     }
 }
 
@@ -196,21 +257,11 @@ fn parse_session_id(value: &str) -> Result<chronicle_common::SessionId, Applicat
 }
 
 fn replay_exit_code(result: &chronicle_application::ReplaySessionResult) -> i32 {
-    if result.dry_run {
-        0
-    } else if result.preflight_denied {
-        4
-    } else if result.transport_failed {
-        5
-    } else if result.operations.iter().any(|operation| {
-        matches!(
-            operation.verification.as_str(),
-            "failed" | "inconclusive" | "unsupported"
-        )
-    }) {
-        6
-    } else {
-        0
+    match result.outcome {
+        ReplayOutcome::Completed | ReplayOutcome::CompletedWithSkips | ReplayOutcome::DryRun => 0,
+        ReplayOutcome::StoppedPolicy | ReplayOutcome::StoppedInvalidSession => 4,
+        ReplayOutcome::StoppedTransport => 5,
+        ReplayOutcome::StoppedVerification => 6,
     }
 }
 
@@ -234,6 +285,56 @@ fn error_code(error: &ApplicationError) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chronicle_replay::OperationExecutionState;
+
+    #[derive(Default)]
+    struct TestWriter {
+        bytes: Vec<u8>,
+        fail_write: bool,
+        fail_flush: bool,
+        flushes: usize,
+    }
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                return Err(io::Error::other("injected write failure"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                return Err(io::Error::other("injected flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn output_boundary_checks_write_and_flush() {
+        let mut writer = TestWriter::default();
+        write_output(&mut writer, "{\"ok\":true}").unwrap();
+        assert_eq!(writer.bytes, b"{\"ok\":true}\n");
+        assert_eq!(writer.flushes, 1);
+
+        let mut write_failure = TestWriter {
+            fail_write: true,
+            ..TestWriter::default()
+        };
+        assert!(write_output(&mut write_failure, "{}").is_err());
+        assert_eq!(write_failure.flushes, 0);
+
+        let mut flush_failure = TestWriter {
+            fail_flush: true,
+            ..TestWriter::default()
+        };
+        assert!(write_output(&mut flush_failure, "{}").is_err());
+        assert_eq!(flush_failure.bytes, b"{}\n");
+        assert_eq!(flush_failure.flushes, 1);
+    }
 
     #[test]
     fn cli_parses_required_runnable_commands() {
@@ -283,27 +384,43 @@ mod tests {
 
     #[test]
     fn replay_outcomes_map_to_stable_exit_codes() {
-        let result = |dry_run, preflight_denied, transport_failed, verification: &str| {
-            chronicle_application::ReplaySessionResult {
-                session_id: "session".into(),
-                dry_run,
-                preflight_denied,
-                transport_failed,
-                operations: vec![chronicle_application::ReplayOperationSummary {
-                    operation_id: "operation".into(),
-                    decision: "allowed".into(),
-                    attempted: false,
-                    verification: verification.into(),
-                    category: String::new(),
-                    transport_error: String::new(),
-                }],
-            }
+        let result = |outcome| chronicle_application::ReplaySessionResult {
+            session_id: "session".into(),
+            outcome,
+            dry_run: outcome == ReplayOutcome::DryRun,
+            preflight_denied: outcome == ReplayOutcome::StoppedPolicy,
+            transport_failed: outcome == ReplayOutcome::StoppedTransport,
+            operations: vec![chronicle_application::ReplayOperationSummary {
+                operation_id: "operation".into(),
+                decision: "allowed".into(),
+                state: OperationExecutionState::NotAttempted,
+                attempted: false,
+                verification: "not_run".into(),
+                category: String::new(),
+                transport_error: String::new(),
+            }],
         };
 
-        assert_eq!(replay_exit_code(&result(true, true, true, "failed")), 0);
-        assert_eq!(replay_exit_code(&result(false, true, false, "skipped")), 4);
-        assert_eq!(replay_exit_code(&result(false, false, true, "skipped")), 5);
-        assert_eq!(replay_exit_code(&result(false, false, false, "failed")), 6);
-        assert_eq!(replay_exit_code(&result(false, false, false, "passed")), 0);
+        for outcome in [
+            ReplayOutcome::Completed,
+            ReplayOutcome::CompletedWithSkips,
+            ReplayOutcome::DryRun,
+        ] {
+            assert_eq!(replay_exit_code(&result(outcome)), 0);
+        }
+        for outcome in [
+            ReplayOutcome::StoppedPolicy,
+            ReplayOutcome::StoppedInvalidSession,
+        ] {
+            assert_eq!(replay_exit_code(&result(outcome)), 4);
+        }
+        assert_eq!(
+            replay_exit_code(&result(ReplayOutcome::StoppedTransport)),
+            5
+        );
+        assert_eq!(
+            replay_exit_code(&result(ReplayOutcome::StoppedVerification)),
+            6
+        );
     }
 }

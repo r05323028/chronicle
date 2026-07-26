@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Minimal record command
-CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROOT` and add production form `record --source ebpf (--pid PID | --cgroup PATH) --wal-dir DIR [--segment-bytes N] [--duration-seconds N] [--max-wal-bytes N]`. Duration SHALL default 600 seconds/max 3600; total WAL SHALL default/hard-cap 4 GiB and be at least segment size. Source-specific/conflicting options SHALL be validated. Production command SHALL show effective cgroup path/ID/subtree before attach, perform preflight, create/finalize metadata, run eBPF plus bounded group-commit WAL, handle limits/signals, and print safe summary; it SHALL NOT run ETL implicitly.
+CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROOT` and add production form `record --source ebpf (--pid PID | --cgroup PATH [--allow-shared-cgroup]) --wal-dir DIR [--segment-bytes N] [--duration-seconds N] [--max-wal-bytes N]`. Shared acknowledgement SHALL be invalid with `--pid`, fixture source, or no explicit `--cgroup`. Duration SHALL default 600 seconds/max 3600; total WAL SHALL default/hard-cap 4 GiB and be at least segment size. Source-specific/conflicting options SHALL be validated. Production command SHALL show effective cgroup path/ID/direct TGID count/descendant cgroup count/selected-subtree scope/acknowledgement before attach, perform preflight, create/finalize metadata, run eBPF plus bounded in-WAL-marker group commit, handle limits/signals, and print safe categorized summary; it SHALL NOT run ETL implicitly. CLI help and diagnostics SHALL use **direct cgroup TGID set** for distinct host-visible TGIDs resolved from numeric PIDs listed directly in selected node's `cgroup.procs`; they SHALL NOT call it a POSIX process group, thread count, container ID, or descendant union.
 
 #### Scenario: Fixture record compatibility
 - **WHEN** existing valid P0 fixture command runs
@@ -9,27 +9,35 @@ CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROO
 
 #### Scenario: Production record happy path
 - **WHEN** supported privileged Linux host records valid dedicated workload selector
-- **THEN** command writes bounded group-committed WAL/metadata, stops gracefully, and outputs recording ID/status/reason/durable watermark/counters
+- **THEN** command writes bounded group-committed WAL/metadata, stops gracefully, and outputs recording ID/status/reason/last valid commit boundary/categorized counters
 
 #### Scenario: Record argument validation
-- **WHEN** selector is missing/multiple or fixture/eBPF options are mixed
+- **WHEN** selector is missing/multiple, fixture/eBPF options are mixed, or shared acknowledgement lacks explicit cgroup
 - **THEN** Clap/application rejects with usage exit 2 and capture does not start
+
+#### Scenario: Explicit shared cgroup acknowledgement
+- **WHEN** non-forbidden explicit cgroup has direct TGID count greater than one or descendant cgroup count greater than zero and is selected with `--allow-shared-cgroup`
+- **THEN** preflight shows separate direct TGID/descendant counts and selected-subtree warning, then persists acknowledgement before exact-subtree attach
+
+#### Scenario: PID selector direct TGID safety
+- **WHEN** selected PID's host-visible TGID is compared with the direct cgroup TGID set
+- **THEN** any unrelated direct TGID rejects selection and CLI offers no shared-cgroup override
 
 #### Scenario: Unsupported platform or privilege
 - **WHEN** eBPF source is requested on unsupported host or without privilege
 - **THEN** command exits non-success with stable safe diagnostic and no successful recording
 
 #### Scenario: Graceful SIGINT
-- **WHEN** SIGINT arrives and detach/drain/group-sync/finalization succeed
+- **WHEN** SIGINT arrives and detach/final sample/capacity-qualified queue handling/final marker sync/finalization succeed
 - **THEN** command marks `completed` with `user_interrupt`, prints final summary, preserves ETL-ready WAL, and exits 0
 
 #### Scenario: Graceful SIGTERM
-- **WHEN** SIGTERM arrives and detach/drain/group-sync/finalization succeed
+- **WHEN** SIGTERM arrives and detach/final sample/capacity-qualified queue handling/final marker sync/finalization succeed
 - **THEN** command marks `completed` with `termination_signal`, prints final summary, and exits 0
 
 #### Scenario: Duration or WAL limit
-- **WHEN** duration or total WAL limit is first reached
-- **THEN** command stops cleanly, completes with exact limit reason, and accepts no silent post-limit traffic
+- **WHEN** duration expires or WAL writer cannot fit next frame while reserving final marker/header
+- **THEN** command stops cleanly, uses exact deterministic reason, reports queued discard/post-stop rejection separately, and completes only after final marker/metadata succeed
 
 ### Requirement: Minimal replay command
 CLI SHALL preserve `replay SESSION_ID --root ROOT --target ORIGIN --allow-host IP [--allow-read] [--allow-write] [--timing asap] [--execute]`. Defaults SHALL remain human output, immediate timing, dry-run, no effect authorization, no target default, and no network. Human/JSON output SHALL include exact replay outcome, fully/partially/not replayable classification, aggregate executable/non-executable counts, and one result per operation.
@@ -159,7 +167,7 @@ README, architecture, canonical, replay safety, WAL format, capability matrix, a
 ## ADDED Requirements
 
 ### Requirement: Standalone ETL command
-CLI SHALL provide `etl --wal-dir DIR --output ROOT` with global human/JSON format. Application SHALL recover/validate recording durable snapshot, atomically publish deterministic session to requested root, update advisory checkpoint after publication, and output session/checkpoint/completeness/counters. Repeated same-root run SHALL verify/report already processed; another root SHALL be allowed and protected by independent no-replace verification.
+CLI SHALL provide `etl --wal-dir DIR --output ROOT` with global human/JSON format. Application SHALL recover/validate recording snapshot through the final recovery-authoritative commit marker, atomically publish deterministic session to requested root, update advisory checkpoint after publication, and output session/checkpoint/completeness/counters. Repeated same-root run SHALL verify/report already processed; another root SHALL be allowed and protected by independent no-replace verification.
 
 #### Scenario: First ETL run
 - **WHEN** valid stopped recording WAL is processed

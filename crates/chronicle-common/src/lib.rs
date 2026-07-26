@@ -103,6 +103,7 @@ macro_rules! uuid_id {
     };
 }
 
+uuid_id!(RecordingId);
 uuid_id!(SessionId);
 uuid_id!(ConnectionId);
 uuid_id!(OperationId);

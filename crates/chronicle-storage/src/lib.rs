@@ -18,6 +18,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
+pub const MANIFEST_SCHEMA_V1: u8 = 1;
+pub const MANIFEST_SCHEMA_V2: u8 = 2;
+pub const MANIFEST_SCHEMA_VERSION: u8 = MANIFEST_SCHEMA_V1;
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,10 +141,38 @@ pub struct PublishSession {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredSessionInspection {
     pub session: CanonicalSession,
+    pub session_checksum: String,
+    pub canonical_schema_version: u16,
+    pub payload_count: usize,
+    pub payload_bytes: u64,
     pub checkpoint: Option<String>,
     pub issues: Vec<String>,
     pub replayability: Vec<String>,
     pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ManifestSchemaVersion {
+    V1 = MANIFEST_SCHEMA_V1,
+    V2 = MANIFEST_SCHEMA_V2,
+}
+
+impl TryFrom<u8> for ManifestSchemaVersion {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            MANIFEST_SCHEMA_V1 => Ok(Self::V1),
+            MANIFEST_SCHEMA_V2 => Ok(Self::V2),
+            other => Err(other),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ManifestDiscriminator {
+    version: u8,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -159,6 +191,19 @@ struct ManifestV1 {
     complete: bool,
 }
 
+fn decode_manifest(bytes: &[u8]) -> Result<ManifestV1, StorageError> {
+    let discriminator: ManifestDiscriminator = serde_json::from_slice(bytes)
+        .map_err(|error| StorageError::Validation(error.to_string()))?;
+    match ManifestSchemaVersion::try_from(discriminator.version) {
+        Ok(ManifestSchemaVersion::V1) => serde_json::from_slice(bytes)
+            .map_err(|error| StorageError::Validation(error.to_string())),
+        Ok(ManifestSchemaVersion::V2) | Err(_) => Err(StorageError::Validation(format!(
+            "unsupported session manifest version {}",
+            discriminator.version
+        ))),
+    }
+}
+
 pub struct FilesystemSessionStore {
     root: PathBuf,
     #[cfg(test)]
@@ -169,6 +214,7 @@ pub struct FilesystemSessionStore {
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublishFault {
+    BeforePayloadDirectorySync,
     BeforeManifest,
     BeforeStagingSync,
     BeforeRename,
@@ -283,12 +329,15 @@ impl FilesystemSessionStore {
                 )?;
             }
         }
+        #[cfg(test)]
+        self.fail_if_injected(PublishFault::BeforePayloadDirectorySync)?;
+        sync_dir(&directory.join("payloads"))?;
         let bytes =
             serde_json::to_vec(&session).map_err(|e| StorageError::Backend(e.to_string()))?;
         let checksum = digest(&bytes);
         write_private_new(&directory.join("session.json"), &bytes)?;
         let manifest = ManifestV1 {
-            version: 1,
+            version: MANIFEST_SCHEMA_VERSION,
             session_id: id,
             canonical_schema_version: session.schema_version,
             session_file: "session.json".into(),
@@ -363,13 +412,33 @@ impl FilesystemSessionStore {
         Ok(session)
     }
 
+    /// Verifies an existing manifest and its canonical session checksum.
+    pub fn verify_existing_manifest(
+        &self,
+        id: SessionId,
+    ) -> Result<StoredSessionInspection, StorageError> {
+        let (session, manifest) = self.load_with_manifest(id)?;
+        Ok(StoredSessionInspection {
+            session,
+            session_checksum: manifest.session_checksum,
+            canonical_schema_version: manifest.canonical_schema_version,
+            payload_count: manifest.payload_count,
+            payload_bytes: manifest.payload_bytes,
+            checkpoint: manifest.checkpoint,
+            issues: manifest.issues,
+            replayability: manifest.replayability,
+            complete: manifest.complete,
+        })
+    }
+
     /// Loads session data plus manifest processing metadata, without body reads.
     pub fn inspect_with_metadata(
         &self,
         id: SessionId,
     ) -> Result<StoredSessionInspection, StorageError> {
-        let (session, manifest) = self.load_with_manifest(id)?;
-        for operation in session
+        let verified = self.verify_existing_manifest(id)?;
+        for operation in verified
+            .session
             .connections
             .iter()
             .flat_map(|connection| &connection.operations)
@@ -379,13 +448,7 @@ impl FilesystemSessionStore {
                 self.inspect_payload(response)?;
             }
         }
-        Ok(StoredSessionInspection {
-            session,
-            checkpoint: manifest.checkpoint,
-            issues: manifest.issues,
-            replayability: manifest.replayability,
-            complete: manifest.complete,
-        })
+        Ok(verified)
     }
 
     /// Loads a session with Artifact payloads verified and restored to Inline bytes.
@@ -447,12 +510,11 @@ impl FilesystemSessionStore {
         id: SessionId,
     ) -> Result<(CanonicalSession, ManifestV1), StorageError> {
         let directory = self.session_dir(id);
-        let manifest: ManifestV1 = serde_json::from_slice(
+        let manifest = decode_manifest(
             &std::fs::read(directory.join("manifest.json"))
                 .map_err(|_| StorageError::NotFound(id))?,
-        )
-        .map_err(|error| StorageError::Validation(error.to_string()))?;
-        if manifest.version != 1
+        )?;
+        if manifest.version != MANIFEST_SCHEMA_VERSION
             || manifest.session_id != id
             || manifest.session_file != "session.json"
         {
@@ -463,8 +525,13 @@ impl FilesystemSessionStore {
         if digest(&bytes) != manifest.session_checksum {
             return Err(StorageError::Validation("session checksum mismatch".into()));
         }
-        let session = serde_json::from_slice(&bytes)
+        let session: CanonicalSession = serde_json::from_slice(&bytes)
             .map_err(|error| StorageError::Validation(error.to_string()))?;
+        if session.schema_version != manifest.canonical_schema_version {
+            return Err(StorageError::Validation(
+                "canonical schema version does not match manifest".into(),
+            ));
+        }
         Ok((session, manifest))
     }
     fn artifact_path(&self, key: &str) -> Result<PathBuf, StorageError> {
@@ -826,6 +893,46 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn manifest_dispatch_preserves_v1_and_rejects_reserved_or_unknown_versions() {
+        let root = root();
+        let store = FilesystemSessionStore::new(&root);
+        let original = session(Vec::new());
+        let id = original.id;
+        store
+            .publish(PublishSession {
+                session: original,
+                checkpoint: None,
+                issues: Vec::new(),
+                replayability: Vec::new(),
+                complete: true,
+            })
+            .unwrap();
+        let manifest_path = store.session_dir(id).join("manifest.json");
+        let original_bytes = std::fs::read(&manifest_path).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&original_bytes).unwrap();
+        assert_eq!(manifest["version"], MANIFEST_SCHEMA_V1);
+        assert!(store.load(id).is_ok());
+
+        for version in [0, MANIFEST_SCHEMA_V2, MANIFEST_SCHEMA_V2 + 1] {
+            let mut manifest = manifest.clone();
+            manifest["version"] = version.into();
+            std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(matches!(store.load(id), Err(StorageError::Validation(_))));
+        }
+
+        let mut mismatched = manifest;
+        mismatched["canonical_schema_version"] = (CANONICAL_SCHEMA_VERSION + 1).into();
+        std::fs::write(&manifest_path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        assert!(matches!(
+            store.verify_existing_manifest(id),
+            Err(StorageError::Validation(_))
+        ));
+
+        std::fs::write(manifest_path, original_bytes).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn staged_publish_is_private_and_refuses_same_session() {
@@ -845,21 +952,38 @@ mod tests {
             })
             .unwrap();
         let directory = root.join("sessions").join(id.to_string());
-        assert!(directory.join("manifest.json").is_file());
+        let manifest_path = directory.join("manifest.json");
+        let session_path = directory.join("session.json");
+        let payload_directory = directory.join("payloads");
+        let payload_path = std::fs::read_dir(&payload_directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let manifest_before = std::fs::read(&manifest_path).unwrap();
+        let session_before = std::fs::read(&session_path).unwrap();
+        assert!(manifest_path.is_file());
         assert_eq!(
             directory.metadata().unwrap().permissions().mode() & 0o777,
             0o700
         );
         assert_eq!(
-            directory
-                .join("manifest.json")
-                .metadata()
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
+            payload_directory.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
         );
+        for file in [&manifest_path, &session_path, &payload_path] {
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let verified = store.verify_existing_manifest(id).unwrap();
+        assert_eq!(verified.session.id, id);
+        assert_eq!(
+            verified.canonical_schema_version,
+            verified.session.schema_version
+        );
+        assert_eq!(verified.payload_count, 1);
+        assert_eq!(verified.payload_bytes, 7);
+        assert!(verified.session_checksum.starts_with("sha256:"));
         assert!(
             store
                 .publish(PublishSession {
@@ -871,6 +995,8 @@ mod tests {
                 })
                 .is_err()
         );
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(std::fs::read(&session_path).unwrap(), session_before);
         assert!(
             std::fs::read_dir(root.join("sessions"))
                 .unwrap()
@@ -914,11 +1040,16 @@ mod tests {
             .map(|thread| thread.join().unwrap())
             .collect();
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let store = FilesystemSessionStore::new(&root);
+        assert_eq!(store.verify_existing_manifest(id).unwrap().session.id, id);
         assert!(
-            root.join("sessions")
-                .join(id.to_string())
-                .join("manifest.json")
-                .is_file()
+            std::fs::read_dir(root.join("sessions"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.'))
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -927,6 +1058,7 @@ mod tests {
     #[test]
     fn injected_failures_cleanup_staging_and_never_publish_final() {
         for fault in [
+            PublishFault::BeforePayloadDirectorySync,
             PublishFault::BeforeManifest,
             PublishFault::BeforeStagingSync,
             PublishFault::BeforeRename,

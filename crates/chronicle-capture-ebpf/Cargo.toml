@@ -11,5 +11,12 @@ license.workspace = true
 chronicle-capture = { path = "../chronicle-capture" }
 thiserror.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+aya = "0.14"
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
 [lints]
 workspace = true

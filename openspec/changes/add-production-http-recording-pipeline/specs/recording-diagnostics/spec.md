@@ -24,7 +24,9 @@ Doctor SHALL mark each probe required or optional and represent it as `supported
 - **THEN** aggregate is supported-with-warnings and doctor exits 0
 
 ### Requirement: Platform and eBPF probes
-Doctor SHALL check operating system, architecture, kernel version, cgroup v2, BTF, required eBPF hooks/helpers, effective privileges/capabilities, capture object/backend availability, and attach feasibility where safely testable. When selector is supplied through record preflight, shared selector diagnostics SHALL reject root/known broad cgroups, show canonical path plus inode/ID/subtree, and verify PID has not moved immediately before attachment. Doctor/record SHALL NOT leave programs attached after probe failure.
+Doctor SHALL check operating system, architecture, kernel version, cgroup v2, BTF, required eBPF hooks/helpers, effective privileges/capabilities, capture object/backend availability, and attach feasibility where safely testable. Selector diagnostics SHALL use **direct cgroup TGID set** to mean distinct host-visible TGIDs represented by numeric PIDs listed directly in the selected node's `cgroup.procs`, after resolving each PID to its host-visible TGID; its cardinality SHALL be **direct TGID count**. It SHALL NOT mean POSIX PGID, session ID, thread count, container ID, or descendant membership. Multiple listed PIDs resolving to one TGID SHALL count once. Descendant cgroups SHALL be counted separately as **descendant cgroup count** because attachment covers the **selected subtree**.
+
+Record preflight SHALL reuse these diagnostics to show canonical path, inode/ID, direct TGID count, descendant cgroup count, selected-subtree scope, and acknowledgement state; reject forbidden roots, Chronicle containment anywhere in the selected subtree, unreadable/unsafe enumeration, or shared PID scope; and require `--allow-shared-cgroup` only for explicit shared cgroup. PID safety SHALL compare the selected PID's host-visible TGID with the direct cgroup TGID set and reject any unrelated direct TGID. A listed PID that exits or cannot be safely resolved SHALL NOT be omitted: required record preflight SHALL reject, and doctor SHALL report `not_checked` or rejection according to the probe's required/optional policy. Chronicle's containment check SHALL compare its own host-visible cgroup identity against the full selected subtree, not only direct `cgroup.procs` membership. Doctor/record SHALL NOT expose command lines/environment values or leave programs attached after probe failure.
 
 #### Scenario: Missing BTF
 - **WHEN** `/sys/kernel/btf/vmlinux` is unavailable or unusable
@@ -34,20 +36,36 @@ Doctor SHALL check operating system, architecture, kernel version, cgroup v2, BT
 - **WHEN** kernel supports capture but caller lacks attach/load privilege
 - **THEN** doctor reports privilege unsupported/not-checked separately from kernel support
 
-#### Scenario: Broad cgroup selector
-- **WHEN** selector preflight resolves root or known host-wide shared cgroup
+#### Scenario: Forbidden broad cgroup selector
+- **WHEN** selector resolves root/known host-wide root or Chronicle's host-visible cgroup identity is in any node of the selected subtree even with acknowledgement
 - **THEN** diagnostic reports unsupported broad-scope code and no attachment occurs
 
+#### Scenario: Shared PID cgroup
+- **WHEN** PID-resolved cgroup's direct cgroup TGID set contains another host-visible TGID
+- **THEN** diagnostic rejects without offering shared acknowledgement override
+
+#### Scenario: Explicit shared cgroup
+- **WHEN** explicit selector has direct TGID count greater than one or descendant cgroup count greater than zero
+- **THEN** diagnostic reports supported-with-warning only when explicit acknowledgement is present; otherwise preflight rejects
+
+#### Scenario: Multithreaded TGID deduplication
+- **WHEN** several listed PIDs resolve to one host-visible TGID
+- **THEN** diagnostic reports direct TGID count one and does not use thread count or POSIX PGID
+
+#### Scenario: PID exits during enumeration
+- **WHEN** a PID from `cgroup.procs` exits or cannot be resolved safely
+- **THEN** diagnostic does not omit it and reports `not_checked` or rejection under the probe's required/optional policy
+
 #### Scenario: PID identity race
-- **WHEN** PID cgroup identity changes between initial and immediate pre-attach resolution
-- **THEN** diagnostic fails safely and reports expected/observed non-sensitive IDs
+- **WHEN** PID cgroup identity changes across initial, pre-attach, or post-attach resolution
+- **THEN** diagnostic fails safely, removes links, and reports expected/observed non-sensitive IDs
 
 #### Scenario: Non-Linux development host
 - **WHEN** doctor runs on macOS
 - **THEN** live capture is unsupported while portable ETL/inspect/replay checks still run
 
 ### Requirement: WAL and filesystem probes
-Doctor SHALL check supplied WAL/output path creation/writability, private permission support, advisory locking, available space warning, file/data sync, bounded group-commit prerequisites, and atomic no-replace publication using private temporary data. If path option is omitted, corresponding path probe SHALL be optional `not_checked` with remediation and SHALL NOT invent default path. It SHALL remove probe artifacts best-effort and SHALL NOT overwrite user files.
+Doctor SHALL check supplied WAL/output path creation/writability, private permission support, advisory locking, available space warning, file/data sync, one-sync in-WAL-marker group-commit prerequisites, strict physical hard-cap accounting, and atomic no-replace publication using private temporary data. If path option is omitted, corresponding path probe SHALL be optional `not_checked` with remediation and SHALL NOT invent default path. It SHALL remove probe artifacts best-effort and SHALL NOT overwrite user files.
 
 #### Scenario: Writable private filesystem
 - **WHEN** directory supports required permissions, sync, lock, and atomic rename

@@ -4,8 +4,32 @@ use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId, SessionI
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const CANONICAL_SCHEMA_VERSION: u16 = 2;
+pub const CANONICAL_SCHEMA_V1: u16 = 1;
+pub const CANONICAL_SCHEMA_V2: u16 = 2;
+pub const CANONICAL_SCHEMA_V3: u16 = 3;
+pub const CANONICAL_SCHEMA_VERSION: u16 = CANONICAL_SCHEMA_V2;
 pub type Attributes = BTreeMap<String, String>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum CanonicalSchemaVersion {
+    V1 = CANONICAL_SCHEMA_V1,
+    V2 = CANONICAL_SCHEMA_V2,
+    V3 = CANONICAL_SCHEMA_V3,
+}
+
+impl TryFrom<u16> for CanonicalSchemaVersion {
+    type Error = u16;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            CANONICAL_SCHEMA_V1 => Ok(Self::V1),
+            CANONICAL_SCHEMA_V2 => Ok(Self::V2),
+            CANONICAL_SCHEMA_V3 => Ok(Self::V3),
+            other => Err(other),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RelativeTimeNanos(pub u64);
@@ -178,12 +202,12 @@ where
     D: serde::Deserializer<'de>,
 {
     let version = u16::deserialize(deserializer)?;
-    if version > CANONICAL_SCHEMA_VERSION {
-        return Err(serde::de::Error::custom(format!(
+    match CanonicalSchemaVersion::try_from(version) {
+        Ok(CanonicalSchemaVersion::V1 | CanonicalSchemaVersion::V2) => Ok(version),
+        Ok(CanonicalSchemaVersion::V3) | Err(_) => Err(serde::de::Error::custom(format!(
             "unsupported canonical schema version {version}"
-        )));
+        ))),
     }
-    Ok(version)
 }
 
 #[cfg(test)]
@@ -253,22 +277,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_newer_schema_version() {
-        let error = serde_json::from_value::<CanonicalSession>(serde_json::json!({
-            "schema_version": CANONICAL_SCHEMA_VERSION + 1,
-            "id": SessionId::new(),
-            "started_at": OffsetDateTime::UNIX_EPOCH,
-            "ended_at": null,
-            "source": SourceMetadata::default(),
-            "connections": [],
-            "timeline": [],
-            "replay": ReplayMetadata::default(),
-        }))
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported canonical schema version")
+    fn dispatches_v1_v2_and_rejects_unimplemented_or_unknown_versions() {
+        assert_eq!(
+            CanonicalSchemaVersion::try_from(CANONICAL_SCHEMA_V1).unwrap(),
+            CanonicalSchemaVersion::V1
         );
+        assert_eq!(
+            CanonicalSchemaVersion::try_from(CANONICAL_SCHEMA_V2).unwrap(),
+            CanonicalSchemaVersion::V2
+        );
+        assert_eq!(
+            CanonicalSchemaVersion::try_from(CANONICAL_SCHEMA_V3).unwrap(),
+            CanonicalSchemaVersion::V3
+        );
+
+        for version in [0, CANONICAL_SCHEMA_V3, CANONICAL_SCHEMA_V3 + 1] {
+            let error = serde_json::from_value::<CanonicalSession>(serde_json::json!({
+                "schema_version": version,
+                "id": SessionId::new(),
+                "started_at": OffsetDateTime::UNIX_EPOCH,
+                "ended_at": null,
+                "source": SourceMetadata::default(),
+                "connections": [],
+                "timeline": [],
+                "replay": ReplayMetadata::default(),
+            }))
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported canonical schema version")
+            );
+        }
     }
 }

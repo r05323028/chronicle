@@ -7,6 +7,7 @@ use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId};
 use chronicle_protocol::{
     ProtocolError, ProtocolRegistry, ReplayContext, VerificationResult, VerificationStatus,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
@@ -404,16 +405,69 @@ impl ReplayPlanner {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayOutcome {
+    Completed,
+    CompletedWithSkips,
+    DryRun,
+    StoppedPolicy,
+    StoppedInvalidSession,
+    StoppedTransport,
+    StoppedVerification,
+}
+
+impl ReplayOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::CompletedWithSkips => "completed_with_skips",
+            Self::DryRun => "dry_run",
+            Self::StoppedPolicy => "stopped_policy",
+            Self::StoppedInvalidSession => "stopped_invalid_session",
+            Self::StoppedTransport => "stopped_transport",
+            Self::StoppedVerification => "stopped_verification",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationExecutionState {
+    Completed,
+    Failed,
+    NotAttempted,
+}
+
+impl OperationExecutionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Replayability {
+    FullyReplayable,
+    PartiallyReplayable,
+    NotReplayable,
+}
+
 #[derive(Clone, Debug)]
 pub struct OperationReplayResult {
     pub operation_id: OperationId,
-    pub attempted: bool,
+    pub state: OperationExecutionState,
     pub verification: Option<VerificationResult>,
     pub transport_error: Option<chronicle_protocol::TransportErrorCategory>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ReplayExecution {
+    pub outcome: ReplayOutcome,
     pub results: Vec<OperationReplayResult>,
 }
 
@@ -432,15 +486,22 @@ impl<'a> ReplayExecutor<'a> {
         contexts: &BTreeMap<ProtocolId, ReplayContext>,
     ) -> Result<ReplayExecution, ReplayError> {
         if plan.dry_run || !plan.is_executable() {
+            let (outcome, category) = if plan.dry_run {
+                (ReplayOutcome::DryRun, "dry_run")
+            } else {
+                (ReplayOutcome::StoppedPolicy, "preflight_denied")
+            };
             return Ok(ReplayExecution {
+                outcome,
                 results: plan
                     .operations
                     .iter()
-                    .map(|planned| no_run_result(planned, "dry_run_or_preflight_denied"))
+                    .map(|planned| no_run_result(planned, category))
                     .collect(),
             });
         }
         let mut results = Vec::with_capacity(plan.operations.len());
+        let mut outcome = ReplayOutcome::Completed;
         let mut stopped = false;
         for planned in &plan.operations {
             if stopped {
@@ -456,7 +517,7 @@ impl<'a> ReplayExecutor<'a> {
             {
                 results.push(OperationReplayResult {
                     operation_id: planned.operation.id,
-                    attempted: false,
+                    state: OperationExecutionState::NotAttempted,
                     verification: Some(verification(
                         VerificationStatus::Inconclusive,
                         "recorded response is incomplete or missing",
@@ -464,6 +525,7 @@ impl<'a> ReplayExecutor<'a> {
                     )),
                     transport_error: None,
                 });
+                outcome = ReplayOutcome::StoppedVerification;
                 stopped = true;
                 continue;
             }
@@ -487,6 +549,7 @@ impl<'a> ReplayExecutor<'a> {
                 Ok(connection) => connection,
                 Err(ProtocolError::Transport { category, .. }) => {
                     results.push(transport_result(planned, category));
+                    outcome = ReplayOutcome::StoppedTransport;
                     stopped = true;
                     continue;
                 }
@@ -496,6 +559,7 @@ impl<'a> ReplayExecutor<'a> {
                 Ok(observed) => observed,
                 Err(ProtocolError::Transport { category, .. }) => {
                     results.push(transport_result(planned, category));
+                    outcome = ReplayOutcome::StoppedTransport;
                     stopped = true;
                     continue;
                 }
@@ -503,21 +567,24 @@ impl<'a> ReplayExecutor<'a> {
             };
             let verification = verifier.verify(&planned.operation, &observed);
             stopped = verification.status != VerificationStatus::Passed;
+            if stopped {
+                outcome = ReplayOutcome::StoppedVerification;
+            }
             results.push(OperationReplayResult {
                 operation_id: planned.operation.id,
-                attempted: true,
+                state: OperationExecutionState::Completed,
                 verification: Some(verification),
                 transport_error: None,
             });
         }
-        Ok(ReplayExecution { results })
+        Ok(ReplayExecution { outcome, results })
     }
 }
 
 fn no_run_result(planned: &PlannedOperation, category: &str) -> OperationReplayResult {
     OperationReplayResult {
         operation_id: planned.operation.id,
-        attempted: false,
+        state: OperationExecutionState::NotAttempted,
         verification: Some(verification(
             VerificationStatus::Skipped,
             "verification was not run",
@@ -533,7 +600,7 @@ fn transport_result(
 ) -> OperationReplayResult {
     OperationReplayResult {
         operation_id: planned.operation.id,
-        attempted: true,
+        state: OperationExecutionState::Failed,
         verification: None,
         transport_error: Some(category),
     }
@@ -677,11 +744,51 @@ mod tests {
             .execute(&plan, &BTreeMap::new())
             .await
             .unwrap();
+        assert_eq!(results.outcome, ReplayOutcome::DryRun);
         assert_eq!(results.results.len(), 1);
-        assert!(!results.results[0].attempted);
+        assert_eq!(
+            results.results[0].state,
+            OperationExecutionState::NotAttempted
+        );
         assert_eq!(
             results.results[0].verification.as_ref().unwrap().status,
             VerificationStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn replay_contract_enums_have_stable_json_names() {
+        for (value, expected) in [
+            (ReplayOutcome::Completed, "\"completed\""),
+            (
+                ReplayOutcome::CompletedWithSkips,
+                "\"completed_with_skips\"",
+            ),
+            (ReplayOutcome::DryRun, "\"dry_run\""),
+            (ReplayOutcome::StoppedPolicy, "\"stopped_policy\""),
+            (
+                ReplayOutcome::StoppedInvalidSession,
+                "\"stopped_invalid_session\"",
+            ),
+            (ReplayOutcome::StoppedTransport, "\"stopped_transport\""),
+            (
+                ReplayOutcome::StoppedVerification,
+                "\"stopped_verification\"",
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_str::<ReplayOutcome>(expected).unwrap(),
+                value
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&OperationExecutionState::NotAttempted).unwrap(),
+            "\"not_attempted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Replayability::PartiallyReplayable).unwrap(),
+            "\"partially_replayable\""
         );
     }
 
@@ -851,8 +958,12 @@ mod tests {
             .execute(&plan, &BTreeMap::new())
             .await
             .unwrap();
+        assert_eq!(results.outcome, ReplayOutcome::StoppedPolicy);
         assert_eq!(results.results.len(), 1);
-        assert!(!results.results[0].attempted);
+        assert_eq!(
+            results.results[0].state,
+            OperationExecutionState::NotAttempted
+        );
         assert_eq!(
             results.results[0].verification.as_ref().unwrap().status,
             VerificationStatus::Skipped

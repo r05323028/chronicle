@@ -17,6 +17,7 @@ chronicle-common = { path = "../chronicle-common" }
 chronicle-protocol = { path = "../chronicle-protocol" }
 chronicle-replay = { path = "../chronicle-replay" }
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

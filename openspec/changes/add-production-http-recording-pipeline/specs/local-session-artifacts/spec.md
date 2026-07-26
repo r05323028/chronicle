@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Versioned checksummed filesystem layout
-Each session SHALL use existing `<root>/sessions/<session-id>/manifest.json`, `session.json`, and `payloads/<sha256-hex>` layout. Artifact refs SHALL remain session-qualified for direct lookup. Manifest v2 SHALL include session/canonical versions, session checksum, payload counts/sizes, ETL durable high-water mark, pipeline version, WAL snapshot digest, source recording ID/status/shutdown reason, capture time range, WAL envelope/loss-window provenance summary, bounded issue summary, completeness counts, integrity, and replayability classification/reasons. Manifest SHALL NOT contain checkpoint-file checksum; post-publication checkpoint may contain manifest checksum. SHA-256 SHALL identify payload/session/WAL-snapshot bytes under documented scopes. Reader SHALL accept manifest v1/v2 and reject unknown newer version.
+Each session SHALL use existing `<root>/sessions/<session-id>/manifest.json`, `session.json`, and `payloads/<sha256-hex>` layout. Artifact refs SHALL remain session-qualified for direct lookup. Manifest v2 SHALL include session/canonical versions, session checksum, payload counts/sizes, ETL last-valid-commit-marker boundary, pipeline version, WAL snapshot digest, source recording ID/status/shutdown reason, capture time range, WAL envelope/loss-window provenance summary, bounded issue summary, completeness counts, integrity, and replayability classification/reasons. Manifest SHALL NOT contain checkpoint-file checksum; post-publication checkpoint may contain manifest checksum. SHA-256 SHALL identify payload/session/WAL-snapshot bytes under documented scopes. Reader SHALL accept manifest v1/v2 and reject unknown newer version.
 
 #### Scenario: Deterministic lookup
 - **WHEN** session ID is known
@@ -32,7 +32,7 @@ Inspect SHALL load manifest and canonical session plus payload file metadata wit
 
 #### Scenario: WAL absent or relocated
 - **WHEN** valid published session is inspected without original WAL at any known path
-- **THEN** inspect succeeds from canonical files and reports embedded source ID/high-water/digest without claiming live WAL availability
+- **THEN** inspect succeeds from canonical files and reports embedded source ID/commit-marker boundary/digest without claiming live WAL availability
 
 #### Scenario: Recording materialized into another root
 - **WHEN** same deterministic session is published into another output root
@@ -71,7 +71,7 @@ JSON inspect output SHALL expose stable versioned structure for same safe summar
 ## ADDED Requirements
 
 ### Requirement: Typed canonical provenance and completeness
-Canonical Session v3 SHALL represent source recording/status/reason, source connection generation, WAL envelope/range provenance, capture/durability loss windows, and typed operation completeness (`complete`, `incomplete`, `truncated`, `malformed`, `unmatched`, `unsupported`). Session completeness SHALL aggregate operation/connection state and SHALL support partial session state while individual operations remain complete, but SHALL NOT label an operation complete when intersecting/ambiguous loss affects it.
+Canonical Session v3 SHALL represent source recording/status/reason, source connection generation, WAL envelope/range/commit-marker provenance, ring/backend and WAL-limit loss windows, and typed operation completeness (`complete`, `incomplete`, `truncated`, `malformed`, `unmatched`, `unsupported`). Session completeness SHALL aggregate operation/connection state and SHALL support partial session state while individual operations remain complete, but SHALL NOT label an operation complete when intersecting/ambiguous loss affects it.
 
 #### Scenario: Complete operation provenance
 - **WHEN** operation is decoded from several WAL records

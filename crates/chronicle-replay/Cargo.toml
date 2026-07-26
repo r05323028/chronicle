@@ -11,9 +11,11 @@ license.workspace = true
 chronicle-canonical = { path = "../chronicle-canonical" }
 chronicle-common = { path = "../chronicle-common" }
 chronicle-protocol = { path = "../chronicle-protocol" }
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
 

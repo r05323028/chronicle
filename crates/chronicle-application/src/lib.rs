@@ -1,24 +1,116 @@
 //! Application services and configuration. CLI remains an outer adapter.
 
 use chronicle_capture::{CaptureError, CaptureSource, FixtureCaptureSource, encode_event};
+use chronicle_common::RecordingId;
 use chronicle_etl::{EtlError, EtlIssue, EtlOutput, EtlPipeline};
 use chronicle_protocol::{ProtocolError, ProtocolRegistry, ReplayContext, SecretBytes};
 use chronicle_replay::{
-    LoopbackReplayOptions, ReplayError, ReplayExecutor, ReplayPlan, ReplayPlanner, ReplayPolicy,
-    ReplayTargetError, TargetMap, TimingMode,
+    LoopbackReplayOptions, OperationExecutionState, ReplayError, ReplayExecutor, ReplayOutcome,
+    ReplayPlan, ReplayPlanner, ReplayPolicy, ReplayTargetError, TargetMap, TimingMode,
 };
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
 use chronicle_wal::{
-    RecordKind, SegmentedWalWriter, WalCheckpoint, WalError, WalReader, WalRecord, WalWriter,
-    encode_record,
+    DEFAULT_MAX_RECORD_BYTES, GroupCommitWalWriter, RecordKind, RecordingLock,
+    RecoveryReopenPreview, RecoveryReopenReport, RecoveryRepair, RecoveryScan, SegmentedWalWriter,
+    WalCheckpoint, WalError, WalReader, WalRecord, WalWriter, encode_record,
+    prepare_group_commit_reopen_from_scan,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+pub const RECORDING_METADATA_SCHEMA_V1: u16 = 1;
+pub const RECORDING_COUNTERS_SCHEMA_V1: u16 = 1;
+pub const REPLAY_REPORT_VERSION: u16 = 2;
+pub const RECOVERY_REPORT_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingStatus {
+    Starting,
+    Recording,
+    Completed,
+    Failed,
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownReason {
+    UserInterrupt,
+    TerminationSignal,
+    SourceCompleted,
+    DurationLimit,
+    WalSizeLimit,
+    CaptureFailure,
+    WalFailure,
+    ProcessCrashRecovered,
+    ForcedTermination,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingSelectorIdentity {
+    pub canonical_cgroup_path: String,
+    pub cgroup_id: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordByteCount {
+    pub records: u64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingCounters {
+    pub received: RecordByteCount,
+    pub accepted_into_queue: RecordByteCount,
+    pub written_not_committed: RecordByteCount,
+    pub committed: RecordByteCount,
+    pub discarded_from_queue_due_to_wal_limit: RecordByteCount,
+    pub kernel_or_backend_dropped: RecordByteCount,
+    pub rejected_after_stop: RecordByteCount,
+    pub etl_checkpointed: RecordByteCount,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingCommitBoundary {
+    pub marker_sequence: u64,
+    pub durable_through_sequence: u64,
+    pub durable_record_count: u64,
+    pub durable_payload_bytes: u64,
+    pub segment_ordinal: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingMetadataV1 {
+    pub version: u16,
+    pub recording_id: RecordingId,
+    pub selector: Option<RecordingSelectorIdentity>,
+    pub status: RecordingStatus,
+    pub shutdown_reason: Option<ShutdownReason>,
+    pub last_valid_commit: Option<RecordingCommitBoundary>,
+    pub counters: RecordingCounters,
+}
+
+#[derive(Deserialize)]
+struct RecordingMetadataDiscriminator {
+    version: u16,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordingMetadataWriteFault {
+    BeforeFileSync,
+    BeforeRename,
+    AfterRename,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -145,7 +237,7 @@ pub enum ReplayTiming {
 
 #[derive(Debug, Error)]
 pub enum ApplicationError {
-    #[error("configuration I/O failed: {0}")]
+    #[error("I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Capture(#[from] CaptureError),
@@ -165,8 +257,8 @@ pub enum ApplicationError {
     MissingReplayCredential { environment: String },
     #[error("runtime Authorization credential has invalid HTTP field-value bytes")]
     InvalidReplayCredential,
-    #[error("inspect JSON encoding failed: {0}")]
-    InspectJson(#[from] serde_json::Error),
+    #[error("JSON serialization failed: {0}")]
+    JsonSerialization(#[from] serde_json::Error),
     #[error("encoded fixture WAL is {bytes} bytes; one-segment limit is {limit} bytes")]
     FixtureWalTooLarge { bytes: u64, limit: u64 },
     #[error("capture flags {0:#x} cannot fit in WAL record flags")]
@@ -177,8 +269,543 @@ pub enum ApplicationError {
     Config(#[from] toml::de::Error),
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+    #[error("recording metadata failed validation: {0}")]
+    RecordingMetadataValidation(String),
     #[error("{0} command is not implemented in current scaffold")]
     NotImplemented(&'static str),
+}
+
+pub fn decode_recording_metadata(bytes: &[u8]) -> Result<RecordingMetadataV1, ApplicationError> {
+    let discriminator: RecordingMetadataDiscriminator = serde_json::from_slice(bytes)
+        .map_err(|error| ApplicationError::RecordingMetadataValidation(error.to_string()))?;
+    if discriminator.version != RECORDING_METADATA_SCHEMA_V1 {
+        return Err(ApplicationError::RecordingMetadataValidation(format!(
+            "unsupported recording metadata version {}",
+            discriminator.version
+        )));
+    }
+    let metadata: RecordingMetadataV1 = serde_json::from_slice(bytes)
+        .map_err(|error| ApplicationError::RecordingMetadataValidation(error.to_string()))?;
+    validate_recording_metadata(&metadata)?;
+    Ok(metadata)
+}
+
+pub fn load_recording_metadata(
+    wal_directory: impl AsRef<Path>,
+) -> Result<Option<RecordingMetadataV1>, ApplicationError> {
+    match fs::read(wal_directory.as_ref().join("recording.json")) {
+        Ok(bytes) => decode_recording_metadata(&bytes).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn write_recording_metadata(
+    wal_directory: impl AsRef<Path>,
+    metadata: &RecordingMetadataV1,
+) -> Result<(), ApplicationError> {
+    write_recording_metadata_inner(wal_directory.as_ref(), metadata, None)
+}
+
+fn validate_recording_metadata(metadata: &RecordingMetadataV1) -> Result<(), ApplicationError> {
+    if metadata.version != RECORDING_METADATA_SCHEMA_V1 {
+        return Err(ApplicationError::RecordingMetadataValidation(format!(
+            "unsupported recording metadata version {}",
+            metadata.version
+        )));
+    }
+    let terminal = matches!(
+        metadata.status,
+        RecordingStatus::Completed | RecordingStatus::Failed | RecordingStatus::Aborted
+    );
+    if terminal != metadata.shutdown_reason.is_some() {
+        return Err(ApplicationError::RecordingMetadataValidation(
+            "terminal status and shutdown reason must be present together".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_recording_metadata_inner(
+    wal_directory: &Path,
+    metadata: &RecordingMetadataV1,
+    fault: Option<RecordingMetadataWriteFault>,
+) -> Result<(), ApplicationError> {
+    validate_recording_metadata(metadata)?;
+    write_private_atomic_json(wal_directory, "recording.json", metadata, fault)
+}
+
+fn write_private_atomic_json<T: Serialize + ?Sized>(
+    directory: &Path,
+    file_name: &str,
+    value: &T,
+    #[cfg_attr(not(test), allow(unused_variables))] fault: Option<RecordingMetadataWriteFault>,
+) -> Result<(), ApplicationError> {
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    return Err(ApplicationError::RecordingMetadataValidation(
+        "private atomic JSON persistence is unsupported on this platform".into(),
+    ));
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        fs::create_dir_all(directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        let final_path = directory.join(file_name);
+        let temp_path = directory.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+        let bytes = serde_json::to_vec(value)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let mut file = options.open(&temp_path)?;
+        let mut published = false;
+        let result = (|| -> Result<(), ApplicationError> {
+            file.write_all(&bytes)?;
+            #[cfg(test)]
+            if fault == Some(RecordingMetadataWriteFault::BeforeFileSync) {
+                return Err(std::io::Error::other("injected atomic JSON failure").into());
+            }
+            file.sync_all()?;
+            #[cfg(test)]
+            if fault == Some(RecordingMetadataWriteFault::BeforeRename) {
+                return Err(std::io::Error::other("injected atomic JSON failure").into());
+            }
+            fs::rename(&temp_path, &final_path)?;
+            published = true;
+            #[cfg(test)]
+            if fault == Some(RecordingMetadataWriteFault::AfterRename) {
+                return Err(std::io::Error::other("injected atomic JSON failure").into());
+            }
+            File::open(directory)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() && !published {
+            let _ = fs::remove_file(temp_path);
+        }
+        result
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordingRecoveryReconciliation {
+    pub metadata: RecordingMetadataV1,
+    pub scan: RecoveryScan,
+    pub metadata_updated: bool,
+}
+
+pub fn reconcile_recording_metadata(
+    wal_directory: impl AsRef<Path>,
+    recording_id: RecordingId,
+    expected_selector: Option<&RecordingSelectorIdentity>,
+) -> Result<RecordingRecoveryReconciliation, ApplicationError> {
+    let wal_directory = wal_directory.as_ref();
+    let lock = RecordingLock::acquire(wal_directory)?;
+    let scan = lock.scan_v2(wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES)?;
+    reconcile_recording_metadata_with_scan(
+        &lock,
+        wal_directory,
+        recording_id,
+        expected_selector,
+        scan,
+    )
+}
+
+pub fn reconcile_recording_metadata_with_scan(
+    _lock: &RecordingLock,
+    wal_directory: impl AsRef<Path>,
+    recording_id: RecordingId,
+    expected_selector: Option<&RecordingSelectorIdentity>,
+    scan: RecoveryScan,
+) -> Result<RecordingRecoveryReconciliation, ApplicationError> {
+    let wal_directory = wal_directory.as_ref();
+    let original = load_recording_metadata(wal_directory)?;
+    let mut metadata = original.clone().unwrap_or_else(|| RecordingMetadataV1 {
+        version: RECORDING_METADATA_SCHEMA_V1,
+        recording_id,
+        selector: expected_selector.cloned(),
+        status: RecordingStatus::Aborted,
+        shutdown_reason: Some(ShutdownReason::ProcessCrashRecovered),
+        last_valid_commit: None,
+        counters: RecordingCounters::default(),
+    });
+    if metadata.recording_id != recording_id {
+        return Err(ApplicationError::RecordingMetadataValidation(
+            "recording ID does not match WAL segment identity".into(),
+        ));
+    }
+    if let Some(expected) = expected_selector
+        && metadata.selector.as_ref() != Some(expected)
+    {
+        return Err(ApplicationError::RecordingMetadataValidation(
+            "recording selector does not match expected immutable selector".into(),
+        ));
+    }
+    if matches!(
+        metadata.status,
+        RecordingStatus::Starting | RecordingStatus::Recording
+    ) {
+        metadata.status = RecordingStatus::Aborted;
+        metadata.shutdown_reason = Some(ShutdownReason::ProcessCrashRecovered);
+    }
+    metadata.last_valid_commit = match (
+        scan.authority.marker_sequence,
+        scan.authority.durable_through_sequence,
+        scan.authority.segment_ordinal,
+    ) {
+        (Some(marker_sequence), Some(durable_through_sequence), Some(segment_ordinal)) => {
+            Some(RecordingCommitBoundary {
+                marker_sequence,
+                durable_through_sequence,
+                durable_record_count: scan.authority.durable_record_count,
+                durable_payload_bytes: scan.authority.durable_payload_bytes,
+                segment_ordinal,
+            })
+        }
+        _ => None,
+    };
+    metadata.counters.committed = RecordByteCount {
+        records: scan.authority.durable_record_count,
+        bytes: scan.authority.durable_payload_bytes,
+    };
+    metadata.counters.written_not_committed = RecordByteCount {
+        records: u64::try_from(scan.uncommitted.len()).map_err(|_| {
+            ApplicationError::RecordingMetadataValidation(
+                "uncommitted record count exceeds metadata range".into(),
+            )
+        })?,
+        bytes: scan.uncommitted.iter().try_fold(0_u64, |total, envelope| {
+            total
+                .checked_add(u64::try_from(envelope.payload.len()).map_err(|_| {
+                    ApplicationError::RecordingMetadataValidation(
+                        "uncommitted payload bytes exceed metadata range".into(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    ApplicationError::RecordingMetadataValidation(
+                        "uncommitted payload bytes exceed metadata range".into(),
+                    )
+                })
+        })?,
+    };
+    let metadata_updated = original.as_ref() != Some(&metadata);
+    if metadata_updated {
+        write_recording_metadata(wal_directory, &metadata)?;
+    }
+    Ok(RecordingRecoveryReconciliation {
+        metadata,
+        scan,
+        metadata_updated,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryIssueCode {
+    TailRepaired,
+    PartialTail,
+    FrameCrc,
+    FrameVersion,
+    HeaderCorruption,
+    MarkerCrc,
+    MarkerVersion,
+    MarkerReference,
+    MarkerDigest,
+    Sequence,
+    Identity,
+    WalLimitLoss,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryTailRepairSummary {
+    pub repaired_bytes: u64,
+    pub truncated_to: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostMarkerUncertainty {
+    pub records: u64,
+    pub bytes: u64,
+    pub first_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+    pub partial_tail_offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryReportV1 {
+    pub version: u16,
+    pub recording_id: RecordingId,
+    pub status: RecordingStatus,
+    pub shutdown_reason: Option<ShutdownReason>,
+    pub repaired_tail: Option<RecoveryTailRepairSummary>,
+    pub removed_segments: usize,
+    pub last_valid_commit: Option<RecordingCommitBoundary>,
+    pub committed: RecordByteCount,
+    pub post_marker: PostMarkerUncertainty,
+    pub wal_limit_loss: RecordByteCount,
+    pub issue_codes: Vec<RecoveryIssueCode>,
+}
+
+pub fn recovery_issue_code(error: &WalError) -> RecoveryIssueCode {
+    match error {
+        WalError::EnvelopeChecksum {
+            kind: RecordKind::CommitMarker,
+            ..
+        } => RecoveryIssueCode::MarkerCrc,
+        WalError::EnvelopeChecksum { .. } | WalError::Checksum { .. } => {
+            RecoveryIssueCode::FrameCrc
+        }
+        WalError::SegmentHeaderChecksum { .. }
+        | WalError::InvalidSegmentMagic
+        | WalError::InvalidSegmentHeaderLength(_)
+        | WalError::NonzeroSegmentHeaderReserved
+        | WalError::TruncatedSegmentHeader { .. }
+        | WalError::UnsupportedSegmentHeaderVersion(_) => RecoveryIssueCode::HeaderCorruption,
+        WalError::UnsupportedCommitMarkerVersion(_) => RecoveryIssueCode::MarkerVersion,
+        WalError::UnsupportedEnvelopeVersion { kind, .. }
+            if *kind == RecordKind::CommitMarker as u16 =>
+        {
+            RecoveryIssueCode::MarkerVersion
+        }
+        WalError::UnsupportedEnvelopeVersion { .. } | WalError::UnsupportedVersion(_) => {
+            RecoveryIssueCode::FrameVersion
+        }
+        WalError::CommitDigestMismatch => RecoveryIssueCode::MarkerDigest,
+        WalError::CommitBoundaryMismatch { .. }
+        | WalError::CommitDurableThroughMismatch { .. }
+        | WalError::CommitRecordCountMismatch { .. }
+        | WalError::CommitPayloadBytesMismatch { .. }
+        | WalError::CommitBatchContainsMarker { .. }
+        | WalError::EmptyCommitBatch => RecoveryIssueCode::MarkerReference,
+        WalError::UnexpectedSequence { .. }
+        | WalError::OutOfOrder { .. }
+        | WalError::RecoverySegmentFirstSequenceMismatch { .. } => RecoveryIssueCode::Sequence,
+        WalError::CommitRecordingIdMismatch
+        | WalError::CommitSegmentMismatch
+        | WalError::SegmentIdentityMismatch(_)
+        | WalError::EnvelopeRecordingIdMismatch => RecoveryIssueCode::Identity,
+        _ => RecoveryIssueCode::Other,
+    }
+}
+
+pub fn build_recovery_report(
+    reconciliation: &RecordingRecoveryReconciliation,
+    repair: Option<&RecoveryRepair>,
+    additional_issues: impl IntoIterator<Item = RecoveryIssueCode>,
+) -> Result<RecoveryReportV1, ApplicationError> {
+    let uncommitted_bytes =
+        reconciliation
+            .scan
+            .uncommitted
+            .iter()
+            .try_fold(0_u64, |total, envelope| {
+                total
+                    .checked_add(u64::try_from(envelope.payload.len()).map_err(|_| {
+                        ApplicationError::RecordingMetadataValidation(
+                            "post-marker payload bytes exceed report range".into(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        ApplicationError::RecordingMetadataValidation(
+                            "post-marker payload bytes exceed report range".into(),
+                        )
+                    })
+            })?;
+    let mut issue_codes: BTreeSet<_> = additional_issues.into_iter().collect();
+    if repair.is_some_and(|repair| repair.repaired_bytes > 0) {
+        issue_codes.insert(RecoveryIssueCode::TailRepaired);
+    }
+    if reconciliation.scan.partial_tail.is_some() {
+        issue_codes.insert(RecoveryIssueCode::PartialTail);
+    }
+    if reconciliation
+        .metadata
+        .counters
+        .discarded_from_queue_due_to_wal_limit
+        .records
+        > 0
+    {
+        issue_codes.insert(RecoveryIssueCode::WalLimitLoss);
+    }
+    Ok(RecoveryReportV1 {
+        version: RECOVERY_REPORT_VERSION,
+        recording_id: reconciliation.metadata.recording_id,
+        status: reconciliation.metadata.status,
+        shutdown_reason: reconciliation.metadata.shutdown_reason,
+        repaired_tail: repair.map(|repair| RecoveryTailRepairSummary {
+            repaired_bytes: repair.repaired_bytes,
+            truncated_to: repair.truncated_to,
+        }),
+        removed_segments: 0,
+        last_valid_commit: reconciliation.metadata.last_valid_commit.clone(),
+        committed: reconciliation.metadata.counters.committed.clone(),
+        post_marker: PostMarkerUncertainty {
+            records: u64::try_from(reconciliation.scan.uncommitted.len()).map_err(|_| {
+                ApplicationError::RecordingMetadataValidation(
+                    "post-marker record count exceeds report range".into(),
+                )
+            })?,
+            bytes: uncommitted_bytes,
+            first_sequence: reconciliation
+                .scan
+                .uncommitted
+                .first()
+                .map(|envelope| envelope.sequence),
+            last_sequence: reconciliation
+                .scan
+                .uncommitted
+                .last()
+                .map(|envelope| envelope.sequence),
+            partial_tail_offset: reconciliation
+                .scan
+                .partial_tail
+                .as_ref()
+                .map(|partial| partial.byte_offset),
+        },
+        wal_limit_loss: reconciliation
+            .metadata
+            .counters
+            .discarded_from_queue_due_to_wal_limit
+            .clone(),
+        issue_codes: issue_codes.into_iter().collect(),
+    })
+}
+
+pub fn build_recovery_report_for_reopen(
+    reconciliation: &RecordingRecoveryReconciliation,
+    preview: &RecoveryReopenPreview,
+    additional_issues: impl IntoIterator<Item = RecoveryIssueCode>,
+) -> Result<RecoveryReportV1, ApplicationError> {
+    let mut report = build_recovery_report(reconciliation, None, additional_issues)?;
+    if preview.truncated_bytes > 0 || preview.removed_segments > 0 {
+        report.repaired_tail = Some(RecoveryTailRepairSummary {
+            repaired_bytes: preview.truncated_bytes,
+            truncated_to: preview.truncated_to,
+        });
+        if !report
+            .issue_codes
+            .contains(&RecoveryIssueCode::TailRepaired)
+        {
+            report.issue_codes.push(RecoveryIssueCode::TailRepaired);
+            report.issue_codes.sort_unstable();
+        }
+    }
+    report.removed_segments = preview.removed_segments;
+    Ok(report)
+}
+
+pub fn render_recovery_report_json(report: &RecoveryReportV1) -> Result<String, ApplicationError> {
+    render_json(report)
+}
+
+pub fn persist_recovery_report(
+    wal_directory: impl AsRef<Path>,
+    report: &RecoveryReportV1,
+) -> Result<(), ApplicationError> {
+    if report.version != RECOVERY_REPORT_VERSION {
+        return Err(ApplicationError::RecordingMetadataValidation(format!(
+            "unsupported recovery report version {}",
+            report.version
+        )));
+    }
+    write_private_atomic_json(
+        &wal_directory.as_ref().join("etl"),
+        "recovery-report.json",
+        report,
+        None,
+    )
+}
+
+pub fn decode_recovery_report(bytes: &[u8]) -> Result<RecoveryReportV1, ApplicationError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            ApplicationError::RecordingMetadataValidation(
+                "recovery report version is missing or invalid".into(),
+            )
+        })?;
+    if version != u64::from(RECOVERY_REPORT_VERSION) {
+        return Err(ApplicationError::RecordingMetadataValidation(format!(
+            "unsupported recovery report version {version}"
+        )));
+    }
+    serde_json::from_value(value).map_err(ApplicationError::JsonSerialization)
+}
+
+pub struct RecoveredRecordingForAppend {
+    pub writer: GroupCommitWalWriter,
+    pub reconciliation: RecordingRecoveryReconciliation,
+    pub recovery_report: RecoveryReportV1,
+    pub reopen_report: RecoveryReopenReport,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn recover_recording_for_append(
+    wal_directory: impl AsRef<Path>,
+    recording_id: RecordingId,
+    expected_selector: Option<&RecordingSelectorIdentity>,
+    max_segment_bytes: u64,
+    max_total_bytes: u64,
+    now_millis: u64,
+) -> Result<RecoveredRecordingForAppend, ApplicationError> {
+    let wal_directory = wal_directory.as_ref();
+    let lock = RecordingLock::acquire(wal_directory)?;
+    let scan = match lock.scan_v2(wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES) {
+        Ok(scan) => scan,
+        Err(error) => {
+            let failure_report = RecoveryReportV1 {
+                version: RECOVERY_REPORT_VERSION,
+                recording_id,
+                status: RecordingStatus::Failed,
+                shutdown_reason: Some(ShutdownReason::WalFailure),
+                repaired_tail: None,
+                removed_segments: 0,
+                last_valid_commit: None,
+                committed: RecordByteCount::default(),
+                post_marker: PostMarkerUncertainty::default(),
+                wal_limit_loss: RecordByteCount::default(),
+                issue_codes: vec![recovery_issue_code(&error)],
+            };
+            persist_recovery_report(wal_directory, &failure_report)?;
+            return Err(error.into());
+        }
+    };
+    let prepared = prepare_group_commit_reopen_from_scan(
+        lock,
+        wal_directory,
+        recording_id,
+        scan,
+        max_segment_bytes,
+        max_total_bytes,
+        now_millis,
+    )?;
+    let before_reconciliation = reconcile_recording_metadata_with_scan(
+        prepared.lock(),
+        wal_directory,
+        recording_id,
+        expected_selector,
+        prepared.preview().scan_before.clone(),
+    )?;
+    let recovery_report = build_recovery_report_for_reopen(
+        &before_reconciliation,
+        prepared.preview(),
+        std::iter::empty(),
+    )?;
+    persist_recovery_report(wal_directory, &recovery_report)?;
+    let (writer, reopen_report) = prepared.apply()?;
+    let reconciliation = reconcile_recording_metadata_with_scan(
+        writer.recording_lock(),
+        wal_directory,
+        recording_id,
+        expected_selector,
+        reopen_report.scan_after.clone(),
+    )?;
+    Ok(RecoveredRecordingForAppend {
+        writer,
+        reconciliation,
+        recovery_report,
+        reopen_report,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -577,12 +1204,16 @@ pub fn render_inspect_human(inspected: &InspectSessionResult) -> String {
     output
 }
 
+pub fn render_json<T: Serialize + ?Sized>(value: &T) -> Result<String, ApplicationError> {
+    serde_json::to_string(value).map_err(ApplicationError::JsonSerialization)
+}
+
 /// Renders stable inspect JSON v1 containing only summary metadata.
 pub fn render_inspect_json(inspected: &InspectSessionResult) -> Result<String, ApplicationError> {
-    Ok(serde_json::to_string(&InspectJsonV1 {
+    render_json(&InspectJsonV1 {
         version: 1,
         result: inspected,
-    })?)
+    })
 }
 
 fn joined_or_none(values: &[String]) -> String {
@@ -611,6 +1242,7 @@ fn payload_size(payload: &chronicle_canonical::PayloadRef) -> Option<u64> {
 pub struct ReplayOperationSummary {
     pub operation_id: String,
     pub decision: String,
+    pub state: OperationExecutionState,
     pub attempted: bool,
     pub verification: String,
     pub category: String,
@@ -620,6 +1252,7 @@ pub struct ReplayOperationSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReplaySessionResult {
     pub session_id: String,
+    pub outcome: ReplayOutcome,
     pub dry_run: bool,
     pub preflight_denied: bool,
     pub transport_failed: bool,
@@ -665,6 +1298,7 @@ where
         .await?;
     Ok(ReplaySessionResult {
         session_id: session.id.to_string(),
+        outcome: execution.outcome,
         dry_run: plan.is_dry_run(),
         preflight_denied: !plan.is_executable(),
         transport_failed: execution
@@ -678,7 +1312,8 @@ where
             .map(|(planned, result)| ReplayOperationSummary {
                 operation_id: result.operation_id.to_string(),
                 decision: format!("{:?}", planned.decision()).to_lowercase(),
-                attempted: result.attempted,
+                state: result.state,
+                attempted: result.state != OperationExecutionState::NotAttempted,
                 verification: result.verification.as_ref().map_or_else(
                     || "not_run".into(),
                     |verification| format!("{:?}", verification.status).to_lowercase(),
@@ -701,6 +1336,13 @@ where
 fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> ReplaySessionResult {
     ReplaySessionResult {
         session_id,
+        outcome: if plan.is_dry_run() {
+            ReplayOutcome::DryRun
+        } else if plan.is_executable() {
+            ReplayOutcome::Completed
+        } else {
+            ReplayOutcome::StoppedPolicy
+        },
         dry_run: plan.is_dry_run(),
         preflight_denied: !plan.is_executable(),
         transport_failed: false,
@@ -710,6 +1352,7 @@ fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> ReplaySessionRes
             .map(|planned| ReplayOperationSummary {
                 operation_id: planned.operation().id.to_string(),
                 decision: format!("{:?}", planned.decision()).to_lowercase(),
+                state: OperationExecutionState::NotAttempted,
                 attempted: false,
                 verification: "not_run".into(),
                 category: String::new(),
@@ -721,15 +1364,20 @@ fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> ReplaySessionRes
 
 pub fn render_replay_human(result: &ReplaySessionResult) -> String {
     let mut output = format!(
-        "session_id: {}\ndry_run: {}\npreflight_denied: {}\ntransport_failed: {}\n",
-        result.session_id, result.dry_run, result.preflight_denied, result.transport_failed
+        "session_id: {}\noutcome: {}\ndry_run: {}\npreflight_denied: {}\ntransport_failed: {}\n",
+        result.session_id,
+        result.outcome.as_str(),
+        result.dry_run,
+        result.preflight_denied,
+        result.transport_failed
     );
     for operation in &result.operations {
         writeln!(
             output,
-            "operation: id={} decision={} attempted={} verification={} category={} transport_error={}",
+            "operation: id={} decision={} state={} attempted={} verification={} category={} transport_error={}",
             operation.operation_id,
             operation.decision,
+            operation.state.as_str(),
             operation.attempted,
             operation.verification,
             optional_text(&operation.category),
@@ -741,9 +1389,10 @@ pub fn render_replay_human(result: &ReplaySessionResult) -> String {
 }
 
 pub fn render_replay_json(result: &ReplaySessionResult) -> Result<String, ApplicationError> {
-    Ok(serde_json::to_string(
-        &serde_json::json!({ "version": 1, "result": result }),
-    )?)
+    render_json(&serde_json::json!({
+        "version": REPLAY_REPORT_VERSION,
+        "result": result
+    }))
 }
 
 fn optional_text(value: &str) -> &str {
@@ -1186,5 +1835,524 @@ mod tests {
         assert_eq!(checkpoint.next_sequence, 2);
         assert_eq!(output.session.connections.len(), 1);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn recording_metadata(status: RecordingStatus) -> RecordingMetadataV1 {
+        RecordingMetadataV1 {
+            version: RECORDING_METADATA_SCHEMA_V1,
+            recording_id: RecordingId::new(),
+            selector: Some(RecordingSelectorIdentity {
+                canonical_cgroup_path: "/sys/fs/cgroup/workload".into(),
+                cgroup_id: 42,
+            }),
+            status,
+            shutdown_reason: None,
+            last_valid_commit: None,
+            counters: RecordingCounters::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)] // Full metadata-lag and mismatch flow stays auditable together.
+    fn recovery_reconciles_wal_authority_without_acknowledgement_claim() {
+        use chronicle_wal::{
+            GroupCommitWalWriter, MIN_V2_SEGMENT_BYTES, WalRecordEnvelope, encode_envelope,
+            scan_v2_wal, v2_segment_file_name,
+        };
+
+        let wal_directory =
+            std::env::temp_dir().join(format!("chronicle-reconcile-{}", uuid::Uuid::new_v4()));
+        let recording_id = RecordingId::new();
+        let selector = RecordingSelectorIdentity {
+            canonical_cgroup_path: "/sys/fs/cgroup/workload".into(),
+            cgroup_id: 42,
+        };
+        let mut writer =
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        writer
+            .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
+            .unwrap();
+        writer.flush(1).unwrap();
+        drop(writer);
+        let uncertain = WalRecordEnvelope::unplaced(
+            recording_id,
+            3,
+            RecordKind::LossWindow,
+            1,
+            0,
+            b"uncertain".to_vec(),
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(wal_directory.join("segments").join(v2_segment_file_name(1)))
+            .unwrap()
+            .write_all(&encode_envelope(&uncertain).unwrap())
+            .unwrap();
+
+        let mut metadata = recording_metadata(RecordingStatus::Starting);
+        metadata.recording_id = recording_id;
+        metadata.selector = Some(selector.clone());
+        metadata.counters.received = RecordByteCount {
+            records: 7,
+            bytes: 70,
+        };
+        write_recording_metadata(&wal_directory, &metadata).unwrap();
+        let before_read_only_scan = fs::read(wal_directory.join("recording.json")).unwrap();
+        let scan = scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        assert_eq!(scan.uncommitted.len(), 1);
+        assert_eq!(
+            fs::read(wal_directory.join("recording.json")).unwrap(),
+            before_read_only_scan
+        );
+
+        let reconciled =
+            reconcile_recording_metadata(&wal_directory, recording_id, Some(&selector)).unwrap();
+        assert!(reconciled.metadata_updated);
+        assert_eq!(reconciled.metadata.status, RecordingStatus::Aborted);
+        assert_eq!(
+            reconciled.metadata.shutdown_reason,
+            Some(ShutdownReason::ProcessCrashRecovered)
+        );
+        assert_eq!(
+            reconciled.metadata.counters.received,
+            RecordByteCount {
+                records: 7,
+                bytes: 70
+            }
+        );
+        assert_eq!(
+            reconciled.metadata.counters.committed,
+            RecordByteCount {
+                records: 1,
+                bytes: 9
+            }
+        );
+        assert_eq!(
+            reconciled.metadata.counters.written_not_committed,
+            RecordByteCount {
+                records: 1,
+                bytes: 9
+            }
+        );
+        assert_eq!(
+            reconciled.metadata.last_valid_commit,
+            Some(RecordingCommitBoundary {
+                marker_sequence: 2,
+                durable_through_sequence: 1,
+                durable_record_count: 1,
+                durable_payload_bytes: 9,
+                segment_ordinal: 0,
+            })
+        );
+        assert_eq!(reconciled.scan.uncommitted[0].payload, b"uncertain");
+
+        let bytes = fs::read(wal_directory.join("recording.json")).unwrap();
+        let second =
+            reconcile_recording_metadata(&wal_directory, recording_id, Some(&selector)).unwrap();
+        assert!(!second.metadata_updated);
+        assert_eq!(
+            fs::read(wal_directory.join("recording.json")).unwrap(),
+            bytes
+        );
+
+        let wrong_selector = RecordingSelectorIdentity {
+            canonical_cgroup_path: "/sys/fs/cgroup/other".into(),
+            cgroup_id: 99,
+        };
+        assert!(matches!(
+            reconcile_recording_metadata(&wal_directory, recording_id, Some(&wrong_selector)),
+            Err(ApplicationError::RecordingMetadataValidation(_))
+        ));
+        assert_eq!(
+            fs::read(wal_directory.join("recording.json")).unwrap(),
+            bytes
+        );
+
+        fs::remove_file(wal_directory.join("recording.json")).unwrap();
+        let recreated = reconcile_recording_metadata(&wal_directory, recording_id, None).unwrap();
+        assert!(recreated.metadata_updated);
+        assert_eq!(recreated.metadata.recording_id, recording_id);
+        assert_eq!(recreated.metadata.selector, None);
+        assert_eq!(recreated.metadata.status, RecordingStatus::Aborted);
+        assert_eq!(
+            recreated.metadata.shutdown_reason,
+            Some(ShutdownReason::ProcessCrashRecovered)
+        );
+        fs::remove_dir_all(wal_directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_issue_categories_distinguish_frame_marker_and_header_failures() {
+        assert_eq!(
+            recovery_issue_code(&WalError::EnvelopeChecksum {
+                sequence: 1,
+                kind: RecordKind::CaptureEvent,
+                expected: 1,
+                actual: 2,
+            }),
+            RecoveryIssueCode::FrameCrc
+        );
+        assert_eq!(
+            recovery_issue_code(&WalError::EnvelopeChecksum {
+                sequence: 2,
+                kind: RecordKind::CommitMarker,
+                expected: 1,
+                actual: 2,
+            }),
+            RecoveryIssueCode::MarkerCrc
+        );
+        assert_eq!(
+            recovery_issue_code(&WalError::UnsupportedEnvelopeVersion {
+                version: 2,
+                kind: RecordKind::CaptureEvent as u16,
+            }),
+            RecoveryIssueCode::FrameVersion
+        );
+        assert_eq!(
+            recovery_issue_code(&WalError::UnsupportedEnvelopeVersion {
+                version: 2,
+                kind: RecordKind::CommitMarker as u16,
+            }),
+            RecoveryIssueCode::MarkerVersion
+        );
+        assert_eq!(
+            recovery_issue_code(&WalError::SegmentHeaderChecksum {
+                expected: 1,
+                actual: 2,
+            }),
+            RecoveryIssueCode::HeaderCorruption
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_report_is_body_safe_versioned_and_private() {
+        use chronicle_wal::{RecoveryRepair, WalRecordEnvelope};
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("chronicle-report-{}", uuid::Uuid::new_v4()));
+        let mut metadata = recording_metadata(RecordingStatus::Aborted);
+        metadata.shutdown_reason = Some(ShutdownReason::ProcessCrashRecovered);
+        metadata.counters.committed = RecordByteCount {
+            records: 1,
+            bytes: 4,
+        };
+        metadata.counters.discarded_from_queue_due_to_wal_limit = RecordByteCount {
+            records: 2,
+            bytes: 20,
+        };
+        let mut scan = RecoveryScan::default();
+        scan.uncommitted.push(WalRecordEnvelope::unplaced(
+            metadata.recording_id,
+            3,
+            RecordKind::CaptureEvent,
+            1,
+            0,
+            b"super-secret-body".to_vec(),
+        ));
+        let reconciliation = RecordingRecoveryReconciliation {
+            metadata,
+            scan,
+            metadata_updated: true,
+        };
+        let repair = RecoveryRepair {
+            repaired_bytes: 5,
+            truncated_to: Some(100),
+            scan: RecoveryScan::default(),
+        };
+        let report = build_recovery_report(
+            &reconciliation,
+            Some(&repair),
+            [RecoveryIssueCode::MarkerDigest],
+        )
+        .unwrap();
+        assert_eq!(
+            report.issue_codes,
+            vec![
+                RecoveryIssueCode::TailRepaired,
+                RecoveryIssueCode::MarkerDigest,
+                RecoveryIssueCode::WalLimitLoss,
+            ]
+        );
+        let rendered = render_recovery_report_json(&report).unwrap();
+        assert!(!rendered.contains("super-secret-body"));
+        assert_eq!(report.post_marker.records, 1);
+        assert_eq!(report.post_marker.bytes, 17);
+        assert_eq!(report.post_marker.first_sequence, Some(3));
+
+        persist_recovery_report(&directory, &report).unwrap();
+        let report_directory = directory.join("etl");
+        let report_path = report_directory.join("recovery-report.json");
+        assert_eq!(
+            report_directory.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            report_path.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let bytes = fs::read(&report_path).unwrap();
+        assert_eq!(decode_recovery_report(&bytes).unwrap(), report);
+        let mut invalid: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        invalid["version"] = (RECOVERY_REPORT_VERSION + 1).into();
+        assert!(matches!(
+            decode_recovery_report(&serde_json::to_vec(&invalid).unwrap()),
+            Err(ApplicationError::RecordingMetadataValidation(_))
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_transaction_reports_before_discard_and_hands_off_lock() {
+        use chronicle_wal::{
+            MIN_V2_SEGMENT_BYTES, WalRecordEnvelope, encode_envelope, v2_segment_file_name,
+        };
+
+        let wal_directory =
+            std::env::temp_dir().join(format!("chronicle-recover-{}", uuid::Uuid::new_v4()));
+        let recording_id = RecordingId::new();
+        let mut writer =
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        writer
+            .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
+            .unwrap();
+        writer.flush(1).unwrap();
+        drop(writer);
+        let segment_path = wal_directory.join("segments").join(v2_segment_file_name(1));
+        let uncertain = WalRecordEnvelope::unplaced(
+            recording_id,
+            3,
+            RecordKind::LossWindow,
+            1,
+            0,
+            b"uncertain".to_vec(),
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&segment_path)
+            .unwrap()
+            .write_all(&encode_envelope(&uncertain).unwrap())
+            .unwrap();
+        let mut metadata = recording_metadata(RecordingStatus::Recording);
+        metadata.recording_id = recording_id;
+        write_recording_metadata(&wal_directory, &metadata).unwrap();
+
+        let recovered = recover_recording_for_append(
+            &wal_directory,
+            recording_id,
+            None,
+            MIN_V2_SEGMENT_BYTES,
+            MIN_V2_SEGMENT_BYTES,
+            1,
+        )
+        .unwrap();
+        assert_eq!(recovered.recovery_report.post_marker.records, 1);
+        assert!(recovered.recovery_report.repaired_tail.is_some());
+        assert_eq!(
+            recovered
+                .reconciliation
+                .metadata
+                .counters
+                .written_not_committed,
+            RecordByteCount::default()
+        );
+        assert!(matches!(
+            RecordingLock::acquire(&wal_directory),
+            Err(WalError::RecordingLockHeld)
+        ));
+        let persisted = decode_recovery_report(
+            &fs::read(wal_directory.join("etl/recovery-report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted, recovered.recovery_report);
+        drop(recovered.writer);
+        fs::remove_dir_all(wal_directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corruption_failure_report_is_specific_body_safe_and_non_destructive() {
+        use chronicle_wal::{MIN_V2_SEGMENT_BYTES, SEGMENT_HEADER_LEN, v2_segment_file_name};
+
+        let wal_directory =
+            std::env::temp_dir().join(format!("chronicle-corrupt-{}", uuid::Uuid::new_v4()));
+        let recording_id = RecordingId::new();
+        let mut writer =
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        writer
+            .append(RecordKind::CaptureEvent, 1, 0, b"secret-body".to_vec(), 0)
+            .unwrap();
+        writer.flush(1).unwrap();
+        drop(writer);
+        let segment_path = wal_directory.join("segments").join(v2_segment_file_name(1));
+        let mut corrupted = fs::read(&segment_path).unwrap();
+        corrupted[SEGMENT_HEADER_LEN + chronicle_wal::ENVELOPE_HEADER_LEN] ^= 0xff;
+        fs::write(&segment_path, &corrupted).unwrap();
+
+        assert!(matches!(
+            recover_recording_for_append(
+                &wal_directory,
+                recording_id,
+                None,
+                MIN_V2_SEGMENT_BYTES,
+                MIN_V2_SEGMENT_BYTES,
+                1,
+            ),
+            Err(ApplicationError::Wal(WalError::EnvelopeChecksum { .. }))
+        ));
+        assert_eq!(fs::read(&segment_path).unwrap(), corrupted);
+        let bytes = fs::read(wal_directory.join("etl/recovery-report.json")).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("secret-body"));
+        let report = decode_recovery_report(&bytes).unwrap();
+        assert_eq!(report.issue_codes, vec![RecoveryIssueCode::FrameCrc]);
+        assert_eq!(report.status, RecordingStatus::Failed);
+        fs::remove_dir_all(wal_directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recording_metadata_round_trip_versions_and_private_atomic_update() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("chronicle-metadata-{}", uuid::Uuid::new_v4()));
+        let metadata = recording_metadata(RecordingStatus::Starting);
+        write_recording_metadata(&directory, &metadata).unwrap();
+        assert_eq!(
+            load_recording_metadata(&directory).unwrap(),
+            Some(metadata.clone())
+        );
+        assert_eq!(
+            directory.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            directory
+                .join("recording.json")
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        fs::write(directory.join(".recording.json.tmp-stale"), b"stale").unwrap();
+        let mut aborted = metadata.clone();
+        aborted.status = RecordingStatus::Aborted;
+        aborted.shutdown_reason = Some(ShutdownReason::ProcessCrashRecovered);
+        aborted.counters.committed = RecordByteCount {
+            records: 2,
+            bytes: 10,
+        };
+        write_recording_metadata(&directory, &aborted).unwrap();
+        assert_eq!(load_recording_metadata(&directory).unwrap(), Some(aborted));
+        fs::remove_file(directory.join(".recording.json.tmp-stale")).unwrap();
+
+        let bytes = fs::read(directory.join("recording.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for version in [0, RECORDING_METADATA_SCHEMA_V1 + 1] {
+            let mut invalid = value.clone();
+            invalid["version"] = version.into();
+            assert!(matches!(
+                decode_recording_metadata(&serde_json::to_vec(&invalid).unwrap()),
+                Err(ApplicationError::RecordingMetadataValidation(_))
+            ));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recording_metadata_faults_preserve_previous_atomic_value() {
+        let directory =
+            std::env::temp_dir().join(format!("chronicle-metadata-fault-{}", uuid::Uuid::new_v4()));
+        let original = recording_metadata(RecordingStatus::Starting);
+        write_recording_metadata(&directory, &original).unwrap();
+        let mut replacement = original.clone();
+        replacement.status = RecordingStatus::Failed;
+        replacement.shutdown_reason = Some(ShutdownReason::WalFailure);
+
+        for fault in [
+            RecordingMetadataWriteFault::BeforeFileSync,
+            RecordingMetadataWriteFault::BeforeRename,
+        ] {
+            assert!(write_recording_metadata_inner(&directory, &replacement, Some(fault)).is_err());
+            assert_eq!(
+                load_recording_metadata(&directory).unwrap(),
+                Some(original.clone())
+            );
+            assert!(fs::read_dir(&directory).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')
+            }));
+        }
+
+        assert!(
+            write_recording_metadata_inner(
+                &directory,
+                &replacement,
+                Some(RecordingMetadataWriteFault::AfterRename)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            load_recording_metadata(&directory).unwrap(),
+            Some(replacement)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn shared_json_renderer_types_serialization_failures() {
+        struct Fails;
+
+        impl Serialize for Fails {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("injected failure"))
+            }
+        }
+
+        assert!(matches!(
+            render_json(&Fails),
+            Err(ApplicationError::JsonSerialization(_))
+        ));
+    }
+
+    #[test]
+    fn replay_report_v2_serializes_outcome_and_operation_state() {
+        let result = ReplaySessionResult {
+            session_id: "session".into(),
+            outcome: ReplayOutcome::DryRun,
+            dry_run: true,
+            preflight_denied: false,
+            transport_failed: false,
+            operations: vec![ReplayOperationSummary {
+                operation_id: "operation".into(),
+                decision: "allowed".into(),
+                state: OperationExecutionState::NotAttempted,
+                attempted: false,
+                verification: "not_run".into(),
+                category: "dry_run".into(),
+                transport_error: String::new(),
+            }],
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&render_replay_json(&result).unwrap()).unwrap();
+        assert_eq!(value["version"], REPLAY_REPORT_VERSION);
+        assert_eq!(value["result"]["outcome"], "dry_run");
+        assert_eq!(value["result"]["operations"][0]["state"], "not_attempted");
     }
 }

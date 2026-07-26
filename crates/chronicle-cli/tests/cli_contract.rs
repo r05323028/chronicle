@@ -268,6 +268,20 @@ fn cli_reports_usage_and_data_errors_as_safe_json() {
     let error: serde_json::Value = serde_json::from_str(&unknown_stderr).expect("JSON error");
     assert_eq!(error["code"], 3);
 
+    let doctor = command(&["--format", "json", "doctor"]);
+    assert_eq!(doctor.status.code(), Some(0));
+    let (doctor_stdout, doctor_stderr) = output_text(&doctor);
+    assert!(doctor_stderr.is_empty());
+    assert_eq!(doctor_stdout.matches('\n').count(), 1);
+    assert!(serde_json::from_str::<serde_json::Value>(&doctor_stdout).is_ok());
+
+    let etl = command(&["--format", "json", "etl"]);
+    assert_eq!(etl.status.code(), Some(3));
+    let (etl_stdout, etl_stderr) = output_text(&etl);
+    assert!(etl_stdout.is_empty());
+    assert_eq!(etl_stderr.matches('\n').count(), 1);
+    assert!(serde_json::from_str::<serde_json::Value>(&etl_stderr).is_ok());
+
     let usage = command(&["record"]);
     assert_eq!(usage.status.code(), Some(2));
     std::fs::remove_dir_all(root).expect("remove test root");
