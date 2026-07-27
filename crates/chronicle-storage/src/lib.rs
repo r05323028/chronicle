@@ -2,7 +2,7 @@
 //!
 //! `PostgreSQL` and S3-compatible clients are deferred; in-memory adapters exercise contracts.
 
-use chronicle_canonical::{CanonicalSession, PayloadRef};
+use chronicle_canonical::{CanonicalSession, CanonicalValidationError, PayloadRef};
 use chronicle_common::SessionId;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, RenameFlags, renameat_with};
@@ -55,6 +55,8 @@ pub enum StorageError {
     Backend(String),
     #[error("storage data failed validation: {0}")]
     Validation(String),
+    #[error(transparent)]
+    CanonicalValidation(#[from] CanonicalValidationError),
 }
 
 pub trait MetadataRepository: Send + Sync {
@@ -81,6 +83,7 @@ impl MetadataRepository for InMemoryMetadataRepository {
         session: &'a CanonicalSession,
     ) -> BoxFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
+            session.validate()?;
             self.sessions
                 .lock()
                 .map_err(|_| StorageError::LockPoisoned)?
@@ -246,6 +249,8 @@ impl FilesystemSessionStore {
         Ok(())
     }
     pub fn publish(&self, publish: PublishSession) -> Result<(), StorageError> {
+        // Validate before staging, checksum, artifact writes, manifest, or visibility.
+        publish.session.validate()?;
         #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
         {
             let _ = publish;
@@ -658,8 +663,8 @@ mod tests {
     use super::*;
     use chronicle_canonical::{
         Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalOperation,
-        Completeness, OperationEffect, OperationKind, ProtocolData, RelativeTimeNanos,
-        ReplayMetadata, SourceMetadata,
+        CanonicalValidationError, Completeness, OperationEffect, OperationKind, ProtocolData,
+        RelativeTimeNanos, ReplayMetadata, SourceMetadata, TimelineEntry,
     };
     use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId};
     use time::OffsetDateTime;
@@ -708,7 +713,11 @@ mod tests {
             }],
             connection_completeness: [(connection_id, Completeness::Complete)].into(),
             operation_completeness: [(operation_id, Completeness::Complete)].into(),
-            timeline: Vec::new(),
+            timeline: vec![TimelineEntry {
+                connection_id,
+                operation_id,
+                offset: RelativeTimeNanos(0),
+            }],
             replay: ReplayMetadata::default(),
             replay_attributes: Attributes::new(),
         }
@@ -1054,6 +1063,31 @@ mod tests {
                     .starts_with('.'))
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_session_never_publishes_artifacts_or_manifest() {
+        let root = root();
+        let store = FilesystemSessionStore::new(&root);
+        let mut invalid = session(b"payload".to_vec());
+        let id = invalid.id;
+        let operation_id = invalid.connections[0].operations[0].id;
+        invalid.timeline.clear();
+
+        assert!(matches!(
+            store.publish(PublishSession {
+                session: invalid,
+                checkpoint: None,
+                issues: Vec::new(),
+                replayability: Vec::new(),
+                complete: true,
+            }),
+            Err(StorageError::CanonicalValidation(
+                CanonicalValidationError::MissingTimelineOperation { id }
+            )) if id == operation_id
+        ));
+        assert!(!root.join("sessions").join(id.to_string()).exists());
+        assert!(!root.exists());
     }
 
     #[cfg(unix)]

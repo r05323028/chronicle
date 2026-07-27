@@ -161,6 +161,7 @@ dependencies = [
  "chronicle-common",
  "serde",
  "serde_json",
+ "thiserror",
  "time",
 ]
 
