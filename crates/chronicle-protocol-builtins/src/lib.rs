@@ -937,7 +937,22 @@ pub mod http {
                 || codes
                     .iter()
                     .any(|code| code == WarningCode::TruncatedMessage.as_str());
-            let replayable = !incomplete && request.pipeline_depth <= 1 && request.method.is_some();
+            if truncated {
+                warnings.push(CanonicalWarning {
+                    code: "truncated_message".into(),
+                    message: "HTTP message was truncated".into(),
+                });
+            }
+            if incomplete {
+                warnings.push(CanonicalWarning {
+                    code: "incomplete_exchange".into(),
+                    message: "HTTP exchange is incomplete".into(),
+                });
+            }
+            let replayable = !incomplete
+                && !truncated
+                && request.pipeline_depth <= 1
+                && request.method.is_some();
             let captured_sensitive_headers = request
                 .headers
                 .iter()
@@ -1008,8 +1023,6 @@ pub mod http {
                 }),
                 attributes,
                 protocol_data,
-                incomplete,
-                truncated,
                 redactions: Vec::new(),
                 warnings,
             }
@@ -1718,8 +1731,6 @@ pub mod http {
                     },
                 }
                 .into_protocol_data(),
-                incomplete: false,
-                truncated: false,
                 redactions: Vec::new(),
                 warnings: Vec::new(),
             }
@@ -2121,7 +2132,7 @@ pub mod http {
             assert_eq!(data.response_status, Some(201));
             assert_eq!(data.request_headers.len(), 2);
             assert_eq!(operations[1].effect, OperationEffect::Unknown);
-            assert!(operations[1].incomplete);
+            assert!(operations[1].recorded_response.is_none());
         }
 
         #[test]
@@ -2154,7 +2165,12 @@ pub mod http {
                 )
                 .unwrap();
             assert_eq!(operations.len(), 1);
-            assert!(operations[0].incomplete);
+            assert!(
+                operations[0]
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "incomplete_exchange")
+            );
             assert!(
                 operations[0]
                     .warnings
@@ -2780,8 +2796,13 @@ pub mod fake {
             response: Option<DecodedFrame>,
             truncated: bool,
         ) -> CanonicalOperation {
-            let incomplete = response.is_none();
-            let (started_at_offset, warnings) = Self::offset(stream, request.sequence);
+            let (started_at_offset, mut warnings) = Self::offset(stream, request.sequence);
+            if truncated {
+                warnings.push(CanonicalWarning {
+                    code: "truncated_stream".into(),
+                    message: "stream was truncated during capture".into(),
+                });
+            }
             let completed_at_offset = response
                 .as_ref()
                 .map(|frame| Self::offset(stream, frame.sequence).0);
@@ -2806,8 +2827,6 @@ pub mod fake {
                     media_type: Some("application/x-chronicle-fake".into()),
                     bytes: request.payload,
                 },
-                incomplete,
-                truncated,
                 redactions: Vec::new(),
                 warnings,
             }

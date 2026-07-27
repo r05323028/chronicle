@@ -71,7 +71,7 @@ JSON inspect output SHALL expose stable versioned structure for same safe summar
 ## ADDED Requirements
 
 ### Requirement: Typed canonical provenance and completeness
-Canonical Session v3 SHALL represent source recording/status/reason, source connection generation, WAL envelope/range/commit-marker provenance, ring/backend and WAL-limit loss windows, and typed operation completeness (`complete`, `incomplete`, `truncated`, `malformed`, `unmatched`, `unsupported`). Session completeness SHALL aggregate operation/connection state and SHALL support partial session state while individual operations remain complete, but SHALL NOT label an operation complete when intersecting/ambiguous loss affects it.
+Canonical Session MVP v1 SHALL represent source recording/status/reason, source connection generation, WAL envelope/range/commit-marker provenance, ring/backend and WAL-limit loss windows, and typed operation completeness (`complete`, `incomplete`, `truncated`, `malformed`, `unmatched`, `unsupported`). Source provenance, connection/operation completeness maps, and replay attributes SHALL be direct session fields. Completeness maps SHALL be authoritative; connection/operation completeness flags and a separate operation-order list SHALL not duplicate them. Timeline SHALL own operation order. Session completeness SHALL aggregate operation/connection state and SHALL support partial session state while individual operations remain complete, but SHALL NOT label an operation complete when intersecting/ambiguous loss affects it. Optional metadata SHALL evolve append-only under v1; v2 is reserved for stable-release breaking changes.
 
 #### Scenario: Complete operation provenance
 - **WHEN** operation is decoded from several WAL records

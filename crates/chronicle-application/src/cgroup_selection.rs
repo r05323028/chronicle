@@ -169,11 +169,13 @@ fn preflight_with_roots(
     let descendant_cgroup_ids = descendant_ids(&selected_path)?;
     let recorder_pid = std::process::id();
     host_tgid(proc_root, recorder_pid)?;
-    let recorder_id = cgroup_id(&canonical_cgroup_path(
+    let recorder_cgroup_id = cgroup_id(&canonical_cgroup_path(
         &cgroup_root,
         &cgroup_path_for_pid(proc_root, recorder_pid)?,
     )?)?;
-    if recorder_id == selected_cgroup_id || descendant_cgroup_ids.contains(&recorder_id) {
+    if recorder_cgroup_id == selected_cgroup_id
+        || descendant_cgroup_ids.contains(&recorder_cgroup_id)
+    {
         return Err(CgroupSelectionError::RecorderInsideSelection);
     }
 

@@ -7,6 +7,7 @@ pub use cgroup_selection::{
     preflight_cgroup_selection, preflight_pid_cgroup_selection,
 };
 
+use chronicle_canonical::Completeness;
 use chronicle_capture::{
     CaptureError, CaptureSource, ClockIdentity, FixtureCaptureSource, MonotonicTimestamp,
     encode_event,
@@ -301,6 +302,7 @@ impl RecordingIngest {
     }
 
     /// WAL-limit detection wins over duration when both occur in one shutdown cycle.
+    #[allow(clippy::result_large_err)] // Failure includes safe final counters needed by callers.
     pub fn finish(
         &mut self,
         requested_reason: ShutdownReason,
@@ -395,15 +397,13 @@ impl RecordingIngest {
         let mut entries: Vec<_> = self
             .terminal_discarded
             .iter()
-            .filter_map(|(clock, accumulator)| {
-                Some(TerminalWalLossSummaryEntry {
-                    clock: Some(clock.clone()),
-                    start: accumulator.start.clone(),
-                    end: accumulator.end.clone(),
-                    discarded: accumulator.discarded.clone(),
-                    time_source: TerminalWalLossTimeSource::Observed,
-                    persistence: TerminalWalLossPersistence::PendingWal,
-                })
+            .map(|(clock, accumulator)| TerminalWalLossSummaryEntry {
+                clock: Some(clock.clone()),
+                start: accumulator.start.clone(),
+                end: accumulator.end.clone(),
+                discarded: accumulator.discarded.clone(),
+                time_source: TerminalWalLossTimeSource::Observed,
+                persistence: TerminalWalLossPersistence::PendingWal,
             })
             .collect();
         if self.terminal_discarded_without_time.records != 0 {
@@ -792,7 +792,9 @@ impl RecordingIngestResult {
         metadata.status = self.status;
         metadata.shutdown_reason = Some(self.shutdown_reason);
         metadata.counters = self.counters.clone();
-        metadata.terminal_wal_loss = self.terminal_wal_loss.clone();
+        metadata
+            .terminal_wal_loss
+            .clone_from(&self.terminal_wal_loss);
         write_recording_metadata(wal_directory, metadata)
     }
 }
@@ -1424,8 +1426,7 @@ pub struct InspectOperationSummary {
     pub response_status: Option<String>,
     pub request_bytes: Option<u64>,
     pub response_bytes: Option<u64>,
-    pub incomplete: bool,
-    pub truncated: bool,
+    pub completeness: Completeness,
     pub warnings: Vec<String>,
 }
 
@@ -1434,8 +1435,7 @@ pub struct InspectConnectionSummary {
     pub protocol: String,
     pub client: chronicle_common::Endpoint,
     pub server: chronicle_common::Endpoint,
-    pub incomplete: bool,
-    pub truncated: bool,
+    pub completeness: Completeness,
     pub operations: Vec<InspectOperationSummary>,
 }
 
@@ -1540,11 +1540,11 @@ fn replayability_reasons(output: &EtlOutput) -> Vec<String> {
         reasons.insert("etl_issues".into());
     }
     for connection in &output.session.connections {
-        if connection.incomplete || connection.truncated {
+        if output.session.connection_state(&connection.id) != Completeness::Complete {
             reasons.insert("incomplete_capture".into());
         }
         for operation in &connection.operations {
-            if operation.incomplete || operation.truncated {
+            if output.session.operation_state(&operation.id) != Completeness::Complete {
                 reasons.insert("incomplete_operation".into());
             }
             if operation.recorded_response.is_none() {
@@ -1564,11 +1564,9 @@ fn session_complete(output: &EtlOutput) -> bool {
 
 fn canonical_session_complete(session: &chronicle_canonical::CanonicalSession) -> bool {
     session.connections.iter().all(|connection| {
-        !connection.incomplete
-            && !connection.truncated
+        session.connection_state(&connection.id) == Completeness::Complete
             && connection.operations.iter().all(|operation| {
-                !operation.incomplete
-                    && !operation.truncated
+                session.operation_state(&operation.id) == Completeness::Complete
                     && operation.recorded_response.is_some()
             })
     })
@@ -1582,11 +1580,11 @@ pub fn inspect_session(
     let stored = FilesystemSessionStore::new(root.as_ref()).inspect_with_metadata(session_id)?;
     let mut blockers: BTreeSet<_> = stored.replayability.into_iter().collect();
     for connection in &stored.session.connections {
-        if connection.incomplete || connection.truncated {
+        if stored.session.connection_state(&connection.id) != Completeness::Complete {
             blockers.insert("incomplete_capture".into());
         }
         for operation in &connection.operations {
-            if operation.incomplete || operation.truncated {
+            if stored.session.operation_state(&operation.id) != Completeness::Complete {
                 blockers.insert("incomplete_operation".into());
             }
             if operation.recorded_response.is_none() {
@@ -1611,8 +1609,7 @@ pub fn inspect_session(
             protocol: connection.protocol.to_string(),
             client: connection.client.clone(),
             server: connection.server.clone(),
-            incomplete: connection.incomplete,
-            truncated: connection.truncated,
+            completeness: stored.session.connection_state(&connection.id),
             operations: connection
                 .operations
                 .iter()
@@ -1625,8 +1622,7 @@ pub fn inspect_session(
                     response_status: operation.attributes.get("http.response_status").cloned(),
                     request_bytes: payload_size(&operation.request),
                     response_bytes: operation.recorded_response.as_ref().and_then(payload_size),
-                    incomplete: operation.incomplete,
-                    truncated: operation.truncated,
+                    completeness: stored.session.operation_state(&operation.id),
                     warnings: operation
                         .warnings
                         .iter()
@@ -1666,20 +1662,19 @@ pub fn render_inspect_human(inspected: &InspectSessionResult) -> String {
     for connection in &inspected.connections {
         writeln!(
             output,
-            "connection: {} {}:{} -> {}:{} incomplete={} truncated={}",
+            "connection: {} {}:{} -> {}:{} completeness={:?}",
             connection.protocol,
             connection.client.host,
             connection.client.port,
             connection.server.host,
             connection.server.port,
-            connection.incomplete,
-            connection.truncated,
+            connection.completeness,
         )
         .expect("writing into String cannot fail");
         for operation in &connection.operations {
             writeln!(
                 output,
-                "operation: sequence={} kind={} effect={} method={} target={} response_status={} request_bytes={} response_bytes={} incomplete={} truncated={} warnings={}",
+                "operation: sequence={} kind={} effect={} method={} target={} response_status={} request_bytes={} response_bytes={} completeness={:?} warnings={}",
                 operation.sequence,
                 operation.kind,
                 operation.effect,
@@ -1688,8 +1683,7 @@ pub fn render_inspect_human(inspected: &InspectSessionResult) -> String {
                 operation.response_status.as_deref().unwrap_or("none"),
                 optional_size(operation.request_bytes),
                 optional_size(operation.response_bytes),
-                operation.incomplete,
-                operation.truncated,
+                operation.completeness,
                 joined_or_none(&operation.warnings),
             )
             .expect("writing into String cannot fail");

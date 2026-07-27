@@ -1,7 +1,7 @@
 //! Replay planning, target mapping, execution, and verification orchestration.
 
 use chronicle_canonical::{
-    CanonicalOperation, CanonicalSession, OperationEffect, RelativeTimeNanos,
+    CanonicalOperation, CanonicalSession, Completeness, OperationEffect, RelativeTimeNanos,
 };
 use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId};
 use chronicle_protocol::{
@@ -241,6 +241,7 @@ pub struct PlannedOperation {
     recorded_target: Endpoint,
     decision: ReplayDecision,
     scheduled_offset: RelativeTimeNanos,
+    completeness: Completeness,
     operation: CanonicalOperation,
 }
 
@@ -349,7 +350,10 @@ impl ReplayPlanner {
                     }
                     Some(target) => (Some(target.clone()), None),
                 };
+            let connection_complete =
+                session.connection_state(&connection.id) == Completeness::Complete;
             for operation in &connection.operations {
+                let completeness = session.operation_state(&operation.id);
                 let decision = if connection.protocol.as_str() == "http/1.1"
                     && !policy.execution_authorized
                 {
@@ -363,8 +367,8 @@ impl ReplayPlanner {
                     ReplayDecision::Denied(ReplayDenial::EffectNotAllowed(
                         OperationEffect::Authentication,
                     ))
-                } else if operation.incomplete
-                    || operation.truncated
+                } else if !connection_complete
+                    || completeness != Completeness::Complete
                     || operation.recorded_response.is_none()
                     || operation
                         .attributes
@@ -391,6 +395,7 @@ impl ReplayPlanner {
                         TimingMode::Preserve => operation.started_at_offset,
                         TimingMode::Asap => RelativeTimeNanos(0),
                     },
+                    completeness,
                     operation: operation.clone(),
                 });
             }
@@ -511,8 +516,7 @@ impl<'a> ReplayExecutor<'a> {
                 ));
                 continue;
             }
-            if planned.operation.incomplete
-                || planned.operation.truncated
+            if planned.completeness != Completeness::Complete
                 || planned.operation.recorded_response.is_none()
             {
                 results.push(OperationReplayResult {
@@ -626,20 +630,23 @@ mod tests {
     use time::OffsetDateTime;
 
     fn session(effect: OperationEffect) -> CanonicalSession {
+        let connection_id = ConnectionId::new();
+        let operation_id = OperationId::new();
         CanonicalSession {
             schema_version: CANONICAL_SCHEMA_VERSION,
             id: SessionId::new(),
             started_at: OffsetDateTime::UNIX_EPOCH,
             ended_at: None,
             source: SourceMetadata::default(),
+            source_provenance: Default::default(),
             connections: vec![CanonicalConnection {
-                id: ConnectionId::new(),
+                id: connection_id,
                 protocol: ProtocolId::new("fake"),
                 client: Endpoint::new("client", 1),
                 server: Endpoint::new("production", 2),
                 attributes: Attributes::new(),
                 operations: vec![CanonicalOperation {
-                    id: OperationId::new(),
+                    id: operation_id,
                     sequence: 1,
                     started_at_offset: RelativeTimeNanos(0),
                     completed_at_offset: None,
@@ -658,17 +665,15 @@ mod tests {
                         media_type: None,
                         bytes: Vec::new(),
                     },
-                    incomplete: false,
-                    truncated: false,
                     redactions: Vec::new(),
                     warnings: Vec::new(),
                 }],
-                incomplete: false,
-                truncated: false,
             }],
+            connection_completeness: [(connection_id, Completeness::Complete)].into(),
+            operation_completeness: [(operation_id, Completeness::Complete)].into(),
             timeline: Vec::new(),
             replay: ReplayMetadata::default(),
-            v3: Default::default(),
+            replay_attributes: Attributes::new(),
         }
     }
 
@@ -873,13 +878,22 @@ mod tests {
         unknown.id = OperationId::new();
         unknown.sequence = 3;
         unknown.effect = OperationEffect::Unknown;
+        let connection_id = connection.id;
+        let write_id = write.id;
+        let unknown_id = unknown.id;
         connection.operations.extend([write, unknown]);
+        session
+            .operation_completeness
+            .insert(write_id, Completeness::Complete);
+        session
+            .operation_completeness
+            .insert(unknown_id, Completeness::Complete);
         let targets = TargetMap {
             rules: vec![TargetRule {
                 protocol: None,
                 host: None,
                 port: None,
-                connection_id: Some(connection.id),
+                connection_id: Some(connection_id),
                 target: Endpoint::new("test", 2),
             }],
         };

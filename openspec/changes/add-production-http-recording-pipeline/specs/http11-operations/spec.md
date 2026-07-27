@@ -124,24 +124,22 @@ Each decoded exchange SHALL become `CanonicalOperation` with protocol `http/1.1`
 - **WHEN** event timestamps are nondecreasing
 - **THEN** operation offsets are deterministic relative to session start and cannot become negative
 
-### Requirement: Canonical schema compatibility
-Writer SHALL emit Canonical Session v3 with backend-neutral Artifact payload refs, structured warnings, typed completeness, and typed recording/WAL provenance. Reader SHALL accept v1, v2, and v3; derive compatibility completeness/provenance defaults for older data; retain existing S3 Object variant; and reject unknown newer schema. Existing P0 v2 sessions SHALL remain inspectable/replayable according to their stored semantics.
+### Requirement: Canonical MVP schema
+Writer SHALL emit Canonical Session MVP v1 with backend-neutral Artifact payload refs, structured warnings, typed completeness, and typed recording/WAL provenance. Reader SHALL accept only `schema_version == 1` and reject every other value. Canonical v1 is evolving during MVP: append optional fields without a schema-version change. Canonical v2 is reserved for first stable-release breaking change in semantics, required fields, payload meaning, or replay behavior. `PayloadRef::Object` remains supported. WAL, protocol payload, and manifest versions remain independent.
 
-#### Scenario: Read existing v1 session
-- **WHEN** reader loads valid canonical v1 fixture
-- **THEN** missing warnings/completeness/provenance default safely without changing payload bytes
-
-#### Scenario: Read existing v2 HTTP session
-- **WHEN** reader loads valid P0 canonical v2 session
-- **THEN** prior booleans/warnings map deterministically to compatibility completeness and absent recording provenance
+`CanonicalSession` SHALL own source provenance, connection/operation completeness maps, and replay attributes directly. Completeness maps SHALL be authoritative; connection/operation flags SHALL not duplicate them. Timeline SHALL be sole authoritative operation order.
 
 #### Scenario: Write production HTTP session
 - **WHEN** P1 ETL publishes production session
-- **THEN** session uses canonical v3 and versioned HTTP/provenance structures
+- **THEN** session uses canonical MVP v1 and typed HTTP/provenance structures
 
-#### Scenario: Unknown canonical version
-- **WHEN** reader sees newer unsupported schema
+#### Scenario: Non-MVP canonical version
+- **WHEN** reader sees schema version zero, two, or newer
 - **THEN** it rejects explicitly and performs no replay
+
+#### Scenario: Append optional MVP metadata
+- **WHEN** Chronicle adds optional canonical metadata without breaking existing field meaning
+- **THEN** writer and reader remain canonical schema version 1
 
 ## ADDED Requirements
 

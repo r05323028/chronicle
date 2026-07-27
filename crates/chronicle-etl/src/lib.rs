@@ -13,6 +13,7 @@ use chronicle_common::{ConnectionId, OperationId, ProtocolId, SessionId};
 use chronicle_protocol::{DecodedFrame, ProtocolRegistry, ProtocolStream, StreamChunk};
 use chronicle_session::{ConnectionStream, SessionAssembler, SessionError, SessionLimits};
 use chronicle_wal::{ReadOutcome, WalError, WalReader, WalRecord};
+use std::collections::BTreeMap;
 use std::io::Read;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -65,6 +66,7 @@ impl EtlPipeline {
         Self { limits, max_issues }
     }
 
+    #[allow(clippy::too_many_lines)] // ETL stays linear: WAL scan, canonicalization, and session assembly share one error boundary.
     pub fn process<R: Read>(
         &self,
         reader: &mut WalReader<R>,
@@ -105,6 +107,8 @@ impl EtlPipeline {
             .flat_map(|stream| stream.chunks.iter().filter_map(|event| event.wall_time))
             .max();
         let mut connections = Vec::with_capacity(streams.len());
+        let mut connection_completeness = BTreeMap::new();
+        let mut operation_completeness = BTreeMap::new();
         let mut timeline = Vec::new();
 
         for stream in streams {
@@ -140,13 +144,27 @@ impl EtlPipeline {
                     (ProtocolId::unknown(), vec![opaque_operation(&stream)])
                 };
             for operation in &operations {
-                timeline.push(TimelineEntry {
-                    sequence: operation.sequence,
-                    connection_id,
-                    operation_id: operation.id,
-                    offset: operation.started_at_offset,
-                });
+                timeline.push((
+                    operation.sequence,
+                    TimelineEntry {
+                        connection_id,
+                        operation_id: operation.id,
+                        offset: operation.started_at_offset,
+                    },
+                ));
+                operation_completeness.insert(
+                    operation.id,
+                    derive_operation_completeness(operation, stream.truncated),
+                );
             }
+            connection_completeness.insert(
+                connection_id,
+                if stream.chunks.is_empty() || stream.truncated {
+                    Completeness::Partial
+                } else {
+                    Completeness::Complete
+                },
+            );
             connections.push(CanonicalConnection {
                 id: connection_id,
                 protocol,
@@ -154,33 +172,10 @@ impl EtlPipeline {
                 server: stream.key.server.clone(),
                 attributes: Attributes::new(),
                 operations,
-                incomplete: stream.chunks.is_empty(),
-                truncated: stream.truncated,
             });
         }
-        timeline.sort_by_key(|entry| entry.sequence);
-        let mut v3 = chronicle_canonical::CanonicalV3Metadata::default();
-        for connection in &connections {
-            v3.connection_completeness.insert(
-                connection.id,
-                if connection.incomplete || connection.truncated {
-                    Completeness::Partial
-                } else {
-                    Completeness::Complete
-                },
-            );
-            for operation in &connection.operations {
-                v3.operation_completeness.insert(
-                    operation.id,
-                    if operation.incomplete || operation.truncated {
-                        Completeness::Partial
-                    } else {
-                        Completeness::Complete
-                    },
-                );
-            }
-        }
-        v3.operation_order = timeline.iter().map(|entry| entry.operation_id).collect();
+        timeline.sort_by_key(|(sequence, _)| *sequence);
+        let timeline = timeline.into_iter().map(|(_, entry)| entry).collect();
         Ok(EtlOutput {
             session: CanonicalSession {
                 schema_version: CANONICAL_SCHEMA_VERSION,
@@ -188,13 +183,32 @@ impl EtlPipeline {
                 started_at,
                 ended_at,
                 source: SourceMetadata::default(),
+                source_provenance: Default::default(),
                 connections,
+                connection_completeness,
+                operation_completeness,
                 timeline,
                 replay: ReplayMetadata::default(),
-                v3,
+                replay_attributes: Attributes::new(),
             },
             issues,
         })
+    }
+}
+
+fn derive_operation_completeness(
+    operation: &CanonicalOperation,
+    stream_truncated: bool,
+) -> Completeness {
+    if stream_truncated
+        || operation.recorded_response.is_none()
+        || operation.warnings.iter().any(|warning| {
+            warning.code.contains("truncated") || warning.code.contains("incomplete")
+        })
+    {
+        Completeness::Partial
+    } else {
+        Completeness::Complete
     }
 }
 
@@ -319,8 +333,6 @@ fn opaque_operation(stream: &ConnectionStream) -> CanonicalOperation {
             media_type: Some("application/octet-stream".into()),
             bytes,
         },
-        incomplete: true,
-        truncated: stream.truncated,
         redactions: Vec::new(),
         warnings: Vec::new(),
     }
@@ -373,7 +385,10 @@ mod tests {
         assert_eq!(output.issues[0].kind, EtlIssueKind::UnknownProtocol);
         let connection = &output.session.connections[0];
         assert_eq!(connection.protocol, ProtocolId::unknown());
-        assert!(connection.truncated);
+        assert_eq!(
+            output.session.connection_state(&connection.id),
+            Completeness::Partial
+        );
         assert_eq!(
             connection.operations[0].protocol_data.bytes,
             b"opaque bytes"

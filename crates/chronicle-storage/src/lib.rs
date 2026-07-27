@@ -658,8 +658,8 @@ mod tests {
     use super::*;
     use chronicle_canonical::{
         Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalOperation,
-        OperationEffect, OperationKind, ProtocolData, RelativeTimeNanos, ReplayMetadata,
-        SourceMetadata,
+        Completeness, OperationEffect, OperationKind, ProtocolData, RelativeTimeNanos,
+        ReplayMetadata, SourceMetadata,
     };
     use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId};
     use time::OffsetDateTime;
@@ -669,22 +669,23 @@ mod tests {
     }
 
     fn session(body: Vec<u8>) -> CanonicalSession {
+        let connection_id = ConnectionId::new();
+        let operation_id = OperationId::new();
         CanonicalSession {
             schema_version: CANONICAL_SCHEMA_VERSION,
             id: SessionId::new(),
             started_at: OffsetDateTime::UNIX_EPOCH,
             ended_at: None,
             source: SourceMetadata::default(),
+            source_provenance: Default::default(),
             connections: vec![CanonicalConnection {
-                id: ConnectionId::new(),
+                id: connection_id,
                 protocol: ProtocolId::new("custom/1"),
                 client: Endpoint::new("127.0.0.1", 1),
                 server: Endpoint::new("127.0.0.1", 2),
                 attributes: Attributes::new(),
-                incomplete: false,
-                truncated: false,
                 operations: vec![CanonicalOperation {
-                    id: OperationId::new(),
+                    id: operation_id,
                     sequence: 1,
                     started_at_offset: RelativeTimeNanos(0),
                     completed_at_offset: None,
@@ -701,15 +702,15 @@ mod tests {
                         media_type: None,
                         bytes: Vec::new(),
                     },
-                    incomplete: false,
-                    truncated: false,
                     redactions: Vec::new(),
                     warnings: Vec::new(),
                 }],
             }],
+            connection_completeness: [(connection_id, Completeness::Complete)].into(),
+            operation_completeness: [(operation_id, Completeness::Complete)].into(),
             timeline: Vec::new(),
             replay: ReplayMetadata::default(),
-            v3: Default::default(),
+            replay_attributes: Attributes::new(),
         }
     }
 

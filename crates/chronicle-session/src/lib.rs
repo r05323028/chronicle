@@ -286,10 +286,9 @@ impl ReconstructionConnection {
             if let Some(previous) = positions.insert(
                 (position.tcp_sequence, position.continuation_position),
                 event.wal_sequence,
-            ) {
-                if previous.is_none() || event.wal_sequence.is_none() {
-                    ambiguity = Some(TcpOrderingAmbiguity::MissingProvenance);
-                }
+            ) && (previous.is_none() || event.wal_sequence.is_none())
+            {
+                ambiguity = Some(TcpOrderingAmbiguity::MissingProvenance);
             }
         }
         payloads.sort_by_key(|event| match &event.evidence {
@@ -575,7 +574,7 @@ impl ReconstructionAssembler {
         let events = self.connections.entry(identity.clone()).or_default();
         let payload_bytes = match &event.evidence {
             ReconstructionEvidence::Payload(payload) => payload.bytes.len(),
-            _ => 0,
+            ReconstructionEvidence::Lifecycle(_) => 0,
         };
         let chunk_count = events
             .iter()
@@ -585,7 +584,7 @@ impl ReconstructionAssembler {
             .iter()
             .filter_map(|event| match &event.evidence {
                 ReconstructionEvidence::Payload(payload) => Some(payload.bytes.len()),
-                _ => None,
+                ReconstructionEvidence::Lifecycle(_) => None,
             })
             .sum();
         let finalization = if matches!(event.evidence, ReconstructionEvidence::Payload(_))
@@ -1257,40 +1256,42 @@ mod tests {
 
     #[test]
     fn loss_windows_classify_without_cross_clock_timestamp_comparison() {
-        let event = match production_event("boot-a", 1, 10) {
-            ReconstructionInput::Event(event) => event,
-            _ => unreachable!(),
+        let ReconstructionInput::Event(event) = production_event("boot-a", 1, 10) else {
+            panic!("production_event must produce an event");
         };
         assert_eq!(
             classify_loss_window(
-                &[event.clone()],
+                std::slice::from_ref(&event),
                 &loss_window("boot-a", 5, 15, Some(1), "sample")
             ),
             LossWindowClassification::Overlaps
         );
         assert_eq!(
             classify_loss_window(
-                &[event.clone()],
+                std::slice::from_ref(&event),
                 &loss_window("boot-a", 20, 30, Some(1), "sample")
             ),
             LossWindowClassification::Outside
         );
         assert_eq!(
             classify_loss_window(
-                &[event.clone()],
+                std::slice::from_ref(&event),
                 &loss_window("boot-a", 5, 15, None, "incomplete")
             ),
             LossWindowClassification::Unknown
         );
         assert_eq!(
             classify_loss_window(
-                &[event.clone()],
+                std::slice::from_ref(&event),
                 &loss_window("boot-a", 5, 15, None, "counter generation changed")
             ),
             LossWindowClassification::Reset
         );
         assert_eq!(
-            classify_loss_window(&[event], &loss_window("boot-b", 5, 15, Some(1), "sample")),
+            classify_loss_window(
+                std::slice::from_ref(&event),
+                &loss_window("boot-b", 5, 15, Some(1), "sample"),
+            ),
             LossWindowClassification::ClockMismatch
         );
     }
