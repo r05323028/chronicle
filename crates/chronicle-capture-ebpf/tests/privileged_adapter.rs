@@ -101,7 +101,7 @@ fn ipv4_connect_and_active_establish_emit_capture_events() -> Result<(), Box<dyn
         .args([
             "-c",
             &format!(
-                "read start; python3 -c 'import socket; s=socket.create_connection((\"127.0.0.1\", {})); s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1); [s.sendall(b\"x\" * 32768) for _ in range(8)]; [s.sendall(b\"y\") for _ in range(200000)]; s.close()'", 
+                "read start; python3 -c 'import socket; s=socket.create_connection((\"127.0.0.1\", {})); s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1); [s.sendall(b\"x\" * 32768) for _ in range(8)]; [s.sendall(b\"y\") for _ in range(200000)]; s.close()'",
                 address.port()
             ),
         ])

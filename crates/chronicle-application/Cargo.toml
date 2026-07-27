@@ -24,6 +24,7 @@ chronicle-storage = { path = "../chronicle-storage" }
 chronicle-wal = { path = "../chronicle-wal" }
 serde.workspace = true
 serde_json.workspace = true
+rustix.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

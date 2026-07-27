@@ -22,7 +22,8 @@ use chronicle_replay::{
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
 use chronicle_wal::{
-    DEFAULT_MAX_RECORD_BYTES, GroupCommitWalWriter, RecordKind, RecordingLock,
+    DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_WAL_BYTES, DEFAULT_V2_SEGMENT_BYTES,
+    GroupCommitWalWriter, MAX_V2_SEGMENT_BYTES, MIN_V2_SEGMENT_BYTES, RecordKind, RecordingLock,
     RecoveryReopenPreview, RecoveryReopenReport, RecoveryRepair, RecoveryScan, SegmentedWalWriter,
     TERMINAL_WAL_LOSS_SCHEMA_VERSION, TerminalWalLoss, TerminalWalLossAmbiguity,
     TerminalWalLossInterval, TerminalWalLossReason, WalCheckpoint, WalError, WalReader, WalRecord,
@@ -40,8 +41,113 @@ use thiserror::Error;
 
 pub const RECORDING_METADATA_SCHEMA_V1: u16 = 1;
 pub const RECORDING_COUNTERS_SCHEMA_V1: u16 = 1;
+pub const RECORDING_CAPTURE_METADATA_SCHEMA_V1: u16 = 1;
+pub const MAX_RECORDING_CAPTURE_ERRORS: usize = 64;
+pub const MAX_RECORDING_CAPABILITIES: usize = 32;
 pub const REPLAY_REPORT_VERSION: u16 = 2;
 pub const RECOVERY_REPORT_VERSION: u16 = 1;
+pub const DEFAULT_RECORDING_DURATION_SECONDS: u64 = 600;
+pub const MAX_RECORDING_DURATION_SECONDS: u64 = 3_600;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionRecordingBounds {
+    pub duration_seconds: u64,
+    pub segment_bytes: u64,
+    pub max_wal_bytes: u64,
+}
+
+impl Default for ProductionRecordingBounds {
+    fn default() -> Self {
+        Self {
+            duration_seconds: DEFAULT_RECORDING_DURATION_SECONDS,
+            segment_bytes: DEFAULT_V2_SEGMENT_BYTES,
+            max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
+        }
+    }
+}
+
+pub fn validate_production_recording_bounds(
+    bounds: ProductionRecordingBounds,
+) -> Result<(), ApplicationError> {
+    if !(1..=MAX_RECORDING_DURATION_SECONDS).contains(&bounds.duration_seconds) {
+        return Err(ApplicationError::ProductionPreflight(
+            "duration bound invalid",
+        ));
+    }
+    if !(MIN_V2_SEGMENT_BYTES..=MAX_V2_SEGMENT_BYTES).contains(&bounds.segment_bytes)
+        || bounds.max_wal_bytes < bounds.segment_bytes
+        || bounds.max_wal_bytes > DEFAULT_MAX_WAL_BYTES
+    {
+        return Err(ApplicationError::ProductionPreflight("WAL bounds invalid"));
+    }
+    Ok(())
+}
+
+/// Combines selector and eBPF prerequisites before a source can attach or metadata can succeed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionWalPreflight {
+    pub available_bytes: u64,
+    pub low_space_warning: bool,
+}
+
+/// Checks writable exclusive WAL destination and available capacity without creating recording metadata.
+pub fn preflight_wal_destination(
+    wal_directory: &Path,
+    bounds: ProductionRecordingBounds,
+) -> Result<ProductionWalPreflight, ApplicationError> {
+    validate_production_recording_bounds(bounds)?;
+    if wal_directory.exists() {
+        return Err(ApplicationError::ProductionPreflight(
+            "WAL destination already exists",
+        ));
+    }
+    let parent = wal_directory
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or(ApplicationError::ProductionPreflight(
+            "WAL parent unavailable",
+        ))?;
+    fs::create_dir_all(parent)
+        .map_err(|_| ApplicationError::ProductionPreflight("WAL parent unwritable"))?;
+    let stats = rustix::fs::statvfs(parent)
+        .map_err(|_| ApplicationError::ProductionPreflight("WAL free space unavailable"))?;
+    let available_bytes = stats.f_bavail.saturating_mul(stats.f_frsize);
+    Ok(ProductionWalPreflight {
+        available_bytes,
+        low_space_warning: available_bytes < bounds.max_wal_bytes,
+    })
+}
+
+/// Combines selector and eBPF prerequisites before a source can attach or metadata can succeed.
+pub fn preflight_production_record(
+    selector: CgroupSelector,
+    allow_shared_cgroup: bool,
+    bounds: ProductionRecordingBounds,
+    wal_directory: &Path,
+) -> Result<CgroupSelection, ApplicationError> {
+    preflight_wal_destination(wal_directory, bounds)?;
+    let selection = preflight_cgroup_selection(selector, allow_shared_cgroup)
+        .map_err(|_| ApplicationError::ProductionPreflight("cgroup selection invalid"))?;
+    preflight_embedded_ebpf()?;
+    Ok(selection)
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
+    chronicle_capture_ebpf::probe_embedded()
+        .is_ready()
+        .then_some(())
+        .ok_or(ApplicationError::ProductionPreflight(
+            "eBPF prerequisites unavailable",
+        ))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
+    Err(ApplicationError::ProductionPreflight(
+        "Linux eBPF capture unavailable",
+    ))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -562,6 +668,66 @@ pub struct RecordingCommitBoundary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingBuildIdentity {
+    pub chronicle_version: String,
+    pub aya_version: String,
+    pub aya_ebpf_version: String,
+    pub ebpf_object_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingHostIdentity {
+    pub kernel_release: String,
+    pub architecture: String,
+    pub boot_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingSelectorScope {
+    pub direct_tgid_count: usize,
+    pub descendant_cgroup_count: usize,
+    pub selected_subtree: bool,
+    pub shared_scope_acknowledged: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingBounds {
+    pub duration_seconds: u64,
+    pub max_wal_bytes: u64,
+    pub segment_bytes: u64,
+    pub ring_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingCaptureErrorCode {
+    Unsupported,
+    Capability,
+    Object,
+    Attach,
+    Source,
+    LossSample,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingCaptureError {
+    pub code: RecordingCaptureErrorCode,
+}
+
+/// Capture-specific fields appended to core metadata after feasibility validation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingCaptureMetadataV1 {
+    pub version: u16,
+    pub build: RecordingBuildIdentity,
+    pub host: RecordingHostIdentity,
+    pub scope: RecordingSelectorScope,
+    pub capabilities: BTreeSet<String>,
+    pub configured_bounds: RecordingBounds,
+    pub effective_bounds: RecordingBounds,
+    pub errors: Vec<RecordingCaptureError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingMetadataV1 {
     pub version: u16,
     pub recording_id: RecordingId,
@@ -572,6 +738,42 @@ pub struct RecordingMetadataV1 {
     pub counters: RecordingCounters,
     #[serde(default)]
     pub terminal_wal_loss: Option<TerminalWalLossSummary>,
+    #[serde(default)]
+    pub capture: Option<RecordingCaptureMetadataV1>,
+}
+
+impl RecordingMetadataV1 {
+    /// Persist feasibility-checked capture context before live eBPF work starts.
+    pub fn transition_to_recording(
+        &mut self,
+        capture: RecordingCaptureMetadataV1,
+    ) -> Result<(), ApplicationError> {
+        if self.status != RecordingStatus::Starting || self.shutdown_reason.is_some() {
+            return Err(ApplicationError::RecordingMetadataValidation(
+                "only a starting recording may transition to recording".into(),
+            ));
+        }
+        self.capture = Some(capture);
+        self.status = RecordingStatus::Recording;
+        validate_recording_metadata(self)
+    }
+
+    pub fn finalize(
+        &mut self,
+        status: RecordingStatus,
+        reason: ShutdownReason,
+    ) -> Result<(), ApplicationError> {
+        if self.status != RecordingStatus::Recording
+            || !matches!(status, RecordingStatus::Completed | RecordingStatus::Failed)
+        {
+            return Err(ApplicationError::RecordingMetadataValidation(
+                "only a recording may finalize as completed or failed".into(),
+            ));
+        }
+        self.status = status;
+        self.shutdown_reason = Some(reason);
+        validate_recording_metadata(self)
+    }
 }
 
 #[derive(Deserialize)]
@@ -746,6 +948,8 @@ pub enum ApplicationError {
     InvalidConfig(String),
     #[error("recording metadata failed validation: {0}")]
     RecordingMetadataValidation(String),
+    #[error("production recording preflight failed: {0}")]
+    ProductionPreflight(&'static str),
     #[error("{0} command is not implemented in current scaffold")]
     NotImplemented(&'static str),
 }
@@ -814,6 +1018,42 @@ fn validate_recording_metadata(metadata: &RecordingMetadataV1) -> Result<(), App
         return Err(ApplicationError::RecordingMetadataValidation(
             "terminal status and shutdown reason must be present together".into(),
         ));
+    }
+    if let Some(capture) = &metadata.capture {
+        if capture.version != RECORDING_CAPTURE_METADATA_SCHEMA_V1 {
+            return Err(ApplicationError::RecordingMetadataValidation(format!(
+                "unsupported recording capture metadata version {}",
+                capture.version
+            )));
+        }
+        if [
+            &capture.build.chronicle_version,
+            &capture.build.aya_version,
+            &capture.build.aya_ebpf_version,
+            &capture.build.ebpf_object_sha256,
+            &capture.host.kernel_release,
+            &capture.host.architecture,
+            &capture.host.boot_id,
+        ]
+        .iter()
+        .any(|value| value.is_empty())
+        {
+            return Err(ApplicationError::RecordingMetadataValidation(
+                "recording capture identity fields must be non-empty".into(),
+            ));
+        }
+        if !capture.scope.selected_subtree {
+            return Err(ApplicationError::RecordingMetadataValidation(
+                "recording capture scope must be selected subtree".into(),
+            ));
+        }
+        if capture.capabilities.len() > MAX_RECORDING_CAPABILITIES
+            || capture.errors.len() > MAX_RECORDING_CAPTURE_ERRORS
+        {
+            return Err(ApplicationError::RecordingMetadataValidation(
+                "recording capture metadata exceeds bounded fields".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -918,6 +1158,7 @@ pub fn reconcile_recording_metadata_with_scan(
         last_valid_commit: None,
         counters: RecordingCounters::default(),
         terminal_wal_loss: None,
+        capture: None,
     });
     if metadata.recording_id != recording_id {
         return Err(ApplicationError::RecordingMetadataValidation(
@@ -2639,7 +2880,142 @@ mod tests {
             last_valid_commit: None,
             counters: RecordingCounters::default(),
             terminal_wal_loss: None,
+            capture: None,
         }
+    }
+
+    fn capture_metadata() -> RecordingCaptureMetadataV1 {
+        RecordingCaptureMetadataV1 {
+            version: RECORDING_CAPTURE_METADATA_SCHEMA_V1,
+            build: RecordingBuildIdentity {
+                chronicle_version: "0.1.0".into(),
+                aya_version: "0.14.0".into(),
+                aya_ebpf_version: "0.2.1".into(),
+                ebpf_object_sha256: "a".repeat(64),
+            },
+            host: RecordingHostIdentity {
+                kernel_release: "6.8.0".into(),
+                architecture: "aarch64".into(),
+                boot_id: "boot-id".into(),
+            },
+            scope: RecordingSelectorScope {
+                direct_tgid_count: 1,
+                descendant_cgroup_count: 0,
+                selected_subtree: true,
+                shared_scope_acknowledged: false,
+            },
+            capabilities: ["btf".into(), "cgroup/connect4".into()]
+                .into_iter()
+                .collect(),
+            configured_bounds: RecordingBounds {
+                duration_seconds: 600,
+                max_wal_bytes: 4 * 1024 * 1024 * 1024,
+                segment_bytes: 256 * 1024 * 1024,
+                ring_bytes: 8 * 1024 * 1024,
+            },
+            effective_bounds: RecordingBounds {
+                duration_seconds: 600,
+                max_wal_bytes: 4 * 1024 * 1024 * 1024,
+                segment_bytes: 256 * 1024 * 1024,
+                ring_bytes: 8 * 1024 * 1024,
+            },
+            errors: vec![RecordingCaptureError {
+                code: RecordingCaptureErrorCode::Attach,
+            }],
+        }
+    }
+
+    #[test]
+    fn recording_capture_metadata_is_versioned_bounded_and_transitions_live_status() {
+        let mut metadata = recording_metadata(RecordingStatus::Starting);
+        let core_bytes = serde_json::to_vec(&metadata).unwrap();
+        assert_eq!(
+            decode_recording_metadata(&core_bytes).unwrap().capture,
+            None
+        );
+
+        metadata
+            .transition_to_recording(capture_metadata())
+            .unwrap();
+        assert_eq!(metadata.status, RecordingStatus::Recording);
+        assert!(metadata.capture.is_some());
+        metadata
+            .finalize(RecordingStatus::Completed, ShutdownReason::DurationLimit)
+            .unwrap();
+        assert_eq!(
+            metadata.shutdown_reason,
+            Some(ShutdownReason::DurationLimit)
+        );
+        assert_eq!(
+            decode_recording_metadata(&serde_json::to_vec(&metadata).unwrap()).unwrap(),
+            metadata
+        );
+
+        let mut invalid = recording_metadata(RecordingStatus::Starting);
+        let mut capture = capture_metadata();
+        capture.errors = vec![
+            RecordingCaptureError {
+                code: RecordingCaptureErrorCode::Source,
+            };
+            MAX_RECORDING_CAPTURE_ERRORS + 1
+        ];
+        assert!(matches!(
+            invalid.transition_to_recording(capture),
+            Err(ApplicationError::RecordingMetadataValidation(_))
+        ));
+    }
+
+    #[test]
+    fn production_recording_bounds_enforce_duration_and_wal_limits() {
+        assert_eq!(
+            ProductionRecordingBounds::default(),
+            ProductionRecordingBounds {
+                duration_seconds: DEFAULT_RECORDING_DURATION_SECONDS,
+                segment_bytes: DEFAULT_V2_SEGMENT_BYTES,
+                max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
+            }
+        );
+        for bounds in [
+            ProductionRecordingBounds {
+                duration_seconds: 0,
+                ..ProductionRecordingBounds::default()
+            },
+            ProductionRecordingBounds {
+                duration_seconds: MAX_RECORDING_DURATION_SECONDS + 1,
+                ..ProductionRecordingBounds::default()
+            },
+            ProductionRecordingBounds {
+                segment_bytes: MIN_V2_SEGMENT_BYTES - 1,
+                ..ProductionRecordingBounds::default()
+            },
+            ProductionRecordingBounds {
+                max_wal_bytes: MIN_V2_SEGMENT_BYTES - 1,
+                ..ProductionRecordingBounds::default()
+            },
+        ] {
+            assert!(matches!(
+                validate_production_recording_bounds(bounds),
+                Err(ApplicationError::ProductionPreflight(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn wal_preflight_is_exclusive_and_reports_free_space_without_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("chronicle-preflight-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let wal = root.join("wal");
+        let preflight =
+            preflight_wal_destination(&wal, ProductionRecordingBounds::default()).unwrap();
+        assert!(preflight.available_bytes > 0);
+        assert!(!wal.exists());
+        std::fs::create_dir(&wal).unwrap();
+        assert!(matches!(
+            preflight_wal_destination(&wal, ProductionRecordingBounds::default()),
+            Err(ApplicationError::ProductionPreflight(_))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

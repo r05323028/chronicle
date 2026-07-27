@@ -73,6 +73,14 @@ impl EbpfCaptureSource {
         Self::load(EMBEDDED_OBJECT, cgroup, adapter)
     }
 
+    pub fn load_embedded_with_post_attach(
+        cgroup: &std::fs::File,
+        adapter: CaptureAdapter,
+        post_attach: impl FnOnce() -> Result<(), EbpfCaptureError>,
+    ) -> Result<Self, EbpfCaptureError> {
+        Self::load_with_post_attach(EMBEDDED_OBJECT, cgroup, adapter, post_attach)
+    }
+
     #[cfg(target_endian = "big")]
     pub fn load_embedded(
         _cgroup: &std::fs::File,
@@ -86,7 +94,16 @@ impl EbpfCaptureSource {
     pub fn load(
         object: &[u8],
         cgroup: &std::fs::File,
+        adapter: CaptureAdapter,
+    ) -> Result<Self, EbpfCaptureError> {
+        Self::load_with_post_attach(object, cgroup, adapter, || Ok(()))
+    }
+
+    pub fn load_with_post_attach(
+        object: &[u8],
+        cgroup: &std::fs::File,
         mut adapter: CaptureAdapter,
+        post_attach: impl FnOnce() -> Result<(), EbpfCaptureError>,
     ) -> Result<Self, EbpfCaptureError> {
         if !matches!(std::env::consts::ARCH, "aarch64" | "x86_64") {
             return Err(EbpfCaptureError::UnsupportedCapability("host architecture"));
@@ -96,6 +113,10 @@ impl EbpfCaptureSource {
             reason: "load failed",
         })?;
         if let Err(error) = attach_all(&mut ebpf, cgroup) {
+            drop(ebpf);
+            return Err(error);
+        }
+        if let Err(error) = post_attach() {
             drop(ebpf);
             return Err(error);
         }
