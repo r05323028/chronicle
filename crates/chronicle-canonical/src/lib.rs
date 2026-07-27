@@ -7,8 +7,50 @@ use std::collections::BTreeMap;
 pub const CANONICAL_SCHEMA_V1: u16 = 1;
 pub const CANONICAL_SCHEMA_V2: u16 = 2;
 pub const CANONICAL_SCHEMA_V3: u16 = 3;
-pub const CANONICAL_SCHEMA_VERSION: u16 = CANONICAL_SCHEMA_V2;
+pub const CANONICAL_SCHEMA_VERSION: u16 = CANONICAL_SCHEMA_V3;
 pub type Attributes = BTreeMap<String, String>;
+
+/// V3 typed capture completeness. `Partial` never implies replay safety.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Completeness {
+    Complete,
+    Partial,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceStatus {
+    Completed,
+    Failed,
+    Aborted,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProvenanceKind {
+    Connection,
+    RingLoss,
+    WalLimitLoss,
+    WalEnvelope,
+    CommitMarker,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvenanceEntry {
+    pub kind: ProvenanceKind,
+    pub sequence_range: Option<(u64, u64)>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceProvenance {
+    pub status: SourceStatus,
+    pub reason: Option<String>,
+    /// Deterministic source evidence order, never a stringly-typed attribute.
+    pub evidence: Vec<ProvenanceEntry>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
@@ -184,6 +226,16 @@ impl Default for ReplayMetadata {
     }
 }
 
+/// V3 metadata is session-scoped to retain loss context without rewriting v1/v2 records.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalV3Metadata {
+    pub source: SourceProvenance,
+    pub connection_completeness: BTreeMap<ConnectionId, Completeness>,
+    pub operation_completeness: BTreeMap<OperationId, Completeness>,
+    pub operation_order: Vec<OperationId>,
+    pub replay_attributes: Attributes,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalSession {
     #[serde(deserialize_with = "deserialize_schema_version")]
@@ -195,6 +247,8 @@ pub struct CanonicalSession {
     pub connections: Vec<CanonicalConnection>,
     pub timeline: Vec<TimelineEntry>,
     pub replay: ReplayMetadata,
+    #[serde(default)]
+    pub v3: CanonicalV3Metadata,
 }
 
 fn deserialize_schema_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
@@ -203,8 +257,10 @@ where
 {
     let version = u16::deserialize(deserializer)?;
     match CanonicalSchemaVersion::try_from(version) {
-        Ok(CanonicalSchemaVersion::V1 | CanonicalSchemaVersion::V2) => Ok(version),
-        Ok(CanonicalSchemaVersion::V3) | Err(_) => Err(serde::de::Error::custom(format!(
+        Ok(
+            CanonicalSchemaVersion::V1 | CanonicalSchemaVersion::V2 | CanonicalSchemaVersion::V3,
+        ) => Ok(version),
+        Err(_) => Err(serde::de::Error::custom(format!(
             "unsupported canonical schema version {version}"
         ))),
     }
@@ -226,6 +282,7 @@ mod tests {
             connections: Vec::new(),
             timeline: Vec::new(),
             replay: ReplayMetadata::default(),
+            v3: CanonicalV3Metadata::default(),
         };
         let encoded = serde_json::to_vec(&session).unwrap();
         let decoded: CanonicalSession = serde_json::from_slice(&encoded).unwrap();
@@ -277,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatches_v1_v2_and_rejects_unimplemented_or_unknown_versions() {
+    fn dispatches_v1_v2_v3_and_rejects_unknown_versions() {
         assert_eq!(
             CanonicalSchemaVersion::try_from(CANONICAL_SCHEMA_V1).unwrap(),
             CanonicalSchemaVersion::V1
@@ -291,7 +348,19 @@ mod tests {
             CanonicalSchemaVersion::V3
         );
 
-        for version in [0, CANONICAL_SCHEMA_V3, CANONICAL_SCHEMA_V3 + 1] {
+        let v3: CanonicalSession = serde_json::from_value(serde_json::json!({
+            "schema_version": CANONICAL_SCHEMA_V3,
+            "id": SessionId::new(),
+            "started_at": OffsetDateTime::UNIX_EPOCH,
+            "ended_at": null,
+            "source": SourceMetadata::default(),
+            "connections": [],
+            "timeline": [],
+            "replay": ReplayMetadata::default(),
+        }))
+        .unwrap();
+        assert_eq!(v3.v3, CanonicalV3Metadata::default());
+        for version in [0, CANONICAL_SCHEMA_V3 + 1] {
             let error = serde_json::from_value::<CanonicalSession>(serde_json::json!({
                 "schema_version": version,
                 "id": SessionId::new(),

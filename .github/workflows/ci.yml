@@ -44,14 +44,26 @@ jobs:
           cargo check --workspace --all-targets --locked
           echo "This rootless check does not prove privileged runtime hook behavior."
 
-      - name: Compile eBPF capture (unprivileged)
-        run: |
-          cd ebpf-capture
-          cargo check --locked
-          echo "Compile success does not prove privileged runtime hook behavior."
-
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace --all-features --locked
+
+  ebpf-compile:
+    name: eBPF compile (unprivileged)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install eBPF build toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          cargo +nightly install bpf-linker --locked
+
+      - name: Compile eBPF capture
+        run: |
+          cd ebpf
+          cargo +nightly check --locked
+          echo "Compile success is unprivileged only; privileged runtime hook behavior is not checked."

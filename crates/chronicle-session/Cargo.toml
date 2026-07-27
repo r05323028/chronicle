@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 chronicle-capture = { path = "../chronicle-capture" }
 chronicle-common = { path = "../chronicle-common" }
+chronicle-wal = { path = "../chronicle-wal" }
 thiserror.workspace = true
 
 [lints]

@@ -11,6 +11,10 @@ license.workspace = true
 name = "chronicle"
 path = "src/main.rs"
 
+[features]
+default = []
+linux-ebpf = ["chronicle-application/linux-ebpf", "tokio/signal"]
+
 [dependencies]
 chronicle-application = { path = "../chronicle-application" }
 chronicle-common = { path = "../chronicle-common" }

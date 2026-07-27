@@ -43,7 +43,7 @@ impl Drop for CgroupGuard {
 
 fn production_object() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../ebpf-capture/target/bpfel-unknown-none/release/chronicle-ebpf-capture")
+        .join("../../ebpf/target/bpfel-unknown-none/release/chronicle-ebpf")
 }
 
 fn bpftool_ids(kind: &str) -> Result<BTreeSet<u32>, Box<dyn std::error::Error>> {

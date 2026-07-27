@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 chronicle-canonical = { path = "../chronicle-canonical" }
 chronicle-common = { path = "../chronicle-common" }
+chronicle-session = { path = "../chronicle-session" }
 thiserror.workspace = true
 
 [lints]

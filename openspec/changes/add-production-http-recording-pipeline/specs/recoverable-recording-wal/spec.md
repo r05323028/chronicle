@@ -107,8 +107,8 @@ When next complete frame cannot fit while preserving reservation, writer SHALL r
 - **THEN** current batch commits first and total reservation includes next header/peak temporary bytes plus data frame plus marker before creating temporary file
 
 #### Scenario: No room for terminal loss marker
-- **WHEN** remaining capacity fits required commit marker but not optional terminal `LossWindow` plus marker
-- **THEN** writer commits written prefix, emits no partial loss frame, and metadata/final summary preserve exact discard counters and interval
+- **WHEN** remaining capacity fits required commit marker but not optional `TerminalWalLoss` frame plus marker
+- **THEN** writer commits written prefix, emits no partial terminal frame, and metadata/final summary preserve exact typed discard evidence
 
 #### Scenario: No room for another data record
 - **WHEN** next complete frame plus marker reservation exceeds remaining bytes
@@ -149,20 +149,52 @@ Capture-to-WAL queue SHALL be bounded to 4096 events. Queue saturation SHALL app
 - **WHEN** final metadata and summary are rendered
 - **THEN** accepted equals written plus still queued plus categorized accepted-queue discard, and durable does not exceed written
 
-### Requirement: WAL-limit terminal loss evidence
-Discarded queued events SHALL create known missing capture evidence. If a typed `LossWindow` frame plus required final marker fits, writer SHALL append window from earliest valid monotonic timestamp among discarded events through capture shutdown using same clock identity. If timestamps are missing/malformed, uncertainty SHALL begin at last successfully persisted capture timestamp. If loss frame cannot fit, recording metadata and final summary SHALL persist same typed interval, exact discard records/bytes, and omission reason outside `segments/`; ETL SHALL consume it. Operations provably outside interval may remain complete; overlapping or temporally/clock-ambiguous operations SHALL degrade. Policy SHALL NOT claim exact drop time or per-connection attribution.
+### Requirement: Typed terminal WAL-loss evidence
+WAL-cap discard SHALL be modeled as recorder/WAL admission loss, not kernel/backend capture loss. It SHALL NOT add a `CaptureEvent` or capture-source event variant. A discarded event is one already accepted into bounded ingest but denied persistence by WAL physical-cap reservation; it remains exclusively in `discarded_from_queue_due_to_wal_limit` accounting.
+
+`QueuedWalRecord` SHALL carry optional typed capture-time metadata using existing `MonotonicTimestamp { clock: ClockIdentity, nanoseconds }`, independent of its opaque WAL payload. Queueing wall time, flush time, terminal-marker time, and unrelated process uptime SHALL NOT substitute for capture time. The ingest state machine SHALL accumulate discarded record/byte counts and earliest/latest valid timestamps separately for each `ClockIdentity`; it SHALL NOT compare or merge incompatible clocks.
+
+`RecordKind::TerminalWalLoss` schema version 1 SHALL encode `TerminalWalLoss { interval: TerminalWalLossInterval { start: MonotonicTimestamp, end: MonotonicTimestamp }, discarded_records: u64, discarded_payload_bytes: u64, reason: TerminalWalLossReason::WalHardLimit, ambiguity: TerminalWalLossAmbiguity::UnknownDownstreamEffects }`. `start.clock` and `end.clock` SHALL match, `start.nanoseconds <= end.nanoseconds`, and `discarded_records > 0`. Zero payload bytes are valid only when every attributed discarded record has zero payload; no decoder SHALL infer otherwise. Reason and ambiguity are closed typed enums; payload SHALL contain no Aya/kernel ABI values, queue addresses, WAL paths, arbitrary error strings, HTTP/reconstruction data, or guessed socket identities.
+
+At most one terminal WAL-loss record per clock identity SHALL be emitted for one WAL-limit stop. A complete terminal frame plus required final marker MUST fit before write. Terminal control records SHALL not be recursively treated as ordinary queue input or added to ordinary discard counters. Only a successful final marker sync makes terminal evidence persisted. If no terminal frame plus marker fits, metadata/final summary SHALL retain a typed per-clock `TerminalWalLossSummary` with exact counts and `MetadataOnly` persistence state; ETL SHALL consume equivalent conservative evidence. A discarded event with no trusted timestamp SHALL be represented in a separate typed summary entry: use compatible last persisted capture timestamp as conservative start only when available; otherwise use `TimestampUnavailable` ambiguity and emit no interval-bearing WAL payload. Marker/frame/flush/sync/metadata failure SHALL finalize `failed` with `wal_failure`, preserve prior committed prefix, and report `NotPersistedDueToWalFailure` rather than claim a terminal record was persisted.
+
+Reader/recovery SHALL decode recovery-authoritative `TerminalWalLoss` envelopes as typed control evidence, expose them separately from ordinary CaptureEvent input, reject unsupported terminal-loss schema versions and malformed/contradictory payloads, and retain existing WAL v1 and fixture v1/v2 dispatch unchanged. Operations provably outside a known matching-clock interval may remain complete; overlapping or clock/timing-ambiguous operations SHALL degrade. Policy SHALL NOT claim exact drop time or per-connection attribution.
+
+#### Scenario: Single discarded record
+- **WHEN** one timestamped record is discarded at WAL cap
+- **THEN** its terminal interval has equal start/end timestamps, exact count/bytes, `WalHardLimit` reason, and `UnknownDownstreamEffects` ambiguity
+
+#### Scenario: Multiple discarded records
+- **WHEN** several discarded records share one clock
+- **THEN** interval start/end are their earliest/latest capture timestamps and record/byte totals are exact
+
+#### Scenario: Incompatible clocks
+- **WHEN** discarded records have different `ClockIdentity` values
+- **THEN** writer emits separate per-clock terminal records/summaries and never compares or merges their timestamps
+
+#### Scenario: Terminal codec compatibility
+- **WHEN** valid terminal-loss payload is encoded then decoded
+- **THEN** every typed field round trips; unsupported schema, unequal clocks, reversed interval, zero records, invalid enum discriminant, or contradictory accounting is rejected
 
 #### Scenario: Terminal loss record fits
-- **WHEN** queued events are discarded and capacity fits loss frame plus final marker
-- **THEN** typed terminal window is appended, marker-committed, and counters match discarded queue
+- **WHEN** one or more per-clock terminal frames plus their required final marker fit
+- **THEN** each is emitted once, marker-committed, recovery exposes typed evidence, and terminal records are not recursively counted as discard
 
-#### Scenario: Terminal loss record does not fit
-- **WHEN** only required marker fits
-- **THEN** metadata/final summary carry terminal window/counters and ETL receives equivalent conservative evidence
+#### Scenario: No room for terminal loss marker
+- **WHEN** only required marker fits after queue discard
+- **THEN** writer emits no partial terminal frame, metadata/final summary has exact typed `MetadataOnly` evidence, and ETL receives equivalent conservative evidence
 
-#### Scenario: Discarded timestamps malformed
-- **WHEN** no discarded event provides trusted monotonic time
-- **THEN** uncertainty begins at last persisted capture timestamp and affected timing remains ambiguous
+#### Scenario: Terminal finalization failure
+- **WHEN** terminal frame, final marker, flush, sync, or metadata persistence fails
+- **THEN** recording is `failed` with `wal_failure`, prior committed prefix remains authoritative, and summary reports `NotPersistedDueToWalFailure`
+
+#### Scenario: Missing timestamp
+- **WHEN** a discarded record has no trusted timestamp
+- **THEN** summary uses compatible last persisted capture timestamp only as conservative fallback or records `TimestampUnavailable`; writer never fabricates an interval-bearing terminal WAL payload
+
+#### Scenario: Compatibility preservation
+- **WHEN** existing WAL v1 or fixture v1/v2 artifacts are read
+- **THEN** their existing capture/loss dispatch remains readable and terminal-loss decoding is not required
 
 ### Requirement: Commit-aware deterministic recovery scan
 Recovery SHALL lock recording, discover final segments numerically, validate every relevant segment header checksum/version/recording identity/ordinal/first sequence and envelope version/order/CRC32C, scan every envelope, and select the final recovery-authoritative commit marker as committed boundary/counters. Authority SHALL require every marker condition defined by the fixed commit-marker requirement; recovery MUST NOT infer authority from marker appearance alone. Complete frames after the final authoritative marker SHALL be written-not-durable uncertainty and SHALL NOT be promoted. Read-only recovery SHALL report them without mutation; reopen-for-append SHALL first report then truncate current segment to marker end/remove later uncommitted segments, sync changed file/directories, and continue at marker sequence plus one. A complete marker with missing, non-contiguous, skipped-prefix, wrong-segment, identity-mismatched, checksum/CRC-mismatched, boundary-mismatched, cumulative-total-mismatched, or batch-SHA-256-mismatched references SHALL be rejected as authoritative and SHALL fail closed according to corruption rules. Recording metadata may lag and SHALL be reconciled from authoritative committed records without claiming runtime acknowledgement delivery occurred; missing metadata SHALL NOT invalidate committed WAL when immutable recording identity is established from validated segment headers. Unknown newer marker version SHALL fail explicitly. Repeated recovery over unchanged bytes SHALL produce the same checkpoint/report/mutation.

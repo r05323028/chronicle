@@ -1,6 +1,16 @@
 //! Application services and configuration. CLI remains an outer adapter.
 
-use chronicle_capture::{CaptureError, CaptureSource, FixtureCaptureSource, encode_event};
+mod cgroup_selection;
+
+pub use cgroup_selection::{
+    CgroupSelection, CgroupSelectionError, CgroupSelector, PidCgroupSelection,
+    preflight_cgroup_selection, preflight_pid_cgroup_selection,
+};
+
+use chronicle_capture::{
+    CaptureError, CaptureSource, ClockIdentity, FixtureCaptureSource, MonotonicTimestamp,
+    encode_event,
+};
 use chronicle_common::RecordingId;
 use chronicle_etl::{EtlError, EtlIssue, EtlOutput, EtlPipeline};
 use chronicle_protocol::{ProtocolError, ProtocolRegistry, ReplayContext, SecretBytes};
@@ -13,11 +23,12 @@ use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
 use chronicle_wal::{
     DEFAULT_MAX_RECORD_BYTES, GroupCommitWalWriter, RecordKind, RecordingLock,
     RecoveryReopenPreview, RecoveryReopenReport, RecoveryRepair, RecoveryScan, SegmentedWalWriter,
-    WalCheckpoint, WalError, WalReader, WalRecord, WalWriter, encode_record,
-    prepare_group_commit_reopen_from_scan,
+    TERMINAL_WAL_LOSS_SCHEMA_VERSION, TerminalWalLoss, TerminalWalLossAmbiguity,
+    TerminalWalLossInterval, TerminalWalLossReason, WalCheckpoint, WalError, WalReader, WalRecord,
+    WalWriter, encode_record, encode_terminal_wal_loss, prepare_group_commit_reopen_from_scan,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -79,6 +90,468 @@ pub struct RecordingCounters {
     pub etl_checkpointed: RecordByteCount,
 }
 
+pub const INGEST_QUEUE_CAPACITY: usize = 4_096;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedWalRecord {
+    pub kind: RecordKind,
+    pub schema_version: u16,
+    pub flags: u16,
+    pub payload: Vec<u8>,
+    /// Capture-domain time. Never substitute queue, flush, or wall-clock time.
+    pub capture_timestamp: Option<MonotonicTimestamp>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngestAdmission {
+    Accepted,
+    RejectedAfterStop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngestState {
+    Accepting,
+    Stopping(ShutdownReason),
+    Terminal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordingIngestResult {
+    pub status: RecordingStatus,
+    pub shutdown_reason: ShutdownReason,
+    pub counters: RecordingCounters,
+    pub terminal_wal_loss: Option<TerminalWalLossSummary>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalWalLossPersistence {
+    PendingWal,
+    PersistedWal,
+    MetadataOnly,
+    NotPersistedDueToWalFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalWalLossTimeSource {
+    Observed,
+    FallbackLastPersisted,
+    TimestampUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalWalLossSummaryEntry {
+    pub clock: Option<ClockIdentity>,
+    pub start: Option<MonotonicTimestamp>,
+    pub end: Option<MonotonicTimestamp>,
+    pub discarded: RecordByteCount,
+    pub time_source: TerminalWalLossTimeSource,
+    pub persistence: TerminalWalLossPersistence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalWalLossSummary {
+    pub entries: Vec<TerminalWalLossSummaryEntry>,
+    pub discarded: RecordByteCount,
+}
+
+#[derive(Debug)]
+pub struct RecordingIngestFailure {
+    pub error: WalError,
+    pub result: RecordingIngestResult,
+}
+
+impl std::fmt::Display for RecordingIngestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "recording ingest failed: {}", self.error)
+    }
+}
+
+impl std::error::Error for RecordingIngestFailure {}
+
+/// Application-owned bounded queue. WAL remains sole authority for physical capacity.
+pub struct RecordingIngest {
+    writer: GroupCommitWalWriter,
+    queue: VecDeque<QueuedWalRecord>,
+    state: IngestState,
+    counters: RecordingCounters,
+    written: RecordByteCount,
+    written_records: BTreeMap<u64, RecordByteCount>,
+    written_capture_timestamps: BTreeMap<u64, MonotonicTimestamp>,
+    persisted_capture_timestamps: BTreeMap<ClockIdentity, MonotonicTimestamp>,
+    terminal_discarded: BTreeMap<ClockIdentity, TerminalDiscardAccumulator>,
+    terminal_discarded_without_time: RecordByteCount,
+    terminal_wal_loss: Option<TerminalWalLossSummary>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TerminalDiscardAccumulator {
+    discarded: RecordByteCount,
+    start: Option<MonotonicTimestamp>,
+    end: Option<MonotonicTimestamp>,
+}
+
+impl RecordingIngest {
+    pub fn new(writer: GroupCommitWalWriter) -> Self {
+        Self {
+            writer,
+            queue: VecDeque::with_capacity(INGEST_QUEUE_CAPACITY),
+            state: IngestState::Accepting,
+            counters: RecordingCounters::default(),
+            written: RecordByteCount::default(),
+            written_records: BTreeMap::new(),
+            written_capture_timestamps: BTreeMap::new(),
+            persisted_capture_timestamps: BTreeMap::new(),
+            terminal_discarded: BTreeMap::new(),
+            terminal_discarded_without_time: RecordByteCount::default(),
+            terminal_wal_loss: None,
+        }
+    }
+
+    /// Returns the unqueued record on backpressure so callers can block and retry without loss.
+    pub fn admit(&mut self, record: QueuedWalRecord) -> Result<IngestAdmission, QueuedWalRecord> {
+        let bytes = record_bytes(&record);
+        match self.state {
+            IngestState::Accepting if self.queue.len() < INGEST_QUEUE_CAPACITY => {
+                add_count(&mut self.counters.received, bytes);
+                add_count(&mut self.counters.accepted_into_queue, bytes);
+                self.queue.push_back(record);
+                Ok(IngestAdmission::Accepted)
+            }
+            IngestState::Accepting => Err(record),
+            IngestState::Stopping(_) | IngestState::Terminal => {
+                add_count(&mut self.counters.rejected_after_stop, bytes);
+                Ok(IngestAdmission::RejectedAfterStop)
+            }
+        }
+    }
+
+    pub fn record_kernel_or_backend_drop(&mut self, records: u64, bytes: u64) {
+        self.counters.kernel_or_backend_dropped.records = self
+            .counters
+            .kernel_or_backend_dropped
+            .records
+            .saturating_add(records);
+        self.counters.kernel_or_backend_dropped.bytes = self
+            .counters
+            .kernel_or_backend_dropped
+            .bytes
+            .saturating_add(bytes);
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn counters(&self) -> &RecordingCounters {
+        &self.counters
+    }
+
+    /// Writes FIFO until empty or WAL's physical-capacity check refuses the next record.
+    pub fn drain(&mut self, now_millis: u64) -> Result<(), WalError> {
+        while self.state == IngestState::Accepting {
+            let Some(record) = self.queue.pop_front() else {
+                break;
+            };
+            let bytes = record_bytes(&record);
+            let QueuedWalRecord {
+                kind,
+                schema_version,
+                flags,
+                payload,
+                capture_timestamp,
+            } = record;
+            // On a write/flush error WAL may have accepted the frame before reporting failure.
+            // Count it as written-not-committed uncertainty; capacity rejection is preflight-only.
+            add_count(&mut self.written, bytes);
+            match self
+                .writer
+                .append(kind, schema_version, flags, payload, now_millis)
+            {
+                Ok(append) => {
+                    self.written_records
+                        .insert(append.sequence, RecordByteCount { records: 1, bytes });
+                    if let Some(timestamp) = capture_timestamp {
+                        self.written_capture_timestamps
+                            .insert(append.sequence, timestamp);
+                    }
+                    self.refresh_durability();
+                }
+                Err(error) if error.is_capacity_exhausted() => {
+                    subtract_count(&mut self.written, bytes);
+                    self.record_wal_limit_discard(bytes, capture_timestamp);
+                    while let Some(discarded) = self.queue.pop_front() {
+                        let bytes = record_bytes(&discarded);
+                        self.record_wal_limit_discard(bytes, discarded.capture_timestamp);
+                    }
+                    self.build_terminal_wal_loss_summary();
+                    self.state = IngestState::Stopping(ShutdownReason::WalSizeLimit);
+                    self.refresh_durability();
+                    break;
+                }
+                Err(error) => {
+                    self.state = IngestState::Stopping(ShutdownReason::WalFailure);
+                    self.refresh_durability();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// WAL-limit detection wins over duration when both occur in one shutdown cycle.
+    pub fn finish(
+        &mut self,
+        requested_reason: ShutdownReason,
+        now_millis: u64,
+    ) -> Result<RecordingIngestResult, RecordingIngestFailure> {
+        if let Err(error) = self.drain(now_millis) {
+            self.state = IngestState::Terminal;
+            return Err(RecordingIngestFailure {
+                error,
+                result: self.failure_result(),
+            });
+        }
+        let shutdown_reason = match self.state {
+            IngestState::Accepting => {
+                self.state = IngestState::Stopping(requested_reason);
+                requested_reason
+            }
+            IngestState::Stopping(reason) => reason,
+            IngestState::Terminal => requested_reason,
+        };
+        if shutdown_reason == ShutdownReason::WalSizeLimit
+            && let Err(error) = self.append_terminal_wal_loss(now_millis)
+        {
+            self.refresh_durability();
+            self.mark_terminal_loss_not_persisted();
+            self.state = IngestState::Terminal;
+            return Err(RecordingIngestFailure {
+                error,
+                result: self.failure_result(),
+            });
+        }
+        if let Err(error) = self.writer.shutdown(now_millis) {
+            self.refresh_durability();
+            self.mark_terminal_loss_not_persisted();
+            self.state = IngestState::Terminal;
+            return Err(RecordingIngestFailure {
+                error,
+                result: self.failure_result(),
+            });
+        }
+        self.refresh_durability();
+        self.mark_terminal_loss_persisted();
+        self.state = IngestState::Terminal;
+        Ok(RecordingIngestResult {
+            status: RecordingStatus::Completed,
+            shutdown_reason,
+            counters: self.counters.clone(),
+            terminal_wal_loss: self.terminal_wal_loss.clone(),
+        })
+    }
+
+    fn failure_result(&self) -> RecordingIngestResult {
+        RecordingIngestResult {
+            status: RecordingStatus::Failed,
+            shutdown_reason: ShutdownReason::WalFailure,
+            counters: self.counters.clone(),
+            terminal_wal_loss: self.terminal_wal_loss.clone(),
+        }
+    }
+
+    fn record_wal_limit_discard(&mut self, bytes: u64, timestamp: Option<MonotonicTimestamp>) {
+        add_count(
+            &mut self.counters.discarded_from_queue_due_to_wal_limit,
+            bytes,
+        );
+        let Some(timestamp) = timestamp.filter(valid_capture_timestamp) else {
+            add_count(&mut self.terminal_discarded_without_time, bytes);
+            return;
+        };
+        let accumulator = self
+            .terminal_discarded
+            .entry(timestamp.clock.clone())
+            .or_default();
+        add_count(&mut accumulator.discarded, bytes);
+        if accumulator
+            .start
+            .as_ref()
+            .is_none_or(|start| timestamp.nanoseconds < start.nanoseconds)
+        {
+            accumulator.start = Some(timestamp.clone());
+        }
+        if accumulator
+            .end
+            .as_ref()
+            .is_none_or(|end| timestamp.nanoseconds > end.nanoseconds)
+        {
+            accumulator.end = Some(timestamp);
+        }
+    }
+
+    fn build_terminal_wal_loss_summary(&mut self) {
+        let mut entries: Vec<_> = self
+            .terminal_discarded
+            .iter()
+            .filter_map(|(clock, accumulator)| {
+                Some(TerminalWalLossSummaryEntry {
+                    clock: Some(clock.clone()),
+                    start: accumulator.start.clone(),
+                    end: accumulator.end.clone(),
+                    discarded: accumulator.discarded.clone(),
+                    time_source: TerminalWalLossTimeSource::Observed,
+                    persistence: TerminalWalLossPersistence::PendingWal,
+                })
+            })
+            .collect();
+        if self.terminal_discarded_without_time.records != 0 {
+            let fallback = (self.persisted_capture_timestamps.len() == 1)
+                .then(|| self.persisted_capture_timestamps.values().next().cloned())
+                .flatten();
+            entries.push(TerminalWalLossSummaryEntry {
+                clock: fallback.as_ref().map(|timestamp| timestamp.clock.clone()),
+                start: fallback,
+                end: None,
+                discarded: self.terminal_discarded_without_time.clone(),
+                time_source: if self.persisted_capture_timestamps.len() == 1 {
+                    TerminalWalLossTimeSource::FallbackLastPersisted
+                } else {
+                    TerminalWalLossTimeSource::TimestampUnavailable
+                },
+                persistence: TerminalWalLossPersistence::MetadataOnly,
+            });
+        }
+        self.terminal_wal_loss = (!entries.is_empty()).then_some(TerminalWalLossSummary {
+            entries,
+            discarded: self.counters.discarded_from_queue_due_to_wal_limit.clone(),
+        });
+    }
+
+    fn append_terminal_wal_loss(&mut self, now_millis: u64) -> Result<(), WalError> {
+        let Some(summary) = &mut self.terminal_wal_loss else {
+            return Ok(());
+        };
+        for entry in &mut summary.entries {
+            if entry.persistence != TerminalWalLossPersistence::PendingWal {
+                continue;
+            }
+            let (Some(start), Some(end)) = (entry.start.clone(), entry.end.clone()) else {
+                entry.persistence = TerminalWalLossPersistence::MetadataOnly;
+                continue;
+            };
+            let loss = TerminalWalLoss {
+                interval: TerminalWalLossInterval { start, end },
+                discarded_records: entry.discarded.records,
+                discarded_payload_bytes: entry.discarded.bytes,
+                reason: TerminalWalLossReason::WalHardLimit,
+                ambiguity: TerminalWalLossAmbiguity::UnknownDownstreamEffects,
+            };
+            let payload = encode_terminal_wal_loss(&loss)?;
+            match self.writer.append(
+                RecordKind::TerminalWalLoss,
+                TERMINAL_WAL_LOSS_SCHEMA_VERSION,
+                0,
+                payload,
+                now_millis,
+            ) {
+                Ok(_) => {}
+                Err(error) if error.is_capacity_exhausted() => {
+                    entry.persistence = TerminalWalLossPersistence::MetadataOnly;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_terminal_loss_persisted(&mut self) {
+        if let Some(summary) = &mut self.terminal_wal_loss {
+            for entry in &mut summary.entries {
+                if entry.persistence == TerminalWalLossPersistence::PendingWal {
+                    entry.persistence = TerminalWalLossPersistence::PersistedWal;
+                }
+            }
+        }
+    }
+
+    fn mark_terminal_loss_not_persisted(&mut self) {
+        if let Some(summary) = &mut self.terminal_wal_loss {
+            for entry in &mut summary.entries {
+                if entry.persistence == TerminalWalLossPersistence::PendingWal {
+                    entry.persistence = TerminalWalLossPersistence::NotPersistedDueToWalFailure;
+                }
+            }
+        }
+    }
+
+    fn refresh_durability(&mut self) {
+        let authority = self.writer.authority();
+        if let Some(durable_through) = authority.durable_through_sequence {
+            let durable_sequences: Vec<_> = self
+                .written_capture_timestamps
+                .range(..=durable_through)
+                .map(|(sequence, timestamp)| (*sequence, timestamp.clone()))
+                .collect();
+            for (sequence, timestamp) in durable_sequences {
+                self.written_capture_timestamps.remove(&sequence);
+                self.persisted_capture_timestamps
+                    .entry(timestamp.clock.clone())
+                    .and_modify(|current| {
+                        if current.nanoseconds < timestamp.nanoseconds {
+                            *current = timestamp.clone();
+                        }
+                    })
+                    .or_insert(timestamp);
+            }
+        }
+        if let Some(durable_through) = authority.durable_through_sequence {
+            let durable_sequences: Vec<_> = self
+                .written_records
+                .range(..=durable_through)
+                .map(|(sequence, count)| (*sequence, count.clone()))
+                .collect();
+            for (sequence, count) in durable_sequences {
+                self.written_records.remove(&sequence);
+                self.counters.committed.records = self
+                    .counters
+                    .committed
+                    .records
+                    .saturating_add(count.records);
+                self.counters.committed.bytes =
+                    self.counters.committed.bytes.saturating_add(count.bytes);
+            }
+        }
+        self.counters.written_not_committed.records = self
+            .written
+            .records
+            .saturating_sub(self.counters.committed.records);
+        self.counters.written_not_committed.bytes = self
+            .written
+            .bytes
+            .saturating_sub(self.counters.committed.bytes);
+    }
+}
+
+fn valid_capture_timestamp(timestamp: &MonotonicTimestamp) -> bool {
+    !timestamp.clock.boot_id.is_empty()
+}
+
+fn record_bytes(record: &QueuedWalRecord) -> u64 {
+    u64::try_from(record.payload.len()).unwrap_or(u64::MAX)
+}
+
+fn add_count(count: &mut RecordByteCount, bytes: u64) {
+    count.records = count.records.saturating_add(1);
+    count.bytes = count.bytes.saturating_add(bytes);
+}
+
+fn subtract_count(count: &mut RecordByteCount, bytes: u64) {
+    count.records = count.records.saturating_sub(1);
+    count.bytes = count.bytes.saturating_sub(bytes);
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingCommitBoundary {
     pub marker_sequence: u64,
@@ -97,6 +570,8 @@ pub struct RecordingMetadataV1 {
     pub shutdown_reason: Option<ShutdownReason>,
     pub last_valid_commit: Option<RecordingCommitBoundary>,
     pub counters: RecordingCounters,
+    #[serde(default)]
+    pub terminal_wal_loss: Option<TerminalWalLossSummary>,
 }
 
 #[derive(Deserialize)]
@@ -307,6 +782,21 @@ pub fn write_recording_metadata(
     write_recording_metadata_inner(wal_directory.as_ref(), metadata, None)
 }
 
+impl RecordingIngestResult {
+    /// Applies final ingest evidence before atomically persisting `recording.json`.
+    pub fn persist_metadata(
+        &self,
+        wal_directory: impl AsRef<Path>,
+        metadata: &mut RecordingMetadataV1,
+    ) -> Result<(), ApplicationError> {
+        metadata.status = self.status;
+        metadata.shutdown_reason = Some(self.shutdown_reason);
+        metadata.counters = self.counters.clone();
+        metadata.terminal_wal_loss = self.terminal_wal_loss.clone();
+        write_recording_metadata(wal_directory, metadata)
+    }
+}
+
 fn validate_recording_metadata(metadata: &RecordingMetadataV1) -> Result<(), ApplicationError> {
     if metadata.version != RECORDING_METADATA_SCHEMA_V1 {
         return Err(ApplicationError::RecordingMetadataValidation(format!(
@@ -425,6 +915,7 @@ pub fn reconcile_recording_metadata_with_scan(
         shutdown_reason: Some(ShutdownReason::ProcessCrashRecovered),
         last_valid_commit: None,
         counters: RecordingCounters::default(),
+        terminal_wal_loss: None,
     });
     if metadata.recording_id != recording_id {
         return Err(ApplicationError::RecordingMetadataValidation(
@@ -1443,6 +1934,307 @@ impl ChronicleApplication {
 mod tests {
     use super::*;
 
+    fn ingest_directory(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("chronicle-ingest-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn ingest(directory: &Path) -> RecordingIngest {
+        RecordingIngest::new(
+            GroupCommitWalWriter::create_with_total_limit(
+                directory,
+                RecordingId::new(),
+                chronicle_wal::MIN_V2_SEGMENT_BYTES,
+                chronicle_wal::MIN_V2_SEGMENT_BYTES,
+                1,
+                0,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn queued(payload: Vec<u8>) -> QueuedWalRecord {
+        let nanoseconds = u64::from(payload.first().copied().unwrap_or_default());
+        queued_at(payload, "fixture-ingest", nanoseconds)
+    }
+
+    fn queued_at(payload: Vec<u8>, boot_id: &str, nanoseconds: u64) -> QueuedWalRecord {
+        QueuedWalRecord {
+            kind: RecordKind::CaptureEvent,
+            schema_version: 1,
+            flags: 0,
+            payload,
+            capture_timestamp: Some(MonotonicTimestamp {
+                clock: ClockIdentity {
+                    boot_id: boot_id.into(),
+                },
+                nanoseconds,
+            }),
+        }
+    }
+
+    fn queued_without_timestamp(payload: Vec<u8>) -> QueuedWalRecord {
+        QueuedWalRecord {
+            kind: RecordKind::CaptureEvent,
+            schema_version: 1,
+            flags: 0,
+            payload,
+            capture_timestamp: None,
+        }
+    }
+
+    #[test]
+    fn ingest_empty_queue_finalizes_without_inventing_durability() {
+        let directory = ingest_directory("empty");
+        let mut ingest = ingest(&directory);
+        let result = ingest.finish(ShutdownReason::SourceCompleted, 1).unwrap();
+        assert_eq!(result.status, RecordingStatus::Completed);
+        assert_eq!(result.shutdown_reason, ShutdownReason::SourceCompleted);
+        assert_eq!(result.counters.committed, RecordByteCount::default());
+        drop(ingest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ingest_final_sync_failure_returns_failed_wal_result_with_uncertain_write() {
+        let directory = ingest_directory("sync-failure");
+        let mut ingest = ingest(&directory);
+        assert_eq!(ingest.admit(queued(vec![1])), Ok(IngestAdmission::Accepted));
+        ingest.writer.inject_data_sync_failure_for_test();
+
+        let failure = ingest
+            .finish(ShutdownReason::SourceCompleted, 1)
+            .unwrap_err();
+        assert_eq!(failure.result.status, RecordingStatus::Failed);
+        assert_eq!(failure.result.shutdown_reason, ShutdownReason::WalFailure);
+        assert_eq!(failure.result.counters.committed.records, 0);
+        assert_eq!(failure.result.counters.written_not_committed.records, 1);
+        drop(ingest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ingest_backpressures_at_fixed_queue_capacity_without_dropping() {
+        let directory = ingest_directory("full");
+        let mut ingest = ingest(&directory);
+        for _ in 0..INGEST_QUEUE_CAPACITY {
+            assert_eq!(ingest.admit(queued(vec![1])), Ok(IngestAdmission::Accepted));
+        }
+        assert_eq!(ingest.admit(queued(vec![2])), Err(queued(vec![2])));
+        assert_eq!(ingest.queue_len(), INGEST_QUEUE_CAPACITY);
+        assert_eq!(
+            ingest.counters().accepted_into_queue.records,
+            INGEST_QUEUE_CAPACITY as u64
+        );
+        drop(ingest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ingest_discards_only_wal_limit_suffix_and_wal_limit_wins_duration_tie() {
+        let directory = ingest_directory("limit");
+        let mut ingest = ingest(&directory);
+        let frame_bytes = (chronicle_wal::MIN_V2_SEGMENT_BYTES
+            - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap())
+            / 2
+            + 1;
+        let payload_bytes = usize::try_from(
+            frame_bytes - u64::try_from(chronicle_wal::ENVELOPE_HEADER_LEN).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ingest.admit(queued(vec![1; payload_bytes])),
+            Ok(IngestAdmission::Accepted)
+        );
+        assert_eq!(
+            ingest.admit(queued(vec![2; payload_bytes])),
+            Ok(IngestAdmission::Accepted)
+        );
+
+        let result = ingest.finish(ShutdownReason::DurationLimit, 1).unwrap();
+        assert_eq!(result.shutdown_reason, ShutdownReason::WalSizeLimit);
+        // Ordinary ingest counters exclude typed terminal control records.
+        assert_eq!(result.counters.committed.records, 1);
+        assert_eq!(
+            result
+                .counters
+                .discarded_from_queue_due_to_wal_limit
+                .records,
+            1
+        );
+        assert_eq!(
+            result.counters.accepted_into_queue.records,
+            result.counters.committed.records
+                + result
+                    .counters
+                    .discarded_from_queue_due_to_wal_limit
+                    .records
+        );
+        let terminal = result.terminal_wal_loss.unwrap();
+        assert_eq!(terminal.entries.len(), 1);
+        assert_eq!(terminal.entries[0].discarded.records, 1);
+        assert_eq!(terminal.entries[0].start, terminal.entries[0].end);
+        assert_eq!(
+            terminal.entries[0].persistence,
+            TerminalWalLossPersistence::PersistedWal
+        );
+        assert_eq!(
+            result.counters.rejected_after_stop,
+            RecordByteCount::default()
+        );
+        assert_eq!(
+            ingest.admit(queued(vec![3])),
+            Ok(IngestAdmission::RejectedAfterStop)
+        );
+        assert_eq!(ingest.counters().rejected_after_stop.records, 1);
+        drop(ingest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ingest_emits_one_terminal_loss_per_incompatible_clock() {
+        let directory = ingest_directory("limit-clocks");
+        let mut ingest = ingest(&directory);
+        let frame_bytes = (chronicle_wal::MIN_V2_SEGMENT_BYTES
+            - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap())
+            / 2
+            + 1;
+        let payload_bytes = usize::try_from(
+            frame_bytes - u64::try_from(chronicle_wal::ENVELOPE_HEADER_LEN).unwrap(),
+        )
+        .unwrap();
+        for (boot_id, nanoseconds) in [("persisted", 1), ("clock-a", 30), ("clock-b", 10)] {
+            assert_eq!(
+                ingest.admit(queued_at(vec![1; payload_bytes], boot_id, nanoseconds)),
+                Ok(IngestAdmission::Accepted)
+            );
+        }
+
+        let result = ingest.finish(ShutdownReason::SourceCompleted, 1).unwrap();
+        let terminal = result.terminal_wal_loss.unwrap();
+        assert_eq!(terminal.discarded.records, 2);
+        assert_eq!(terminal.entries.len(), 2);
+        assert!(terminal.entries.iter().all(|entry| {
+            entry.persistence == TerminalWalLossPersistence::PersistedWal
+                && entry.discarded.records == 1
+                && entry.start == entry.end
+        }));
+        drop(ingest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ingest_missing_timestamp_uses_only_last_persisted_clock_as_metadata_fallback() {
+        let directory = ingest_directory("limit-missing-time");
+        let mut ingest = ingest(&directory);
+        let frame_bytes = (chronicle_wal::MIN_V2_SEGMENT_BYTES
+            - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap())
+            / 2
+            + 1;
+        let payload_bytes = usize::try_from(
+            frame_bytes - u64::try_from(chronicle_wal::ENVELOPE_HEADER_LEN).unwrap(),
+        )
+        .unwrap();
+        ingest
+            .admit(queued_at(vec![1; payload_bytes], "persisted", 42))
+            .unwrap();
+        ingest.drain(10).unwrap();
+        ingest
+            .admit(queued_without_timestamp(vec![2; payload_bytes]))
+            .unwrap();
+
+        let result = ingest.finish(ShutdownReason::SourceCompleted, 11).unwrap();
+        let entry = &result.terminal_wal_loss.unwrap().entries[0];
+        assert_eq!(
+            entry.time_source,
+            TerminalWalLossTimeSource::FallbackLastPersisted
+        );
+        assert_eq!(entry.start.as_ref().unwrap().nanoseconds, 42);
+        assert_eq!(entry.end, None);
+        assert_eq!(entry.persistence, TerminalWalLossPersistence::MetadataOnly);
+        drop(ingest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ingest_uses_metadata_only_when_terminal_frame_cannot_fit() {
+        let directory = ingest_directory("limit-no-terminal-room");
+        let mut ingest = ingest(&directory);
+        let frame_bytes = chronicle_wal::MIN_V2_SEGMENT_BYTES
+            - u64::try_from(chronicle_wal::SEGMENT_HEADER_LEN).unwrap()
+            - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap();
+        let payload_bytes = usize::try_from(
+            frame_bytes - u64::try_from(chronicle_wal::ENVELOPE_HEADER_LEN).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ingest.admit(queued_at(vec![1; payload_bytes], "persisted", 1)),
+            Ok(IngestAdmission::Accepted)
+        );
+        assert_eq!(
+            ingest.admit(queued_at(vec![2], "discarded", 2)),
+            Ok(IngestAdmission::Accepted)
+        );
+
+        let result = ingest.finish(ShutdownReason::SourceCompleted, 1).unwrap();
+        assert_eq!(result.counters.committed.records, 1);
+        let terminal = result.terminal_wal_loss.clone().unwrap();
+        assert_eq!(
+            terminal.entries[0].persistence,
+            TerminalWalLossPersistence::MetadataOnly
+        );
+        let mut metadata = recording_metadata(RecordingStatus::Recording);
+        result.persist_metadata(&directory, &mut metadata).unwrap();
+        assert_eq!(
+            load_recording_metadata(&directory)
+                .unwrap()
+                .unwrap()
+                .terminal_wal_loss,
+            Some(terminal)
+        );
+        let physical_bytes: u64 = std::fs::read_dir(directory.join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert_eq!(physical_bytes, chronicle_wal::MIN_V2_SEGMENT_BYTES);
+        drop(ingest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ingest_terminal_sync_failure_does_not_claim_terminal_persistence() {
+        let directory = ingest_directory("limit-terminal-sync-failure");
+        let mut ingest = ingest(&directory);
+        let frame_bytes = (chronicle_wal::MIN_V2_SEGMENT_BYTES
+            - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap())
+            / 2
+            + 1;
+        let payload_bytes = usize::try_from(
+            frame_bytes - u64::try_from(chronicle_wal::ENVELOPE_HEADER_LEN).unwrap(),
+        )
+        .unwrap();
+        ingest
+            .admit(queued_at(vec![1; payload_bytes], "persisted", 1))
+            .unwrap();
+        ingest
+            .admit(queued_at(vec![2; payload_bytes], "discarded", 2))
+            .unwrap();
+        ingest.drain(1).unwrap();
+        assert!(ingest.terminal_wal_loss.is_some());
+        ingest.writer.inject_data_sync_failure_for_test();
+
+        let failure = ingest
+            .finish(ShutdownReason::SourceCompleted, 1)
+            .unwrap_err();
+        assert_eq!(failure.result.status, RecordingStatus::Failed);
+        assert_eq!(failure.result.shutdown_reason, ShutdownReason::WalFailure);
+        assert_eq!(
+            failure.result.terminal_wal_loss.unwrap().entries[0].persistence,
+            TerminalWalLossPersistence::NotPersistedDueToWalFailure
+        );
+        drop(ingest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn scaffold_commands_return_typed_not_implemented_error() {
         let error = ChronicleApplication::new(AppConfig::default())
@@ -1852,6 +2644,7 @@ mod tests {
             shutdown_reason: None,
             last_valid_commit: None,
             counters: RecordingCounters::default(),
+            terminal_wal_loss: None,
         }
     }
 

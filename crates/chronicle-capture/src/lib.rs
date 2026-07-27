@@ -146,6 +146,101 @@ pub struct LossWindowObserved {
     pub ambiguity: LossAmbiguity,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LossCounterSample {
+    pub timestamp: MonotonicTimestamp,
+    pub total: u64,
+    pub generation: Option<u64>,
+}
+
+/// Converts cumulative loss counters into bounded, explicitly ambiguous windows.
+#[derive(Clone, Debug)]
+pub struct LossWindowSampler {
+    attached_at: MonotonicTimestamp,
+    previous: Option<LossCounterSample>,
+}
+
+impl LossWindowSampler {
+    pub fn new(attached_at: MonotonicTimestamp) -> Self {
+        Self {
+            attached_at,
+            previous: None,
+        }
+    }
+
+    pub fn reset_attachment(&mut self, attached_at: MonotonicTimestamp) {
+        self.attached_at = attached_at;
+        self.previous = None;
+    }
+
+    pub fn incomplete_sample(
+        &self,
+        timestamp: MonotonicTimestamp,
+        reason: impl Into<String>,
+    ) -> LossWindowObserved {
+        LossWindowObserved {
+            start: self.previous.as_ref().map_or_else(
+                || self.attached_at.clone(),
+                |previous| previous.timestamp.clone(),
+            ),
+            end: timestamp,
+            drop_delta: None,
+            loss_generation: None,
+            ambiguity: LossAmbiguity {
+                exact_drop_timing_unknown: true,
+                affected_sockets_unknown: true,
+                reason: Some(reason.into()),
+            },
+        }
+    }
+
+    pub fn observe(&mut self, current: LossCounterSample) -> Option<LossWindowObserved> {
+        let previous = self.previous.replace(current.clone());
+        let (start, drop_delta, reason) = match previous {
+            None if current.total == 0 => return None,
+            None => (
+                self.attached_at.clone(),
+                Some(current.total),
+                "before first complete sample",
+            ),
+            Some(previous) if previous.timestamp.clock != current.timestamp.clock => {
+                (previous.timestamp, None, "counter clock identity changed")
+            }
+            Some(previous)
+                if previous.generation != current.generation || current.total < previous.total =>
+            {
+                (
+                    previous.timestamp,
+                    None,
+                    "counter generation changed or regressed",
+                )
+            }
+            Some(previous) => {
+                let delta = current.total - previous.total;
+                if delta == 0 {
+                    return None;
+                }
+                (
+                    previous.timestamp,
+                    Some(delta),
+                    "loss occurred between complete counter samples",
+                )
+            }
+        };
+        Some(LossWindowObserved {
+            start,
+            end: current.timestamp,
+            drop_delta,
+            loss_generation: current.generation,
+            ambiguity: LossAmbiguity {
+                exact_drop_timing_unknown: true,
+                affected_sockets_unknown: true,
+                reason: Some(reason.into()),
+            },
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "evidence", rename_all = "snake_case")]
 pub enum CaptureEventKind {
@@ -171,6 +266,37 @@ pub struct CaptureEventV2 {
 pub enum CaptureEvent {
     V2(CaptureEventV2),
     V1(CaptureEventV1),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum V2FixtureObservation {
+    Event(CaptureEventV2),
+    LossWindow(LossWindowObserved),
+}
+
+#[derive(Debug)]
+pub struct V2FixtureSource {
+    observations: VecDeque<V2FixtureObservation>,
+}
+
+impl V2FixtureSource {
+    pub fn new(
+        observations: impl IntoIterator<Item = V2FixtureObservation>,
+    ) -> Result<Self, CaptureError> {
+        let observations: VecDeque<_> = observations.into_iter().collect();
+        for observation in &observations {
+            if let V2FixtureObservation::Event(event) = observation
+                && event.schema_version != CAPTURE_EVENT_V2_SCHEMA_VERSION
+            {
+                return Err(CaptureError::UnsupportedSchema(event.schema_version));
+            }
+        }
+        Ok(Self { observations })
+    }
+
+    pub fn next_observation(&mut self) -> Option<V2FixtureObservation> {
+        self.observations.pop_front()
+    }
 }
 
 impl CaptureEvent {
@@ -574,6 +700,9 @@ pub fn encode_event(event: &CaptureEvent) -> Result<Vec<u8>, CaptureError> {
         CaptureEvent::V1(event) if event.schema_version == CAPTURE_EVENT_SCHEMA_VERSION => {
             Ok(serde_json::to_vec(event)?)
         }
+        CaptureEvent::V2(event) if event.schema_version == CAPTURE_EVENT_V2_SCHEMA_VERSION => {
+            Ok(serde_json::to_vec(event)?)
+        }
         _ => Err(CaptureError::UnsupportedSchema(event.schema_version())),
     }
 }
@@ -583,6 +712,9 @@ pub fn decode_event(bytes: &[u8]) -> Result<CaptureEvent, CaptureError> {
     match event {
         CaptureEvent::V1(event) if event.schema_version == CAPTURE_EVENT_SCHEMA_VERSION => {
             Ok(CaptureEvent::V1(event))
+        }
+        CaptureEvent::V2(event) if event.schema_version == CAPTURE_EVENT_V2_SCHEMA_VERSION => {
+            Ok(CaptureEvent::V2(event))
         }
         event => Err(CaptureError::UnsupportedSchema(event.schema_version())),
     }
@@ -665,12 +797,255 @@ mod tests {
         let v2_json = serde_json::to_value(&v2).unwrap();
         assert_eq!(v2_json["schema_version"], CAPTURE_EVENT_V2_SCHEMA_VERSION);
         assert_eq!(v2_json["kind"], "socket_connect_observed");
+        let round_trip = decode_event(&encode_event(&v2).unwrap()).unwrap();
+        assert_eq!(round_trip, v2);
+    }
+
+    #[test]
+    fn v2_payload_round_trips_binary_capture_evidence() {
+        let timestamp = MonotonicTimestamp {
+            clock: ClockIdentity {
+                boot_id: "boot-a".into(),
+            },
+            nanoseconds: 10,
+        };
+        let event = CaptureEvent::V2(CaptureEventV2 {
+            schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
+            kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+                timestamp: timestamp.clone(),
+                socket: SocketIdentity {
+                    socket_cookie: 7,
+                    first_seen: timestamp,
+                    network_namespace: Some(9),
+                },
+                recording_scope: RecordingScopeIdentity {
+                    cgroup_id: 11,
+                    canonical_path: "/scope".into(),
+                    namespace: Some(9),
+                },
+                network_family: NetworkFamily::Ipv6,
+                direction: PayloadDirection::Ingress,
+                sequence: FragmentSequenceEvidence {
+                    tcp_sequence: 42,
+                    continuation_position: 1,
+                },
+                payload: vec![0, 255, 1],
+                truncation: TruncationMetadata {
+                    captured_length: 3,
+                    observed_length: Some(5),
+                    state: TruncationState::Truncated,
+                    reason: Some("kernel capture bound".into()),
+                },
+            }),
+        });
+
+        assert_eq!(decode_event(&encode_event(&event).unwrap()).unwrap(), event);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn v2_fixture_source_keeps_lifecycle_payload_and_loss_observations_distinct() {
+        let timestamp = MonotonicTimestamp {
+            clock: ClockIdentity {
+                boot_id: "fixture-boot".into(),
+            },
+            nanoseconds: 100,
+        };
+        let socket = SocketIdentity {
+            socket_cookie: 7,
+            first_seen: timestamp.clone(),
+            network_namespace: Some(9),
+        };
+        let scope = RecordingScopeIdentity {
+            cgroup_id: 11,
+            canonical_path: "/scope".into(),
+            namespace: Some(9),
+        };
+        let lifecycle = CaptureEventV2 {
+            schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
+            kind: CaptureEventKind::SocketStateChangedObserved(SocketStateChangeObserved {
+                socket: SocketEvidence {
+                    timestamp: timestamp.clone(),
+                    socket: socket.clone(),
+                    recording_scope: scope.clone(),
+                    network_family: NetworkFamily::Ipv4,
+                    process: None,
+                    observed_cgroup_id: 11,
+                },
+                raw_state: 99,
+            }),
+        };
+        let payload = CaptureEventV2 {
+            schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
+            kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+                timestamp: MonotonicTimestamp {
+                    clock: timestamp.clock.clone(),
+                    nanoseconds: 101,
+                },
+                socket,
+                recording_scope: scope,
+                network_family: NetworkFamily::Ipv4,
+                direction: PayloadDirection::Egress,
+                sequence: FragmentSequenceEvidence {
+                    tcp_sequence: 42,
+                    continuation_position: 1,
+                },
+                payload: vec![0, 255],
+                truncation: TruncationMetadata {
+                    captured_length: 2,
+                    observed_length: Some(3),
+                    state: TruncationState::Truncated,
+                    reason: Some("fixture capture bound".into()),
+                },
+            }),
+        };
+        let loss = LossWindowObserved {
+            start: timestamp.clone(),
+            end: MonotonicTimestamp {
+                clock: timestamp.clock,
+                nanoseconds: 200,
+            },
+            drop_delta: Some(2),
+            loss_generation: Some(1),
+            ambiguity: LossAmbiguity {
+                exact_drop_timing_unknown: true,
+                affected_sockets_unknown: true,
+                reason: Some("fixture loss".into()),
+            },
+        };
+        let mut source = V2FixtureSource::new([
+            V2FixtureObservation::Event(lifecycle.clone()),
+            V2FixtureObservation::Event(payload.clone()),
+            V2FixtureObservation::LossWindow(loss.clone()),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            source.next_observation(),
+            Some(V2FixtureObservation::Event(lifecycle))
+        );
+        assert_eq!(
+            source.next_observation(),
+            Some(V2FixtureObservation::Event(payload))
+        );
+        assert_eq!(
+            source.next_observation(),
+            Some(V2FixtureObservation::LossWindow(loss))
+        );
+        assert_eq!(source.next_observation(), None);
         assert!(matches!(
-            encode_event(&v2),
-            Err(CaptureError::UnsupportedSchema(
-                CAPTURE_EVENT_V2_SCHEMA_VERSION
-            ))
+            V2FixtureSource::new([V2FixtureObservation::Event(CaptureEventV2 {
+                schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION + 1,
+                kind: CaptureEventKind::SocketConnected(SocketEvidence {
+                    timestamp: MonotonicTimestamp {
+                        clock: ClockIdentity {
+                            boot_id: "fixture-boot".into(),
+                        },
+                        nanoseconds: 1,
+                    },
+                    socket: SocketIdentity {
+                        socket_cookie: 1,
+                        first_seen: MonotonicTimestamp {
+                            clock: ClockIdentity {
+                                boot_id: "fixture-boot".into(),
+                            },
+                            nanoseconds: 1,
+                        },
+                        network_namespace: None,
+                    },
+                    recording_scope: RecordingScopeIdentity {
+                        cgroup_id: 1,
+                        canonical_path: "/scope".into(),
+                        namespace: None,
+                    },
+                    network_family: NetworkFamily::Ipv4,
+                    process: None,
+                    observed_cgroup_id: 1,
+                }),
+            })]),
+            Err(CaptureError::UnsupportedSchema(_))
         ));
+    }
+
+    #[test]
+    fn loss_window_sampler_uses_actual_fake_monotonic_boundaries() {
+        let clock = ClockIdentity {
+            boot_id: "fixture-boot".into(),
+        };
+        let sample = |nanoseconds, total, generation| LossCounterSample {
+            timestamp: MonotonicTimestamp {
+                clock: clock.clone(),
+                nanoseconds,
+            },
+            total,
+            generation,
+        };
+        let mut sampler = LossWindowSampler::new(sample(0, 0, Some(1)).timestamp);
+        assert_eq!(sampler.observe(sample(100, 0, Some(1))), None);
+        assert_eq!(sampler.observe(sample(200, 0, Some(1))), None);
+
+        let regular = sampler.observe(sample(300, 2, Some(1))).unwrap();
+        assert_eq!(regular.start.nanoseconds, 200);
+        assert_eq!(regular.end.nanoseconds, 300);
+        assert_eq!(regular.drop_delta, Some(2));
+
+        let delayed = sampler.observe(sample(550, 3, Some(1))).unwrap();
+        assert_eq!(delayed.start.nanoseconds, 300);
+        assert_eq!(delayed.end.nanoseconds, 550);
+        assert_eq!(delayed.drop_delta, Some(1));
+
+        let reset = sampler.observe(sample(650, 1, Some(2))).unwrap();
+        assert_eq!(reset.drop_delta, None);
+        assert_eq!(
+            reset.ambiguity.reason.as_deref(),
+            Some("counter generation changed or regressed")
+        );
+
+        let final_sample = sampler.observe(sample(750, 2, Some(2))).unwrap();
+        assert_eq!(final_sample.start.nanoseconds, 650);
+        assert_eq!(final_sample.end.nanoseconds, 750);
+        assert_eq!(final_sample.drop_delta, Some(1));
+    }
+
+    #[test]
+    fn incomplete_loss_sample_keeps_last_complete_boundary() {
+        let clock = ClockIdentity {
+            boot_id: "fixture-boot".into(),
+        };
+        let timestamp = |nanoseconds| MonotonicTimestamp {
+            clock: clock.clone(),
+            nanoseconds,
+        };
+        let mut sampler = LossWindowSampler::new(timestamp(1));
+        assert_eq!(
+            sampler.observe(LossCounterSample {
+                timestamp: timestamp(10),
+                total: 0,
+                generation: Some(1),
+            }),
+            None
+        );
+
+        let incomplete =
+            sampler.incomplete_sample(timestamp(80), "incomplete per-CPU counter read");
+        assert_eq!(incomplete.start.nanoseconds, 10);
+        assert_eq!(incomplete.end.nanoseconds, 80);
+        assert_eq!(incomplete.drop_delta, None);
+        assert_eq!(
+            incomplete.ambiguity.reason.as_deref(),
+            Some("incomplete per-CPU counter read")
+        );
+
+        let recovered = sampler
+            .observe(LossCounterSample {
+                timestamp: timestamp(90),
+                total: 1,
+                generation: Some(1),
+            })
+            .unwrap();
+        assert_eq!(recovered.start.nanoseconds, 10);
+        assert_eq!(recovered.end.nanoseconds, 90);
+        assert_eq!(recovered.drop_delta, Some(1));
     }
 
     #[test]

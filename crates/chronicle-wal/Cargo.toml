@@ -7,7 +7,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
+chronicle-capture = { path = "../chronicle-capture" }
 chronicle-common = { path = "../chronicle-common" }
 crc32c.workspace = true
 rustix.workspace = true

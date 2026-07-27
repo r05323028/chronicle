@@ -7,13 +7,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+linux-ebpf = ["dep:aya", "dep:libc"]
+
 [dependencies]
 chronicle-capture = { path = "../chronicle-capture" }
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-aya = "0.14"
-libc = "0.2"
+aya = { version = "0.14", optional = true }
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 serde.workspace = true

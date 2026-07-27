@@ -1,5 +1,6 @@
 //! Versioned append-only WAL framing and segmented writer.
 
+use chronicle_capture::{ClockIdentity, MonotonicTimestamp};
 use chronicle_common::RecordingId;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, FlockOperation, RenameFlags, flock, renameat_with};
@@ -25,6 +26,7 @@ const ENVELOPE_HEADER_LEN_U32: u32 = 48;
 pub const HEADER_LEN: usize = 28;
 pub const DEFAULT_MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub const COMMIT_MARKER_VERSION: u16 = 1;
+pub const TERMINAL_WAL_LOSS_SCHEMA_VERSION: u16 = 1;
 pub const COMMIT_MARKER_PAYLOAD_LEN: usize = 76;
 pub const COMMIT_MARKER_FRAME_LEN: usize = ENVELOPE_HEADER_LEN + COMMIT_MARKER_PAYLOAD_LEN;
 pub const GROUP_COMMIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -90,10 +92,16 @@ pub enum RecordKind {
     CaptureEvent = 1,
     LossWindow = 2,
     CommitMarker = 3,
+    TerminalWalLoss = 4,
 }
 
 impl RecordKind {
-    pub const ALL: [Self; 3] = [Self::CaptureEvent, Self::LossWindow, Self::CommitMarker];
+    pub const ALL: [Self; 4] = [
+        Self::CaptureEvent,
+        Self::LossWindow,
+        Self::CommitMarker,
+        Self::TerminalWalLoss,
+    ];
 
     fn from_v1(value: u16) -> Result<Self, WalError> {
         match value {
@@ -111,6 +119,7 @@ impl TryFrom<u16> for RecordKind {
             1 => Ok(Self::CaptureEvent),
             2 => Ok(Self::LossWindow),
             3 => Ok(Self::CommitMarker),
+            4 => Ok(Self::TerminalWalLoss),
             other => Err(WalError::UnknownRecordKind(other)),
         }
     }
@@ -140,6 +149,39 @@ pub struct WalRecordEnvelope {
     pub schema_version: u16,
     pub flags: u16,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalWalLossInterval {
+    pub start: MonotonicTimestamp,
+    pub end: MonotonicTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TerminalWalLossReason {
+    WalHardLimit = 1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TerminalWalLossAmbiguity {
+    UnknownDownstreamEffects = 1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalWalLoss {
+    pub interval: TerminalWalLossInterval,
+    pub discarded_records: u64,
+    pub discarded_payload_bytes: u64,
+    pub reason: TerminalWalLossReason,
+    pub ambiguity: TerminalWalLossAmbiguity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveredTerminalWalLoss {
+    pub sequence: u64,
+    pub loss: TerminalWalLoss,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,6 +353,12 @@ pub enum WalError {
     SegmentOrdinalExhausted,
     #[error("commit marker payload must be exactly 76 bytes; got {actual}")]
     InvalidCommitMarkerLength { actual: usize },
+    #[error("unsupported terminal WAL-loss schema version {0}")]
+    UnsupportedTerminalWalLossVersion(u16),
+    #[error("invalid terminal WAL-loss payload: {0}")]
+    InvalidTerminalWalLoss(&'static str),
+    #[error("terminal WAL-loss clock identity exceeds 65535 bytes: {actual}")]
+    TerminalWalLossClockTooLong { actual: usize },
     #[error("unsupported commit marker version {0}")]
     UnsupportedCommitMarkerVersion(u16),
     #[error("commit marker reserved field is nonzero: {0}")]
@@ -357,6 +405,12 @@ pub enum WalError {
     CommitMarkerAfterUncommitted,
     #[error("WAL segment first sequence mismatch: expected {expected}, got {actual}")]
     RecoverySegmentFirstSequenceMismatch { expected: u64, actual: u64 },
+}
+
+impl WalError {
+    pub const fn is_capacity_exhausted(&self) -> bool {
+        matches!(self, Self::WalCapacityExceeded { .. })
+    }
 }
 
 pub fn encode_segment_header(header: &SegmentHeader) -> [u8; SEGMENT_HEADER_LEN] {
@@ -498,6 +552,130 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
         bytes[offset + 6],
         bytes[offset + 7],
     ])
+}
+
+pub fn encode_terminal_wal_loss(loss: &TerminalWalLoss) -> Result<Vec<u8>, WalError> {
+    validate_terminal_wal_loss(loss)?;
+    let start_clock = loss.interval.start.clock.boot_id.as_bytes();
+    let end_clock = loss.interval.end.clock.boot_id.as_bytes();
+    let start_len =
+        u16::try_from(start_clock.len()).map_err(|_| WalError::TerminalWalLossClockTooLong {
+            actual: start_clock.len(),
+        })?;
+    let end_len =
+        u16::try_from(end_clock.len()).map_err(|_| WalError::TerminalWalLossClockTooLong {
+            actual: end_clock.len(),
+        })?;
+    let mut bytes =
+        Vec::with_capacity(2 + start_clock.len() + 8 + 2 + end_clock.len() + 8 + 8 + 8 + 2);
+    bytes.extend_from_slice(&start_len.to_le_bytes());
+    bytes.extend_from_slice(start_clock);
+    bytes.extend_from_slice(&loss.interval.start.nanoseconds.to_le_bytes());
+    bytes.extend_from_slice(&end_len.to_le_bytes());
+    bytes.extend_from_slice(end_clock);
+    bytes.extend_from_slice(&loss.interval.end.nanoseconds.to_le_bytes());
+    bytes.extend_from_slice(&loss.discarded_records.to_le_bytes());
+    bytes.extend_from_slice(&loss.discarded_payload_bytes.to_le_bytes());
+    bytes.push(loss.reason as u8);
+    bytes.push(loss.ambiguity as u8);
+    Ok(bytes)
+}
+
+pub fn decode_terminal_wal_loss(
+    schema_version: u16,
+    payload: &[u8],
+) -> Result<TerminalWalLoss, WalError> {
+    if schema_version != TERMINAL_WAL_LOSS_SCHEMA_VERSION {
+        return Err(WalError::UnsupportedTerminalWalLossVersion(schema_version));
+    }
+    let mut offset = 0;
+    let start_clock = decode_terminal_clock(payload, &mut offset)?;
+    let start = MonotonicTimestamp {
+        clock: start_clock,
+        nanoseconds: decode_terminal_u64(payload, &mut offset)?,
+    };
+    let end_clock = decode_terminal_clock(payload, &mut offset)?;
+    let end = MonotonicTimestamp {
+        clock: end_clock,
+        nanoseconds: decode_terminal_u64(payload, &mut offset)?,
+    };
+    let discarded_records = decode_terminal_u64(payload, &mut offset)?;
+    let discarded_payload_bytes = decode_terminal_u64(payload, &mut offset)?;
+    let reason = match decode_terminal_byte(payload, &mut offset)? {
+        1 => TerminalWalLossReason::WalHardLimit,
+        _ => return Err(WalError::InvalidTerminalWalLoss("unknown reason")),
+    };
+    let ambiguity = match decode_terminal_byte(payload, &mut offset)? {
+        1 => TerminalWalLossAmbiguity::UnknownDownstreamEffects,
+        _ => return Err(WalError::InvalidTerminalWalLoss("unknown ambiguity")),
+    };
+    if offset != payload.len() {
+        return Err(WalError::InvalidTerminalWalLoss("trailing bytes"));
+    }
+    let loss = TerminalWalLoss {
+        interval: TerminalWalLossInterval { start, end },
+        discarded_records,
+        discarded_payload_bytes,
+        reason,
+        ambiguity,
+    };
+    validate_terminal_wal_loss(&loss)?;
+    Ok(loss)
+}
+
+fn validate_terminal_wal_loss(loss: &TerminalWalLoss) -> Result<(), WalError> {
+    if loss.interval.start.clock != loss.interval.end.clock {
+        return Err(WalError::InvalidTerminalWalLoss("interval clocks differ"));
+    }
+    if loss.interval.start.nanoseconds > loss.interval.end.nanoseconds {
+        return Err(WalError::InvalidTerminalWalLoss("interval is reversed"));
+    }
+    if loss.discarded_records == 0 {
+        return Err(WalError::InvalidTerminalWalLoss(
+            "discarded records is zero",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_terminal_clock(payload: &[u8], offset: &mut usize) -> Result<ClockIdentity, WalError> {
+    let length = usize::from(decode_terminal_u16(payload, offset)?);
+    let bytes = decode_terminal_bytes(payload, offset, length)?;
+    let boot_id = std::str::from_utf8(bytes)
+        .map_err(|_| WalError::InvalidTerminalWalLoss("clock identity is not UTF-8"))?
+        .to_owned();
+    Ok(ClockIdentity { boot_id })
+}
+
+fn decode_terminal_u16(payload: &[u8], offset: &mut usize) -> Result<u16, WalError> {
+    let bytes = decode_terminal_bytes(payload, offset, 2)?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn decode_terminal_u64(payload: &[u8], offset: &mut usize) -> Result<u64, WalError> {
+    let bytes = decode_terminal_bytes(payload, offset, 8)?;
+    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| {
+        WalError::InvalidTerminalWalLoss("invalid integer")
+    })?))
+}
+
+fn decode_terminal_byte(payload: &[u8], offset: &mut usize) -> Result<u8, WalError> {
+    Ok(decode_terminal_bytes(payload, offset, 1)?[0])
+}
+
+fn decode_terminal_bytes<'a>(
+    payload: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], WalError> {
+    let end = offset
+        .checked_add(length)
+        .ok_or(WalError::InvalidTerminalWalLoss("length overflow"))?;
+    let bytes = payload
+        .get(*offset..end)
+        .ok_or(WalError::InvalidTerminalWalLoss("truncated payload"))?;
+    *offset = end;
+    Ok(bytes)
 }
 
 pub fn batch_sha256(batch: &[WalRecordEnvelope]) -> Result<[u8; 32], WalError> {
@@ -1193,6 +1371,7 @@ pub struct RecoveryPartialTail {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryScan {
     pub authority: CommitAuthority,
+    pub terminal_wal_losses: Vec<RecoveredTerminalWalLoss>,
     pub final_marker: Option<WalRecordEnvelope>,
     pub uncommitted: Vec<WalRecordEnvelope>,
     pub partial_tail: Option<RecoveryPartialTail>,
@@ -1247,13 +1426,31 @@ fn scan_v2_wal_unlocked(
                     if uncommitted_suffix_started {
                         return Err(WalError::CommitMarkerAfterUncommitted);
                     }
-                    scan.authority =
+                    let authority =
                         validate_commit_authority(&scan.authority, &pending, &envelope)?;
+                    for terminal in pending
+                        .iter()
+                        .filter(|record| record.kind == RecordKind::TerminalWalLoss)
+                    {
+                        scan.terminal_wal_losses.push(RecoveredTerminalWalLoss {
+                            sequence: terminal.sequence,
+                            loss: decode_terminal_wal_loss(
+                                terminal.schema_version,
+                                &terminal.payload,
+                            )?,
+                        });
+                    }
+                    scan.authority = authority;
                     scan.authoritative_marker_count += 1;
                     scan.final_marker = Some(envelope);
                     pending.clear();
                 }
-                VersionedReadOutcome::Record(envelope) => pending.push(envelope),
+                VersionedReadOutcome::Record(envelope) => {
+                    if envelope.kind == RecordKind::TerminalWalLoss {
+                        decode_terminal_wal_loss(envelope.schema_version, &envelope.payload)?;
+                    }
+                    pending.push(envelope);
+                }
                 VersionedReadOutcome::End => break,
                 VersionedReadOutcome::PartialTail { offset } => {
                     if index != final_index {
@@ -1396,9 +1593,9 @@ pub struct SegmentedEnvelopeWriter {
     last_sequence: Option<u64>,
     #[cfg(test)]
     fault: Option<SegmentPublishFault>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     data_sync_count: usize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fail_next_data_sync: bool,
 }
 
@@ -1455,9 +1652,9 @@ impl SegmentedEnvelopeWriter {
                 last_sequence: None,
                 #[cfg(test)]
                 fault: None,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 data_sync_count: 0,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 fail_next_data_sync: false,
             })
         }
@@ -1518,9 +1715,9 @@ impl SegmentedEnvelopeWriter {
             last_sequence: Some(final_marker.sequence),
             #[cfg(test)]
             fault: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             data_sync_count: 0,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fail_next_data_sync: false,
         })
     }
@@ -1541,12 +1738,12 @@ impl SegmentedEnvelopeWriter {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn inject_data_sync_failure(&mut self) {
         self.fail_next_data_sync = true;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn data_sync_count(&self) -> usize {
         self.data_sync_count
     }
@@ -1707,7 +1904,7 @@ impl SegmentedEnvelopeWriter {
 
     pub fn flush(&mut self) -> Result<(), WalError> {
         if let Some(file) = self.file.as_mut() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 self.data_sync_count += 1;
                 if self.fail_next_data_sync {
@@ -1819,6 +2016,9 @@ impl GroupCommitWalWriter {
     ) -> Result<GroupAppendResult, WalError> {
         if kind == RecordKind::CommitMarker {
             return Err(WalError::InvalidCommitMarkerEnvelope);
+        }
+        if kind == RecordKind::TerminalWalLoss {
+            decode_terminal_wal_loss(schema_version, &payload)?;
         }
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| WalError::PayloadTooLarge(payload.len()))?;
@@ -1969,14 +2169,24 @@ impl GroupCommitWalWriter {
         }))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_data_sync_failure_for_test(&mut self) {
+        self.writer.inject_data_sync_failure();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn data_sync_count_for_test(&self) -> usize {
+        self.writer.data_sync_count()
+    }
+
     #[cfg(test)]
     fn inject_data_sync_failure(&mut self) {
-        self.writer.inject_data_sync_failure();
+        self.inject_data_sync_failure_for_test();
     }
 
     #[cfg(test)]
     fn data_sync_count(&self) -> usize {
-        self.writer.data_sync_count()
+        self.data_sync_count_for_test()
     }
 }
 
@@ -4029,10 +4239,10 @@ mod tests {
         ));
 
         let mut invalid = encoded.clone();
-        invalid[frame + 6..frame + 8].copy_from_slice(&4_u16.to_le_bytes());
+        invalid[frame + 6..frame + 8].copy_from_slice(&5_u16.to_le_bytes());
         assert!(matches!(
             read_error(invalid),
-            WalError::UnknownRecordKind(4)
+            WalError::UnknownRecordKind(5)
         ));
 
         let mut invalid = encoded.clone();
@@ -4096,6 +4306,94 @@ mod tests {
         ));
     }
 
+    fn terminal_loss(boot_id: &str, start: u64, end: u64, records: u64) -> TerminalWalLoss {
+        let clock = ClockIdentity {
+            boot_id: boot_id.into(),
+        };
+        TerminalWalLoss {
+            interval: TerminalWalLossInterval {
+                start: MonotonicTimestamp {
+                    clock: clock.clone(),
+                    nanoseconds: start,
+                },
+                end: MonotonicTimestamp {
+                    clock,
+                    nanoseconds: end,
+                },
+            },
+            discarded_records: records,
+            discarded_payload_bytes: 7,
+            reason: TerminalWalLossReason::WalHardLimit,
+            ambiguity: TerminalWalLossAmbiguity::UnknownDownstreamEffects,
+        }
+    }
+
+    #[test]
+    fn terminal_wal_loss_codec_round_trips_and_rejects_invalid_contracts() {
+        let loss = terminal_loss("boot-a", 10, 20, 2);
+        let encoded = encode_terminal_wal_loss(&loss).unwrap();
+        assert_eq!(
+            decode_terminal_wal_loss(TERMINAL_WAL_LOSS_SCHEMA_VERSION, &encoded).unwrap(),
+            loss
+        );
+        assert!(matches!(
+            decode_terminal_wal_loss(TERMINAL_WAL_LOSS_SCHEMA_VERSION + 1, &encoded),
+            Err(WalError::UnsupportedTerminalWalLossVersion(_))
+        ));
+        assert!(matches!(
+            encode_terminal_wal_loss(&terminal_loss("boot-a", 20, 10, 1)),
+            Err(WalError::InvalidTerminalWalLoss("interval is reversed"))
+        ));
+        assert!(matches!(
+            encode_terminal_wal_loss(&terminal_loss("boot-a", 10, 20, 0)),
+            Err(WalError::InvalidTerminalWalLoss(
+                "discarded records is zero"
+            ))
+        ));
+        let mut malformed = encoded;
+        let records_offset = 2 + "boot-a".len() + 8 + 2 + "boot-a".len() + 8;
+        malformed[records_offset..records_offset + 8].copy_from_slice(&0_u64.to_le_bytes());
+        assert!(matches!(
+            decode_terminal_wal_loss(TERMINAL_WAL_LOSS_SCHEMA_VERSION, &malformed),
+            Err(WalError::InvalidTerminalWalLoss(
+                "discarded records is zero"
+            ))
+        ));
+    }
+
+    #[test]
+    fn recovery_exposes_only_marker_committed_terminal_wal_loss() {
+        let directory =
+            std::env::temp_dir().join(format!("chronicle-terminal-loss-{}", uuid::Uuid::new_v4()));
+        let recording_id = RecordingId::new();
+        let mut writer = GroupCommitWalWriter::create_with_total_limit(
+            &directory,
+            recording_id,
+            MIN_V2_SEGMENT_BYTES,
+            MIN_V2_SEGMENT_BYTES,
+            1,
+            0,
+        )
+        .unwrap();
+        let loss = terminal_loss("boot-a", 10, 20, 2);
+        writer
+            .append(
+                RecordKind::TerminalWalLoss,
+                TERMINAL_WAL_LOSS_SCHEMA_VERSION,
+                0,
+                encode_terminal_wal_loss(&loss).unwrap(),
+                1,
+            )
+            .unwrap();
+        writer.shutdown(1).unwrap();
+        drop(writer);
+
+        let scan = scan_v2_wal(&directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        assert_eq!(scan.terminal_wal_losses.len(), 1);
+        assert_eq!(scan.terminal_wal_losses[0].loss, loss);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn record_round_trip() {
         let encoded = encode_record(&record()).unwrap();
@@ -4130,7 +4428,11 @@ mod tests {
 
     #[test]
     fn p0_v1_dispatch_remains_capture_event_only() {
-        for kind in [RecordKind::LossWindow, RecordKind::CommitMarker] {
+        for kind in [
+            RecordKind::LossWindow,
+            RecordKind::CommitMarker,
+            RecordKind::TerminalWalLoss,
+        ] {
             assert!(matches!(
                 encode_record(&WalRecord { kind, ..record() }),
                 Err(WalError::UnknownRecordKind(actual)) if actual == kind as u16
@@ -4155,8 +4457,8 @@ mod tests {
             Err(WalError::UnknownRecordKind(0))
         ));
         assert!(matches!(
-            RecordKind::try_from(4),
-            Err(WalError::UnknownRecordKind(4))
+            RecordKind::try_from(5),
+            Err(WalError::UnknownRecordKind(5))
         ));
     }
 

@@ -1,18 +1,58 @@
 use crate::{adapter::CaptureAdapter, error::EbpfCaptureError};
 use chronicle_capture::{CaptureError, CaptureSource};
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use crate::abi::{RawKernelObservation, RawLossCounters, decode_raw_kernel_observation};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_capture::{CaptureEvent, CaptureSourceState, CaptureSourceSummary};
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+const EMBEDDED_OBJECT: &[u8] = include_bytes!("../objects/chronicle-ebpf-capture-bpfel.o");
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+const LOSS_SAMPLE_INTERVAL_NS: u64 = 100_000_000;
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+#[derive(Clone, Debug)]
+struct LossSampleSchedule {
+    next_due_ns: u64,
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+impl LossSampleSchedule {
+    const fn new(attached_at_ns: u64) -> Self {
+        Self {
+            next_due_ns: attached_at_ns.saturating_add(LOSS_SAMPLE_INTERVAL_NS),
+        }
+    }
+
+    fn due(&mut self, now_ns: u64) -> bool {
+        if now_ns < self.next_due_ns {
+            return false;
+        }
+        self.next_due_ns = now_ns.saturating_add(LOSS_SAMPLE_INTERVAL_NS);
+        true
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 pub struct EbpfCaptureSource {
     // Dropping this object detaches producer links while independently owned maps stay drainable.
     ebpf: Option<aya::Ebpf>,
     ring: Option<aya::maps::RingBuf<aya::maps::MapData>>,
     counters: Option<aya::maps::PerCpuArray<aya::maps::MapData, u64>>,
     adapter: CaptureAdapter,
+    loss_schedule: LossSampleSchedule,
+    pending: std::collections::VecDeque<CaptureEvent>,
     counter_generation: u64,
     state: CaptureSourceState,
     drain_complete: bool,
@@ -20,11 +60,29 @@ pub struct EbpfCaptureSource {
     summary: CaptureSourceSummary,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), not(feature = "linux-ebpf")))]
 pub struct EbpfCaptureSource;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 impl EbpfCaptureSource {
+    #[cfg(target_endian = "little")]
+    pub fn load_embedded(
+        cgroup: &std::fs::File,
+        adapter: CaptureAdapter,
+    ) -> Result<Self, EbpfCaptureError> {
+        Self::load(EMBEDDED_OBJECT, cgroup, adapter)
+    }
+
+    #[cfg(target_endian = "big")]
+    pub fn load_embedded(
+        _cgroup: &std::fs::File,
+        _adapter: CaptureAdapter,
+    ) -> Result<Self, EbpfCaptureError> {
+        Err(EbpfCaptureError::UnsupportedCapability(
+            "big-endian embedded eBPF object",
+        ))
+    }
+
     pub fn load(
         object: &[u8],
         cgroup: &std::fs::File,
@@ -41,7 +99,8 @@ impl EbpfCaptureSource {
             drop(ebpf);
             return Err(error);
         }
-        adapter.attached_at_ns = monotonic_nanoseconds()?;
+        let attached_at_ns = monotonic_nanoseconds()?;
+        adapter.reset_attachment_time(attached_at_ns);
         let ring = aya::maps::RingBuf::try_from(ebpf.take_map("EVENTS").ok_or(
             EbpfCaptureError::Attach {
                 hook: "EVENTS",
@@ -62,6 +121,8 @@ impl EbpfCaptureSource {
             ring: Some(ring),
             counters: Some(counters),
             adapter,
+            loss_schedule: LossSampleSchedule::new(attached_at_ns),
+            pending: std::collections::VecDeque::new(),
             counter_generation: 0,
             state: CaptureSourceState::Running,
             drain_complete: false,
@@ -71,18 +132,21 @@ impl EbpfCaptureSource {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), not(feature = "linux-ebpf")))]
 impl EbpfCaptureSource {
     pub fn load(
         _object: &[u8],
         _cgroup: &std::fs::File,
         _adapter: CaptureAdapter,
     ) -> Result<Self, EbpfCaptureError> {
+        if cfg!(target_os = "linux") {
+            return Err(EbpfCaptureError::FeatureDisabled);
+        }
         Err(EbpfCaptureError::UnsupportedPlatform)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 fn attach_all(ebpf: &mut aya::Ebpf, cgroup: &std::fs::File) -> Result<(), EbpfCaptureError> {
     use aya::programs::{
         CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, SockOps,
@@ -161,20 +225,36 @@ fn attach_all(ebpf: &mut aya::Ebpf, cgroup: &std::fs::File) -> Result<(), EbpfCa
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 impl EbpfCaptureSource {
     fn source_error(error: &EbpfCaptureError) -> CaptureError {
         CaptureError::Source(error.to_string())
     }
 
-    fn sample_loss(&mut self) -> Result<Option<CaptureEvent>, EbpfCaptureError> {
-        let values = self
+    fn sample_loss_at(
+        &mut self,
+        timestamp_ns: u64,
+        final_sample: bool,
+    ) -> Result<Option<CaptureEvent>, EbpfCaptureError> {
+        let values = match self
             .counters
             .as_mut()
             .ok_or(EbpfCaptureError::RingLoss("counter map released"))?
             .get(&1, 0)
-            .map_err(|_| EbpfCaptureError::RingLoss("incomplete per-CPU counter read"))?;
-        let timestamp_ns = monotonic_nanoseconds()?;
+        {
+            Ok(values) => values,
+            Err(_) if !final_sample => {
+                return Ok(Some(self.adapter.incomplete_loss_sample(
+                    timestamp_ns,
+                    "incomplete per-CPU counter read",
+                )));
+            }
+            Err(_) => {
+                return Err(EbpfCaptureError::RingLoss(
+                    "incomplete per-CPU counter read",
+                ));
+            }
+        };
         self.adapter
             .convert(RawKernelObservation::LossCounters(RawLossCounters {
                 timestamp_ns,
@@ -204,7 +284,7 @@ impl EbpfCaptureSource {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 impl CaptureSource for EbpfCaptureSource {
     fn start(&mut self) -> Result<(), CaptureError> {
         match self.state {
@@ -223,16 +303,27 @@ impl CaptureSource for EbpfCaptureSource {
                 state: self.state,
             });
         }
-        let event = match self
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(self.emitted(Some(event)));
+        }
+
+        let timestamp_ns = monotonic_nanoseconds().map_err(|error| Self::source_error(&error))?;
+        let ring_event = self
             .ring_event()
-            .map_err(|error| Self::source_error(&error))?
-        {
-            Some(event) => Some(event),
-            None => self
-                .sample_loss()
-                .map_err(|error| Self::source_error(&error))?,
+            .map_err(|error| Self::source_error(&error))?;
+        let sampled_loss = if self.loss_schedule.due(timestamp_ns) {
+            self.sample_loss_at(timestamp_ns, false)
+                .map_err(|error| Self::source_error(&error))?
+        } else {
+            None
         };
-        Ok(self.emitted(event))
+        if let Some(ring_event) = ring_event {
+            if let Some(sampled_loss) = sampled_loss {
+                self.pending.push_back(sampled_loss);
+            }
+            return Ok(self.emitted(Some(ring_event)));
+        }
+        Ok(self.emitted(sampled_loss))
     }
 
     fn request_shutdown(&mut self) -> Result<(), CaptureError> {
@@ -252,7 +343,9 @@ impl CaptureSource for EbpfCaptureSource {
         // Drop links first: retained map handles keep accepted ring items and counters readable.
         drop(self.ebpf.take());
         self.state.request_shutdown()?;
-        self.final_loss = match self.sample_loss() {
+        let timestamp_ns = monotonic_nanoseconds()
+            .map_err(|error| CaptureError::FinalLossSample(error.to_string()))?;
+        self.final_loss = match self.sample_loss_at(timestamp_ns, true) {
             Ok(event) => event,
             Err(error) => {
                 self.summary.final_loss_sample_failed = true;
@@ -264,6 +357,10 @@ impl CaptureSource for EbpfCaptureSource {
 
     fn drain(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
         self.state.begin_drain()?;
+
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(self.emitted(Some(event)));
+        }
 
         let ring_event = match self.ring_event() {
             Ok(event) => event,
@@ -312,7 +409,7 @@ impl CaptureSource for EbpfCaptureSource {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 #[allow(unsafe_code)] // libc exposes Linux CLOCK_MONOTONIC only as an unsafe FFI call.
 fn monotonic_nanoseconds() -> Result<u64, EbpfCaptureError> {
     let mut value = libc::timespec {
@@ -329,11 +426,29 @@ fn monotonic_nanoseconds() -> Result<u64, EbpfCaptureError> {
         .ok_or(EbpfCaptureError::RingLoss("monotonic clock out of range"))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), not(feature = "linux-ebpf")))]
 impl CaptureSource for EbpfCaptureSource {
     fn next_event(&mut self) -> Result<Option<chronicle_capture::CaptureEvent>, CaptureError> {
         Err(CaptureError::Source(
             EbpfCaptureError::UnsupportedPlatform.to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LOSS_SAMPLE_INTERVAL_NS, LossSampleSchedule};
+
+    #[test]
+    fn fake_clock_schedules_every_100ms_and_uses_delayed_actual_time() {
+        let mut schedule = LossSampleSchedule::new(10);
+        assert!(!schedule.due(10 + LOSS_SAMPLE_INTERVAL_NS - 1));
+        assert!(schedule.due(10 + LOSS_SAMPLE_INTERVAL_NS));
+        assert!(!schedule.due(10 + LOSS_SAMPLE_INTERVAL_NS * 2 - 1));
+
+        // Delayed poll advances from observed time, never inventing a 100ms boundary.
+        assert!(schedule.due(350_000_000));
+        assert!(!schedule.due(449_999_999));
+        assert!(schedule.due(450_000_000));
     }
 }

@@ -1,7 +1,14 @@
 //! Compile-time protocol capability interfaces and registry.
 
+/// Protocol decoders consume this transport-neutral reconstruction boundary.
+pub use chronicle_session::{
+    DerivedTermination, DirectionCompletion, LossWindowClassification, ProtocolNeutralConnection,
+    ReconstructionFinalization,
+};
+
 use chronicle_canonical::{CanonicalOperation, PayloadRef, ProtocolData};
 use chronicle_common::{Direction, Endpoint, ProtocolId, Timestamp};
+use chronicle_session::{ReconstructionDirection, ReconstructionEvidence};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -85,6 +92,54 @@ pub struct DecodedFrame {
     pub sequence: u64,
     pub payload: Vec<u8>,
     pub attributes: BTreeMap<String, String>,
+}
+
+/// Convert reconstruction fragments to decoder frames without merging bytes or losing provenance.
+pub fn reconstructed_frames(connection: &ProtocolNeutralConnection) -> Vec<DecodedFrame> {
+    let mut frames = Vec::new();
+    for (direction, fragments) in [
+        (Direction::ClientToServer, &connection.ingress.fragments),
+        (Direction::ServerToClient, &connection.egress.fragments),
+    ] {
+        for event in fragments {
+            let ReconstructionEvidence::Payload(payload) = &event.evidence else {
+                continue;
+            };
+            let mut attributes = BTreeMap::new();
+            if let Some(sequence) = event.wal_sequence {
+                attributes.insert("chronicle.wal_sequence".into(), sequence.to_string());
+            }
+            if let Some(position) = &payload.tcp_position {
+                attributes.insert(
+                    "chronicle.tcp_sequence".into(),
+                    position.tcp_sequence.to_string(),
+                );
+                attributes.insert(
+                    "chronicle.tcp_continuation".into(),
+                    position.continuation_position.to_string(),
+                );
+            }
+            attributes.insert(
+                "chronicle.reconstruction_direction".into(),
+                match payload.direction {
+                    ReconstructionDirection::ClientToServer => "client_to_server",
+                    ReconstructionDirection::ServerToClient => "server_to_client",
+                    ReconstructionDirection::Ingress => "ingress",
+                    ReconstructionDirection::Egress => "egress",
+                }
+                .into(),
+            );
+            frames.push(DecodedFrame {
+                direction,
+                sequence: event
+                    .wal_sequence
+                    .unwrap_or_else(|| u64::try_from(frames.len()).unwrap_or(u64::MAX)),
+                payload: payload.bytes.clone(),
+                attributes,
+            });
+        }
+    }
+    frames
 }
 
 #[derive(Debug, Error)]

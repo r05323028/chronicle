@@ -1086,6 +1086,65 @@ pub mod http {
                 pending_methods: VecDeque::new(),
             }
         }
+
+        /// Feed protocol-neutral reconstruction fragments into existing bounded HTTP parsing.
+        pub fn push_reconstructed(
+            &mut self,
+            connection: &chronicle_protocol::ProtocolNeutralConnection,
+        ) -> Result<Vec<chronicle_protocol::DecodedFrame>, chronicle_protocol::ProtocolError>
+        {
+            let mut decoded = Vec::new();
+            for frame in chronicle_protocol::reconstructed_frames(connection) {
+                decoded.extend(chronicle_protocol::ProtocolDecoder::push(self, frame)?);
+            }
+            Ok(decoded)
+        }
+
+        /// Finalize reconstructed input; close-delimited response bodies require trusted evidence.
+        pub fn finish_reconstructed(
+            &mut self,
+            connection: &chronicle_protocol::ProtocolNeutralConnection,
+        ) -> Result<Vec<chronicle_protocol::DecodedFrame>, chronicle_protocol::ProtocolError>
+        {
+            let trusted = trusted_close(
+                connection.termination,
+                connection.finalization,
+                connection
+                    .loss_windows
+                    .iter()
+                    .map(|loss| loss.classification),
+            );
+            if !trusted || self.server.bytes.is_empty() {
+                return chronicle_protocol::ProtocolDecoder::finish(self);
+            }
+            let sequence = self.server.start_sequence.unwrap_or_default();
+            let head = self
+                .pending_methods
+                .front()
+                .is_some_and(|method| method == "HEAD");
+            let Some((_, mut message)) =
+                parse_close_delimited_response(&self.server.bytes, sequence, head)?
+            else {
+                return chronicle_protocol::ProtocolDecoder::finish(self);
+            };
+            message.pipeline_depth = self.pending_methods.len();
+            message.orphan_response = self.pending_methods.pop_front().is_none();
+            self.server.bytes.clear();
+            self.server.start_sequence = None;
+            encode_messages(Direction::ServerToClient, vec![message])
+        }
+    }
+
+    fn trusted_close(
+        termination: chronicle_protocol::DerivedTermination,
+        finalization: Option<chronicle_protocol::ReconstructionFinalization>,
+        losses: impl IntoIterator<Item = chronicle_protocol::LossWindowClassification>,
+    ) -> bool {
+        termination == chronicle_protocol::DerivedTermination::CleanClose
+            && finalization.is_none()
+            && losses
+                .into_iter()
+                .all(|loss| loss == chronicle_protocol::LossWindowClassification::Outside)
     }
 
     impl Default for Decoder {
@@ -1291,6 +1350,9 @@ pub mod http {
         let headers = normalize_headers(request.headers)?;
         reject_unsupported_headers(&headers)?;
         let body_length = content_length(&headers)?;
+        if body_length > MAX_RESPONSE_BYTES {
+            return Err(malformed("request exceeds byte limit"));
+        }
         let total = head_bytes.saturating_add(body_length);
         if bytes.len() < total {
             return Ok(None);
@@ -1337,18 +1399,41 @@ pub mod http {
             return Err(malformed("unsupported informational response"));
         }
         let headers = normalize_headers(response.headers)?;
-        reject_unsupported_headers(&headers)?;
-        let body_length = if head_response || matches!(status, 204 | 304) {
-            0
+        let chunked = headers
+            .iter()
+            .filter(|header| header.name == "transfer-encoding")
+            .collect::<Vec<_>>();
+        let (total, body) = if head_response || matches!(status, 204 | 304) {
+            reject_unsupported_headers(&headers)?;
+            (head_bytes, Vec::new())
+        } else if !chunked.is_empty() {
+            if chunked.len() != 1
+                || !chunked[0]
+                    .value
+                    .trim_ascii()
+                    .eq_ignore_ascii_case(b"chunked")
+            {
+                return Err(malformed("unsupported transfer encoding"));
+            }
+            reject_upgrade_headers(&headers)?;
+            let Some((consumed, body)) = parse_chunked_body(&bytes[head_bytes..])? else {
+                return Ok(None);
+            };
+            (head_bytes.saturating_add(consumed), body)
         } else if headers.iter().any(|header| header.name == "content-length") {
-            content_length(&headers)?
+            reject_unsupported_headers(&headers)?;
+            let body_length = content_length(&headers)?;
+            if body_length > MAX_RESPONSE_BYTES {
+                return Err(malformed("response exceeds byte limit"));
+            }
+            let total = head_bytes.saturating_add(body_length);
+            if bytes.len() < total {
+                return Ok(None);
+            }
+            (total, bytes[head_bytes..total].to_vec())
         } else {
             return Err(malformed("unsupported close-delimited response body"));
         };
-        let total = head_bytes.saturating_add(body_length);
-        if bytes.len() < total {
-            return Ok(None);
-        }
         Ok(Some((
             total,
             MessageV1 {
@@ -1359,7 +1444,56 @@ pub mod http {
                 status: Some(status),
                 reason: response.reason.map(|reason| reason.as_bytes().to_vec()),
                 headers,
-                body: bytes[head_bytes..total].to_vec(),
+                body,
+                pipeline_depth: 0,
+                orphan_response: false,
+                warnings: Vec::new(),
+            },
+        )))
+    }
+
+    fn parse_close_delimited_response(
+        bytes: &[u8],
+        sequence: u64,
+        head_response: bool,
+    ) -> Result<Option<(usize, MessageV1)>, chronicle_protocol::ProtocolError> {
+        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
+        let mut response = httparse::Response::new(&mut headers);
+        let head_bytes = match response
+            .parse(bytes)
+            .map_err(|error| malformed(&error.to_string()))?
+        {
+            httparse::Status::Partial => return partial_or_limit(bytes),
+            httparse::Status::Complete(length) => length,
+        };
+        if response.version != Some(1) {
+            return Err(malformed("unsupported HTTP response version"));
+        }
+        let status = response
+            .code
+            .ok_or_else(|| malformed("missing HTTP status"))?;
+        if (100..200).contains(&status) {
+            return Err(malformed("unsupported informational response"));
+        }
+        let headers = normalize_headers(response.headers)?;
+        reject_unsupported_headers(&headers)?;
+        if head_response
+            || matches!(status, 204 | 304)
+            || headers.iter().any(|header| header.name == "content-length")
+        {
+            return parse_response(bytes, sequence, head_response);
+        }
+        Ok(Some((
+            bytes.len(),
+            MessageV1 {
+                kind: MessageKindV1::Response,
+                sequence,
+                method: None,
+                target: None,
+                status: Some(status),
+                reason: response.reason.map(|reason| reason.as_bytes().to_vec()),
+                headers,
+                body: bytes[head_bytes..].to_vec(),
                 pipeline_depth: 0,
                 orphan_response: false,
                 warnings: Vec::new(),
@@ -1403,6 +1537,12 @@ pub mod http {
         {
             return Err(malformed("unsupported transfer encoding"));
         }
+        reject_upgrade_headers(headers)
+    }
+
+    fn reject_upgrade_headers(
+        headers: &[HeaderV1],
+    ) -> Result<(), chronicle_protocol::ProtocolError> {
         if headers.iter().any(|header| {
             header.name == "upgrade"
                 || (header.name == "connection"
@@ -1414,6 +1554,55 @@ pub mod http {
             return Err(malformed("unsupported upgrade"));
         }
         Ok(())
+    }
+
+    fn parse_chunked_body(
+        bytes: &[u8],
+    ) -> Result<Option<(usize, Vec<u8>)>, chronicle_protocol::ProtocolError> {
+        let mut cursor = 0;
+        let mut body = Vec::new();
+        loop {
+            let Some(line_end) = bytes[cursor..].windows(2).position(|pair| pair == b"\r\n") else {
+                return Ok(None);
+            };
+            let line_end = cursor + line_end;
+            let size = std::str::from_utf8(
+                bytes[cursor..line_end]
+                    .split(|byte| *byte == b';')
+                    .next()
+                    .unwrap(),
+            )
+            .map_err(|_| malformed("invalid chunk size"))?;
+            let size =
+                usize::from_str_radix(size, 16).map_err(|_| malformed("invalid chunk size"))?;
+            cursor = line_end + 2;
+            if size == 0 {
+                if bytes[cursor..].starts_with(b"\r\n") {
+                    return Ok(Some((cursor + 2, body)));
+                }
+                let Some(trailer_end) = bytes[cursor..]
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some((cursor + trailer_end + 4, body)));
+            }
+            let end = cursor
+                .checked_add(size)
+                .ok_or_else(|| malformed("chunk exceeds byte limit"))?;
+            if end.checked_add(2).is_none_or(|end| end > bytes.len()) {
+                return Ok(None);
+            }
+            if &bytes[end..end + 2] != b"\r\n" {
+                return Err(malformed("invalid chunk terminator"));
+            }
+            if body.len().saturating_add(size) > MAX_RESPONSE_BYTES {
+                return Err(malformed("response exceeds byte limit"));
+            }
+            body.extend_from_slice(&bytes[cursor..end]);
+            cursor = end + 2;
+        }
     }
 
     fn content_length(headers: &[HeaderV1]) -> Result<usize, chronicle_protocol::ProtocolError> {
@@ -2051,6 +2240,129 @@ pub mod http {
         }
 
         #[test]
+        fn close_delimited_response_requires_trusted_clean_source() {
+            use chronicle_protocol::{
+                DerivedTermination, LossWindowClassification, ReconstructionFinalization,
+            };
+
+            assert!(trusted_close(
+                DerivedTermination::CleanClose,
+                None,
+                [LossWindowClassification::Outside]
+            ));
+            assert!(!trusted_close(
+                DerivedTermination::UnknownTermination,
+                None,
+                [LossWindowClassification::Outside]
+            ));
+            assert!(!trusted_close(
+                DerivedTermination::Reset,
+                None,
+                [LossWindowClassification::Outside]
+            ));
+            assert!(!trusted_close(
+                DerivedTermination::CleanClose,
+                Some(ReconstructionFinalization::Idle),
+                [LossWindowClassification::Outside]
+            ));
+            assert!(!trusted_close(
+                DerivedTermination::CleanClose,
+                None,
+                [LossWindowClassification::Overlaps]
+            ));
+        }
+
+        #[test]
+        fn close_delimited_response_requires_final_input_and_consumes_remaining_bytes() {
+            assert!(parse_response(b"HTTP/1.1 200 OK\r\n\r\nbody", 1, false).is_err());
+            let parsed = parse_close_delimited_response(b"HTTP/1.1 200 OK\r\n\r\nbody", 1, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(parsed.0, b"HTTP/1.1 200 OK\r\n\r\nbody".len());
+            assert_eq!(parsed.1.body, b"body");
+        }
+
+        #[test]
+        fn chunked_response_decodes_binary_body_across_fragments_and_consumes_trailer() {
+            use chronicle_protocol::{DecodedFrame, ProtocolDecoder};
+
+            let mut decoder = Decoder::new();
+            decoder
+                .push(DecodedFrame {
+                    direction: Direction::ClientToServer,
+                    sequence: 1,
+                    payload: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+                    attributes: Default::default(),
+                })
+                .unwrap();
+            assert!(
+                decoder
+                    .push(DecodedFrame {
+                        direction: Direction::ServerToClient,
+                        sequence: 2,
+                        payload: b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n\x00"
+                            .to_vec(),
+                        attributes: Default::default(),
+                    })
+                    .unwrap()
+                    .is_empty()
+            );
+            let response = decoder
+                .push(DecodedFrame {
+                    direction: Direction::ServerToClient,
+                    sequence: 3,
+                    payload: b"\xff\r\n0\r\nX-Trailer: ok\r\n\r\n".to_vec(),
+                    attributes: Default::default(),
+                })
+                .unwrap();
+            let response: MessageV1 = serde_json::from_slice(&response[0].payload).unwrap();
+            assert_eq!(response.body, [0, 255]);
+            assert_eq!(parse_chunked_body(b"1\r\na\r\n0\r\n").unwrap(), None);
+            assert!(parse_chunked_body(b"1\r\naX\r\n0\r\n\r\n").is_err());
+        }
+
+        #[test]
+        fn decoder_consumes_zero_and_no_body_responses_without_waiting_for_body() {
+            use chronicle_protocol::{DecodedFrame, ProtocolDecoder};
+
+            let mut decoder = Decoder::new();
+            let request = decoder
+                .push(DecodedFrame {
+                    direction: Direction::ClientToServer,
+                    sequence: 1,
+                    payload: b"POST /zero HTTP/1.1\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    attributes: Default::default(),
+                })
+                .unwrap();
+            let request: MessageV1 = serde_json::from_slice(&request[0].payload).unwrap();
+            assert_eq!(request.body, b"");
+
+            for (method, status) in [("HEAD", 200), ("GET", 204), ("GET", 304)] {
+                let mut decoder = Decoder::new();
+                decoder
+                    .push(DecodedFrame {
+                        direction: Direction::ClientToServer,
+                        sequence: 1,
+                        payload: format!("{method} / HTTP/1.1\r\n\r\n").into_bytes(),
+                        attributes: Default::default(),
+                    })
+                    .unwrap();
+                let response = decoder
+                    .push(DecodedFrame {
+                        direction: Direction::ServerToClient,
+                        sequence: 2,
+                        payload: format!("HTTP/1.1 {status} OK\r\nContent-Length: 3\r\n\r\n")
+                            .into_bytes(),
+                        attributes: Default::default(),
+                    })
+                    .unwrap();
+                let response: MessageV1 = serde_json::from_slice(&response[0].payload).unwrap();
+                assert_eq!(response.status, Some(status));
+                assert_eq!(response.body, b"");
+            }
+        }
+
+        #[test]
         fn content_length_accepts_only_one_unsigned_decimal_field() {
             let header = |value: &[u8]| HeaderV1 {
                 name: "content-length".into(),
@@ -2163,6 +2475,17 @@ pub mod http {
             let message: MessageV1 = serde_json::from_slice(&frames[0].payload).unwrap();
             assert_eq!(message.body, over_limit);
             assert_eq!(message.warnings, [WarningCode::Malformed.as_str()]);
+
+            let oversized = format!(
+                "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_RESPONSE_BYTES + 1
+            );
+            assert!(parse_request(oversized.as_bytes(), 1).is_err());
+            let oversized = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_RESPONSE_BYTES + 1
+            );
+            assert!(parse_response(oversized.as_bytes(), 1, false).is_err());
         }
 
         #[test]

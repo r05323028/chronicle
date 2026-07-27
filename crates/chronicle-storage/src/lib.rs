@@ -709,6 +709,7 @@ mod tests {
             }],
             timeline: Vec::new(),
             replay: ReplayMetadata::default(),
+            v3: Default::default(),
         }
     }
 

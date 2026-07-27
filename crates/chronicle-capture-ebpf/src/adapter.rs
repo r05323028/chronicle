@@ -8,13 +8,12 @@ use crate::{
 };
 use chronicle_capture::{
     CaptureEvent, CaptureEventKind, CaptureEventV2, ClockIdentity, FragmentSequenceEvidence,
-    LossAmbiguity, LossWindowObserved, MonotonicTimestamp, NetworkFamily, PayloadDirection,
+    LossCounterSample, LossWindowSampler, MonotonicTimestamp, NetworkFamily, PayloadDirection,
     PayloadFragment, ProcessMetadata, RecordingScopeIdentity, SocketEvidence, SocketIdentity,
     SocketStateChangeObserved, TruncationMetadata, TruncationState,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-const LOSS_BETWEEN_SAMPLES_REASON: &str = "loss occurred between complete counter samples";
 const PAYLOAD_LENGTH_MISMATCH_REASON: &str =
     "observed and captured payload lengths differ without kernel truncation flag";
 
@@ -30,20 +29,12 @@ impl RecordingScopeConfig {
     }
 }
 
-#[derive(Clone, Debug)]
-struct LossSample {
-    timestamp_ns: u64,
-    total: u64,
-    generation: Option<u64>,
-}
-
 /// Sole conversion path from private kernel evidence to public capture-domain evidence.
 pub struct CaptureAdapter {
     clock: ClockIdentity,
     scope: RecordingScopeConfig,
-    pub(crate) attached_at_ns: u64,
+    loss_sampler: LossWindowSampler,
     sockets: BTreeMap<SocketIdentity, SocketEvidence>,
-    previous_loss_sample: Option<LossSample>,
 }
 
 impl CaptureAdapter {
@@ -66,12 +57,33 @@ impl CaptureAdapter {
             ));
         }
         Ok(Self {
+            loss_sampler: LossWindowSampler::new(MonotonicTimestamp {
+                clock: clock.clone(),
+                nanoseconds: attached_at_ns,
+            }),
             clock,
             scope,
-            attached_at_ns,
             sockets: BTreeMap::new(),
-            previous_loss_sample: None,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reset_attachment_time(&mut self, attached_at_ns: u64) {
+        self.loss_sampler.reset_attachment(MonotonicTimestamp {
+            clock: self.clock.clone(),
+            nanoseconds: attached_at_ns,
+        });
+    }
+
+    pub(crate) fn incomplete_loss_sample(
+        &self,
+        timestamp_ns: u64,
+        reason: &'static str,
+    ) -> CaptureEvent {
+        event(CaptureEventKind::LossWindowObserved(
+            self.loss_sampler
+                .incomplete_sample(self.timestamp(timestamp_ns), reason),
+        ))
     }
 
     pub(crate) fn convert(
@@ -184,61 +196,14 @@ impl CaptureAdapter {
             .iter()
             .try_fold(0_u64, |total, value| total.checked_add(*value))
             .ok_or(EbpfCaptureError::RingLoss("per-CPU counter total overflow"))?;
-        let current = LossSample {
-            timestamp_ns: observation.timestamp_ns,
-            total,
-            generation: observation.generation,
-        };
-        let previous = self.previous_loss_sample.replace(current.clone());
-        let (start_ns, drop_delta, ambiguity) = match previous {
-            None if total == 0 => return Ok(None),
-            None => (
-                self.attached_at_ns,
-                Some(total),
-                LossAmbiguity {
-                    exact_drop_timing_unknown: true,
-                    affected_sockets_unknown: true,
-                    reason: Some("before first complete sample".into()),
-                },
-            ),
-            Some(previous)
-                if previous.generation != current.generation || current.total < previous.total =>
-            {
-                (
-                    previous.timestamp_ns,
-                    None,
-                    LossAmbiguity {
-                        exact_drop_timing_unknown: true,
-                        affected_sockets_unknown: true,
-                        reason: Some("counter generation changed or regressed".into()),
-                    },
-                )
-            }
-            Some(previous) => {
-                let delta = current.total - previous.total;
-                if delta == 0 {
-                    return Ok(None);
-                }
-                (
-                    previous.timestamp_ns,
-                    Some(delta),
-                    LossAmbiguity {
-                        exact_drop_timing_unknown: true,
-                        affected_sockets_unknown: true,
-                        reason: Some(LOSS_BETWEEN_SAMPLES_REASON.into()),
-                    },
-                )
-            }
-        };
-        Ok(Some(event(CaptureEventKind::LossWindowObserved(
-            LossWindowObserved {
-                start: self.timestamp(start_ns),
-                end: self.timestamp(current.timestamp_ns),
-                drop_delta,
-                loss_generation: current.generation,
-                ambiguity,
-            },
-        ))))
+        Ok(self
+            .loss_sampler
+            .observe(LossCounterSample {
+                timestamp: self.timestamp(observation.timestamp_ns),
+                total,
+                generation: observation.generation,
+            })
+            .map(|window| event(CaptureEventKind::LossWindowObserved(window))))
     }
 
     fn socket_evidence(
@@ -426,7 +391,7 @@ mod tests {
         })
     }
 
-    fn loss_window(event: CaptureEvent) -> LossWindowObserved {
+    fn loss_window(event: CaptureEvent) -> chronicle_capture::LossWindowObserved {
         let CaptureEvent::V2(CaptureEventV2 {
             kind: CaptureEventKind::LossWindowObserved(window),
             ..
@@ -630,7 +595,7 @@ mod tests {
         assert!(positive.ambiguity.affected_sockets_unknown);
         assert_eq!(
             positive.ambiguity.reason.as_deref(),
-            Some(LOSS_BETWEEN_SAMPLES_REASON)
+            Some("loss occurred between complete counter samples")
         );
     }
 
@@ -711,6 +676,36 @@ mod tests {
         assert_eq!(final_sample.drop_delta, Some(2));
         assert!(final_sample.ambiguity.exact_drop_timing_unknown);
         assert!(final_sample.ambiguity.affected_sockets_unknown);
+    }
+
+    #[test]
+    fn incomplete_per_cpu_sample_is_ambiguous_without_advancing_boundary() {
+        let mut adapter = adapter();
+        assert!(
+            adapter
+                .convert(loss_observation(10, vec![0]))
+                .unwrap()
+                .is_none()
+        );
+        let incomplete =
+            loss_window(adapter.incomplete_loss_sample(80, "incomplete per-CPU counter read"));
+        assert_eq!(incomplete.start.nanoseconds, 10);
+        assert_eq!(incomplete.end.nanoseconds, 80);
+        assert_eq!(incomplete.drop_delta, None);
+        assert_eq!(
+            incomplete.ambiguity.reason.as_deref(),
+            Some("incomplete per-CPU counter read")
+        );
+
+        let recovered = loss_window(
+            adapter
+                .convert(loss_observation(90, vec![1]))
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(recovered.start.nanoseconds, 10);
+        assert_eq!(recovered.end.nanoseconds, 90);
+        assert_eq!(recovered.drop_delta, Some(1));
     }
 
     #[test]

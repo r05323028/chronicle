@@ -1,9 +1,12 @@
 //! Restartable WAL-to-canonical transformation boundary.
 
+/// ETL input boundary before protocol-specific decoding.
+pub use chronicle_protocol::ProtocolNeutralConnection;
+
 use chronicle_canonical::{
     Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalOperation,
-    CanonicalSession, OperationEffect, OperationKind, PayloadRef, ProtocolData, RelativeTimeNanos,
-    ReplayMetadata, SourceMetadata, TimelineEntry,
+    CanonicalSession, Completeness, OperationEffect, OperationKind, PayloadRef, ProtocolData,
+    RelativeTimeNanos, ReplayMetadata, SourceMetadata, TimelineEntry,
 };
 use chronicle_capture::decode_event;
 use chronicle_common::{ConnectionId, OperationId, ProtocolId, SessionId};
@@ -156,6 +159,28 @@ impl EtlPipeline {
             });
         }
         timeline.sort_by_key(|entry| entry.sequence);
+        let mut v3 = chronicle_canonical::CanonicalV3Metadata::default();
+        for connection in &connections {
+            v3.connection_completeness.insert(
+                connection.id,
+                if connection.incomplete || connection.truncated {
+                    Completeness::Partial
+                } else {
+                    Completeness::Complete
+                },
+            );
+            for operation in &connection.operations {
+                v3.operation_completeness.insert(
+                    operation.id,
+                    if operation.incomplete || operation.truncated {
+                        Completeness::Partial
+                    } else {
+                        Completeness::Complete
+                    },
+                );
+            }
+        }
+        v3.operation_order = timeline.iter().map(|entry| entry.operation_id).collect();
         Ok(EtlOutput {
             session: CanonicalSession {
                 schema_version: CANONICAL_SCHEMA_VERSION,
@@ -166,6 +191,7 @@ impl EtlPipeline {
                 connections,
                 timeline,
                 replay: ReplayMetadata::default(),
+                v3,
             },
             issues,
         })
