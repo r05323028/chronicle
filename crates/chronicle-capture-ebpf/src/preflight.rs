@@ -106,7 +106,7 @@ const EMBEDDED_OBJECT: &[u8] = include_bytes!("../objects/chronicle-ebpf-capture
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
 fn embedded_object_checks() -> (PreflightCheck, PreflightCheck) {
-    let Ok(mut ebpf) = aya::Ebpf::load(EMBEDDED_OBJECT) else {
+    let Ok(object) = aya_obj::Object::parse(EMBEDDED_OBJECT) else {
         return (
             PreflightCheck::Unavailable("embedded eBPF object unreadable"),
             PreflightCheck::Unavailable("embedded eBPF object unreadable"),
@@ -114,7 +114,7 @@ fn embedded_object_checks() -> (PreflightCheck, PreflightCheck) {
     };
     let programs_present = REQUIRED_PROGRAMS
         .iter()
-        .all(|program| ebpf.program_mut(program).is_some());
+        .all(|program| object.programs.contains_key(*program));
     (
         PreflightCheck::Available,
         if programs_present {

@@ -1371,6 +1371,8 @@ pub struct RecoveryPartialTail {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryScan {
     pub authority: CommitAuthority,
+    /// Complete envelopes through final authoritative commit marker, marker included.
+    pub committed: Vec<WalRecordEnvelope>,
     pub terminal_wal_losses: Vec<RecoveredTerminalWalLoss>,
     pub final_marker: Option<WalRecordEnvelope>,
     pub uncommitted: Vec<WalRecordEnvelope>,
@@ -1385,6 +1387,52 @@ pub fn scan_v2_wal(
 ) -> Result<RecoveryScan, WalError> {
     let _lock = RecordingLock::acquire(&wal_directory)?;
     scan_v2_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)
+}
+
+/// Hashes exact verified v2 segment bytes through final authoritative commit marker.
+pub fn verified_snapshot_sha256(
+    wal_directory: impl AsRef<Path>,
+    scan: &RecoveryScan,
+) -> Result<[u8; 32], WalError> {
+    let marker = scan
+        .final_marker
+        .as_ref()
+        .ok_or(WalError::NoAuthoritativeCommit)?;
+    let provenance = marker
+        .provenance
+        .as_ref()
+        .ok_or(WalError::MissingProvenance {
+            sequence: marker.sequence,
+        })?;
+    let marker_end = provenance
+        .byte_offset
+        .checked_add(u64::try_from(COMMIT_MARKER_FRAME_LEN).unwrap_or(u64::MAX))
+        .ok_or(WalError::CommitArithmeticOverflow)?;
+    let segments =
+        discover_v2_segments(wal_directory.as_ref().join("segments"), marker.recording_id)?;
+    let mut digest = Sha256::new();
+    let mut found_marker = false;
+    for segment in segments {
+        if segment.header.segment_ordinal > provenance.segment_ordinal {
+            break;
+        }
+        let bytes = fs::read(&segment.path)?;
+        if segment.header.segment_ordinal == provenance.segment_ordinal {
+            let end =
+                usize::try_from(marker_end).map_err(|_| WalError::CommitArithmeticOverflow)?;
+            if bytes.len() < end {
+                return Err(WalError::CommitSegmentMismatch);
+            }
+            digest.update(&bytes[..end]);
+            found_marker = true;
+            break;
+        }
+        digest.update(bytes);
+    }
+    if !found_marker {
+        return Err(WalError::CommitSegmentMismatch);
+    }
+    Ok(digest.finalize().into())
 }
 
 fn scan_v2_wal_unlocked(
@@ -1442,8 +1490,9 @@ fn scan_v2_wal_unlocked(
                     }
                     scan.authority = authority;
                     scan.authoritative_marker_count += 1;
+                    scan.committed.append(&mut pending);
+                    scan.committed.push(envelope.clone());
                     scan.final_marker = Some(envelope);
-                    pending.clear();
                 }
                 VersionedReadOutcome::Record(envelope) => {
                     if envelope.kind == RecordKind::TerminalWalLoss {
@@ -3027,11 +3076,21 @@ mod tests {
             .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
             .unwrap();
         assert_eq!(writer.flush(1).unwrap().unwrap().marker_sequence, 2);
+        writer
+            .append(
+                RecordKind::CaptureEvent,
+                1,
+                0,
+                b"also committed".to_vec(),
+                2,
+            )
+            .unwrap();
+        assert_eq!(writer.flush(3).unwrap().unwrap().marker_sequence, 4);
         drop(writer);
 
         let uncertain = WalRecordEnvelope::unplaced(
             recording_id,
-            3,
+            5,
             RecordKind::LossWindow,
             1,
             0,
@@ -3048,12 +3107,29 @@ mod tests {
         let first = scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         let second = scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.authority.marker_sequence, Some(2));
-        assert_eq!(first.authority.durable_through_sequence, Some(1));
-        assert_eq!(first.authoritative_marker_count, 1);
+        assert_eq!(first.authority.marker_sequence, Some(4));
+        assert_eq!(first.authority.durable_through_sequence, Some(3));
+        assert_eq!(first.authoritative_marker_count, 2);
+        assert_eq!(
+            first
+                .committed
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
         assert_eq!(first.uncommitted.len(), 1);
-        assert_eq!(first.uncommitted[0].sequence, 3);
+        assert_eq!(first.uncommitted[0].sequence, 5);
         assert_eq!(first.partial_tail, None);
+        let marker = first.final_marker.as_ref().unwrap();
+        let offset = marker.provenance.as_ref().unwrap().byte_offset;
+        let bytes = fs::read(segments.join(v2_segment_file_name(1))).unwrap();
+        let end = usize::try_from(offset).unwrap() + COMMIT_MARKER_FRAME_LEN;
+        let expected_snapshot: [u8; 32] = Sha256::digest(&bytes[..end]).into();
+        assert_eq!(
+            verified_snapshot_sha256(&wal_directory, &first).unwrap(),
+            expected_snapshot
+        );
         fs::remove_dir_all(wal_directory).unwrap();
     }
 

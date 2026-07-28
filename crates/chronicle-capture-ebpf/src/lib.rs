@@ -14,4 +14,4 @@ mod source;
 pub use adapter::{CaptureAdapter, RecordingScopeConfig};
 pub use error::EbpfCaptureError;
 pub use preflight::{EbpfPreflight, PreflightCheck, probe_embedded};
-pub use source::EbpfCaptureSource;
+pub use source::{EbpfCaptureSource, embedded_object_sha256};

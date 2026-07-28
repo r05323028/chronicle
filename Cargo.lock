@@ -148,6 +148,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "time",
  "tokio",
@@ -182,10 +183,12 @@ name = "chronicle-capture-ebpf"
 version = "0.1.0"
 dependencies = [
  "aya",
+ "aya-obj",
  "chronicle-capture",
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
 ]
@@ -195,9 +198,12 @@ name = "chronicle-cli"
 version = "0.1.0"
 dependencies = [
  "chronicle-application",
+ "chronicle-capture",
  "chronicle-common",
  "chronicle-protocol",
+ "chronicle-protocol-builtins",
  "chronicle-replay",
+ "chronicle-wal",
  "clap",
  "serde",
  "serde_json",
@@ -223,10 +229,13 @@ dependencies = [
  "chronicle-capture",
  "chronicle-common",
  "chronicle-protocol",
+ "chronicle-protocol-builtins",
  "chronicle-session",
  "chronicle-wal",
+ "sha2",
  "thiserror",
  "time",
+ "uuid",
 ]
 
 [[package]]

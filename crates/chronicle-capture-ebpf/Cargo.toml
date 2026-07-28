@@ -9,14 +9,16 @@ license.workspace = true
 
 [features]
 default = []
-linux-ebpf = ["dep:aya", "dep:libc"]
+linux-ebpf = ["dep:aya", "dep:aya-obj", "dep:libc"]
 
 [dependencies]
 chronicle-capture = { path = "../chronicle-capture" }
+sha2.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.14", optional = true }
+aya-obj = { version = "0.3", optional = true }
 libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -39,6 +39,83 @@ fn record(root: &std::path::Path) -> String {
         .into()
 }
 
+fn production_wal(directory: &std::path::Path) {
+    use chronicle_application::{
+        RECORDING_METADATA_SCHEMA_V1, RecordByteCount, RecordingCommitBoundary, RecordingCounters,
+        RecordingMetadataV1, RecordingStatus, ShutdownReason, write_recording_metadata,
+    };
+    use chronicle_capture::{
+        CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureEventV1, CaptureFlags, encode_event,
+    };
+    use chronicle_common::{ConnectionKey, Direction, Endpoint, RecordingId, TransportProtocol};
+    use chronicle_wal::{
+        DEFAULT_MAX_RECORD_BYTES, GroupCommitWalWriter, MIN_V2_SEGMENT_BYTES, RecordKind,
+        scan_v2_wal,
+    };
+
+    let recording_id = RecordingId::new();
+    let event = CaptureEvent::V1(CaptureEventV1 {
+        schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+        monotonic_sequence: 1,
+        wall_time: None,
+        connection: ConnectionKey::new(
+            Endpoint::new("client", 1234),
+            Endpoint::new("server", 8080),
+            TransportProtocol::Tcp,
+        ),
+        direction: Direction::ClientToServer,
+        payload: b"opaque".to_vec(),
+        process: None,
+        container: None,
+        file_descriptor: None,
+        truncated: false,
+        flags: CaptureFlags::default(),
+    });
+    let mut writer =
+        GroupCommitWalWriter::create(directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            .expect("create production WAL");
+    writer
+        .append(
+            RecordKind::CaptureEvent,
+            CAPTURE_EVENT_SCHEMA_VERSION,
+            0,
+            encode_event(&event).expect("encode capture"),
+            0,
+        )
+        .expect("append capture");
+    writer.flush(1).expect("flush WAL").expect("durable batch");
+    drop(writer);
+    let scan = scan_v2_wal(directory, recording_id, DEFAULT_MAX_RECORD_BYTES).expect("scan WAL");
+    let authority = scan.authority;
+    write_recording_metadata(
+        directory,
+        &RecordingMetadataV1 {
+            version: RECORDING_METADATA_SCHEMA_V1,
+            recording_id,
+            selector: None,
+            status: RecordingStatus::Completed,
+            shutdown_reason: Some(ShutdownReason::SourceCompleted),
+            last_valid_commit: Some(RecordingCommitBoundary {
+                marker_sequence: authority.marker_sequence.expect("marker"),
+                durable_through_sequence: authority.durable_through_sequence.expect("boundary"),
+                durable_record_count: authority.durable_record_count,
+                durable_payload_bytes: authority.durable_payload_bytes,
+                segment_ordinal: authority.segment_ordinal.expect("segment"),
+            }),
+            counters: RecordingCounters {
+                committed: RecordByteCount {
+                    records: authority.durable_record_count,
+                    bytes: authority.durable_payload_bytes,
+                },
+                ..RecordingCounters::default()
+            },
+            terminal_wal_loss: None,
+            capture: None,
+        },
+    )
+    .expect("write metadata");
+}
+
 fn spawn_server(response: &'static [u8]) -> (String, Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     listener.set_nonblocking(true).expect("set nonblocking");
@@ -237,6 +314,93 @@ fn cli_dry_run_ignores_unneeded_missing_runtime_credential() {
 }
 
 #[test]
+fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
+    let root = std::env::temp_dir().join(format!("chronicle-cli-etl-{}", uuid::Uuid::new_v4()));
+    let wal = root.join("wal");
+    let output = root.join("output");
+    production_wal(&wal);
+    let wal = wal.to_str().expect("WAL path is UTF-8");
+    let output = output.to_str().expect("output path is UTF-8");
+
+    let first = command(&[
+        "--format",
+        "json",
+        "etl",
+        "--wal-dir",
+        wal,
+        "--output",
+        output,
+    ]);
+    assert!(first.status.success());
+    let (stdout, stderr) = output_text(&first);
+    assert!(stderr.is_empty());
+    let first: serde_json::Value = serde_json::from_str(&stdout).expect("ETL JSON");
+    assert_eq!(first["already_processed"], false);
+    let session_id = first["session_id"].as_str().expect("session ID").to_owned();
+
+    std::fs::remove_file(std::path::Path::new(wal).join("etl-checkpoint.json"))
+        .expect("remove checkpoint");
+    let same = command(&[
+        "--format",
+        "json",
+        "etl",
+        "--wal-dir",
+        wal,
+        "--output",
+        output,
+    ]);
+    assert!(same.status.success());
+    let (stdout, stderr) = output_text(&same);
+    assert!(stderr.is_empty());
+    let same: serde_json::Value = serde_json::from_str(&stdout).expect("ETL JSON");
+    assert_eq!(same["session_id"], session_id);
+    assert_eq!(same["already_processed"], true);
+    assert!(
+        std::path::Path::new(wal)
+            .join("etl-checkpoint.json")
+            .exists()
+    );
+
+    let second_output = root.join("second-output");
+    let second_output = second_output.to_str().expect("second output path is UTF-8");
+    let second = command(&[
+        "--format",
+        "json",
+        "etl",
+        "--wal-dir",
+        wal,
+        "--output",
+        second_output,
+    ]);
+    assert!(second.status.success());
+    let (stdout, stderr) = output_text(&second);
+    assert!(stderr.is_empty());
+    let second: serde_json::Value = serde_json::from_str(&stdout).expect("ETL JSON");
+    assert_eq!(second["session_id"], session_id);
+    assert_eq!(second["already_processed"], false);
+
+    let segment = std::path::Path::new(wal).join("segments/00000000000000000001.chwal");
+    let mut bytes = std::fs::read(&segment).expect("read segment");
+    *bytes.last_mut().expect("segment content") ^= 1;
+    std::fs::write(segment, bytes).expect("corrupt segment");
+    let corrupt = command(&[
+        "--format",
+        "json",
+        "etl",
+        "--wal-dir",
+        wal,
+        "--output",
+        output,
+    ]);
+    assert_eq!(corrupt.status.code(), Some(3));
+    let (stdout, stderr) = output_text(&corrupt);
+    assert!(stdout.is_empty());
+    assert!(serde_json::from_str::<serde_json::Value>(&stderr).is_ok());
+
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
 fn cli_reports_usage_and_data_errors_as_safe_json() {
     let root = std::env::temp_dir().join(format!("chronicle-cli-errors-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("create test root");
@@ -276,11 +440,10 @@ fn cli_reports_usage_and_data_errors_as_safe_json() {
     assert!(serde_json::from_str::<serde_json::Value>(&doctor_stdout).is_ok());
 
     let etl = command(&["--format", "json", "etl"]);
-    assert_eq!(etl.status.code(), Some(3));
+    assert_eq!(etl.status.code(), Some(2));
     let (etl_stdout, etl_stderr) = output_text(&etl);
     assert!(etl_stdout.is_empty());
-    assert_eq!(etl_stderr.matches('\n').count(), 1);
-    assert!(serde_json::from_str::<serde_json::Value>(&etl_stderr).is_ok());
+    assert!(!etl_stderr.is_empty());
 
     let usage = command(&["record"]);
     assert_eq!(usage.status.code(), Some(2));

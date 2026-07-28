@@ -14,8 +14,13 @@ chronicle-common = { path = "../chronicle-common" }
 chronicle-protocol = { path = "../chronicle-protocol" }
 chronicle-session = { path = "../chronicle-session" }
 chronicle-wal = { path = "../chronicle-wal" }
+sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+chronicle-protocol-builtins = { path = "../chronicle-protocol-builtins" }
 
 [lints]
 workspace = true

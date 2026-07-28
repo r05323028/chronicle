@@ -7,13 +7,18 @@ pub use cgroup_selection::{
     preflight_cgroup_selection, preflight_pid_cgroup_selection,
 };
 
-use chronicle_canonical::Completeness;
+use chronicle_canonical::{
+    Completeness, ProvenanceEntry, ProvenanceKind, SourceProvenance, SourceStatus,
+};
 use chronicle_capture::{
-    CaptureError, CaptureSource, ClockIdentity, FixtureCaptureSource, MonotonicTimestamp,
-    encode_event,
+    CaptureError, CaptureEvent, CaptureEventKind, CaptureSource, CaptureSourceSummary,
+    ClockIdentity, FixtureCaptureSource, MonotonicTimestamp, encode_event,
 };
 use chronicle_common::RecordingId;
-use chronicle_etl::{EtlError, EtlIssue, EtlOutput, EtlPipeline};
+use chronicle_etl::{
+    ETL_PIPELINE_VERSION, EtlError, EtlIssue, EtlOutput, EtlPipeline,
+    assign_recording_ids_with_snapshot,
+};
 use chronicle_protocol::{ProtocolError, ProtocolRegistry, ReplayContext, SecretBytes};
 use chronicle_replay::{
     LoopbackReplayOptions, OperationExecutionState, ReplayError, ReplayExecutor, ReplayOutcome,
@@ -28,8 +33,10 @@ use chronicle_wal::{
     TERMINAL_WAL_LOSS_SCHEMA_VERSION, TerminalWalLoss, TerminalWalLossAmbiguity,
     TerminalWalLossInterval, TerminalWalLossReason, WalCheckpoint, WalError, WalReader, WalRecord,
     WalWriter, encode_record, encode_terminal_wal_loss, prepare_group_commit_reopen_from_scan,
+    verified_snapshot_sha256,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
@@ -37,6 +44,12 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const RECORDING_METADATA_SCHEMA_V1: u16 = 1;
@@ -48,6 +61,7 @@ pub const REPLAY_REPORT_VERSION: u16 = 2;
 pub const RECOVERY_REPORT_VERSION: u16 = 1;
 pub const DEFAULT_RECORDING_DURATION_SECONDS: u64 = 600;
 pub const MAX_RECORDING_DURATION_SECONDS: u64 = 3_600;
+pub const RECORDING_FINALIZATION_GRACE_MILLIS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProductionRecordingBounds {
@@ -63,6 +77,36 @@ impl Default for ProductionRecordingBounds {
             segment_bytes: DEFAULT_V2_SEGMENT_BYTES,
             max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
         }
+    }
+}
+
+/// Signal state shared by platform adapters and synchronous recording.
+#[derive(Clone, Default)]
+pub struct ProductionSignalStop(Arc<AtomicU8>);
+
+impl ProductionSignalStop {
+    /// Requests graceful shutdown. Returns false when this is a second signal.
+    pub fn request_interrupt(&self) -> bool {
+        self.request(1)
+    }
+
+    /// Requests graceful shutdown. Returns false when this is a second signal.
+    pub fn request_termination(&self) -> bool {
+        self.request(2)
+    }
+
+    pub fn shutdown_reason(&self) -> Option<ShutdownReason> {
+        match self.0.load(Ordering::SeqCst) {
+            1 => Some(ShutdownReason::UserInterrupt),
+            2 => Some(ShutdownReason::TerminationSignal),
+            _ => None,
+        }
+    }
+
+    fn request(&self, signal: u8) -> bool {
+        self.0
+            .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 }
 
@@ -149,6 +193,119 @@ fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
     ))
 }
 
+/// Runs live eBPF recording. Signal adapters request stop through `stop`.
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+pub fn record_live_ebpf(
+    selector: CgroupSelector,
+    allow_shared_cgroup: bool,
+    wal_directory: impl AsRef<Path>,
+    bounds: ProductionRecordingBounds,
+    stop: ProductionSignalStop,
+) -> Result<ProductionRecordingResult, ApplicationError> {
+    preflight_wal_destination(wal_directory.as_ref(), bounds)?;
+    preflight_embedded_ebpf()?;
+    if matches!(&selector, CgroupSelector::Pid(_)) && allow_shared_cgroup {
+        return Err(ApplicationError::ProductionPreflight(
+            "shared cgroup acknowledgement requires explicit cgroup",
+        ));
+    }
+    let pid_baseline = match &selector {
+        CgroupSelector::Pid(pid) => {
+            Some(preflight_pid_cgroup_selection(*pid).map_err(|_| {
+                ApplicationError::ProductionPreflight("PID cgroup selection invalid")
+            })?)
+        }
+        CgroupSelector::Explicit(_) => None,
+    };
+    let selection = match &pid_baseline {
+        Some(baseline) => baseline.selection().clone(),
+        None => preflight_cgroup_selection(selector, allow_shared_cgroup)
+            .map_err(|_| ApplicationError::ProductionPreflight("cgroup selection invalid"))?,
+    };
+    let capture_metadata = live_capture_metadata(&selection, bounds)?;
+    let mut metadata = RecordingMetadataV1 {
+        version: RECORDING_METADATA_SCHEMA_V1,
+        recording_id: RecordingId::new(),
+        selector: Some(RecordingSelectorIdentity {
+            canonical_cgroup_path: selection.canonical_path.display().to_string(),
+            cgroup_id: selection.cgroup_id,
+        }),
+        status: RecordingStatus::Starting,
+        shutdown_reason: None,
+        last_valid_commit: None,
+        counters: RecordingCounters::default(),
+        terminal_wal_loss: None,
+        capture: None,
+    };
+    record_production(
+        wal_directory,
+        &mut metadata,
+        capture_metadata,
+        bounds,
+        || load_production_ebpf_source(&selection, pid_baseline.as_ref()),
+        monotonic_millis,
+        || stop.shutdown_reason(),
+    )
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn live_capture_metadata(
+    selection: &CgroupSelection,
+    bounds: ProductionRecordingBounds,
+) -> Result<RecordingCaptureMetadataV1, ApplicationError> {
+    let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map_err(|_| ApplicationError::ProductionPreflight("kernel identity unavailable"))?
+        .trim()
+        .to_owned();
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|_| ApplicationError::ProductionPreflight("boot clock identity unavailable"))?
+        .trim()
+        .to_owned();
+    let ebpf_object_sha256 = chronicle_capture_ebpf::embedded_object_sha256().ok_or(
+        ApplicationError::ProductionPreflight("eBPF object unavailable"),
+    )?;
+    let recording_bounds = RecordingBounds {
+        duration_seconds: bounds.duration_seconds,
+        max_wal_bytes: bounds.max_wal_bytes,
+        segment_bytes: bounds.segment_bytes,
+        ring_bytes: 8 * 1024 * 1024,
+    };
+    Ok(RecordingCaptureMetadataV1 {
+        version: RECORDING_CAPTURE_METADATA_SCHEMA_V1,
+        build: RecordingBuildIdentity {
+            chronicle_version: env!("CARGO_PKG_VERSION").into(),
+            aya_version: "0.14.0".into(),
+            aya_ebpf_version: "0.2.1".into(),
+            ebpf_object_sha256,
+        },
+        host: RecordingHostIdentity {
+            kernel_release,
+            architecture: std::env::consts::ARCH.into(),
+            boot_id,
+        },
+        scope: RecordingSelectorScope {
+            direct_tgid_count: selection.direct_tgid_count(),
+            descendant_cgroup_count: selection.descendant_cgroup_count(),
+            selected_subtree: true,
+            shared_scope_acknowledged: selection.shared_scope_acknowledged,
+        },
+        capabilities: BTreeSet::from(["CAP_BPF".into(), "CAP_NET_ADMIN".into()]),
+        configured_bounds: recording_bounds.clone(),
+        effective_bounds: recording_bounds,
+        errors: Vec::new(),
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn monotonic_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingStatus {
@@ -228,6 +385,17 @@ pub struct RecordingIngestResult {
     pub shutdown_reason: ShutdownReason,
     pub counters: RecordingCounters,
     pub terminal_wal_loss: Option<TerminalWalLossSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProductionRecordingResult {
+    pub recording_id: RecordingId,
+    pub status: RecordingStatus,
+    pub shutdown_reason: ShutdownReason,
+    pub last_valid_commit: Option<RecordingCommitBoundary>,
+    pub counters: RecordingCounters,
+    pub terminal_wal_loss: Option<TerminalWalLossSummary>,
+    pub source_summary: CaptureSourceSummary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +521,24 @@ impl RecordingIngest {
 
     pub fn counters(&self) -> &RecordingCounters {
         &self.counters
+    }
+
+    fn commit_boundary(&self) -> Option<RecordingCommitBoundary> {
+        let authority = self.writer.authority();
+        Some(RecordingCommitBoundary {
+            marker_sequence: authority.marker_sequence?,
+            durable_through_sequence: authority.durable_through_sequence?,
+            durable_record_count: authority.durable_record_count,
+            durable_payload_bytes: authority.durable_payload_bytes,
+            segment_ordinal: authority.segment_ordinal?,
+        })
+    }
+
+    pub fn stop_reason(&self) -> Option<ShutdownReason> {
+        match self.state {
+            IngestState::Stopping(reason) => Some(reason),
+            IngestState::Accepting | IngestState::Terminal => None,
+        }
     }
 
     /// Writes FIFO until empty or WAL's physical-capacity check refuses the next record.
@@ -758,6 +944,17 @@ impl RecordingMetadataV1 {
         validate_recording_metadata(self)
     }
 
+    pub fn fail_start(&mut self, reason: ShutdownReason) -> Result<(), ApplicationError> {
+        if self.status != RecordingStatus::Starting {
+            return Err(ApplicationError::RecordingMetadataValidation(
+                "only a starting recording may fail before attachment".into(),
+            ));
+        }
+        self.status = RecordingStatus::Failed;
+        self.shutdown_reason = Some(reason);
+        validate_recording_metadata(self)
+    }
+
     pub fn finalize(
         &mut self,
         status: RecordingStatus,
@@ -918,6 +1115,9 @@ pub enum ApplicationError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Capture(#[from] CaptureError),
+    #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+    #[error(transparent)]
+    Ebpf(#[from] chronicle_capture_ebpf::EbpfCaptureError),
     #[error(transparent)]
     Wal(#[from] WalError),
     #[error(transparent)]
@@ -948,6 +1148,12 @@ pub enum ApplicationError {
     InvalidConfig(String),
     #[error("recording metadata failed validation: {0}")]
     RecordingMetadataValidation(String),
+    #[error("existing published session {session_id} does not match recording output")]
+    PublishedRecordingMismatch {
+        session_id: chronicle_common::SessionId,
+    },
+    #[error("recording ETL checkpoint contradicts recovered WAL snapshot")]
+    CheckpointContradiction,
     #[error("production recording preflight failed: {0}")]
     ProductionPreflight(&'static str),
     #[error("{0} command is not implemented in current scaffold")]
@@ -986,6 +1192,25 @@ pub fn write_recording_metadata(
     write_recording_metadata_inner(wal_directory.as_ref(), metadata, None)
 }
 
+/// Best-effort persistence for a second signal before forced process exit.
+pub fn mark_recording_forced_termination(
+    wal_directory: impl AsRef<Path>,
+) -> Result<(), ApplicationError> {
+    let wal_directory = wal_directory.as_ref();
+    let Some(mut metadata) = load_recording_metadata(wal_directory)? else {
+        return Ok(());
+    };
+    if matches!(
+        metadata.status,
+        RecordingStatus::Starting | RecordingStatus::Recording
+    ) {
+        metadata.status = RecordingStatus::Aborted;
+        metadata.shutdown_reason = Some(ShutdownReason::ForcedTermination);
+        write_recording_metadata(wal_directory, &metadata)?;
+    }
+    Ok(())
+}
+
 impl RecordingIngestResult {
     /// Applies final ingest evidence before atomically persisting `recording.json`.
     pub fn persist_metadata(
@@ -1001,6 +1226,399 @@ impl RecordingIngestResult {
             .clone_from(&self.terminal_wal_loss);
         write_recording_metadata(wal_directory, metadata)
     }
+}
+
+/// Drives one already-preflighted production source through bounded WAL persistence.
+/// `requested_stop` supplies source completion or future signal handling; duration is enforced here.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn record_production<S, Build, Now, Stop>(
+    wal_directory: impl AsRef<Path>,
+    metadata: &mut RecordingMetadataV1,
+    capture_metadata: RecordingCaptureMetadataV1,
+    bounds: ProductionRecordingBounds,
+    build_source: Build,
+    mut now_millis: Now,
+    mut requested_stop: Stop,
+) -> Result<ProductionRecordingResult, ApplicationError>
+where
+    S: CaptureSource,
+    Build: FnOnce() -> Result<S, ApplicationError>,
+    Now: FnMut() -> u64,
+    Stop: FnMut() -> Option<ShutdownReason>,
+{
+    validate_production_recording_bounds(bounds)?;
+    if metadata.status != RecordingStatus::Starting || metadata.shutdown_reason.is_some() {
+        return Err(ApplicationError::RecordingMetadataValidation(
+            "production recording must begin in starting state".into(),
+        ));
+    }
+
+    let wal_directory = wal_directory.as_ref();
+    write_recording_metadata(wal_directory, metadata)?;
+    let mut source = match build_source() {
+        Ok(source) => source,
+        Err(error) => {
+            persist_pre_attach_failure(
+                wal_directory,
+                metadata,
+                capture_metadata,
+                RecordingCaptureErrorCode::Attach,
+            )?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = source.start() {
+        persist_pre_attach_failure(
+            wal_directory,
+            metadata,
+            capture_metadata,
+            RecordingCaptureErrorCode::Source,
+        )?;
+        return Err(error.into());
+    }
+
+    metadata.transition_to_recording(capture_metadata)?;
+    write_recording_metadata(wal_directory, metadata)?;
+    let started_at = now_millis();
+    let writer = match GroupCommitWalWriter::create_with_total_limit(
+        wal_directory,
+        metadata.recording_id,
+        bounds.segment_bytes,
+        bounds.max_wal_bytes,
+        1,
+        started_at,
+    ) {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = shutdown_source_without_wal(&mut source);
+            return persist_live_failure(
+                wal_directory,
+                metadata,
+                RecordingCaptureErrorCode::Source,
+                ShutdownReason::WalFailure,
+                error.into(),
+            );
+        }
+    };
+    let mut ingest = RecordingIngest::new(writer);
+    let mut capture_failed = false;
+    let mut wal_failed = false;
+    let mut requested_reason = loop {
+        let now = now_millis();
+        if let Some(reason) = requested_stop().or_else(|| {
+            (now.saturating_sub(started_at) >= bounds.duration_seconds.saturating_mul(1_000))
+                .then_some(ShutdownReason::DurationLimit)
+        }) {
+            break reason;
+        }
+        match source.poll() {
+            Ok(Some(event)) => match persist_capture_event(&mut ingest, &event, now) {
+                Ok(()) => {
+                    if let Some(reason) = ingest.stop_reason() {
+                        break reason;
+                    }
+                }
+                Err(error) => match recording_failure_reason(&error) {
+                    ShutdownReason::WalFailure => {
+                        wal_failed = true;
+                        break ShutdownReason::WalFailure;
+                    }
+                    ShutdownReason::CaptureFailure => {
+                        capture_failed = true;
+                        break ShutdownReason::CaptureFailure;
+                    }
+                    _ => unreachable!("recording failures have one of two terminal reasons"),
+                },
+            },
+            Ok(None) => {}
+            Err(_) => {
+                capture_failed = true;
+                break ShutdownReason::CaptureFailure;
+            }
+        }
+    };
+
+    let source_summary = match stop_and_finalize_source(&mut source, &mut ingest, &mut now_millis) {
+        Ok(summary) => summary,
+        Err(ApplicationError::Wal(_)) => {
+            requested_reason = ShutdownReason::WalFailure;
+            wal_failed = true;
+            CaptureSourceSummary::default()
+        }
+        Err(_) => {
+            requested_reason = ShutdownReason::CaptureFailure;
+            capture_failed = true;
+            CaptureSourceSummary::default()
+        }
+    };
+    let mut result = match ingest.finish(requested_reason, now_millis()) {
+        Ok(result) => result,
+        Err(failure) => {
+            wal_failed = true;
+            failure.result
+        }
+    };
+    if capture_failed {
+        result.status = RecordingStatus::Failed;
+        result.shutdown_reason = ShutdownReason::CaptureFailure;
+        append_capture_error(metadata, RecordingCaptureErrorCode::Source);
+    } else if wal_failed {
+        result.status = RecordingStatus::Failed;
+        result.shutdown_reason = ShutdownReason::WalFailure;
+    }
+    metadata.last_valid_commit = ingest.commit_boundary();
+    result.persist_metadata(wal_directory, metadata)?;
+    Ok(ProductionRecordingResult {
+        recording_id: metadata.recording_id,
+        status: result.status,
+        shutdown_reason: result.shutdown_reason,
+        last_valid_commit: metadata.last_valid_commit.clone(),
+        counters: result.counters,
+        terminal_wal_loss: result.terminal_wal_loss,
+        source_summary,
+    })
+}
+
+/// Counts every physical byte below the WAL segments directory.
+pub fn recording_physical_wal_bytes(
+    wal_directory: impl AsRef<Path>,
+) -> Result<u64, ApplicationError> {
+    fn count(path: &Path) -> Result<u64, ApplicationError> {
+        fs::read_dir(path)?.try_fold(0_u64, |total, entry| {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            let bytes = if metadata.is_dir() {
+                count(&entry.path())?
+            } else {
+                metadata.len()
+            };
+            total.checked_add(bytes).ok_or_else(|| {
+                ApplicationError::RecordingMetadataValidation(
+                    "physical WAL size exceeds u64".into(),
+                )
+            })
+        })
+    }
+
+    let segments = wal_directory.as_ref().join("segments");
+    if !segments.is_dir() {
+        return Ok(0);
+    }
+    count(&segments)
+}
+
+/// Builds the Linux eBPF source after `recording.json` reached `starting`.
+/// PID baselines are rechecked after links attach; source construction drops links on failure.
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+pub fn load_production_ebpf_source(
+    selection: &CgroupSelection,
+    pid_baseline: Option<&PidCgroupSelection>,
+) -> Result<chronicle_capture_ebpf::EbpfCaptureSource, ApplicationError> {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned();
+    if boot_id.is_empty() {
+        return Err(ApplicationError::ProductionPreflight(
+            "boot clock identity unavailable",
+        ));
+    }
+    let adapter = chronicle_capture_ebpf::CaptureAdapter::new(
+        ClockIdentity { boot_id },
+        chronicle_capture_ebpf::RecordingScopeConfig {
+            identity: chronicle_capture::RecordingScopeIdentity {
+                cgroup_id: selection.cgroup_id,
+                canonical_path: selection.canonical_path.display().to_string(),
+                namespace: None,
+            },
+            descendant_cgroup_ids: selection.descendant_cgroup_ids.clone(),
+        },
+        0,
+    )?;
+    let cgroup = File::open(&selection.canonical_path)?;
+    chronicle_capture_ebpf::EbpfCaptureSource::load_embedded_with_post_attach(
+        &cgroup,
+        adapter,
+        || {
+            if let Some(baseline) = pid_baseline {
+                baseline.revalidate().map_err(|_| {
+                    chronicle_capture_ebpf::EbpfCaptureError::MissingIdentity(
+                        "PID cgroup scope changed after attach",
+                    )
+                })?;
+            }
+            Ok(())
+        },
+    )
+    .map_err(ApplicationError::from)
+}
+
+fn persist_pre_attach_failure(
+    wal_directory: &Path,
+    metadata: &mut RecordingMetadataV1,
+    mut capture_metadata: RecordingCaptureMetadataV1,
+    error: RecordingCaptureErrorCode,
+) -> Result<(), ApplicationError> {
+    if capture_metadata.errors.len() < MAX_RECORDING_CAPTURE_ERRORS {
+        capture_metadata
+            .errors
+            .push(RecordingCaptureError { code: error });
+    }
+    metadata.capture = Some(capture_metadata);
+    metadata.fail_start(ShutdownReason::CaptureFailure)?;
+    write_recording_metadata(wal_directory, metadata)
+}
+
+fn persist_live_failure(
+    wal_directory: &Path,
+    metadata: &mut RecordingMetadataV1,
+    error: RecordingCaptureErrorCode,
+    reason: ShutdownReason,
+    original: ApplicationError,
+) -> Result<ProductionRecordingResult, ApplicationError> {
+    if reason == ShutdownReason::CaptureFailure {
+        append_capture_error(metadata, error);
+    }
+    metadata.finalize(RecordingStatus::Failed, reason)?;
+    write_recording_metadata(wal_directory, metadata)?;
+    Err(original)
+}
+
+fn recording_failure_reason(error: &ApplicationError) -> ShutdownReason {
+    if matches!(error, ApplicationError::Wal(_)) {
+        ShutdownReason::WalFailure
+    } else {
+        ShutdownReason::CaptureFailure
+    }
+}
+
+fn append_capture_error(metadata: &mut RecordingMetadataV1, error: RecordingCaptureErrorCode) {
+    if let Some(capture) = &mut metadata.capture
+        && capture.errors.len() < MAX_RECORDING_CAPTURE_ERRORS
+    {
+        capture.errors.push(RecordingCaptureError { code: error });
+    }
+}
+
+fn persist_capture_event(
+    ingest: &mut RecordingIngest,
+    event: &CaptureEvent,
+    now_millis: u64,
+) -> Result<(), ApplicationError> {
+    let (kind, capture_timestamp, kernel_drops) = match event {
+        CaptureEvent::V1(_event) => (RecordKind::CaptureEvent, None, None),
+        CaptureEvent::V2(event) => match &event.kind {
+            CaptureEventKind::LossWindowObserved(window) => (
+                RecordKind::LossWindow,
+                Some(window.end.clone()),
+                window.drop_delta,
+            ),
+            CaptureEventKind::SocketConnectObserved(evidence)
+            | CaptureEventKind::SocketConnected(evidence)
+            | CaptureEventKind::SocketClosedObserved(evidence)
+            | CaptureEventKind::SocketResetObserved(evidence) => (
+                RecordKind::CaptureEvent,
+                Some(evidence.timestamp.clone()),
+                None,
+            ),
+            CaptureEventKind::SocketStateChangedObserved(observed) => (
+                RecordKind::CaptureEvent,
+                Some(observed.socket.timestamp.clone()),
+                None,
+            ),
+            CaptureEventKind::PayloadFragment(fragment) => (
+                RecordKind::CaptureEvent,
+                Some(fragment.timestamp.clone()),
+                None,
+            ),
+        },
+    };
+    if let Some(drops) = kernel_drops {
+        ingest.record_kernel_or_backend_drop(drops, 0);
+    }
+    let mut record = QueuedWalRecord {
+        kind,
+        schema_version: event.schema_version(),
+        flags: event
+            .as_v1()
+            .map(|event| {
+                u16::try_from(event.flags.0)
+                    .map_err(|_| ApplicationError::CaptureFlagsOutOfRange(event.flags.0))
+            })
+            .transpose()?
+            .unwrap_or(0),
+        payload: encode_event(event)?,
+        capture_timestamp,
+    };
+    loop {
+        match ingest.admit(record) {
+            Ok(IngestAdmission::Accepted) => {
+                ingest.drain(now_millis)?;
+                return Ok(());
+            }
+            Ok(IngestAdmission::RejectedAfterStop) => return Ok(()),
+            Err(backpressured) => {
+                record = backpressured;
+                ingest.drain(now_millis)?;
+                if ingest.stop_reason().is_some() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn stop_and_finalize_source<Now>(
+    source: &mut impl CaptureSource,
+    ingest: &mut RecordingIngest,
+    now_millis: &mut Now,
+) -> Result<CaptureSourceSummary, ApplicationError>
+where
+    Now: FnMut() -> u64,
+{
+    let deadline = now_millis().saturating_add(RECORDING_FINALIZATION_GRACE_MILLIS);
+    let mut failure = source.request_shutdown().err().map(ApplicationError::from);
+    loop {
+        if now_millis() > deadline {
+            failure.get_or_insert(CaptureError::Drain("finalization grace exceeded".into()).into());
+            break;
+        }
+        match source.drain() {
+            Ok(Some(event)) => {
+                if let Err(error) = persist_capture_event(ingest, &event, now_millis()) {
+                    failure.get_or_insert(error);
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                failure.get_or_insert(error.into());
+                break;
+            }
+        }
+    }
+    let summary = source.finalize();
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(summary?)
+}
+
+fn shutdown_source_without_wal(source: &mut impl CaptureSource) -> Result<(), CaptureError> {
+    let mut failure = source.request_shutdown().err();
+    loop {
+        match source.drain() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error) => {
+                failure.get_or_insert(error);
+                break;
+            }
+        }
+    }
+    let finalized = source.finalize();
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    finalized.map(|_| ())
 }
 
 fn validate_recording_metadata(metadata: &RecordingMetadataV1) -> Result<(), ApplicationError> {
@@ -1612,6 +2230,380 @@ pub fn process_single_wal(
     Ok((output, reader.checkpoint()))
 }
 
+#[derive(Clone, Debug)]
+pub struct RecordingEtlResult {
+    pub output: EtlOutput,
+    /// Complete frames beyond final marker are visible but never canonicalized.
+    pub ignored_post_commit_records: u64,
+    pub recording_id: RecordingId,
+    pub status: RecordingStatus,
+    pub counters: RecordingCounters,
+    pub commit_boundary: RecordingCommitBoundary,
+    pub commit_marker_byte_offset: u64,
+    pub wal_snapshot_sha256: [u8; 32],
+    pub recovery_sha256: [u8; 32],
+}
+
+/// ETL one finalized production recording while holding its exclusive WAL lock.
+#[allow(clippy::too_many_lines)] // Validation and provenance share one recovery-authoritative boundary.
+pub fn process_recording_wal(
+    wal_directory: impl AsRef<Path>,
+    registry: &ProtocolRegistry,
+    session_id: chronicle_common::SessionId,
+) -> Result<RecordingEtlResult, ApplicationError> {
+    let wal_directory = wal_directory.as_ref();
+    let lock = RecordingLock::acquire(wal_directory)?;
+    let metadata = load_recording_metadata(wal_directory)?.ok_or_else(|| {
+        ApplicationError::RecordingMetadataValidation("recording metadata is missing".into())
+    })?;
+    let source_status = match metadata.status {
+        RecordingStatus::Completed => SourceStatus::Completed,
+        RecordingStatus::Failed => SourceStatus::Failed,
+        RecordingStatus::Aborted => SourceStatus::Aborted,
+        RecordingStatus::Starting | RecordingStatus::Recording => {
+            return Err(ApplicationError::RecordingMetadataValidation(
+                "cannot process an active recording".into(),
+            ));
+        }
+    };
+    let scan = lock.scan_v2(
+        wal_directory,
+        metadata.recording_id,
+        DEFAULT_MAX_RECORD_BYTES,
+    )?;
+    let Some(boundary) = metadata.last_valid_commit.as_ref() else {
+        return Err(ApplicationError::RecordingMetadataValidation(
+            "finalized recording is missing commit boundary".into(),
+        ));
+    };
+    if scan.authority.marker_sequence != Some(boundary.marker_sequence)
+        || scan.authority.durable_through_sequence != Some(boundary.durable_through_sequence)
+        || scan.authority.durable_record_count != boundary.durable_record_count
+        || scan.authority.durable_payload_bytes != boundary.durable_payload_bytes
+        || scan.authority.segment_ordinal != Some(boundary.segment_ordinal)
+    {
+        return Err(ApplicationError::RecordingMetadataValidation(
+            "recording commit boundary does not match recovered WAL".into(),
+        ));
+    }
+
+    let marker_provenance = scan
+        .final_marker
+        .as_ref()
+        .and_then(|marker| marker.provenance.as_ref())
+        .ok_or_else(|| {
+            ApplicationError::RecordingMetadataValidation(
+                "recovered commit marker is missing segment provenance".into(),
+            )
+        })?;
+    let metadata_terminal_losses =
+        metadata_terminal_wal_losses(metadata.terminal_wal_loss.as_ref());
+    let wal_envelope_range = scan
+        .committed
+        .first()
+        .zip(scan.committed.last())
+        .map(|(first, last)| (first.sequence, last.sequence));
+    let mut output = EtlPipeline::new(SessionLimits::default())
+        .process_envelopes_with_terminal_losses(
+            &scan.committed,
+            &metadata_terminal_losses,
+            registry,
+            session_id,
+        )?;
+    let wal_snapshot_sha256 = verified_snapshot_sha256(wal_directory, &scan)?;
+    let recovery_sha256 = recovery_sha256(&scan);
+    assign_recording_ids_with_snapshot(&mut output.session, wal_snapshot_sha256)?;
+    let connection_evidence: Vec<_> = output
+        .session
+        .connections
+        .iter()
+        .filter_map(|connection| {
+            let mut sequences = connection
+                .operations
+                .iter()
+                .map(|operation| operation.sequence);
+            let first = sequences.next()?;
+            let (first, last) = sequences.fold((first, first), |(first, last), sequence| {
+                (first.min(sequence), last.max(sequence))
+            });
+            Some(ProvenanceEntry {
+                kind: ProvenanceKind::Connection,
+                sequence_range: Some((first, last)),
+                reason: None,
+            })
+        })
+        .collect();
+    let mut source_evidence: Vec<_> = wal_envelope_range
+        .map(|sequence_range| ProvenanceEntry {
+            kind: ProvenanceKind::WalEnvelope,
+            sequence_range: Some(sequence_range),
+            reason: None,
+        })
+        .into_iter()
+        .chain(
+            output
+                .evidence
+                .commit_marker_sequences
+                .iter()
+                .map(|&sequence| ProvenanceEntry {
+                    kind: ProvenanceKind::CommitMarker,
+                    sequence_range: Some((sequence, sequence)),
+                    reason: None,
+                }),
+        )
+        .chain(connection_evidence)
+        .chain(
+            output
+                .evidence
+                .loss_windows
+                .iter()
+                .map(|loss| ProvenanceEntry {
+                    kind: ProvenanceKind::RingLoss,
+                    sequence_range: loss.sequence.map(|sequence| (sequence, sequence)),
+                    reason: loss.value.ambiguity.reason.clone(),
+                }),
+        )
+        .chain(
+            output
+                .evidence
+                .terminal_wal_losses
+                .iter()
+                .map(|loss| ProvenanceEntry {
+                    kind: ProvenanceKind::WalLimitLoss,
+                    sequence_range: loss.sequence.map(|sequence| (sequence, sequence)),
+                    reason: Some("wal_hard_limit".into()),
+                }),
+        )
+        .collect();
+    source_evidence.sort_by_key(|entry| entry.sequence_range);
+    output.session.source_provenance = SourceProvenance {
+        status: source_status,
+        reason: metadata
+            .shutdown_reason
+            .map(shutdown_reason_name)
+            .map(str::to_owned),
+        evidence: source_evidence,
+    };
+    Ok(RecordingEtlResult {
+        output,
+        ignored_post_commit_records: u64::try_from(scan.uncommitted.len()).map_err(|_| {
+            ApplicationError::RecordingMetadataValidation(
+                "post-commit record count exceeds metadata range".into(),
+            )
+        })?,
+        recording_id: metadata.recording_id,
+        status: metadata.status,
+        counters: metadata.counters,
+        commit_boundary: boundary.clone(),
+        commit_marker_byte_offset: marker_provenance.byte_offset,
+        wal_snapshot_sha256,
+        recovery_sha256,
+    })
+}
+
+pub const RECORDING_ETL_CHECKPOINT_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingEtlCheckpointV1 {
+    pub version: u16,
+    pub recording_id: RecordingId,
+    pub commit_marker_segment_ordinal: u64,
+    pub commit_marker_byte_offset: u64,
+    pub commit_marker_sequence: u64,
+    pub wal_snapshot_sha256: String,
+    pub recovery_sha256: String,
+    pub wal_format_version: u16,
+    pub pipeline_version: String,
+    pub canonical_schema_version: u16,
+    pub session_id: chronicle_common::SessionId,
+    pub manifest_checksum: String,
+    pub output_root: String,
+    pub output_identity: String,
+    pub status: RecordingStatus,
+    pub counters: RecordingCounters,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedRecordingResult {
+    pub session_id: chronicle_common::SessionId,
+    pub already_published: bool,
+    pub ignored_post_commit_records: u64,
+}
+
+/// Processes one finalized recording and atomically publishes its deterministic session.
+pub fn process_and_publish_recording_wal(
+    wal_directory: impl AsRef<Path>,
+    root: impl AsRef<Path>,
+    registry: &ProtocolRegistry,
+) -> Result<PublishedRecordingResult, ApplicationError> {
+    let wal_directory = wal_directory.as_ref();
+    let root = root.as_ref();
+    let processed =
+        process_recording_wal(wal_directory, registry, chronicle_common::SessionId::new())?;
+    if let Some(checkpoint) = load_recording_etl_checkpoint(wal_directory)?
+        && checkpoint.recording_id == processed.recording_id
+        && checkpoint.wal_snapshot_sha256 != sha256_string(&processed.wal_snapshot_sha256)
+    {
+        return Err(ApplicationError::CheckpointContradiction);
+    }
+    let issues = issue_summaries(&processed.output.issues);
+    let replayability = replayability_reasons(&processed.output);
+    let complete = session_complete(&processed.output);
+    let expected = PublishSession {
+        session: processed.output.session,
+        checkpoint: None,
+        issues: issues.into_iter().map(|issue| issue.code).collect(),
+        replayability,
+        complete,
+    };
+    let session_id = expected.session.id;
+    let store = FilesystemSessionStore::new(root);
+    let already_published = match store.publish(expected.clone()) {
+        Ok(()) => false,
+        Err(error) => match published_recording_matches(&store, &expected) {
+            Ok(true) => true,
+            Ok(false) => {
+                return Err(ApplicationError::PublishedRecordingMismatch { session_id });
+            }
+            Err(_) => return Err(error.into()),
+        },
+    };
+    let inspection = store.verify_existing_manifest(session_id)?;
+    let checkpoint = RecordingEtlCheckpointV1 {
+        version: RECORDING_ETL_CHECKPOINT_VERSION,
+        recording_id: processed.recording_id,
+        commit_marker_segment_ordinal: processed.commit_boundary.segment_ordinal,
+        commit_marker_byte_offset: processed.commit_marker_byte_offset,
+        commit_marker_sequence: processed.commit_boundary.marker_sequence,
+        wal_snapshot_sha256: sha256_string(&processed.wal_snapshot_sha256),
+        recovery_sha256: sha256_string(&processed.recovery_sha256),
+        wal_format_version: chronicle_wal::WAL_FORMAT_V2,
+        pipeline_version: ETL_PIPELINE_VERSION.into(),
+        canonical_schema_version: chronicle_canonical::CANONICAL_SCHEMA_VERSION,
+        session_id,
+        manifest_checksum: inspection.session_checksum,
+        output_root: fs::canonicalize(root)?.display().to_string(),
+        output_identity: format!("sessions/{session_id}/manifest.json"),
+        status: processed.status,
+        counters: processed.counters,
+    };
+    write_private_atomic_json(wal_directory, "etl-checkpoint.json", &checkpoint, None)?;
+    Ok(PublishedRecordingResult {
+        session_id,
+        already_published,
+        ignored_post_commit_records: processed.ignored_post_commit_records,
+    })
+}
+
+fn load_recording_etl_checkpoint(
+    wal_directory: &Path,
+) -> Result<Option<RecordingEtlCheckpointV1>, ApplicationError> {
+    match fs::read(wal_directory.join("etl-checkpoint.json")) {
+        Ok(bytes) => {
+            let checkpoint: RecordingEtlCheckpointV1 = serde_json::from_slice(&bytes)?;
+            if checkpoint.version != RECORDING_ETL_CHECKPOINT_VERSION {
+                return Err(ApplicationError::RecordingMetadataValidation(format!(
+                    "unsupported recording ETL checkpoint version {}",
+                    checkpoint.version
+                )));
+            }
+            Ok(Some(checkpoint))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn recovery_sha256(scan: &RecoveryScan) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"chronicle/recovery/v1\0");
+    digest.update(
+        scan.authority
+            .marker_sequence
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
+    digest.update(
+        scan.authority
+            .durable_through_sequence
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
+    digest.update(scan.authority.durable_record_count.to_le_bytes());
+    digest.update(scan.authority.durable_payload_bytes.to_le_bytes());
+    digest.update(
+        scan.authority
+            .segment_ordinal
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
+    digest.update(
+        u64::try_from(scan.committed.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    digest.update(
+        u64::try_from(scan.uncommitted.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    digest.update([u8::from(scan.partial_tail.is_some())]);
+    digest.finalize().into()
+}
+
+fn sha256_string(bytes: &[u8; 32]) -> String {
+    let mut value = String::from("sha256:");
+    for byte in bytes {
+        write!(value, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    value
+}
+
+fn published_recording_matches(
+    store: &FilesystemSessionStore,
+    expected: &PublishSession,
+) -> Result<bool, StorageError> {
+    let inspection = store.inspect_with_metadata(expected.session.id)?;
+    let hydrated = store.hydrate(expected.session.id)?;
+    Ok(hydrated == expected.session
+        && inspection.checkpoint == expected.checkpoint
+        && inspection.issues == expected.issues
+        && inspection.replayability == expected.replayability
+        && inspection.complete == expected.complete)
+}
+
+fn metadata_terminal_wal_losses(summary: Option<&TerminalWalLossSummary>) -> Vec<TerminalWalLoss> {
+    summary
+        .into_iter()
+        .flat_map(|summary| &summary.entries)
+        .filter(|entry| entry.persistence != TerminalWalLossPersistence::PersistedWal)
+        .filter_map(|entry| {
+            let (start, end) = (entry.start.clone()?, entry.end.clone()?);
+            (start.clock == end.clock).then_some(TerminalWalLoss {
+                interval: TerminalWalLossInterval { start, end },
+                discarded_records: entry.discarded.records,
+                discarded_payload_bytes: entry.discarded.bytes,
+                reason: TerminalWalLossReason::WalHardLimit,
+                ambiguity: TerminalWalLossAmbiguity::UnknownDownstreamEffects,
+            })
+        })
+        .collect()
+}
+
+fn shutdown_reason_name(reason: ShutdownReason) -> &'static str {
+    match reason {
+        ShutdownReason::UserInterrupt => "user_interrupt",
+        ShutdownReason::TerminationSignal => "termination_signal",
+        ShutdownReason::SourceCompleted => "source_completed",
+        ShutdownReason::DurationLimit => "duration_limit",
+        ShutdownReason::WalSizeLimit => "wal_size_limit",
+        ShutdownReason::CaptureFailure => "capture_failure",
+        ShutdownReason::WalFailure => "wal_failure",
+        ShutdownReason::ProcessCrashRecovered => "process_crash_recovered",
+        ShutdownReason::ForcedTermination => "forced_termination",
+    }
+}
+
 /// Builds replay inputs solely from explicit command options; config cannot authorize execution.
 pub fn replay_command_inputs(
     session: &chronicle_canonical::CanonicalSession,
@@ -1761,6 +2753,11 @@ fn issue_summaries(issues: &[EtlIssue]) -> Vec<RecordIssueSummary> {
                 chronicle_etl::EtlIssueKind::PartialWalTail => "partial_wal_tail",
                 chronicle_etl::EtlIssueKind::UnknownProtocol => "unknown_protocol",
                 chronicle_etl::EtlIssueKind::ProtocolDecode => "protocol_decode",
+                chronicle_etl::EtlIssueKind::MalformedLossWindow => "malformed_loss_window",
+                chronicle_etl::EtlIssueKind::MalformedTerminalWalLoss => {
+                    "malformed_terminal_wal_loss"
+                }
+                chronicle_etl::EtlIssueKind::MalformedCommitMarker => "malformed_commit_marker",
             }
             .into(),
             sequence: issue.sequence,
@@ -2168,6 +3165,45 @@ impl ChronicleApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_signal_stop_keeps_first_signal_and_flags_second() {
+        let stop = ProductionSignalStop::default();
+        assert!(stop.request_interrupt());
+        assert_eq!(stop.shutdown_reason(), Some(ShutdownReason::UserInterrupt));
+        assert!(!stop.request_termination());
+        assert_eq!(stop.shutdown_reason(), Some(ShutdownReason::UserInterrupt));
+    }
+
+    #[test]
+    fn second_signal_persists_forced_termination_for_recovery() {
+        let directory = ingest_directory("forced-termination");
+        let mut metadata = recording_metadata(RecordingStatus::Recording);
+        metadata.capture = Some(capture_metadata());
+        write_recording_metadata(&directory, &metadata).unwrap();
+
+        mark_recording_forced_termination(&directory).unwrap();
+        let persisted = load_recording_metadata(&directory).unwrap().unwrap();
+        assert_eq!(persisted.status, RecordingStatus::Aborted);
+        assert_eq!(
+            persisted.shutdown_reason,
+            Some(ShutdownReason::ForcedTermination)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn physical_wal_size_counts_nested_segment_files_only() {
+        let directory = ingest_directory("physical-size");
+        let nested = directory.join("segments/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(directory.join("segments/first"), [0_u8; 3]).unwrap();
+        std::fs::write(nested.join("second"), [0_u8; 5]).unwrap();
+        std::fs::write(directory.join("recording.json"), [0_u8; 7]).unwrap();
+
+        assert_eq!(recording_physical_wal_bytes(&directory).unwrap(), 8);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn ingest_directory(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("chronicle-ingest-{label}-{}", uuid::Uuid::new_v4()))
@@ -2926,6 +3962,429 @@ mod tests {
     }
 
     #[test]
+    fn production_recording_persists_starting_before_source_and_finalizes_committed_prefix() {
+        use chronicle_capture::{
+            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEventV1, CaptureFlags, InMemoryCaptureSource,
+        };
+        use chronicle_common::{ConnectionKey, Direction, Endpoint, TransportProtocol};
+        use std::cell::Cell;
+
+        let directory = ingest_directory("production-lifecycle");
+        let mut metadata = recording_metadata(RecordingStatus::Starting);
+        let event = CaptureEvent::V1(CaptureEventV1 {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            monotonic_sequence: 1,
+            wall_time: None,
+            connection: ConnectionKey::new(
+                Endpoint::new("client", 1234),
+                Endpoint::new("server", 8080),
+                TransportProtocol::Tcp,
+            ),
+            direction: Direction::ClientToServer,
+            payload: b"payload".to_vec(),
+            process: None,
+            container: None,
+            file_descriptor: None,
+            truncated: false,
+            flags: CaptureFlags::default(),
+        });
+        let stop_checks = Cell::new(0_u8);
+        let result = record_production(
+            &directory,
+            &mut metadata,
+            capture_metadata(),
+            ProductionRecordingBounds {
+                duration_seconds: 60,
+                segment_bytes: MIN_V2_SEGMENT_BYTES,
+                max_wal_bytes: MIN_V2_SEGMENT_BYTES,
+            },
+            || {
+                let persisted = load_recording_metadata(&directory).unwrap().unwrap();
+                assert_eq!(persisted.status, RecordingStatus::Starting);
+                Ok(InMemoryCaptureSource::new([event]))
+            },
+            || 1,
+            || {
+                let checks = stop_checks.get();
+                stop_checks.set(checks + 1);
+                (checks == 1).then_some(ShutdownReason::SourceCompleted)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.status, RecordingStatus::Completed);
+        assert_eq!(result.shutdown_reason, ShutdownReason::SourceCompleted);
+        assert_eq!(result.counters.committed.records, 1);
+        assert!(result.last_valid_commit.is_some());
+        let persisted = load_recording_metadata(&directory).unwrap().unwrap();
+        assert_eq!(persisted.status, RecordingStatus::Completed);
+        assert!(persisted.last_valid_commit.is_some());
+        assert_eq!(persisted.counters.committed.records, 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Lifecycle variants share one recovered WAL fixture.
+    fn recording_scoped_etl_preserves_finalized_source_provenance() {
+        use chronicle_capture::{
+            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEventV1, CaptureFlags, InMemoryCaptureSource,
+        };
+        use chronicle_common::{ConnectionKey, Direction, Endpoint, SessionId, TransportProtocol};
+        use std::cell::Cell;
+
+        let directory = ingest_directory("recording-etl");
+        let mut metadata = recording_metadata(RecordingStatus::Starting);
+        metadata.recording_id = RecordingId(uuid::Uuid::from_u128(1));
+        let event = CaptureEvent::V1(CaptureEventV1 {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            monotonic_sequence: 1,
+            wall_time: None,
+            connection: ConnectionKey::new(
+                Endpoint::new("client", 1234),
+                Endpoint::new("server", 8080),
+                TransportProtocol::Tcp,
+            ),
+            direction: Direction::ClientToServer,
+            payload: b"opaque".to_vec(),
+            process: None,
+            container: None,
+            file_descriptor: None,
+            truncated: false,
+            flags: CaptureFlags::default(),
+        });
+        let stop_checks = Cell::new(0_u8);
+        let recorded = record_production(
+            &directory,
+            &mut metadata,
+            capture_metadata(),
+            ProductionRecordingBounds {
+                duration_seconds: 60,
+                segment_bytes: MIN_V2_SEGMENT_BYTES,
+                max_wal_bytes: MIN_V2_SEGMENT_BYTES,
+            },
+            || Ok(InMemoryCaptureSource::new([event])),
+            || 1,
+            || {
+                let checks = stop_checks.get();
+                stop_checks.set(checks + 1);
+                (checks == 1).then_some(ShutdownReason::SourceCompleted)
+            },
+        )
+        .unwrap();
+        let suffix = chronicle_wal::WalRecordEnvelope::unplaced(
+            recorded.recording_id,
+            recorded.last_valid_commit.as_ref().unwrap().marker_sequence + 1,
+            RecordKind::CaptureEvent,
+            1,
+            0,
+            b"written but not durable".to_vec(),
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(
+                directory
+                    .join("segments")
+                    .join(chronicle_wal::v2_segment_file_name(1)),
+            )
+            .unwrap()
+            .write_all(&chronicle_wal::encode_envelope(&suffix).unwrap())
+            .unwrap();
+
+        let processed = process_recording_wal(
+            &directory,
+            &chronicle_protocol_builtins::registry().unwrap(),
+            SessionId::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            processed.output.session.source_provenance.status,
+            SourceStatus::Completed
+        );
+        assert_eq!(
+            processed.output.session.source_provenance.reason.as_deref(),
+            Some("source_completed")
+        );
+        assert_eq!(processed.ignored_post_commit_records, 1);
+        assert!(
+            !processed
+                .output
+                .issues
+                .iter()
+                .any(|issue| { issue.kind == chronicle_etl::EtlIssueKind::MalformedCaptureEvent })
+        );
+        assert_eq!(
+            processed.output.session.source_provenance.evidence,
+            [
+                ProvenanceEntry {
+                    kind: ProvenanceKind::Connection,
+                    sequence_range: Some((1, 1)),
+                    reason: None,
+                },
+                ProvenanceEntry {
+                    kind: ProvenanceKind::WalEnvelope,
+                    sequence_range: Some((1, 2)),
+                    reason: None,
+                },
+                ProvenanceEntry {
+                    kind: ProvenanceKind::CommitMarker,
+                    sequence_range: Some((2, 2)),
+                    reason: None,
+                },
+            ]
+        );
+        let repeated = process_recording_wal(
+            &directory,
+            &chronicle_protocol_builtins::registry().unwrap(),
+            SessionId::new(),
+        )
+        .unwrap();
+        assert_eq!(repeated.output.session.id, processed.output.session.id);
+        assert_eq!(
+            repeated.output.session.connections[0].id,
+            processed.output.session.connections[0].id
+        );
+        assert_eq!(
+            repeated.output.session.connections[0].operations[0].id,
+            processed.output.session.connections[0].operations[0].id
+        );
+        let root = ingest_directory("recording-publish");
+        let first = process_and_publish_recording_wal(
+            &directory,
+            &root,
+            &chronicle_protocol_builtins::registry().unwrap(),
+        )
+        .unwrap();
+        assert!(!first.already_published);
+        assert!(!directory.join("output-binding.json").exists());
+        let checkpoint_path = directory.join("etl-checkpoint.json");
+        let first_checkpoint = load_recording_etl_checkpoint(&directory).unwrap().unwrap();
+        assert_eq!(first_checkpoint.session_id, first.session_id);
+        assert_eq!(first_checkpoint.commit_marker_sequence, 2);
+        assert_eq!(first_checkpoint.status, RecordingStatus::Completed);
+        std::fs::remove_file(&checkpoint_path).unwrap();
+        let same_root = process_and_publish_recording_wal(
+            &directory,
+            &root,
+            &chronicle_protocol_builtins::registry().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(same_root.session_id, first.session_id);
+        assert!(same_root.already_published);
+        assert!(checkpoint_path.exists());
+        let second_root = ingest_directory("recording-second-root");
+        assert!(
+            !process_and_publish_recording_wal(
+                &directory,
+                &second_root,
+                &chronicle_protocol_builtins::registry().unwrap(),
+            )
+            .unwrap()
+            .already_published
+        );
+        assert_ne!(
+            load_recording_etl_checkpoint(&directory)
+                .unwrap()
+                .unwrap()
+                .output_root,
+            first_checkpoint.output_root
+        );
+        let mismatch_root = ingest_directory("recording-mismatch-root");
+        let mut mismatched = processed.output.session.clone();
+        mismatched.source_provenance.reason = Some("mismatch".into());
+        FilesystemSessionStore::new(&mismatch_root)
+            .publish(PublishSession {
+                session: mismatched,
+                checkpoint: None,
+                issues: issue_summaries(&processed.output.issues)
+                    .into_iter()
+                    .map(|issue| issue.code)
+                    .collect(),
+                replayability: replayability_reasons(&processed.output),
+                complete: session_complete(&processed.output),
+            })
+            .unwrap();
+        assert!(matches!(
+            process_and_publish_recording_wal(
+                &directory,
+                &mismatch_root,
+                &chronicle_protocol_builtins::registry().unwrap(),
+            ),
+            Err(ApplicationError::PublishedRecordingMismatch { .. })
+        ));
+
+        for (status, reason, expected) in [
+            (
+                RecordingStatus::Failed,
+                ShutdownReason::CaptureFailure,
+                SourceStatus::Failed,
+            ),
+            (
+                RecordingStatus::Aborted,
+                ShutdownReason::ProcessCrashRecovered,
+                SourceStatus::Aborted,
+            ),
+        ] {
+            let mut metadata = load_recording_metadata(&directory).unwrap().unwrap();
+            metadata.status = status;
+            metadata.shutdown_reason = Some(reason);
+            write_recording_metadata(&directory, &metadata).unwrap();
+            let processed = process_recording_wal(
+                &directory,
+                &chronicle_protocol_builtins::registry().unwrap(),
+                SessionId::new(),
+            )
+            .unwrap();
+            assert_eq!(processed.output.session.source_provenance.status, expected);
+            assert_eq!(
+                processed.output.session.source_provenance.reason.as_deref(),
+                Some(shutdown_reason_name(reason))
+            );
+        }
+        let segment = directory
+            .join("segments")
+            .join(chronicle_wal::v2_segment_file_name(1));
+        let mut bytes = std::fs::read(&segment).unwrap();
+        bytes[64] ^= 0xff; // First committed envelope magic; never accepted as a recoverable tail.
+        std::fs::write(&segment, bytes).unwrap();
+        assert!(matches!(
+            process_recording_wal(
+                &directory,
+                &chronicle_protocol_builtins::registry().unwrap(),
+                SessionId::new(),
+            ),
+            Err(ApplicationError::Wal(_))
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(second_root).unwrap();
+        std::fs::remove_dir_all(mismatch_root).unwrap();
+    }
+
+    #[test]
+    fn metadata_only_terminal_loss_becomes_typed_etl_evidence() {
+        let clock = ClockIdentity {
+            boot_id: "boot".into(),
+        };
+        let timestamp = |nanoseconds| MonotonicTimestamp {
+            clock: clock.clone(),
+            nanoseconds,
+        };
+        let summary = TerminalWalLossSummary {
+            entries: vec![
+                TerminalWalLossSummaryEntry {
+                    clock: Some(clock.clone()),
+                    start: Some(timestamp(10)),
+                    end: Some(timestamp(20)),
+                    discarded: RecordByteCount {
+                        records: 3,
+                        bytes: 4,
+                    },
+                    time_source: TerminalWalLossTimeSource::Observed,
+                    persistence: TerminalWalLossPersistence::MetadataOnly,
+                },
+                TerminalWalLossSummaryEntry {
+                    clock: None,
+                    start: None,
+                    end: None,
+                    discarded: RecordByteCount::default(),
+                    time_source: TerminalWalLossTimeSource::TimestampUnavailable,
+                    persistence: TerminalWalLossPersistence::PersistedWal,
+                },
+            ],
+            discarded: RecordByteCount {
+                records: 3,
+                bytes: 4,
+            },
+        };
+
+        let losses = metadata_terminal_wal_losses(Some(&summary));
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].discarded_records, 3);
+        assert_eq!(losses[0].discarded_payload_bytes, 4);
+    }
+
+    #[test]
+    fn recording_scoped_etl_rejects_active_metadata_before_wal_access() {
+        let directory = ingest_directory("active-recording-etl");
+        write_recording_metadata(&directory, &recording_metadata(RecordingStatus::Starting))
+            .unwrap();
+
+        assert!(matches!(
+            process_recording_wal(
+                &directory,
+                &chronicle_protocol_builtins::registry().unwrap(),
+                chronicle_common::SessionId::new(),
+            ),
+            Err(ApplicationError::RecordingMetadataValidation(message))
+                if message == "cannot process an active recording"
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn production_recording_marks_source_failure_failed_after_finalization() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct FailingSource {
+            finalized: Arc<AtomicBool>,
+        }
+
+        impl CaptureSource for FailingSource {
+            fn request_shutdown(&mut self) -> Result<(), CaptureError> {
+                Err(CaptureError::FinalLossSample(
+                    "injected final sample failure".into(),
+                ))
+            }
+
+            fn drain(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+                Ok(None)
+            }
+
+            fn finalize(&mut self) -> Result<CaptureSourceSummary, CaptureError> {
+                self.finalized.store(true, Ordering::SeqCst);
+                Ok(CaptureSourceSummary::default())
+            }
+
+            fn next_event(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+                Err(CaptureError::Source("injected source failure".into()))
+            }
+        }
+
+        let directory = ingest_directory("production-source-failure");
+        let mut metadata = recording_metadata(RecordingStatus::Starting);
+        let finalized = Arc::new(AtomicBool::new(false));
+        let result = record_production(
+            &directory,
+            &mut metadata,
+            capture_metadata(),
+            ProductionRecordingBounds {
+                duration_seconds: 60,
+                segment_bytes: MIN_V2_SEGMENT_BYTES,
+                max_wal_bytes: MIN_V2_SEGMENT_BYTES,
+            },
+            {
+                let finalized = Arc::clone(&finalized);
+                move || Ok(FailingSource { finalized })
+            },
+            || 1,
+            || None,
+        )
+        .unwrap();
+
+        assert!(finalized.load(Ordering::SeqCst));
+        assert_eq!(result.status, RecordingStatus::Failed);
+        assert_eq!(result.shutdown_reason, ShutdownReason::CaptureFailure);
+        assert_eq!(
+            load_recording_metadata(&directory).unwrap().unwrap().status,
+            RecordingStatus::Failed
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn recording_capture_metadata_is_versioned_bounded_and_transitions_live_status() {
         let mut metadata = recording_metadata(RecordingStatus::Starting);
         let core_bytes = serde_json::to_vec(&metadata).unwrap();
@@ -2963,6 +4422,14 @@ mod tests {
             invalid.transition_to_recording(capture),
             Err(ApplicationError::RecordingMetadataValidation(_))
         ));
+    }
+
+    #[test]
+    fn capture_encoding_errors_do_not_become_wal_failures() {
+        assert_eq!(
+            recording_failure_reason(&ApplicationError::CaptureFlagsOutOfRange(u32::MAX)),
+            ShutdownReason::CaptureFailure
+        );
     }
 
     #[test]

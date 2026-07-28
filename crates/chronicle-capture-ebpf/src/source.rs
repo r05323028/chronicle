@@ -1,5 +1,7 @@
 use crate::{adapter::CaptureAdapter, error::EbpfCaptureError};
 use chronicle_capture::{CaptureError, CaptureSource};
+#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+use sha2::{Digest, Sha256};
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use crate::abi::{RawKernelObservation, RawLossCounters, decode_raw_kernel_observation};
@@ -8,6 +10,22 @@ use chronicle_capture::{CaptureEvent, CaptureSourceState, CaptureSourceSummary};
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
 const EMBEDDED_OBJECT: &[u8] = include_bytes!("../objects/chronicle-ebpf-capture-bpfel.o");
+
+/// SHA-256 identity for metadata; unavailable on unsupported object targets.
+#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+pub fn embedded_object_sha256() -> Option<String> {
+    Some(
+        Sha256::digest(EMBEDDED_OBJECT)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little")))]
+pub fn embedded_object_sha256() -> Option<String> {
+    None
+}
 
 #[cfg_attr(
     not(all(target_os = "linux", feature = "linux-ebpf")),
