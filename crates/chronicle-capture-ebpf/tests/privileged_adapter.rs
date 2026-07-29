@@ -276,6 +276,90 @@ fn ipv4_passive_establish_emits_complete_endpoint_evidence()
 
 #[test]
 #[ignore = "requires root, cgroup v2, BTF, and Ubuntu 24.04/Linux 6.8.0-136-generic/aarch64"]
+fn ipv6_passive_establish_emits_complete_endpoint_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let object = fs::read(production_object())?;
+    let reservation = TcpListener::bind(("::1", 0))?;
+    let address = reservation.local_addr()?;
+    drop(reservation);
+
+    let cgroup = CgroupGuard::create()?;
+    let cgroup_id = cgroup.id()?;
+    let scope = RecordingScopeConfig {
+        identity: RecordingScopeIdentity {
+            cgroup_id,
+            canonical_path: cgroup.path.to_string_lossy().into_owned(),
+            namespace: None,
+        },
+        descendant_cgroup_ids: BTreeSet::new(),
+    };
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned();
+    let adapter = CaptureAdapter::new(ClockIdentity { boot_id }, scope, 0)?;
+    let cgroup_file = File::open(&cgroup.path)?;
+    let mut source = EbpfCaptureSource::load(&object, &cgroup_file, adapter)?;
+
+    let mut server = Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "read start; python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"::1\", {})); s.listen(1); c,_=s.accept(); c.recv(1024); c.close(); s.close()'",
+                address.port()
+            ),
+        ])
+        .stdin(Stdio::piped())
+        .spawn()?;
+    fs::write(cgroup.path.join("cgroup.procs"), server.id().to_string())?;
+    server.stdin.take().unwrap().write_all(b"start\n")?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut client = loop {
+        match TcpStream::connect(address) {
+            Ok(stream) => break stream,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    client.write_all(b"passive")?;
+    drop(client);
+    assert!(server.wait()?.success());
+
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        if let Some(event) = source.next_event()? {
+            events.push(event);
+        } else {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    source.request_shutdown()?;
+    while let Some(event) = source.drain()? {
+        events.push(event);
+    }
+    source.finalize()?;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        CaptureEvent {
+            kind: CaptureEventKind::SocketConnected(evidence),
+            ..
+        } if evidence.network_family == chronicle_capture::NetworkFamily::Ipv6
+            && evidence.recording_scope.cgroup_id == cgroup_id
+            && evidence.role == SocketRole::Passive
+            && evidence.local_endpoint.host == "::1"
+            && evidence.local_endpoint.port == address.port()
+            && evidence.remote_endpoint.host == "::1"
+            && evidence.remote_endpoint.port != 0
+    )));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, cgroup v2, BTF, and Ubuntu 24.04/Linux 6.8.0-136-generic/aarch64"]
 fn ipv6_connect_emits_ipv6_evidence() -> Result<(), Box<dyn std::error::Error>> {
     let object = fs::read(production_object())?;
     let listener = TcpListener::bind(("::1", 0))?;

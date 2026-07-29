@@ -184,6 +184,10 @@ impl CaptureAdapter {
         observation: RawPayloadObservation,
     ) -> Result<Option<CaptureEvent>, EbpfCaptureError> {
         let evidence = self.correlated_evidence(&observation.socket)?;
+        let network_family = map_family(observation.family);
+        if network_family != evidence.network_family {
+            return Err(EbpfCaptureError::ConflictingSocketEvidence);
+        }
         let captured_length = u32::try_from(observation.payload.len()).map_err(|_| {
             EbpfCaptureError::InvalidPayload {
                 context: "payload",
@@ -220,7 +224,7 @@ impl CaptureAdapter {
                 timestamp: self.timestamp(observation.socket.timestamp_ns),
                 socket: evidence.socket,
                 recording_scope: evidence.recording_scope,
-                network_family: map_family(observation.family),
+                network_family,
                 direction: match observation.direction {
                     RawDirection::Ingress => PayloadDirection::Ingress,
                     RawDirection::Egress => PayloadDirection::Egress,
@@ -658,6 +662,25 @@ mod tests {
         assert_eq!(fragment.sequence.tcp_sequence, 100);
         assert_eq!(fragment.sequence.continuation_position, 2);
         assert_eq!(fragment.payload, b"bytes");
+    }
+
+    #[test]
+    fn payload_family_must_match_cached_socket_evidence() {
+        let mut adapter = adapter();
+        connect(&mut adapter);
+        assert!(matches!(
+            adapter.convert(RawKernelObservation::Payload(RawPayloadObservation {
+                socket: raw_socket(12),
+                family: RawNetworkFamily::Ipv4,
+                direction: RawDirection::Egress,
+                tcp_sequence: 100,
+                continuation_position: 2,
+                observed_length: None,
+                truncated: false,
+                payload: b"bytes".to_vec(),
+            })),
+            Err(EbpfCaptureError::ConflictingSocketEvidence)
+        ));
     }
 
     #[test]

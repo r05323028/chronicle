@@ -20,7 +20,7 @@ Storage crate SHALL provide filesystem adapter implementing existing metadata an
 - **THEN** save fails without overwrite
 
 ### Requirement: Versioned checksummed filesystem layout
-Each session SHALL use `<root>/sessions/<session-id>/manifest.json`, `session.json`, and `payloads/<sha256-hex>`. Artifact refs SHALL use session-qualified keys `sessions/<session-id>/payloads/<sha256-hex>` for direct key lookup. Manifest v1 SHALL include session/canonical versions, session checksum, payload counts/sizes, processing checkpoint, bounded issue summary, completeness, and replayability reasons. SHA-256 SHALL identify payload and session bytes.
+Each session SHALL use `<root>/sessions/<session-id>/manifest.json`, `session.json`, and `payloads/<sha256-hex>`. Artifact refs SHALL use session-qualified keys `sessions/<session-id>/payloads/<sha256-hex>` for direct key lookup. Sole current manifest v1 SHALL include current Canonical v1 identifier, session checksum, payload counts/sizes, processing checkpoint, bounded issue summary, completeness, replayability reasons, and source endpoint provenance summary where applicable. SHA-256 SHALL identify payload and session bytes. Store SHALL read only current manifest v1 and Canonical v1; obsolete repository layouts SHALL NOT have compatibility readers.
 
 #### Scenario: Deterministic lookup
 - **WHEN** valid session ID is requested
@@ -37,6 +37,11 @@ Each session SHALL use `<root>/sessions/<session-id>/manifest.json`, `session.js
 #### Scenario: Corrupt payload
 - **WHEN** payload bytes do not match Artifact checksum
 - **THEN** replay hydration fails typed integrity error; inspect checks reference existence and filesystem size only and does not claim full payload checksum verification
+
+#### Scenario: Obsolete layout version
+- **WHEN** manifest or canonical session declares version other than 1
+- **THEN** store rejects artifact with typed unsupported-version error
+- **AND** no compatibility dispatch, migration, or defaulting occurs
 
 ### Requirement: Atomic session publication
 Store SHALL write payloads and session into unique staging directory, sync files where supported, write manifest last, and atomically rename complete staging directory to absent final path. Failures SHALL leave final path absent and cleanup staging best-effort. On Unix, all store/session/payload directories SHALL be mode `0700` and manifest/session/payload files SHALL be mode `0600`; non-Unix deployments SHALL enforce equivalent private ACLs or fail closed.

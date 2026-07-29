@@ -203,7 +203,7 @@ impl EtlPipeline {
         Self { limits, max_issues }
     }
 
-    /// Processes only recovery-authoritative v2 envelopes. Commit markers remain
+    /// Processes only recovery-authoritative WAL v1 envelopes. Commit markers remain
     /// provenance, never protocol input.
     pub fn process_envelopes(
         &self,

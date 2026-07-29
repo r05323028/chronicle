@@ -123,19 +123,21 @@ Each supported exchange SHALL become `CanonicalOperation` with protocol `http/1.
 - **THEN** request/response offsets are deterministic relative to session start; missing timestamps produce warning rather than fabricated precision
 
 ### Requirement: Canonical schema compatibility
-Writer SHALL emit Canonical Session v2 with backend-neutral Artifact payload refs and structured canonical warnings. Reader SHALL accept v1 and v2, default missing v1 warning lists to empty, retain existing S3 Object variant, and reject unknown newer schema.
+Writer and reader SHALL use sole mutable Canonical Session v1 with backend-neutral Artifact payload refs, structured canonical warnings, and current HTTP operation data. Reader SHALL reject any canonical schema value other than 1 and MUST NOT dispatch to, migrate, or default fields from obsolete canonical models.
 
-#### Scenario: Read existing v1 session
-- **WHEN** valid schema v1 session is loaded
-- **THEN** it remains readable with empty new warning fields
+#### Scenario: Read current v1 session
+- **WHEN** valid current schema v1 session is loaded
+- **THEN** all required warning, payload-reference, protocol-data, endpoint, and replay metadata fields are interpreted directly
 
 #### Scenario: Write HTTP session
 - **WHEN** HTTP session is persisted
-- **THEN** schema version is 2 and HTTP protocol-data media type/version identifies `HttpOperationDataV1`
+- **THEN** canonical schema version is 1
+- **AND** HTTP protocol data uses sole active v1 representation
 
-#### Scenario: Unknown canonical version
-- **WHEN** filesystem manifest/session declares unsupported newer canonical schema
-- **THEN** inspect/replay fail typed compatibility error without partial interpretation
+#### Scenario: Unsupported canonical version
+- **WHEN** filesystem manifest or session declares canonical schema other than 1
+- **THEN** inspect and replay fail typed compatibility error without partial interpretation
+- **AND** no old-version fallback or migration path runs
 
 ### Requirement: Capability registration integrity
 HTTP registration SHALL mark detection, decoding, canonicalization, replay, and verification Available only when corresponding implementation object is registered. Fake protocol SHALL remain Available. No other protocol status SHALL become Available.
