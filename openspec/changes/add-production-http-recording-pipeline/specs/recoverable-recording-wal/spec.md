@@ -1,28 +1,28 @@
 ## ADDED Requirements
 
-### Requirement: Versioned append-only segment format
-Production WAL SHALL use ordered segment files with checksummed fixed segment headers and checksummed length-framed `WalRecordEnvelope` records. V2 segment header SHALL be exactly 64 bytes, little-endian: `CHS2` magic at bytes 0..4, format version 2 at 4..6, header version 1 at 6..8, header length 64 at 8..12, raw recording UUID at 12..28, segment ordinal at 28..36, first sequence at 36..44, signed Unix-nanosecond creation time at 44..52, zero reserved bytes at 52..60, and CRC32C over bytes 0..60 at 60..64. Envelope SHALL own recording ID, WAL sequence, segment/offset provenance, `RecordKind`, schema version, flags, payload length, payload, and CRC32C. V2 envelope frame SHALL have an exact 48-byte little-endian header: `CHE2` magic at bytes 0..4, envelope version 1 at 4..6, `RecordKind` at 6..8, flags at 8..10, payload schema version at 10..12, header length 48 at 12..16, payload length at 16..20, raw recording UUID at 20..36, WAL sequence at 36..44, and CRC32C over bytes 0..44 followed by payload at 44..48; payload SHALL immediately follow. Segment ordinal, segment first sequence, and frame byte offset SHALL be derived provenance from validated segment context and physical position, not duplicated frame fields. `CaptureEvent`, `LossWindow`, and `CommitMarker` record kinds SHALL all consume one monotonically increasing WAL envelope sequence; Capture Event SHALL NOT require WAL sequence before append. Reader SHALL accept existing P0 WAL v1 unchanged where declared, accept P1 v2, reject unknown newer segment/envelope/record versions before allocation, and cap record length.
+### Requirement: Sole WAL v1 append-only segment format
+Production and fixture WAL SHALL use sole mutable v1 ordered segment files with checksummed fixed segment headers and checksummed length-framed `WalRecordEnvelope` records. Segment header SHALL be exactly 64 bytes, little-endian: `CHS1` magic at bytes 0..4, format version 1 at 4..6, header version 1 at 6..8, header length 64 at 8..12, raw recording UUID at 12..28, segment ordinal at 28..36, first sequence at 36..44, signed Unix-nanosecond creation time at 44..52, zero reserved bytes at 52..60, and CRC32C over bytes 0..60 at 60..64. Envelope SHALL own recording ID, WAL sequence, segment/offset provenance, `RecordKind`, schema version, flags, payload length, payload, and CRC32C. Envelope frame SHALL have exact 48-byte little-endian header: `CHE1` magic at bytes 0..4, envelope version 1 at 4..6, `RecordKind` at 6..8, flags at 8..10, record schema version 1 at 10..12, header length 48 at 12..16, payload length at 16..20, raw recording UUID at 20..36, WAL sequence at 36..44, and CRC32C over bytes 0..44 followed by payload at 44..48; payload SHALL immediately follow. Segment ordinal, segment first sequence, and frame byte offset SHALL be derived provenance. Every record kind consumes one monotonically increasing sequence. Reader SHALL reject every non-v1 segment/envelope/record schema before allocation and cap record length; no earlier framing or format dispatch remains.
 
 #### Scenario: Record framing round trip
-- **WHEN** valid capture, loss-window, and commit-marker records are encoded and read from v2 segment
+- **WHEN** valid capture, loss-window, and commit-marker records are encoded and read from WAL v1 segment
 - **THEN** every envelope field/payload round trips, each CRC32C validates, and sequence advances across all record kinds
 
 #### Scenario: Capture event has no persistence sequence
-- **WHEN** v2 Capture Event reaches writer without WAL identity
+- **WHEN** Capture Event v1 reaches writer without WAL identity
 - **THEN** writer assigns next envelope sequence while Capture Event bytes remain capture-domain data
 
 #### Scenario: Unsupported schema version
 - **WHEN** segment, envelope, or record declares unknown newer format/schema
 - **THEN** reader fails with stable unsupported-version error without processing payload
 
-#### Scenario: WAL v1 compatibility
-- **WHEN** checked-in P0 WAL v1 fixture is read
-- **THEN** existing bytes, ordering, checkpoint, and outcome remain unchanged and no v2 commit marker is required
+#### Scenario: Earlier framing is rejected
+- **WHEN** bytes use old single-file magic or any non-v1 declaration
+- **THEN** sole WAL v1 reader returns typed error without compatibility dispatch
 
 ### Requirement: Fixed in-WAL commit-marker format
 P1 SHALL represent durable boundaries only with `RecordKind::CommitMarker` schema v1 inside normal `WalRecordEnvelope` framing; it SHALL NOT use an external durable-watermark file. Commit-marker payload SHALL be exactly 76 bytes in this order: little-endian `u16 schema_version = 1`, `u16 reserved = 0`, `u64 durable_through_sequence`, `u64 durable_record_count`, `u64 durable_payload_bytes`, `u64 batch_first_sequence`, `u64 batch_last_sequence`, and 32 raw `batch_sha256` bytes. Marker envelope CRC32C SHALL cover normal envelope header/payload. `batch_sha256` SHALL cover exact encoded framed bytes of every contiguous non-marker envelope in current-segment batch, in sequence order. Durable count/bytes SHALL be cumulative committed non-marker record/payload counts. Marker sequence SHALL equal `batch_last_sequence + 1`; `durable_through_sequence` SHALL equal `batch_last_sequence`. Marker SHALL cover at least one record, cover no other marker, and never reference another segment. Marker sequence itself SHALL be recovered physical durable boundary; next envelope SHALL use marker sequence plus one.
 
-A marker SHALL be recovery-authoritative only when all of these validate: marker frame completeness; marker envelope CRC32C; presence of every referenced frame; contiguous referenced WAL sequences; permitted same-segment non-marker batch membership; `batch_first_sequence` equal to segment first sequence for the first batch in that segment or previous recovery-authoritative marker sequence plus one for a later batch; `batch_last_sequence` equal to the final referenced frame sequence; marker sequence equal to `batch_last_sequence + 1`; durable-through and cumulative counts/bytes equal to previous authoritative totals plus exact current-batch totals; SHA-256 over the exact referenced framed bytes; and all relevant segment/header checksums, recording identities, ordinals, first sequences, and versions. A complete-looking marker failing any reference, sequence, segment, identity, version, CRC32C, boundary, cumulative-field, or batch-digest check MUST NOT be authoritative and SHALL fail closed according to corruption rules. Frames after the final recovery-authoritative marker SHALL remain uncommitted uncertainty. P0 WAL v1 behavior SHALL remain unchanged.
+A marker SHALL be recovery-authoritative only when all of these validate: marker frame completeness; marker envelope CRC32C; presence of every referenced frame; contiguous referenced WAL sequences; permitted same-segment non-marker batch membership; `batch_first_sequence` equal to segment first sequence for the first batch in that segment or previous recovery-authoritative marker sequence plus one for a later batch; `batch_last_sequence` equal to the final referenced frame sequence; marker sequence equal to `batch_last_sequence + 1`; durable-through and cumulative counts/bytes equal to previous authoritative totals plus exact current-batch totals; SHA-256 over the exact referenced framed bytes; and all relevant segment/header checksums, recording identities, ordinals, first sequences, and versions. A complete-looking marker failing any reference, sequence, segment, identity, version, CRC32C, boundary, cumulative-field, or batch-digest check MUST NOT be authoritative and SHALL fail closed according to corruption rules. Frames after the final recovery-authoritative marker SHALL remain uncommitted uncertainty.
 
 #### Scenario: One record plus marker
 - **WHEN** one data record forms group-commit batch
@@ -158,7 +158,7 @@ WAL-cap discard SHALL be modeled as recorder/WAL admission loss, not kernel/back
 
 At most one terminal WAL-loss record per clock identity SHALL be emitted for one WAL-limit stop. A complete terminal frame plus required final marker MUST fit before write. Terminal control records SHALL not be recursively treated as ordinary queue input or added to ordinary discard counters. Only a successful final marker sync makes terminal evidence persisted. If no terminal frame plus marker fits, metadata/final summary SHALL retain a typed per-clock `TerminalWalLossSummary` with exact counts and `MetadataOnly` persistence state; ETL SHALL consume equivalent conservative evidence. A discarded event with no trusted timestamp SHALL be represented in a separate typed summary entry: use compatible last persisted capture timestamp as conservative start only when available; otherwise use `TimestampUnavailable` ambiguity and emit no interval-bearing WAL payload. Marker/frame/flush/sync/metadata failure SHALL finalize `failed` with `wal_failure`, preserve prior committed prefix, and report `NotPersistedDueToWalFailure` rather than claim a terminal record was persisted.
 
-Reader/recovery SHALL decode recovery-authoritative `TerminalWalLoss` envelopes as typed control evidence, expose them separately from ordinary CaptureEvent input, reject unsupported terminal-loss schema versions and malformed/contradictory payloads, and retain existing WAL v1 and fixture v1/v2 dispatch unchanged. Operations provably outside a known matching-clock interval may remain complete; overlapping or clock/timing-ambiguous operations SHALL degrade. Policy SHALL NOT claim exact drop time or per-connection attribution.
+Reader/recovery SHALL decode recovery-authoritative `TerminalWalLoss` envelopes as typed control evidence, expose them separately from ordinary CaptureEvent input, and reject non-v1 terminal-loss schema values plus malformed/contradictory payloads without compatibility dispatch. Operations provably outside a known matching-clock interval may remain complete; overlapping or clock/timing-ambiguous operations SHALL degrade. Policy SHALL NOT claim exact drop time or per-connection attribution.
 
 #### Scenario: Single discarded record
 - **WHEN** one timestamped record is discarded at WAL cap
@@ -172,7 +172,7 @@ Reader/recovery SHALL decode recovery-authoritative `TerminalWalLoss` envelopes 
 - **WHEN** discarded records have different `ClockIdentity` values
 - **THEN** writer emits separate per-clock terminal records/summaries and never compares or merges their timestamps
 
-#### Scenario: Terminal codec compatibility
+#### Scenario: Terminal codec validation
 - **WHEN** valid terminal-loss payload is encoded then decoded
 - **THEN** every typed field round trips; unsupported schema, unequal clocks, reversed interval, zero records, invalid enum discriminant, or contradictory accounting is rejected
 
@@ -192,9 +192,9 @@ Reader/recovery SHALL decode recovery-authoritative `TerminalWalLoss` envelopes 
 - **WHEN** a discarded record has no trusted timestamp
 - **THEN** summary uses compatible last persisted capture timestamp only as conservative fallback or records `TimestampUnavailable`; writer never fabricates an interval-bearing terminal WAL payload
 
-#### Scenario: Compatibility preservation
-- **WHEN** existing WAL v1 or fixture v1/v2 artifacts are read
-- **THEN** their existing capture/loss dispatch remains readable and terminal-loss decoding is not required
+#### Scenario: Sole-v1 preservation
+- **WHEN** current repository WAL v1 artifacts are read
+- **THEN** capture, loss, marker, and terminal-loss records use one current dispatch and every non-v1 declaration is rejected
 
 ### Requirement: Commit-aware deterministic recovery scan
 Recovery SHALL lock recording, discover final segments numerically, validate every relevant segment header checksum/version/recording identity/ordinal/first sequence and envelope version/order/CRC32C, scan every envelope, and select the final recovery-authoritative commit marker as committed boundary/counters. Authority SHALL require every marker condition defined by the fixed commit-marker requirement; recovery MUST NOT infer authority from marker appearance alone. Complete frames after the final authoritative marker SHALL be written-not-durable uncertainty and SHALL NOT be promoted. Read-only recovery SHALL report them without mutation; reopen-for-append SHALL first report then truncate current segment to marker end/remove later uncommitted segments, sync changed file/directories, and continue at marker sequence plus one. A complete marker with missing, non-contiguous, skipped-prefix, wrong-segment, identity-mismatched, checksum/CRC-mismatched, boundary-mismatched, cumulative-total-mismatched, or batch-SHA-256-mismatched references SHALL be rejected as authoritative and SHALL fail closed according to corruption rules. Recording metadata may lag and SHALL be reconciled from authoritative committed records without claiming runtime acknowledgement delivery occurred; missing metadata SHALL NOT invalidate committed WAL when immutable recording identity is established from validated segment headers. Unknown newer marker version SHALL fail explicitly. Repeated recovery over unchanged bytes SHALL produce the same checkpoint/report/mutation.

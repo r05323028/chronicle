@@ -98,8 +98,14 @@ pub struct DecodedFrame {
 pub fn reconstructed_frames(connection: &ProtocolNeutralConnection) -> Vec<DecodedFrame> {
     let mut frames = Vec::new();
     for (direction, fragments) in [
-        (Direction::ClientToServer, &connection.ingress.fragments),
-        (Direction::ServerToClient, &connection.egress.fragments),
+        (
+            Direction::ClientToServer,
+            &connection.client_to_server.fragments,
+        ),
+        (
+            Direction::ServerToClient,
+            &connection.server_to_client.fragments,
+        ),
     ] {
         for event in fragments {
             let ReconstructionEvidence::Payload(payload) = &event.evidence else {

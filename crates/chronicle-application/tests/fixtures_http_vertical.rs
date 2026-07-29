@@ -3,8 +3,7 @@ mod support;
 use chronicle_application::{ReplayConfig, inspect_session, record_fixture, replay_session};
 use chronicle_capture::FixtureCaptureSource;
 use chronicle_replay::{LoopbackReplayOptions, TimingMode};
-use chronicle_wal::{ReadOutcome, WalReader, segment_file_name};
-use std::fs::File;
+use chronicle_wal::segment_file_name;
 use support::{HttpTestServer, ResponseMode};
 
 fn fixture() -> Vec<u8> {
@@ -41,13 +40,10 @@ async fn fixture_wal_http_artifact_replay_and_verification_vertical_slice() {
     let segment = root
         .join("wal")
         .join(recorded.session_id.to_string())
+        .join("segments")
         .join(segment_file_name(1));
-    let mut reader = WalReader::new(File::open(segment).expect("open WAL"), 1);
-    let mut records = 0;
-    while let ReadOutcome::Record(_) = reader.next_record().expect("read WAL") {
-        records += 1;
-    }
-    assert_eq!(records, 3);
+    assert!(segment.is_file());
+    assert_eq!(recorded.checkpoint.next_sequence, 6);
 
     std::fs::remove_file(fixture_path).expect("remove fixture copy");
     std::fs::remove_dir_all(root.join("wal")).expect("remove WAL");

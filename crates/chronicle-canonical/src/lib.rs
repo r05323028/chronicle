@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub const CANONICAL_SCHEMA_VERSION: u16 = 1;
+pub const PROTOCOL_DATA_SCHEMA_VERSION: u16 = 1;
 pub type Attributes = BTreeMap<String, String>;
 
 /// Typed capture completeness. `Partial` never implies replay safety.
@@ -210,6 +211,8 @@ pub enum CanonicalValidationError {
     DuplicateConnectionId { id: ConnectionId },
     #[error("duplicate canonical operation {id}")]
     DuplicateOperationId { id: OperationId },
+    #[error("canonical operation {id} has unsupported protocol-data schema version {found}")]
+    UnsupportedProtocolDataSchemaVersion { id: OperationId, found: u16 },
     #[error("canonical connection {id} is missing completeness")]
     MissingConnectionCompleteness { id: ConnectionId },
     #[error("canonical operation {id} is missing completeness")]
@@ -295,6 +298,14 @@ impl CanonicalSession {
                 });
             }
             for operation in &connection.operations {
+                if operation.protocol_data.schema_version != PROTOCOL_DATA_SCHEMA_VERSION {
+                    return Err(
+                        CanonicalValidationError::UnsupportedProtocolDataSchemaVersion {
+                            id: operation.id,
+                            found: operation.protocol_data.schema_version,
+                        },
+                    );
+                }
                 if operations.insert(operation.id, connection.id).is_some() {
                     return Err(CanonicalValidationError::DuplicateOperationId {
                         id: operation.id,
@@ -420,7 +431,7 @@ mod tests {
             recorded_response: None,
             attributes: Attributes::new(),
             protocol_data: ProtocolData {
-                schema_version: 1,
+                schema_version: PROTOCOL_DATA_SCHEMA_VERSION,
                 media_type: None,
                 bytes: Vec::new(),
             },
@@ -522,7 +533,7 @@ mod tests {
             recorded_response: None,
             attributes: Attributes::new(),
             protocol_data: ProtocolData {
-                schema_version: 1,
+                schema_version: PROTOCOL_DATA_SCHEMA_VERSION,
                 media_type: None,
                 bytes: Vec::new(),
             },
@@ -533,6 +544,23 @@ mod tests {
             serde_json::from_slice::<CanonicalOperation>(&serde_json::to_vec(&operation).unwrap())
                 .unwrap(),
             operation
+        );
+    }
+
+    #[test]
+    fn rejects_non_v1_protocol_data() {
+        let mut invalid = valid_session();
+        let operation = &mut invalid.connections[0].operations[0];
+        let id = operation.id;
+        operation.protocol_data.schema_version = PROTOCOL_DATA_SCHEMA_VERSION + 1;
+        assert_eq!(
+            invalid.validate(),
+            Err(
+                CanonicalValidationError::UnsupportedProtocolDataSchemaVersion {
+                    id,
+                    found: PROTOCOL_DATA_SCHEMA_VERSION + 1,
+                }
+            )
         );
     }
 

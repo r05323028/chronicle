@@ -87,19 +87,19 @@ Record service SHALL check BTF, capture object availability, required eBPF capab
 - **THEN** recording status is failed with stable backend error and no claim that traffic was captured
 
 ### Requirement: Payload-only transport capture
-Capture backend SHALL observe client-initiated plaintext IPv4/IPv6 TCP application payload and corresponding response payload for selected workload. Capture Event v2 SHALL contain capture-domain evidence only: kernel timestamp, connect-attributed process/stable-cgroup identity joined to later evidence by socket cookie, feasibility-proven connection identity, raw lifecycle evidence, direction, TCP position, payload, and truncation; typed counter-derived `LossWindow` SHALL be separate persistence payload. Raw lifecycle values SHALL be `established`, `state_changed`, `closed`, `reset`, or `unknown`; `closed`/`reset` require a proven signal, and sock-ops state alone SHALL remain `state_changed` or `unknown`. Directional half-close SHALL NOT be promised. WAL recording ID/sequence/segment/offset SHALL belong to `WalRecordEnvelope`, not Capture Event. Backend SHALL NOT parse HTTP in eBPF or persist raw packet headers as full packet capture.
+Capture backend SHALL observe plaintext IPv4/IPv6 TCP application payload and response payload for selected active or passive workload sockets. Capture Event v1 SHALL contain capture-domain evidence only. Pre-autobind connect intent carries remote endpoint and active role; complete `SocketConnected` evidence carries stable socket identity, validated local/remote endpoints, active/passive role, recording scope, and network family. Payload fragments carry direction, TCP/continuation position, payload, and truncation but MUST NOT duplicate endpoints or role. Typed counter-derived `LossWindow` remains separate. Raw lifecycle values SHALL be `established`, `state_changed`, `closed`, `reset`, or `unknown`; `closed`/`reset` require proven signal. WAL provenance belongs only to `WalRecordEnvelope`. Backend SHALL NOT parse HTTP in eBPF or persist raw packet headers as full packet capture.
 
 #### Scenario: Real plaintext HTTP exchange
 - **WHEN** selected workload sends plaintext HTTP/1.1 request and receives response
-- **THEN** capture emits directional payload and raw lifecycle evidence sufficient for userspace reconstruction without embedding WAL sequence
+- **THEN** capture emits complete endpoint/role evidence before endpoint-free directional payload sufficient for userspace reconstruction without embedding WAL sequence
 
 #### Scenario: TLS traffic
 - **WHEN** selected workload sends TLS records
 - **THEN** capture may preserve opaque TCP payload but SHALL NOT claim decrypted HTTP or TLS plaintext support
 
-#### Scenario: Mid-connection observation
-- **WHEN** payload is observed without required connection-open attribution
-- **THEN** event remains inspectable with synthetic identity marker and affected connection is not complete/replay-ready
+#### Scenario: Payload lacks endpoint evidence
+- **WHEN** payload references socket without complete cached `SocketEvidence`
+- **THEN** adapter/reconstruction returns typed missing-evidence failure and never fabricates endpoint or role
 
 #### Scenario: Packet hook executes outside socket owner task
 - **WHEN** sock-ops or cgroup-skb executes without authoritative current PID/TGID or socket-owner cgroup context

@@ -3,9 +3,9 @@
 ### Requirement: Minimal record command
 CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROOT` and add production form `record --source ebpf (--pid PID | --cgroup PATH [--allow-shared-cgroup]) --wal-dir DIR [--segment-bytes N] [--duration-seconds N] [--max-wal-bytes N]`. Shared acknowledgement SHALL be invalid with `--pid`, fixture source, or no explicit `--cgroup`. Duration SHALL default 600 seconds/max 3600; total WAL SHALL default/hard-cap 4 GiB and be at least segment size. Source-specific/conflicting options SHALL be validated. Production command SHALL show effective cgroup path/ID/direct TGID count/descendant cgroup count/selected-subtree scope/acknowledgement before attach, perform preflight, create/finalize metadata, run eBPF plus bounded in-WAL-marker group commit, handle limits/signals, and print safe categorized summary; it SHALL NOT run ETL implicitly. CLI help and diagnostics SHALL use **direct cgroup TGID set** for distinct host-visible TGIDs resolved from numeric PIDs listed directly in selected node's `cgroup.procs`; they SHALL NOT call it a POSIX process group, thread count, container ID, or descendant union.
 
-#### Scenario: Fixture record compatibility
-- **WHEN** existing valid P0 fixture command runs
-- **THEN** it retains fixture -> WAL -> ETL -> publication behavior and output compatibility
+#### Scenario: Fixture record uses current artifacts
+- **WHEN** valid fixture command runs
+- **THEN** it uses same Capture Event v1, segmented WAL v1, reconstruction, Canonical Session v1, manifest v1, and report v1 family as production
 
 #### Scenario: Production record happy path
 - **WHEN** supported privileged Linux host records valid dedicated workload selector

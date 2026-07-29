@@ -21,7 +21,7 @@ Each session SHALL use existing `<root>/sessions/<session-id>/manifest.json`, `s
 
 #### Scenario: Production provenance manifest
 - **WHEN** P1 ETL publishes recovered recording
-- **THEN** manifest v2 contains recording/checkpoint/provenance/completeness metadata without raw payload/header values
+- **THEN** manifest v1 contains recording/checkpoint/provenance/completeness metadata without raw payload/header values
 
 #### Scenario: Read P0 manifest
 - **WHEN** valid manifest v1 session is loaded

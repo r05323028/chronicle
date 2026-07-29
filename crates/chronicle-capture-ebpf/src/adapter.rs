@@ -1,18 +1,22 @@
 use crate::{
     abi::{
-        RawConnectObservation, RawDirection, RawKernelObservation, RawLifecycleObservation,
-        RawLifecycleSignal, RawLossCounters, RawNetworkFamily, RawPayloadObservation,
-        RawSocketObservation,
+        RawConnectObservation, RawDirection, RawEndpoint, RawEstablishedSocketEvidence,
+        RawKernelObservation, RawLifecycleObservation, RawLifecycleSignal, RawLossCounters,
+        RawNetworkFamily, RawPayloadObservation, RawSocketObservation, RawSocketRole,
     },
     error::EbpfCaptureError,
 };
 use chronicle_capture::{
-    CaptureEvent, CaptureEventKind, CaptureEventV2, ClockIdentity, FragmentSequenceEvidence,
+    CaptureEvent, CaptureEventKind, CaptureFlags, ClockIdentity, FragmentSequenceEvidence,
     LossCounterSample, LossWindowSampler, MonotonicTimestamp, NetworkFamily, PayloadDirection,
-    PayloadFragment, ProcessMetadata, RecordingScopeIdentity, SocketEvidence, SocketIdentity,
-    SocketStateChangeObserved, TruncationMetadata, TruncationState,
+    PayloadFragment, ProcessMetadata, RecordingScopeIdentity, SocketConnectIntent, SocketEvidence,
+    SocketIdentity, SocketRole, SocketStateChangeObserved, TruncationMetadata, TruncationState,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use chronicle_common::Endpoint;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 const PAYLOAD_LENGTH_MISMATCH_REASON: &str =
     "observed and captured payload lengths differ without kernel truncation flag";
@@ -34,6 +38,7 @@ pub struct CaptureAdapter {
     clock: ClockIdentity,
     scope: RecordingScopeConfig,
     loss_sampler: LossWindowSampler,
+    pending_connects: BTreeMap<SocketIdentity, SocketConnectIntent>,
     sockets: BTreeMap<SocketIdentity, SocketEvidence>,
 }
 
@@ -63,6 +68,7 @@ impl CaptureAdapter {
             }),
             clock,
             scope,
+            pending_connects: BTreeMap::new(),
             sockets: BTreeMap::new(),
         })
     }
@@ -104,30 +110,72 @@ impl CaptureAdapter {
         &mut self,
         observation: &RawConnectObservation,
     ) -> Result<Option<CaptureEvent>, EbpfCaptureError> {
-        let evidence = self.socket_evidence(&observation.socket, observation.family)?;
-        self.sockets
-            .insert(evidence.socket.clone(), evidence.clone());
-        Ok(Some(event(CaptureEventKind::SocketConnectObserved(
-            evidence,
-        ))))
+        let observed_cgroup_id = self.require_scope(
+            &observation.socket,
+            "connect-observed recording-scope cgroup",
+            false,
+        )?;
+        let intent = SocketConnectIntent {
+            timestamp: self.timestamp(observation.socket.timestamp_ns),
+            socket: self.socket_identity(&observation.socket)?,
+            recording_scope: self.scope.identity.clone(),
+            network_family: map_family(observation.family),
+            remote_endpoint: map_endpoint(observation.family, &observation.remote_endpoint),
+            role: SocketRole::Active,
+            process: process_metadata(&observation.socket),
+            observed_cgroup_id,
+        };
+        intent
+            .validate()
+            .map_err(|error| EbpfCaptureError::InvalidSocketEvidence(error.to_string()))?;
+        if let Some(existing) = self.pending_connects.get(&intent.socket)
+            && (existing.network_family != intent.network_family
+                || existing.remote_endpoint != intent.remote_endpoint)
+        {
+            return Err(EbpfCaptureError::ConflictingSocketEvidence);
+        }
+        self.pending_connects
+            .insert(intent.socket.clone(), intent.clone());
+        Ok(Some(event(CaptureEventKind::SocketConnectObserved(intent))))
     }
 
     fn convert_lifecycle(
-        &self,
+        &mut self,
         observation: &RawLifecycleObservation,
     ) -> Result<Option<CaptureEvent>, EbpfCaptureError> {
-        let evidence = self.correlated_evidence(&observation.socket)?;
-        let kind = match observation.signal {
-            RawLifecycleSignal::ActiveEstablished => CaptureEventKind::SocketConnected(evidence),
-            RawLifecycleSignal::Close => CaptureEventKind::SocketClosedObserved(evidence),
-            RawLifecycleSignal::Reset => CaptureEventKind::SocketResetObserved(evidence),
-            RawLifecycleSignal::Ambiguous(raw_state) => {
-                CaptureEventKind::SocketStateChangedObserved(SocketStateChangeObserved {
-                    socket: evidence,
-                    raw_state,
-                })
-            }
-        };
+        let kind =
+            match observation.signal {
+                RawLifecycleSignal::ActiveEstablished | RawLifecycleSignal::PassiveEstablished => {
+                    let established = observation.established.as_ref().ok_or(
+                        EbpfCaptureError::MissingIdentity("established endpoint evidence"),
+                    )?;
+                    let evidence = self.established_evidence(&observation.socket, established)?;
+                    if let Some(existing) = self.sockets.get(&evidence.socket)
+                        && (existing.network_family != evidence.network_family
+                            || existing.local_endpoint != evidence.local_endpoint
+                            || existing.remote_endpoint != evidence.remote_endpoint
+                            || existing.role != evidence.role)
+                    {
+                        return Err(EbpfCaptureError::ConflictingSocketEvidence);
+                    }
+                    self.pending_connects.remove(&evidence.socket);
+                    self.sockets
+                        .insert(evidence.socket.clone(), evidence.clone());
+                    CaptureEventKind::SocketConnected(evidence)
+                }
+                RawLifecycleSignal::Close => CaptureEventKind::SocketClosedObserved(
+                    self.correlated_evidence(&observation.socket)?,
+                ),
+                RawLifecycleSignal::Reset => CaptureEventKind::SocketResetObserved(
+                    self.correlated_evidence(&observation.socket)?,
+                ),
+                RawLifecycleSignal::Ambiguous(raw_state) => {
+                    CaptureEventKind::SocketStateChangedObserved(SocketStateChangeObserved {
+                        socket: self.correlated_evidence(&observation.socket)?,
+                        raw_state,
+                    })
+                }
+            };
         Ok(Some(event(kind)))
     }
 
@@ -183,6 +231,7 @@ impl CaptureAdapter {
                 },
                 payload: observation.payload,
                 truncation,
+                flags: CaptureFlags::default(),
             },
         ))))
     }
@@ -206,28 +255,57 @@ impl CaptureAdapter {
             .map(|window| event(CaptureEventKind::LossWindowObserved(window))))
     }
 
-    fn socket_evidence(
+    fn established_evidence(
         &self,
         socket: &RawSocketObservation,
-        family: RawNetworkFamily,
+        established: &RawEstablishedSocketEvidence,
     ) -> Result<SocketEvidence, EbpfCaptureError> {
-        if !self.scope.contains(socket.cgroup_id) {
-            return Err(EbpfCaptureError::MissingIdentity(
-                "connect-observed recording-scope cgroup",
-            ));
-        }
-        Ok(SocketEvidence {
+        let attachment_scope_id =
+            self.require_scope(socket, "established recording-scope cgroup", true)?;
+        let identity = self.socket_identity(socket)?;
+        let pending = self.pending_connects.get(&identity);
+        let observed_cgroup_id =
+            pending.map_or(attachment_scope_id, |intent| intent.observed_cgroup_id);
+        let evidence = SocketEvidence {
             timestamp: self.timestamp(socket.timestamp_ns),
-            socket: self.socket_identity(socket)?,
+            socket: identity,
             recording_scope: self.scope.identity.clone(),
-            network_family: map_family(family),
-            process: Some(ProcessMetadata {
-                pid: socket.pid,
-                tid: (socket.tid != socket.pid).then_some(socket.tid),
-                executable: None,
-            }),
-            observed_cgroup_id: socket.cgroup_id,
-        })
+            network_family: map_family(established.family),
+            local_endpoint: map_endpoint(established.family, &established.local_endpoint),
+            remote_endpoint: map_endpoint(established.family, &established.remote_endpoint),
+            role: map_role(established.role),
+            process: pending
+                .and_then(|intent| intent.process.clone())
+                .or_else(|| process_metadata(socket)),
+            observed_cgroup_id,
+        };
+        if let Some(intent) = pending
+            && (evidence.role != SocketRole::Active
+                || evidence.network_family != intent.network_family
+                || evidence.remote_endpoint != intent.remote_endpoint)
+        {
+            return Err(EbpfCaptureError::ConflictingSocketEvidence);
+        }
+        evidence
+            .validate()
+            .map_err(|error| EbpfCaptureError::InvalidSocketEvidence(error.to_string()))?;
+        Ok(evidence)
+    }
+
+    fn require_scope(
+        &self,
+        socket: &RawSocketObservation,
+        label: &'static str,
+        allow_attachment_scope: bool,
+    ) -> Result<u64, EbpfCaptureError> {
+        if socket.cgroup_id == 0 && allow_attachment_scope {
+            // SockOps may run in peer context; attachment proves root scope.
+            Ok(self.scope.identity.cgroup_id)
+        } else if self.scope.contains(socket.cgroup_id) {
+            Ok(socket.cgroup_id)
+        } else {
+            Err(EbpfCaptureError::MissingIdentity(label))
+        }
     }
 
     fn correlated_evidence(
@@ -274,10 +352,10 @@ impl CaptureAdapter {
 }
 
 fn event(kind: CaptureEventKind) -> CaptureEvent {
-    CaptureEvent::V2(CaptureEventV2 {
-        schema_version: chronicle_capture::CAPTURE_EVENT_V2_SCHEMA_VERSION,
+    CaptureEvent {
+        schema_version: chronicle_capture::CAPTURE_EVENT_SCHEMA_VERSION,
         kind,
-    })
+    }
 }
 
 const fn map_family(family: RawNetworkFamily) -> NetworkFamily {
@@ -287,12 +365,41 @@ const fn map_family(family: RawNetworkFamily) -> NetworkFamily {
     }
 }
 
+const fn map_role(role: RawSocketRole) -> SocketRole {
+    match role {
+        RawSocketRole::Active => SocketRole::Active,
+        RawSocketRole::Passive => SocketRole::Passive,
+    }
+}
+
+fn map_endpoint(family: RawNetworkFamily, endpoint: &RawEndpoint) -> Endpoint {
+    let address = match family {
+        RawNetworkFamily::Ipv4 => IpAddr::V4(Ipv4Addr::new(
+            endpoint.address[0],
+            endpoint.address[1],
+            endpoint.address[2],
+            endpoint.address[3],
+        )),
+        RawNetworkFamily::Ipv6 => IpAddr::V6(Ipv6Addr::from(endpoint.address)),
+    };
+    Endpoint::new(address.to_string(), endpoint.port)
+}
+
+fn process_metadata(socket: &RawSocketObservation) -> Option<ProcessMetadata> {
+    (socket.pid != 0).then(|| ProcessMetadata {
+        pid: socket.pid,
+        tid: (socket.tid != 0 && socket.tid != socket.pid).then_some(socket.tid),
+        executable: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::abi::{
-        RawConnectObservation, RawKernelObservation, RawLifecycleObservation, RawLifecycleSignal,
-        RawLossCounters, RawPayloadObservation, RawSocketObservation,
+        RawConnectObservation, RawEndpoint, RawEstablishedSocketEvidence, RawKernelObservation,
+        RawLifecycleObservation, RawLifecycleSignal, RawLossCounters, RawPayloadObservation,
+        RawSocketObservation, RawSocketRole,
     };
 
     fn adapter() -> CaptureAdapter {
@@ -336,13 +443,62 @@ mod tests {
         }
     }
 
+    fn raw_endpoint(family: RawNetworkFamily, local: bool) -> RawEndpoint {
+        let mut address = [0; 16];
+        match family {
+            RawNetworkFamily::Ipv4 => address[..4].copy_from_slice(if local {
+                &[192, 0, 2, 10]
+            } else {
+                &[192, 0, 2, 20]
+            }),
+            RawNetworkFamily::Ipv6 => {
+                address = if local { [1; 16] } else { [2; 16] };
+            }
+        }
+        RawEndpoint {
+            address,
+            port: if local { 41_000 } else { 8_080 },
+        }
+    }
+
+    fn establish(
+        adapter: &mut CaptureAdapter,
+        socket: RawSocketObservation,
+        family: RawNetworkFamily,
+        role: RawSocketRole,
+    ) -> CaptureEvent {
+        adapter
+            .convert(RawKernelObservation::Lifecycle(RawLifecycleObservation {
+                socket,
+                signal: match role {
+                    RawSocketRole::Active => RawLifecycleSignal::ActiveEstablished,
+                    RawSocketRole::Passive => RawLifecycleSignal::PassiveEstablished,
+                },
+                established: Some(RawEstablishedSocketEvidence {
+                    family,
+                    local_endpoint: raw_endpoint(family, true),
+                    remote_endpoint: raw_endpoint(family, false),
+                    role,
+                }),
+            }))
+            .unwrap()
+            .unwrap()
+    }
+
     fn connect(adapter: &mut CaptureAdapter) {
         adapter
             .convert(RawKernelObservation::Connect(RawConnectObservation {
                 socket: raw_socket(10),
                 family: RawNetworkFamily::Ipv6,
+                remote_endpoint: raw_endpoint(RawNetworkFamily::Ipv6, false),
             }))
             .unwrap();
+        establish(
+            adapter,
+            raw_socket(11),
+            RawNetworkFamily::Ipv6,
+            RawSocketRole::Active,
+        );
     }
 
     fn payload_fragment(
@@ -365,10 +521,10 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        let CaptureEvent::V2(CaptureEventV2 {
+        let CaptureEvent {
             kind: CaptureEventKind::PayloadFragment(fragment),
             ..
-        }) = event
+        } = event
         else {
             panic!("expected payload fragment");
         };
@@ -392,10 +548,10 @@ mod tests {
     }
 
     fn loss_window(event: CaptureEvent) -> chronicle_capture::LossWindowObserved {
-        let CaptureEvent::V2(CaptureEventV2 {
+        let CaptureEvent {
             kind: CaptureEventKind::LossWindowObserved(window),
             ..
-        }) = event
+        } = event
         else {
             panic!("expected loss window");
         };
@@ -409,13 +565,14 @@ mod tests {
             .convert(RawKernelObservation::Connect(RawConnectObservation {
                 socket: raw_socket(10),
                 family: RawNetworkFamily::Ipv6,
+                remote_endpoint: raw_endpoint(RawNetworkFamily::Ipv6, false),
             }))
             .unwrap()
             .unwrap();
         assert!(matches!(
             connect,
-            CaptureEvent::V2(CaptureEventV2 {
-                kind: CaptureEventKind::SocketConnectObserved(SocketEvidence {
+            CaptureEvent {
+                kind: CaptureEventKind::SocketConnectObserved(SocketConnectIntent {
                     socket: SocketIdentity {
                         socket_cookie: 20,
                         first_seen: MonotonicTimestamp { nanoseconds: 5, .. },
@@ -427,25 +584,42 @@ mod tests {
                     ..
                 }),
                 ..
-            })
+            }
         ));
 
+        let established = establish(
+            &mut adapter,
+            raw_socket(11),
+            RawNetworkFamily::Ipv6,
+            RawSocketRole::Active,
+        );
+        assert!(matches!(
+            established,
+            CaptureEvent {
+                kind: CaptureEventKind::SocketConnected(SocketEvidence {
+                    observed_cgroup_id: 31,
+                    ..
+                }),
+                ..
+            }
+        ));
         let lifecycle = adapter
             .convert(RawKernelObservation::Lifecycle(RawLifecycleObservation {
-                socket: raw_socket(11),
+                socket: raw_socket(12),
                 signal: RawLifecycleSignal::Ambiguous(99),
+                established: None,
             }))
             .unwrap()
             .unwrap();
         assert!(matches!(
             lifecycle,
-            CaptureEvent::V2(CaptureEventV2 {
+            CaptureEvent {
                 kind: CaptureEventKind::SocketStateChangedObserved(SocketStateChangeObserved {
                     raw_state: 99,
                     ..
                 }),
                 ..
-            })
+            }
         ));
     }
 
@@ -494,10 +668,17 @@ mod tests {
         for socket in [first, reused.clone()] {
             adapter
                 .convert(RawKernelObservation::Connect(RawConnectObservation {
-                    socket,
+                    socket: socket.clone(),
                     family: RawNetworkFamily::Ipv4,
+                    remote_endpoint: raw_endpoint(RawNetworkFamily::Ipv4, false),
                 }))
                 .unwrap();
+            establish(
+                &mut adapter,
+                socket,
+                RawNetworkFamily::Ipv4,
+                RawSocketRole::Active,
+            );
         }
 
         let event = adapter
@@ -513,10 +694,10 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        let CaptureEvent::V2(CaptureEventV2 {
+        let CaptureEvent {
             kind: CaptureEventKind::PayloadFragment(fragment),
             ..
-        }) = event
+        } = event
         else {
             panic!("expected payload fragment");
         };
@@ -540,6 +721,80 @@ mod tests {
                 "connect-derived socket attribution"
             ))
         ));
+    }
+
+    #[test]
+    fn passive_establishment_creates_complete_socket_cache() {
+        let mut adapter = adapter();
+        let mut socket = raw_socket(10);
+        socket.cgroup_id = 0;
+        let event = establish(
+            &mut adapter,
+            socket,
+            RawNetworkFamily::Ipv4,
+            RawSocketRole::Passive,
+        );
+        let CaptureEvent {
+            kind: CaptureEventKind::SocketConnected(evidence),
+            ..
+        } = event
+        else {
+            panic!("expected connected evidence");
+        };
+        assert_eq!(evidence.role, SocketRole::Passive);
+        assert_eq!(evidence.observed_cgroup_id, 30);
+        assert_eq!(evidence.local_endpoint, Endpoint::new("192.0.2.10", 41_000));
+        assert_eq!(evidence.remote_endpoint, Endpoint::new("192.0.2.20", 8_080));
+
+        let payload = adapter
+            .convert(RawKernelObservation::Payload(RawPayloadObservation {
+                socket: raw_socket(11),
+                family: RawNetworkFamily::Ipv4,
+                direction: RawDirection::Ingress,
+                tcp_sequence: 1,
+                continuation_position: 0,
+                observed_length: Some(1),
+                truncated: false,
+                payload: vec![1],
+            }))
+            .unwrap();
+        assert!(payload.is_some());
+    }
+
+    #[test]
+    fn conflicting_established_evidence_does_not_overwrite_cache() {
+        let mut adapter = adapter();
+        establish(
+            &mut adapter,
+            raw_socket(10),
+            RawNetworkFamily::Ipv4,
+            RawSocketRole::Passive,
+        );
+        let mut conflicting = RawEstablishedSocketEvidence {
+            family: RawNetworkFamily::Ipv4,
+            local_endpoint: raw_endpoint(RawNetworkFamily::Ipv4, true),
+            remote_endpoint: raw_endpoint(RawNetworkFamily::Ipv4, false),
+            role: RawSocketRole::Passive,
+        };
+        conflicting.remote_endpoint.port = 9_090;
+        assert!(matches!(
+            adapter.convert(RawKernelObservation::Lifecycle(RawLifecycleObservation {
+                socket: raw_socket(11),
+                signal: RawLifecycleSignal::PassiveEstablished,
+                established: Some(conflicting),
+            })),
+            Err(EbpfCaptureError::ConflictingSocketEvidence)
+        ));
+        assert_eq!(
+            adapter
+                .sockets
+                .values()
+                .next()
+                .unwrap()
+                .remote_endpoint
+                .port,
+            8_080
+        );
     }
 
     #[test]

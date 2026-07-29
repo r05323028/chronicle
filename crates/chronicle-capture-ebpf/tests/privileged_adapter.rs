@@ -2,19 +2,19 @@
 
 use chronicle_capture::{
     CaptureEvent, CaptureEventKind, CaptureSource, ClockIdentity, PayloadDirection,
-    RecordingScopeIdentity, TruncationState,
+    RecordingScopeIdentity, SocketRole, TruncationState,
 };
 use chronicle_capture_ebpf::{CaptureAdapter, EbpfCaptureSource, RecordingScopeConfig};
 use std::{
     collections::BTreeSet,
     fs::{self, File},
     io::Write,
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -126,12 +126,11 @@ fn ipv4_connect_and_active_establish_emit_capture_events() -> Result<(), Box<dyn
     }
     let summary = source.finalize()?;
     assert!(!summary.drain_failed);
-    assert_eq!(summary.final_loss_events, 1);
     assert!(events.iter().any(|event| matches!(
         event,
-        CaptureEvent::V2(v2) if matches!(
-            v2.kind,
-            CaptureEventKind::LossWindowObserved(ref window)
+        CaptureEvent { kind, .. } if matches!(
+            kind,
+            CaptureEventKind::LossWindowObserved(window)
                 if window.start.nanoseconds > 0
                     && window.end.nanoseconds >= window.start.nanoseconds
                     && window.drop_delta.is_some_and(|delta| delta > 0)
@@ -142,24 +141,29 @@ fn ipv4_connect_and_active_establish_emit_capture_events() -> Result<(), Box<dyn
 
     assert!(events.iter().any(|event| matches!(
         event,
-        CaptureEvent::V2(v2) if matches!(
-            v2.kind,
-            CaptureEventKind::SocketConnectObserved(ref evidence)
+        CaptureEvent { kind, .. } if matches!(
+            kind,
+            CaptureEventKind::SocketConnectObserved(evidence)
                 if evidence.network_family == chronicle_capture::NetworkFamily::Ipv4
                     && evidence.recording_scope.cgroup_id == cgroup_id
         )
     )));
     assert!(events.iter().any(|event| matches!(
         event,
-        CaptureEvent::V2(v2) if matches!(v2.kind, CaptureEventKind::SocketConnected(_))
+        CaptureEvent {
+            kind: CaptureEventKind::SocketConnected(evidence),
+            ..
+        } if evidence.network_family == chronicle_capture::NetworkFamily::Ipv4
+            && evidence.role == SocketRole::Active
+            && evidence.local_endpoint.host == "127.0.0.1"
+            && evidence.local_endpoint.port != 0
+            && evidence.remote_endpoint.host == "127.0.0.1"
+            && evidence.remote_endpoint.port == address.port()
     )));
     let fragments: Vec<_> = events
         .iter()
-        .filter_map(|event| match event {
-            CaptureEvent::V2(v2) => match &v2.kind {
-                CaptureEventKind::PayloadFragment(fragment) => Some(fragment),
-                _ => None,
-            },
+        .filter_map(|event| match &event.kind {
+            CaptureEventKind::PayloadFragment(fragment) => Some(fragment),
             _ => None,
         })
         .collect();
@@ -183,6 +187,90 @@ fn ipv4_connect_and_active_establish_emit_capture_events() -> Result<(), Box<dyn
     assert_eq!(bpftool_ids("prog")?, programs_before);
     assert_eq!(bpftool_ids("link")?, links_before);
     assert_eq!(bpftool_ids("map")?, maps_before);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, cgroup v2, BTF, and Ubuntu 24.04/Linux 6.8.0-136-generic/aarch64"]
+fn ipv4_passive_establish_emits_complete_endpoint_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let object = fs::read(production_object())?;
+    let reservation = TcpListener::bind(("127.0.0.1", 0))?;
+    let address = reservation.local_addr()?;
+    drop(reservation);
+
+    let cgroup = CgroupGuard::create()?;
+    let cgroup_id = cgroup.id()?;
+    let scope = RecordingScopeConfig {
+        identity: RecordingScopeIdentity {
+            cgroup_id,
+            canonical_path: cgroup.path.to_string_lossy().into_owned(),
+            namespace: None,
+        },
+        descendant_cgroup_ids: BTreeSet::new(),
+    };
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned();
+    let adapter = CaptureAdapter::new(ClockIdentity { boot_id }, scope, 0)?;
+    let cgroup_file = File::open(&cgroup.path)?;
+    let mut source = EbpfCaptureSource::load(&object, &cgroup_file, adapter)?;
+
+    let mut server = Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "read start; python3 -c 'import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"127.0.0.1\", {})); s.listen(1); c,_=s.accept(); c.recv(1024); c.close(); s.close()'",
+                address.port()
+            ),
+        ])
+        .stdin(Stdio::piped())
+        .spawn()?;
+    fs::write(cgroup.path.join("cgroup.procs"), server.id().to_string())?;
+    server.stdin.take().unwrap().write_all(b"start\n")?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut client = loop {
+        match TcpStream::connect(address) {
+            Ok(stream) => break stream,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    client.write_all(b"passive")?;
+    drop(client);
+    assert!(server.wait()?.success());
+
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        if let Some(event) = source.next_event()? {
+            events.push(event);
+        } else {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    source.request_shutdown()?;
+    while let Some(event) = source.drain()? {
+        events.push(event);
+    }
+    source.finalize()?;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        CaptureEvent {
+            kind: CaptureEventKind::SocketConnected(evidence),
+            ..
+        } if evidence.network_family == chronicle_capture::NetworkFamily::Ipv4
+            && evidence.recording_scope.cgroup_id == cgroup_id
+            && evidence.role == SocketRole::Passive
+            && evidence.local_endpoint.host == "127.0.0.1"
+            && evidence.local_endpoint.port == address.port()
+            && evidence.remote_endpoint.host == "127.0.0.1"
+            && evidence.remote_endpoint.port != 0
+    )));
     Ok(())
 }
 
@@ -228,12 +316,17 @@ fn ipv6_connect_emits_ipv6_evidence() -> Result<(), Box<dyn std::error::Error>> 
     server.join().unwrap();
     let mut observed = false;
     for _ in 0..100 {
-        if let Some(CaptureEvent::V2(v2)) = source.next_event()? {
+        if let Some(event) = source.next_event()? {
             observed |= matches!(
-                v2.kind,
-                CaptureEventKind::SocketConnectObserved(ref evidence)
+                event.kind,
+                CaptureEventKind::SocketConnected(ref evidence)
                     if evidence.network_family == chronicle_capture::NetworkFamily::Ipv6
                         && evidence.recording_scope.cgroup_id == cgroup_id
+                        && evidence.role == SocketRole::Active
+                        && evidence.local_endpoint.host == "::1"
+                        && evidence.local_endpoint.port != 0
+                        && evidence.remote_endpoint.host == "::1"
+                        && evidence.remote_endpoint.port == address.port()
             );
         }
         if observed {

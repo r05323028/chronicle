@@ -1,4 +1,4 @@
-//! Versioned append-only WAL framing and segmented writer.
+//! WAL v1 append-only framing, segmented writer, and recovery.
 
 use chronicle_capture::{ClockIdentity, MonotonicTimestamp};
 use chronicle_common::RecordingId;
@@ -13,17 +13,15 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-pub const WAL_FORMAT_V1: u16 = 1;
-pub const WAL_FORMAT_V2: u16 = 2;
-pub const WAL_VERSION: u16 = WAL_FORMAT_V1;
+pub const WAL_FORMAT_VERSION: u16 = 1;
 pub const SEGMENT_HEADER_VERSION: u16 = 1;
 pub const SEGMENT_HEADER_LEN: usize = 64;
 const SEGMENT_HEADER_LEN_U32: u32 = 64;
 const SEGMENT_HEADER_LEN_U64: u64 = 64;
 pub const ENVELOPE_VERSION: u16 = 1;
+pub const WAL_RECORD_SCHEMA_VERSION: u16 = 1;
 pub const ENVELOPE_HEADER_LEN: usize = 48;
 const ENVELOPE_HEADER_LEN_U32: u32 = 48;
-pub const HEADER_LEN: usize = 28;
 pub const DEFAULT_MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub const COMMIT_MARKER_VERSION: u16 = 1;
 pub const TERMINAL_WAL_LOSS_SCHEMA_VERSION: u16 = 1;
@@ -31,32 +29,12 @@ pub const COMMIT_MARKER_PAYLOAD_LEN: usize = 76;
 pub const COMMIT_MARKER_FRAME_LEN: usize = ENVELOPE_HEADER_LEN + COMMIT_MARKER_PAYLOAD_LEN;
 pub const GROUP_COMMIT_BYTES: u64 = 4 * 1024 * 1024;
 pub const GROUP_COMMIT_INTERVAL_MILLIS: u64 = 10;
-pub const DEFAULT_V2_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
-pub const MIN_V2_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
-pub const MAX_V2_SEGMENT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-pub const DEFAULT_MAX_WAL_BYTES: u64 = MAX_V2_SEGMENT_BYTES;
-const MAGIC: [u8; 4] = *b"CHWL";
-const SEGMENT_MAGIC: [u8; 4] = *b"CHS2";
-const ENVELOPE_MAGIC: [u8; 4] = *b"CHE2";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u16)]
-pub enum WalFormatVersion {
-    V1 = WAL_FORMAT_V1,
-    V2 = WAL_FORMAT_V2,
-}
-
-impl TryFrom<u16> for WalFormatVersion {
-    type Error = WalError;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            WAL_FORMAT_V1 => Ok(Self::V1),
-            WAL_FORMAT_V2 => Ok(Self::V2),
-            other => Err(WalError::UnsupportedVersion(other)),
-        }
-    }
-}
+pub const DEFAULT_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
+pub const MIN_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_WAL_BYTES: u64 = MAX_SEGMENT_BYTES;
+const SEGMENT_MAGIC: [u8; 4] = *b"CHS1";
+const ENVELOPE_MAGIC: [u8; 4] = *b"CHE1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentHeader {
@@ -102,13 +80,6 @@ impl RecordKind {
         Self::CommitMarker,
         Self::TerminalWalLoss,
     ];
-
-    fn from_v1(value: u16) -> Result<Self, WalError> {
-        match value {
-            1 => Ok(Self::CaptureEvent),
-            other => Err(WalError::UnknownRecordKind(other)),
-        }
-    }
 }
 
 impl TryFrom<u16> for RecordKind {
@@ -123,14 +94,6 @@ impl TryFrom<u16> for RecordKind {
             other => Err(WalError::UnknownRecordKind(other)),
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WalRecord {
-    pub kind: RecordKind,
-    pub flags: u16,
-    pub sequence: u64,
-    pub payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,13 +202,6 @@ pub struct WalCheckpoint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadOutcome {
-    Record(WalRecord),
-    End,
-    PartialTail { offset: u64 },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VersionedReadOutcome {
     Record(WalRecordEnvelope),
     End,
     PartialTail { offset: u64 },
@@ -307,6 +263,8 @@ pub enum WalError {
     },
     #[error("unsupported WAL version {0}")]
     UnsupportedVersion(u16),
+    #[error("unsupported WAL record schema version {version} for kind {kind}")]
+    UnsupportedRecordSchemaVersion { kind: u16, version: u16 },
     #[error("unknown WAL record kind {0}")]
     UnknownRecordKind(u16),
     #[error("WAL record payload is too large: {0} bytes")]
@@ -334,8 +292,8 @@ pub enum WalError {
     InvalidSegmentSize,
     #[error("WAL writer has no active segment")]
     NoActiveSegment,
-    #[error("v2 segment size must be between 16 MiB and 4 GiB")]
-    InvalidV2SegmentSize,
+    #[error("segment size must be between 16 MiB and 4 GiB")]
+    InvalidSegmentSizeRange,
     #[error("WAL envelope recording ID does not match writer")]
     WriterRecordingIdMismatch,
     #[error("WAL envelope already has segment provenance")]
@@ -347,7 +305,7 @@ pub enum WalError {
         record_bytes: u64,
         segment_bytes: u64,
     },
-    #[error("v2 segment publication is unsupported on this platform")]
+    #[error("WAL segment publication is unsupported on this platform")]
     UnsupportedSegmentPublication,
     #[error("WAL segment ordinal space is exhausted")]
     SegmentOrdinalExhausted,
@@ -395,7 +353,7 @@ pub enum WalError {
     WalCapacityExceeded { required: u64, limit: u64 },
     #[error("recording WAL lock is already held")]
     RecordingLockHeld,
-    #[error("recording WAL has no published v2 segments")]
+    #[error("recording WAL has no published WAL segments")]
     NoPublishedSegments,
     #[error("partial WAL tail appears before final segment")]
     PartialTailBeforeFinalSegment,
@@ -416,7 +374,7 @@ impl WalError {
 pub fn encode_segment_header(header: &SegmentHeader) -> [u8; SEGMENT_HEADER_LEN] {
     let mut bytes = [0_u8; SEGMENT_HEADER_LEN];
     bytes[0..4].copy_from_slice(&SEGMENT_MAGIC);
-    bytes[4..6].copy_from_slice(&WAL_FORMAT_V2.to_le_bytes());
+    bytes[4..6].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
     bytes[6..8].copy_from_slice(&SEGMENT_HEADER_VERSION.to_le_bytes());
     bytes[8..12].copy_from_slice(&SEGMENT_HEADER_LEN_U32.to_le_bytes());
     bytes[12..28].copy_from_slice(header.recording_id.0.as_bytes());
@@ -439,7 +397,7 @@ pub fn decode_segment_header(bytes: &[u8]) -> Result<SegmentHeader, WalError> {
         return Err(WalError::InvalidSegmentMagic);
     }
     let format_version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if format_version != WAL_FORMAT_V2 {
+    if format_version != WAL_FORMAT_VERSION {
         return Err(WalError::UnsupportedVersion(format_version));
     }
     let header_version = u16::from_le_bytes([bytes[6], bytes[7]]);
@@ -475,6 +433,12 @@ pub fn decode_segment_header(bytes: &[u8]) -> Result<SegmentHeader, WalError> {
 }
 
 pub fn encode_envelope(envelope: &WalRecordEnvelope) -> Result<Vec<u8>, WalError> {
+    if envelope.schema_version != WAL_RECORD_SCHEMA_VERSION {
+        return Err(WalError::UnsupportedRecordSchemaVersion {
+            kind: envelope.kind as u16,
+            version: envelope.schema_version,
+        });
+    }
     let payload_len = u32::try_from(envelope.payload.len())
         .map_err(|_| WalError::PayloadTooLarge(envelope.payload.len()))?;
     let mut bytes = Vec::with_capacity(ENVELOPE_HEADER_LEN + envelope.payload.len());
@@ -838,184 +802,7 @@ pub fn validate_commit_authority(
     })
 }
 
-pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>, WalError> {
-    if record.kind != RecordKind::CaptureEvent {
-        return Err(WalError::UnknownRecordKind(record.kind as u16));
-    }
-    let payload_len = u32::try_from(record.payload.len())
-        .map_err(|_| WalError::PayloadTooLarge(record.payload.len()))?;
-    let mut bytes = Vec::with_capacity(HEADER_LEN + record.payload.len());
-    bytes.extend_from_slice(&MAGIC);
-    bytes.extend_from_slice(&WAL_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&(record.kind as u16).to_le_bytes());
-    bytes.extend_from_slice(&record.flags.to_le_bytes());
-    bytes.extend_from_slice(&0_u16.to_le_bytes());
-    bytes.extend_from_slice(&payload_len.to_le_bytes());
-    bytes.extend_from_slice(&record.sequence.to_le_bytes());
-    bytes.extend_from_slice(&0_u32.to_le_bytes());
-    bytes.extend_from_slice(&record.payload);
-
-    let checksum = record_checksum(&bytes[4..24], &record.payload);
-    bytes[24..28].copy_from_slice(&checksum.to_le_bytes());
-    Ok(bytes)
-}
-
-fn record_checksum(fixed_header: &[u8], payload: &[u8]) -> u32 {
-    let mut checksum_input = Vec::with_capacity(fixed_header.len() + payload.len());
-    checksum_input.extend_from_slice(fixed_header);
-    checksum_input.extend_from_slice(payload);
-    crc32c::crc32c(&checksum_input)
-}
-
 pub struct WalReader<R> {
-    reader: R,
-    offset: u64,
-    segment_first_sequence: u64,
-    next_sequence: u64,
-    max_record_bytes: usize,
-}
-
-impl<R: Read> WalReader<R> {
-    pub fn new(reader: R, segment_first_sequence: u64) -> Self {
-        Self::with_max_record_bytes(reader, segment_first_sequence, DEFAULT_MAX_RECORD_BYTES)
-    }
-
-    pub fn with_max_record_bytes(
-        reader: R,
-        segment_first_sequence: u64,
-        max_record_bytes: usize,
-    ) -> Self {
-        Self {
-            reader,
-            offset: 0,
-            segment_first_sequence,
-            next_sequence: segment_first_sequence,
-            max_record_bytes,
-        }
-    }
-
-    pub fn checkpoint(&self) -> WalCheckpoint {
-        WalCheckpoint {
-            segment_first_sequence: self.segment_first_sequence,
-            byte_offset: self.offset,
-            next_sequence: self.next_sequence,
-        }
-    }
-
-    pub fn next_record(&mut self) -> Result<ReadOutcome, WalError> {
-        let record_offset = self.offset;
-        let mut header = [0_u8; HEADER_LEN];
-        let header_read = read_up_to(&mut self.reader, &mut header)?;
-        if header_read == 0 {
-            return Ok(ReadOutcome::End);
-        }
-        if header_read < HEADER_LEN {
-            return Ok(ReadOutcome::PartialTail {
-                offset: record_offset,
-            });
-        }
-        if header[..4] != MAGIC {
-            return Err(WalError::InvalidMagic {
-                offset: record_offset,
-            });
-        }
-
-        let version = u16::from_le_bytes([header[4], header[5]]);
-        match WalFormatVersion::try_from(version)? {
-            WalFormatVersion::V1 => {}
-            WalFormatVersion::V2 => return Err(WalError::UnsupportedVersion(version)),
-        }
-        let kind = RecordKind::from_v1(u16::from_le_bytes([header[6], header[7]]))?;
-        let flags = u16::from_le_bytes([header[8], header[9]]);
-        let payload_len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
-        let sequence = u64::from_le_bytes([
-            header[16], header[17], header[18], header[19], header[20], header[21], header[22],
-            header[23],
-        ]);
-        if sequence != self.next_sequence {
-            return Err(WalError::UnexpectedSequence {
-                expected: self.next_sequence,
-                actual: sequence,
-            });
-        }
-        let next_sequence = sequence
-            .checked_add(1)
-            .ok_or(WalError::SequenceExhausted { sequence })?;
-        let expected = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
-        let payload_len = usize::try_from(payload_len).map_err(|_| WalError::RecordTooLarge {
-            record_bytes: usize::MAX,
-            max_record_bytes: self.max_record_bytes,
-        })?;
-        let record_bytes = HEADER_LEN.saturating_add(payload_len);
-        if record_bytes > self.max_record_bytes {
-            return Err(WalError::RecordTooLarge {
-                record_bytes,
-                max_record_bytes: self.max_record_bytes,
-            });
-        }
-        let mut payload = vec![0_u8; payload_len];
-        if read_up_to(&mut self.reader, &mut payload)? < payload.len() {
-            return Ok(ReadOutcome::PartialTail {
-                offset: record_offset,
-            });
-        }
-        let actual = record_checksum(&header[4..24], &payload);
-        if actual != expected {
-            return Err(WalError::Checksum {
-                sequence,
-                expected,
-                actual,
-            });
-        }
-        self.offset += u64::try_from(record_bytes).unwrap_or(u64::MAX);
-        self.next_sequence = next_sequence;
-        Ok(ReadOutcome::Record(WalRecord {
-            kind,
-            flags,
-            sequence,
-            payload,
-        }))
-    }
-}
-
-struct PrefixedReader<R> {
-    prefix: [u8; 4],
-    prefix_offset: usize,
-    inner: R,
-}
-
-impl<R> PrefixedReader<R> {
-    fn new(prefix: [u8; 4], inner: R) -> Self {
-        Self {
-            prefix,
-            prefix_offset: 0,
-            inner,
-        }
-    }
-}
-
-impl<R: Read> Read for PrefixedReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        let mut written = 0;
-        if self.prefix_offset < self.prefix.len() {
-            let count = (self.prefix.len() - self.prefix_offset).min(buffer.len());
-            buffer[..count].copy_from_slice(
-                &self.prefix[self.prefix_offset..self.prefix_offset.saturating_add(count)],
-            );
-            self.prefix_offset += count;
-            written = count;
-        }
-        if written < buffer.len() {
-            written += self.inner.read(&mut buffer[written..])?;
-        }
-        Ok(written)
-    }
-}
-
-struct V2WalReader<R> {
     reader: R,
     header: SegmentHeader,
     offset: u64,
@@ -1023,8 +810,8 @@ struct V2WalReader<R> {
     max_record_bytes: usize,
 }
 
-impl<R: Read> V2WalReader<R> {
-    fn new(
+impl<R: Read> WalReader<R> {
+    pub fn new(
         mut reader: R,
         recording_id: RecordingId,
         segment_ordinal: u64,
@@ -1044,15 +831,16 @@ impl<R: Read> V2WalReader<R> {
         })
     }
 
-    fn next_record(&mut self) -> Result<VersionedReadOutcome, WalError> {
+    #[allow(clippy::too_many_lines)] // Fixed envelope validation stays linear and fail-closed.
+    pub fn next_record(&mut self) -> Result<ReadOutcome, WalError> {
         let record_offset = self.offset;
         let mut header = [0_u8; ENVELOPE_HEADER_LEN];
         let header_read = read_up_to(&mut self.reader, &mut header)?;
         if header_read == 0 {
-            return Ok(VersionedReadOutcome::End);
+            return Ok(ReadOutcome::End);
         }
         if header_read < ENVELOPE_HEADER_LEN {
-            return Ok(VersionedReadOutcome::PartialTail {
+            return Ok(ReadOutcome::PartialTail {
                 offset: record_offset,
             });
         }
@@ -1072,6 +860,12 @@ impl<R: Read> V2WalReader<R> {
         let kind = RecordKind::try_from(raw_kind)?;
         let flags = u16::from_le_bytes([header[8], header[9]]);
         let schema_version = u16::from_le_bytes([header[10], header[11]]);
+        if schema_version != WAL_RECORD_SCHEMA_VERSION {
+            return Err(WalError::UnsupportedRecordSchemaVersion {
+                kind: raw_kind,
+                version: schema_version,
+            });
+        }
         let header_len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
         if header_len != ENVELOPE_HEADER_LEN_U32 {
             return Err(WalError::InvalidEnvelopeHeaderLength(header_len));
@@ -1110,7 +904,7 @@ impl<R: Read> V2WalReader<R> {
         }
         let mut payload = vec![0_u8; payload_len];
         if read_up_to(&mut self.reader, &mut payload)? < payload.len() {
-            return Ok(VersionedReadOutcome::PartialTail {
+            return Ok(ReadOutcome::PartialTail {
                 offset: record_offset,
             });
         }
@@ -1125,7 +919,7 @@ impl<R: Read> V2WalReader<R> {
         }
         self.offset += u64::try_from(record_bytes).unwrap_or(u64::MAX);
         self.next_sequence = next_sequence;
-        Ok(VersionedReadOutcome::Record(
+        Ok(ReadOutcome::Record(
             WalRecordEnvelope::unplaced(
                 recording_id,
                 sequence,
@@ -1143,113 +937,17 @@ impl<R: Read> V2WalReader<R> {
     }
 }
 
-enum VersionedReaderInner<R> {
-    V1 {
-        reader: WalReader<PrefixedReader<R>>,
-        recording_id: RecordingId,
-        segment_ordinal: u64,
-    },
-    V2(V2WalReader<PrefixedReader<R>>),
-}
-
-pub struct VersionedWalReader<R> {
-    inner: VersionedReaderInner<R>,
-}
-
-impl<R: Read> VersionedWalReader<R> {
-    pub fn new(
-        reader: R,
-        recording_id: RecordingId,
-        segment_ordinal: u64,
-        first_sequence: u64,
-    ) -> Result<Self, WalError> {
-        Self::with_max_record_bytes(
-            reader,
-            recording_id,
-            segment_ordinal,
-            first_sequence,
-            DEFAULT_MAX_RECORD_BYTES,
-        )
-    }
-
-    pub fn with_max_record_bytes(
-        mut reader: R,
-        recording_id: RecordingId,
-        segment_ordinal: u64,
-        first_sequence: u64,
-        max_record_bytes: usize,
-    ) -> Result<Self, WalError> {
-        let mut magic = [0_u8; 4];
-        if read_up_to(&mut reader, &mut magic)? < magic.len() {
-            return Err(WalError::InvalidMagic { offset: 0 });
-        }
-        let reader = PrefixedReader::new(magic, reader);
-        let inner = if magic == MAGIC {
-            VersionedReaderInner::V1 {
-                reader: WalReader::with_max_record_bytes(reader, first_sequence, max_record_bytes),
-                recording_id,
-                segment_ordinal,
-            }
-        } else if magic == SEGMENT_MAGIC {
-            VersionedReaderInner::V2(V2WalReader::new(
-                reader,
-                recording_id,
-                segment_ordinal,
-                first_sequence,
-                max_record_bytes,
-            )?)
-        } else {
-            return Err(WalError::InvalidMagic { offset: 0 });
-        };
-        Ok(Self { inner })
-    }
-
-    pub fn next_record(&mut self) -> Result<VersionedReadOutcome, WalError> {
-        match &mut self.inner {
-            VersionedReaderInner::V1 {
-                reader,
-                recording_id,
-                segment_ordinal,
-            } => {
-                let checkpoint = reader.checkpoint();
-                match reader.next_record()? {
-                    ReadOutcome::Record(record) => Ok(VersionedReadOutcome::Record(
-                        WalRecordEnvelope::unplaced(
-                            *recording_id,
-                            record.sequence,
-                            record.kind,
-                            1,
-                            record.flags,
-                            record.payload,
-                        )
-                        .with_provenance(WalRecordProvenance {
-                            segment_ordinal: *segment_ordinal,
-                            segment_first_sequence: checkpoint.segment_first_sequence,
-                            byte_offset: checkpoint.byte_offset,
-                        }),
-                    )),
-                    ReadOutcome::End => Ok(VersionedReadOutcome::End),
-                    ReadOutcome::PartialTail { offset } => {
-                        Ok(VersionedReadOutcome::PartialTail { offset })
-                    }
-                }
-            }
-            VersionedReaderInner::V2(reader) => reader.next_record(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredSegment {
     pub path: PathBuf,
     pub header: SegmentHeader,
 }
 
-pub fn v2_segment_file_name(first_sequence: u64) -> String {
+pub fn segment_file_name(first_sequence: u64) -> String {
     format!("{first_sequence:020}.chwal")
 }
 
-pub fn discover_v2_segments(
+pub fn discover_segments(
     directory: impl AsRef<Path>,
     recording_id: RecordingId,
 ) -> Result<Vec<DiscoveredSegment>, WalError> {
@@ -1352,13 +1050,13 @@ impl RecordingLock {
         }
     }
 
-    pub fn scan_v2(
+    pub fn scan(
         &self,
         wal_directory: impl AsRef<Path>,
         recording_id: RecordingId,
         max_record_bytes: usize,
     ) -> Result<RecoveryScan, WalError> {
-        scan_v2_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)
+        scan_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)
     }
 }
 
@@ -1380,16 +1078,16 @@ pub struct RecoveryScan {
     pub authoritative_marker_count: usize,
 }
 
-pub fn scan_v2_wal(
+pub fn scan_wal(
     wal_directory: impl AsRef<Path>,
     recording_id: RecordingId,
     max_record_bytes: usize,
 ) -> Result<RecoveryScan, WalError> {
     let _lock = RecordingLock::acquire(&wal_directory)?;
-    scan_v2_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)
+    scan_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)
 }
 
-/// Hashes exact verified v2 segment bytes through final authoritative commit marker.
+/// Hashes exact verified WAL v1 segment bytes through final authoritative commit marker.
 pub fn verified_snapshot_sha256(
     wal_directory: impl AsRef<Path>,
     scan: &RecoveryScan,
@@ -1408,8 +1106,7 @@ pub fn verified_snapshot_sha256(
         .byte_offset
         .checked_add(u64::try_from(COMMIT_MARKER_FRAME_LEN).unwrap_or(u64::MAX))
         .ok_or(WalError::CommitArithmeticOverflow)?;
-    let segments =
-        discover_v2_segments(wal_directory.as_ref().join("segments"), marker.recording_id)?;
+    let segments = discover_segments(wal_directory.as_ref().join("segments"), marker.recording_id)?;
     let mut digest = Sha256::new();
     let mut found_marker = false;
     for segment in segments {
@@ -1435,12 +1132,12 @@ pub fn verified_snapshot_sha256(
     Ok(digest.finalize().into())
 }
 
-fn scan_v2_wal_unlocked(
+fn scan_wal_unlocked(
     wal_directory: &Path,
     recording_id: RecordingId,
     max_record_bytes: usize,
 ) -> Result<RecoveryScan, WalError> {
-    let segments = discover_v2_segments(wal_directory.join("segments"), recording_id)?;
+    let segments = discover_segments(wal_directory.join("segments"), recording_id)?;
     if segments.is_empty() {
         return Err(WalError::NoPublishedSegments);
     }
@@ -1458,7 +1155,7 @@ fn scan_v2_wal_unlocked(
                 actual: segment.header.first_sequence,
             });
         }
-        let mut reader = VersionedWalReader::with_max_record_bytes(
+        let mut reader = WalReader::new(
             File::open(&segment.path)?,
             recording_id,
             segment.header.segment_ordinal,
@@ -1468,9 +1165,7 @@ fn scan_v2_wal_unlocked(
         let mut pending = Vec::new();
         loop {
             match reader.next_record()? {
-                VersionedReadOutcome::Record(envelope)
-                    if envelope.kind == RecordKind::CommitMarker =>
-                {
+                ReadOutcome::Record(envelope) if envelope.kind == RecordKind::CommitMarker => {
                     if uncommitted_suffix_started {
                         return Err(WalError::CommitMarkerAfterUncommitted);
                     }
@@ -1494,14 +1189,14 @@ fn scan_v2_wal_unlocked(
                     scan.committed.push(envelope.clone());
                     scan.final_marker = Some(envelope);
                 }
-                VersionedReadOutcome::Record(envelope) => {
+                ReadOutcome::Record(envelope) => {
                     if envelope.kind == RecordKind::TerminalWalLoss {
                         decode_terminal_wal_loss(envelope.schema_version, &envelope.payload)?;
                     }
                     pending.push(envelope);
                 }
-                VersionedReadOutcome::End => break,
-                VersionedReadOutcome::PartialTail { offset } => {
+                ReadOutcome::End => break,
+                ReadOutcome::PartialTail { offset } => {
                     if index != final_index {
                         return Err(WalError::PartialTailBeforeFinalSegment);
                     }
@@ -1542,13 +1237,13 @@ pub struct RecoveryRepair {
     pub scan: RecoveryScan,
 }
 
-pub fn repair_v2_partial_tail(
+pub fn repair_partial_tail(
     wal_directory: impl AsRef<Path>,
     recording_id: RecordingId,
     max_record_bytes: usize,
 ) -> Result<RecoveryRepair, WalError> {
     let _lock = RecordingLock::acquire(&wal_directory)?;
-    let scan = scan_v2_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)?;
+    let scan = scan_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)?;
     let Some(partial) = scan.partial_tail else {
         return Ok(RecoveryRepair {
             repaired_bytes: 0,
@@ -1567,45 +1262,12 @@ pub fn repair_v2_partial_tail(
             .ok_or_else(|| WalError::Io(io::Error::other("segment has no parent directory")))?,
     )?;
     let repaired_bytes = original_len.saturating_sub(partial.byte_offset);
-    let scan = scan_v2_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)?;
+    let scan = scan_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)?;
     Ok(RecoveryRepair {
         repaired_bytes,
         truncated_to: Some(partial.byte_offset),
         scan,
     })
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LegacyRecoveryScan {
-    pub committed: Vec<WalRecordEnvelope>,
-    pub partial_tail_offset: Option<u64>,
-}
-
-pub fn scan_v1_wal(
-    path: impl AsRef<Path>,
-    recording_id: RecordingId,
-    segment_ordinal: u64,
-    first_sequence: u64,
-    max_record_bytes: usize,
-) -> Result<LegacyRecoveryScan, WalError> {
-    let mut reader = VersionedWalReader::with_max_record_bytes(
-        File::open(path)?,
-        recording_id,
-        segment_ordinal,
-        first_sequence,
-        max_record_bytes,
-    )?;
-    let mut scan = LegacyRecoveryScan::default();
-    loop {
-        match reader.next_record()? {
-            VersionedReadOutcome::Record(envelope) => scan.committed.push(envelope),
-            VersionedReadOutcome::End => return Ok(scan),
-            VersionedReadOutcome::PartialTail { offset } => {
-                scan.partial_tail_offset = Some(offset);
-                return Ok(scan);
-            }
-        }
-    }
 }
 
 fn read_up_to(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
@@ -1668,8 +1330,8 @@ impl SegmentedEnvelopeWriter {
         max_segment_bytes: u64,
         max_total_bytes: u64,
     ) -> Result<Self, WalError> {
-        if !(MIN_V2_SEGMENT_BYTES..=MAX_V2_SEGMENT_BYTES).contains(&max_segment_bytes) {
-            return Err(WalError::InvalidV2SegmentSize);
+        if !(MIN_SEGMENT_BYTES..=MAX_SEGMENT_BYTES).contains(&max_segment_bytes) {
+            return Err(WalError::InvalidSegmentSizeRange);
         }
         if max_total_bytes < max_segment_bytes || max_total_bytes > DEFAULT_MAX_WAL_BYTES {
             return Err(WalError::InvalidTotalWalSize);
@@ -1716,8 +1378,8 @@ impl SegmentedEnvelopeWriter {
         max_total_bytes: u64,
         final_marker: &WalRecordEnvelope,
     ) -> Result<Self, WalError> {
-        if !(MIN_V2_SEGMENT_BYTES..=MAX_V2_SEGMENT_BYTES).contains(&max_segment_bytes) {
-            return Err(WalError::InvalidV2SegmentSize);
+        if !(MIN_SEGMENT_BYTES..=MAX_SEGMENT_BYTES).contains(&max_segment_bytes) {
+            return Err(WalError::InvalidSegmentSizeRange);
         }
         if max_total_bytes < max_segment_bytes || max_total_bytes > DEFAULT_MAX_WAL_BYTES {
             return Err(WalError::InvalidTotalWalSize);
@@ -1728,7 +1390,7 @@ impl SegmentedEnvelopeWriter {
             .ok_or(WalError::MissingProvenance {
                 sequence: final_marker.sequence,
             })?;
-        let discovered = discover_v2_segments(&directory, recording_id)?;
+        let discovered = discover_segments(&directory, recording_id)?;
         let final_segment = discovered.last().ok_or(WalError::NoPublishedSegments)?;
         final_segment.header.validate_identity(
             recording_id,
@@ -1827,10 +1489,10 @@ impl SegmentedEnvelopeWriter {
                 .ok_or(WalError::SegmentOrdinalExhausted)?,
             None => 0,
         };
-        let final_path = self.directory.join(v2_segment_file_name(first_sequence));
+        let final_path = self.directory.join(segment_file_name(first_sequence));
         let temp_path = self.directory.join(format!(
             ".{}.tmp-{}",
-            v2_segment_file_name(first_sequence),
+            segment_file_name(first_sequence),
             uuid::Uuid::new_v4()
         ));
         let header = SegmentHeader {
@@ -2018,8 +1680,8 @@ impl GroupCommitWalWriter {
         first_sequence: u64,
         now_millis: u64,
     ) -> Result<Self, WalError> {
-        if !(MIN_V2_SEGMENT_BYTES..=MAX_V2_SEGMENT_BYTES).contains(&max_segment_bytes) {
-            return Err(WalError::InvalidV2SegmentSize);
+        if !(MIN_SEGMENT_BYTES..=MAX_SEGMENT_BYTES).contains(&max_segment_bytes) {
+            return Err(WalError::InvalidSegmentSizeRange);
         }
         if max_total_bytes < max_segment_bytes || max_total_bytes > DEFAULT_MAX_WAL_BYTES {
             return Err(WalError::InvalidTotalWalSize);
@@ -2300,7 +1962,7 @@ impl PreparedRecoveryReopen {
             sync_directory(&segments_directory)?;
         }
 
-        let scan_after = self.lock.scan_v2(
+        let scan_after = self.lock.scan(
             &self.wal_directory,
             self.recording_id,
             DEFAULT_MAX_RECORD_BYTES,
@@ -2358,7 +2020,7 @@ pub fn prepare_group_commit_reopen(
 ) -> Result<PreparedRecoveryReopen, WalError> {
     let wal_directory = wal_directory.as_ref();
     let lock = RecordingLock::acquire(wal_directory)?;
-    let scan = lock.scan_v2(wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES)?;
+    let scan = lock.scan(wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES)?;
     prepare_group_commit_reopen_from_scan(
         lock,
         wal_directory,
@@ -2380,8 +2042,8 @@ pub fn prepare_group_commit_reopen_from_scan(
     max_total_bytes: u64,
     now_millis: u64,
 ) -> Result<PreparedRecoveryReopen, WalError> {
-    if !(MIN_V2_SEGMENT_BYTES..=MAX_V2_SEGMENT_BYTES).contains(&max_segment_bytes) {
-        return Err(WalError::InvalidV2SegmentSize);
+    if !(MIN_SEGMENT_BYTES..=MAX_SEGMENT_BYTES).contains(&max_segment_bytes) {
+        return Err(WalError::InvalidSegmentSizeRange);
     }
     if max_total_bytes < max_segment_bytes || max_total_bytes > DEFAULT_MAX_WAL_BYTES {
         return Err(WalError::InvalidTotalWalSize);
@@ -2406,7 +2068,7 @@ pub fn prepare_group_commit_reopen_from_scan(
                 sequence: final_marker.sequence,
             })?;
     let segments_directory = wal_directory.join("segments");
-    let discovered = discover_v2_segments(&segments_directory, recording_id)?;
+    let discovered = discover_segments(&segments_directory, recording_id)?;
     let marker_segment = discovered
         .iter()
         .find(|segment| segment.header.segment_ordinal == marker_provenance.segment_ordinal)
@@ -2565,121 +2227,10 @@ fn sync_directory(path: &Path) -> Result<(), WalError> {
     Ok(())
 }
 
-pub trait WalWriter {
-    fn append(&mut self, record: &WalRecord) -> Result<WalCheckpoint, WalError>;
-    fn flush(&mut self) -> Result<(), WalError>;
-}
-
-pub struct SegmentedWalWriter {
-    directory: PathBuf,
-    max_segment_bytes: u64,
-    file: Option<File>,
-    segment_first_sequence: u64,
-    segment_bytes: u64,
-    last_sequence: Option<u64>,
-}
-
-impl SegmentedWalWriter {
-    pub fn create(directory: impl AsRef<Path>, max_segment_bytes: u64) -> Result<Self, WalError> {
-        if max_segment_bytes <= HEADER_LEN as u64 {
-            return Err(WalError::InvalidSegmentSize);
-        }
-        fs::create_dir_all(directory.as_ref())?;
-        #[cfg(unix)]
-        fs::set_permissions(directory.as_ref(), fs::Permissions::from_mode(0o700))?;
-        Ok(Self {
-            directory: directory.as_ref().to_path_buf(),
-            max_segment_bytes,
-            file: None,
-            segment_first_sequence: 0,
-            segment_bytes: 0,
-            last_sequence: None,
-        })
-    }
-
-    fn rotate(&mut self, first_sequence: u64) -> Result<(), WalError> {
-        if let Some(file) = self.file.as_mut() {
-            file.sync_data()?;
-        }
-        let path = self.directory.join(segment_file_name(first_sequence));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options.open(path)?;
-        self.file = Some(file);
-        self.segment_first_sequence = first_sequence;
-        self.segment_bytes = 0;
-        Ok(())
-    }
-}
-
-impl WalWriter for SegmentedWalWriter {
-    fn append(&mut self, record: &WalRecord) -> Result<WalCheckpoint, WalError> {
-        let next_sequence = record
-            .sequence
-            .checked_add(1)
-            .ok_or(WalError::SequenceExhausted {
-                sequence: record.sequence,
-            })?;
-        if let Some(previous) = self.last_sequence {
-            let expected = previous
-                .checked_add(1)
-                .ok_or(WalError::SequenceExhausted { sequence: previous })?;
-            if record.sequence != expected {
-                return Err(WalError::OutOfOrder {
-                    previous,
-                    current: record.sequence,
-                });
-            }
-        }
-        let encoded = encode_record(record)?;
-        let encoded_len = u64::try_from(encoded.len())
-            .map_err(|_| WalError::PayloadTooLarge(record.payload.len()))?;
-        if self.file.is_none()
-            || (self.segment_bytes > 0
-                && self.segment_bytes.saturating_add(encoded_len) > self.max_segment_bytes)
-        {
-            self.rotate(record.sequence)?;
-        }
-        self.file
-            .as_mut()
-            .ok_or(WalError::NoActiveSegment)?
-            .write_all(&encoded)?;
-        self.segment_bytes += encoded_len;
-        self.last_sequence = Some(record.sequence);
-        Ok(WalCheckpoint {
-            segment_first_sequence: self.segment_first_sequence,
-            byte_offset: self.segment_bytes,
-            next_sequence,
-        })
-    }
-
-    fn flush(&mut self) -> Result<(), WalError> {
-        if let Some(file) = self.file.as_mut() {
-            file.sync_data()?;
-        }
-        Ok(())
-    }
-}
-
-pub fn segment_file_name(first_sequence: u64) -> String {
-    format!("segment-{first_sequence:020}.wal")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
-
-    fn record() -> WalRecord {
-        WalRecord {
-            kind: RecordKind::CaptureEvent,
-            flags: 2,
-            sequence: 7,
-            payload: b"payload".to_vec(),
-        }
-    }
 
     fn segment_header() -> SegmentHeader {
         SegmentHeader {
@@ -2694,7 +2245,11 @@ mod tests {
     fn segment_header_round_trip_and_identity_validation() {
         let header = segment_header();
         let bytes = encode_segment_header(&header);
-        assert_eq!(&bytes[..4], b"CHS2");
+        assert_eq!(&bytes[..4], b"CHS1");
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            WAL_FORMAT_VERSION
+        );
         assert_eq!(bytes.len(), SEGMENT_HEADER_LEN);
         assert_eq!(decode_segment_header(&bytes).unwrap(), header);
         header.validate_identity(header.recording_id, 4, 7).unwrap();
@@ -2731,10 +2286,10 @@ mod tests {
         ));
 
         let mut invalid = encoded;
-        invalid[4..6].copy_from_slice(&WAL_FORMAT_V1.to_le_bytes());
+        invalid[4..6].copy_from_slice(&(WAL_FORMAT_VERSION + 1).to_le_bytes());
         assert!(matches!(
             decode_segment_header(&invalid),
-            Err(WalError::UnsupportedVersion(WAL_FORMAT_V1))
+            Err(WalError::UnsupportedVersion(version)) if version == WAL_FORMAT_VERSION + 1
         ));
 
         let mut invalid = encoded;
@@ -2767,7 +2322,7 @@ mod tests {
         ));
     }
 
-    fn v2_segment(header: &SegmentHeader, envelopes: &[WalRecordEnvelope]) -> Vec<u8> {
+    fn wal_segment(header: &SegmentHeader, envelopes: &[WalRecordEnvelope]) -> Vec<u8> {
         let mut bytes = encode_segment_header(header).to_vec();
         for envelope in envelopes {
             bytes.extend_from_slice(&encode_envelope(envelope).unwrap());
@@ -2828,25 +2383,24 @@ mod tests {
         bytes: Vec<u8>,
         header: &SegmentHeader,
     ) -> Result<(CommitAuthority, usize, bool), WalError> {
-        let mut reader = VersionedWalReader::new(
+        let mut reader = WalReader::new(
             Cursor::new(bytes),
             header.recording_id,
             header.segment_ordinal,
             header.first_sequence,
+            DEFAULT_MAX_RECORD_BYTES,
         )?;
         let mut authority = CommitAuthority::default();
         let mut pending = Vec::new();
         loop {
             match reader.next_record()? {
-                VersionedReadOutcome::Record(envelope)
-                    if envelope.kind == RecordKind::CommitMarker =>
-                {
+                ReadOutcome::Record(envelope) if envelope.kind == RecordKind::CommitMarker => {
                     authority = validate_commit_authority(&authority, &pending, &envelope)?;
                     pending.clear();
                 }
-                VersionedReadOutcome::Record(envelope) => pending.push(envelope),
-                VersionedReadOutcome::End => return Ok((authority, pending.len(), false)),
-                VersionedReadOutcome::PartialTail { .. } => {
+                ReadOutcome::Record(envelope) => pending.push(envelope),
+                ReadOutcome::End => return Ok((authority, pending.len(), false)),
+                ReadOutcome::PartialTail { .. } => {
                     return Ok((authority, pending.len(), true));
                 }
             }
@@ -2866,7 +2420,7 @@ mod tests {
     ) {
         fs::create_dir_all(directory).unwrap();
         fs::write(
-            directory.join(v2_segment_file_name(file_first_sequence)),
+            directory.join(segment_file_name(file_first_sequence)),
             encode_segment_header(&SegmentHeader {
                 recording_id,
                 segment_ordinal,
@@ -3070,7 +2624,7 @@ mod tests {
         let segments = wal_directory.join("segments");
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
@@ -3098,14 +2652,14 @@ mod tests {
         );
         OpenOptions::new()
             .append(true)
-            .open(segments.join(v2_segment_file_name(1)))
+            .open(segments.join(segment_file_name(1)))
             .unwrap()
             .write_all(&encode_envelope(&uncertain).unwrap())
             .unwrap();
         assert!(!wal_directory.join("recording.json").exists());
 
-        let first = scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
-        let second = scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        let first = scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        let second = scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.authority.marker_sequence, Some(4));
         assert_eq!(first.authority.durable_through_sequence, Some(3));
@@ -3123,7 +2677,7 @@ mod tests {
         assert_eq!(first.partial_tail, None);
         let marker = first.final_marker.as_ref().unwrap();
         let offset = marker.provenance.as_ref().unwrap().byte_offset;
-        let bytes = fs::read(segments.join(v2_segment_file_name(1))).unwrap();
+        let bytes = fs::read(segments.join(segment_file_name(1))).unwrap();
         let end = usize::try_from(offset).unwrap() + COMMIT_MARKER_FRAME_LEN;
         let expected_snapshot: [u8; 32] = Sha256::digest(&bytes[..end]).into();
         assert_eq!(
@@ -3178,17 +2732,17 @@ mod tests {
         );
         fs::create_dir_all(&segments).unwrap();
         fs::write(
-            segments.join(v2_segment_file_name(1)),
-            v2_segment(&first_header, &[first_data]),
+            segments.join(segment_file_name(1)),
+            wal_segment(&first_header, &[first_data]),
         )
         .unwrap();
         fs::write(
-            segments.join(v2_segment_file_name(2)),
-            v2_segment(&second_header, &[second_data, second_marker]),
+            segments.join(segment_file_name(2)),
+            wal_segment(&second_header, &[second_data, second_marker]),
         )
         .unwrap();
         assert!(matches!(
-            scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
+            scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
             Err(WalError::CommitMarkerAfterUncommitted)
         ));
         fs::remove_dir_all(&wal_directory).unwrap();
@@ -3232,17 +2786,17 @@ mod tests {
         );
         let gap_marker = marker_for(&previous, std::slice::from_ref(&gap_data), 1, 4);
         fs::write(
-            segments.join(v2_segment_file_name(1)),
-            v2_segment(&first_header, &[committed_data, committed_marker]),
+            segments.join(segment_file_name(1)),
+            wal_segment(&first_header, &[committed_data, committed_marker]),
         )
         .unwrap();
         fs::write(
-            segments.join(v2_segment_file_name(4)),
-            v2_segment(&gap_header, &[gap_data, gap_marker]),
+            segments.join(segment_file_name(4)),
+            wal_segment(&gap_header, &[gap_data, gap_marker]),
         )
         .unwrap();
         assert!(matches!(
-            scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
+            scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
             Err(WalError::RecoverySegmentFirstSequenceMismatch {
                 expected: 3,
                 actual: 4
@@ -3252,44 +2806,6 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    #[test]
-    fn recovery_scan_respects_lock_and_p0_v1_boundary() {
-        let wal_directory = discovery_directory();
-        let recording_id = RecordingId::new();
-        let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
-                .unwrap();
-        writer
-            .append(RecordKind::CaptureEvent, 1, 0, b"data".to_vec(), 0)
-            .unwrap();
-        writer.flush(1).unwrap();
-        drop(writer);
-        let held = RecordingLock::acquire(&wal_directory).unwrap();
-        assert!(matches!(
-            scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
-            Err(WalError::RecordingLockHeld)
-        ));
-        drop(held);
-
-        let legacy = wal_directory.join("legacy");
-        let mut legacy_writer = SegmentedWalWriter::create(&legacy, 1_024).unwrap();
-        legacy_writer.append(&record()).unwrap();
-        legacy_writer.flush().unwrap();
-        drop(legacy_writer);
-        let legacy_scan = scan_v1_wal(
-            legacy.join(segment_file_name(7)),
-            recording_id,
-            0,
-            7,
-            DEFAULT_MAX_RECORD_BYTES,
-        )
-        .unwrap();
-        assert_eq!(legacy_scan.committed.len(), 1);
-        assert_eq!(legacy_scan.committed[0].sequence, 7);
-        assert_eq!(legacy_scan.partial_tail_offset, None);
-        fs::remove_dir_all(wal_directory).unwrap();
-    }
-
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn repair_truncates_only_incomplete_final_frame_and_is_idempotent() {
@@ -3297,7 +2813,7 @@ mod tests {
         let segments = wal_directory.join("segments");
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
@@ -3314,7 +2830,7 @@ mod tests {
             b"partial".to_vec(),
         ))
         .unwrap();
-        let segment_path = segments.join(v2_segment_file_name(1));
+        let segment_path = segments.join(segment_file_name(1));
         let committed_len = fs::metadata(&segment_path).unwrap().len();
         OpenOptions::new()
             .append(true)
@@ -3324,7 +2840,7 @@ mod tests {
             .unwrap();
 
         let repaired =
-            repair_v2_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+            repair_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(repaired.truncated_to, Some(committed_len));
         assert!(repaired.repaired_bytes > 0);
         assert_eq!(repaired.scan.authority.marker_sequence, Some(2));
@@ -3333,7 +2849,7 @@ mod tests {
         assert_eq!(fs::metadata(&segment_path).unwrap().len(), committed_len);
 
         let second =
-            repair_v2_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+            repair_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(second.repaired_bytes, 0);
         assert_eq!(second.truncated_to, None);
         assert_eq!(second.scan, repaired.scan);
@@ -3356,7 +2872,7 @@ mod tests {
             .unwrap();
         drop(file);
         let repaired_marker =
-            repair_v2_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+            repair_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(
             repaired_marker.truncated_to,
             Some(committed_len + u64::try_from(data_bytes.len()).unwrap())
@@ -3374,19 +2890,19 @@ mod tests {
         let segments = wal_directory.join("segments");
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
             .unwrap();
         writer.flush(1).unwrap();
         drop(writer);
-        let segment_path = segments.join(v2_segment_file_name(1));
+        let segment_path = segments.join(segment_file_name(1));
         let mut corrupted = fs::read(&segment_path).unwrap();
         corrupted[SEGMENT_HEADER_LEN + ENVELOPE_HEADER_LEN] ^= 0xff;
         fs::write(&segment_path, &corrupted).unwrap();
         assert!(matches!(
-            repair_v2_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
+            repair_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
             Err(WalError::EnvelopeChecksum { .. })
         ));
         assert_eq!(fs::read(&segment_path).unwrap(), corrupted);
@@ -3396,7 +2912,7 @@ mod tests {
         let truncated_header = vec![0xa5; 10];
         fs::write(&segment_path, &truncated_header).unwrap();
         assert!(matches!(
-            repair_v2_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
+            repair_partial_tail(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
             Err(WalError::TruncatedSegmentHeader { actual: 10 })
         ));
         assert_eq!(fs::read(&segment_path).unwrap(), truncated_header);
@@ -3409,7 +2925,7 @@ mod tests {
         let wal_directory = discovery_directory();
         let recording_id = RecordingId::new();
         let payload_len = usize::try_from(
-            MIN_V2_SEGMENT_BYTES
+            MIN_SEGMENT_BYTES
                 - SEGMENT_HEADER_LEN_U64
                 - u64::try_from(ENVELOPE_HEADER_LEN).unwrap()
                 - u64::try_from(COMMIT_MARKER_FRAME_LEN).unwrap(),
@@ -3418,8 +2934,8 @@ mod tests {
         let mut writer = GroupCommitWalWriter::create_with_total_limit(
             &wal_directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES,
-            MIN_V2_SEGMENT_BYTES * 2,
+            MIN_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES * 2,
             1,
             0,
         )
@@ -3432,8 +2948,8 @@ mod tests {
         let prepared = prepare_group_commit_reopen(
             &wal_directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES,
-            MIN_V2_SEGMENT_BYTES * 2,
+            MIN_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES * 2,
             1,
         )
         .unwrap();
@@ -3452,10 +2968,9 @@ mod tests {
         assert_eq!(reopened.shutdown(2).unwrap().unwrap().marker_sequence, 4);
         drop(reopened);
 
-        let discovered =
-            discover_v2_segments(wal_directory.join("segments"), recording_id).unwrap();
+        let discovered = discover_segments(wal_directory.join("segments"), recording_id).unwrap();
         assert_eq!(discovered.len(), 2);
-        let scan = scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        let scan = scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(scan.authority.marker_sequence, Some(4));
         assert_eq!(scan.authority.durable_record_count, 2);
         fs::remove_dir_all(wal_directory).unwrap();
@@ -3467,14 +2982,14 @@ mod tests {
         let wal_directory = discovery_directory();
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
             .unwrap();
         writer.flush(1).unwrap();
         drop(writer);
-        let segment_path = wal_directory.join("segments").join(v2_segment_file_name(1));
+        let segment_path = wal_directory.join("segments").join(segment_file_name(1));
         let partial = encode_envelope(&WalRecordEnvelope::unplaced(
             recording_id,
             3,
@@ -3494,8 +3009,8 @@ mod tests {
         let prepared = prepare_group_commit_reopen(
             &wal_directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES,
-            MIN_V2_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
             2,
         )
         .unwrap();
@@ -3523,8 +3038,8 @@ mod tests {
         let mut writer = GroupCommitWalWriter::create_with_total_limit(
             &wal_directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES * 2,
-            MIN_V2_SEGMENT_BYTES * 2,
+            MIN_SEGMENT_BYTES * 2,
+            MIN_SEGMENT_BYTES * 2,
             1,
             0,
         )
@@ -3539,7 +3054,7 @@ mod tests {
             )
             .unwrap();
         drop(writer);
-        let segment_path = wal_directory.join("segments").join(v2_segment_file_name(1));
+        let segment_path = wal_directory.join("segments").join(segment_file_name(1));
         let uncertain = WalRecordEnvelope::unplaced(
             recording_id,
             3,
@@ -3560,8 +3075,8 @@ mod tests {
             prepare_group_commit_reopen(
                 &wal_directory,
                 recording_id,
-                MIN_V2_SEGMENT_BYTES,
-                MIN_V2_SEGMENT_BYTES,
+                MIN_SEGMENT_BYTES,
+                MIN_SEGMENT_BYTES,
                 1,
             ),
             Err(WalError::EnvelopeExceedsSegment { .. })
@@ -3577,7 +3092,7 @@ mod tests {
         let segments = wal_directory.join("segments");
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
@@ -3604,8 +3119,8 @@ mod tests {
             SEGMENT_HEADER_LEN_U64,
         );
         fs::write(
-            segments.join(v2_segment_file_name(3)),
-            v2_segment(
+            segments.join(segment_file_name(3)),
+            wal_segment(
                 &SegmentHeader {
                     recording_id,
                     segment_ordinal: 1,
@@ -3617,8 +3132,8 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            segments.join(v2_segment_file_name(4)),
-            v2_segment(
+            segments.join(segment_file_name(4)),
+            wal_segment(
                 &SegmentHeader {
                     recording_id,
                     segment_ordinal: 2,
@@ -3629,20 +3144,20 @@ mod tests {
             ),
         )
         .unwrap();
-        let before = scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        let before = scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(before.uncommitted.len(), 2);
 
         let prepared = prepare_group_commit_reopen(
             &wal_directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
             DEFAULT_MAX_WAL_BYTES,
             2,
         )
         .unwrap();
         assert_eq!(prepared.preview().discarded_complete_records, 2);
-        assert!(segments.join(v2_segment_file_name(3)).exists());
-        assert!(segments.join(v2_segment_file_name(4)).exists());
+        assert!(segments.join(segment_file_name(3)).exists());
+        assert!(segments.join(segment_file_name(4)).exists());
         let (mut reopened, report) = prepared.apply().unwrap();
         assert_eq!(report.discarded_complete_records, 2);
         assert_eq!(report.discarded_payload_bytes, 11);
@@ -3658,10 +3173,7 @@ mod tests {
         );
         reopened.shutdown(3).unwrap();
         drop(reopened);
-        assert_eq!(
-            discover_v2_segments(&segments, recording_id).unwrap().len(),
-            1
-        );
+        assert_eq!(discover_segments(&segments, recording_id).unwrap().len(), 1);
         fs::remove_dir_all(wal_directory).unwrap();
     }
 
@@ -3740,12 +3252,12 @@ mod tests {
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn group_writer_enforces_physical_total_cap_and_marker_reservation() {
-        for total in [MIN_V2_SEGMENT_BYTES - 1, DEFAULT_MAX_WAL_BYTES + 1] {
+        for total in [MIN_SEGMENT_BYTES - 1, DEFAULT_MAX_WAL_BYTES + 1] {
             assert!(matches!(
                 GroupCommitWalWriter::create_with_total_limit(
                     discovery_directory(),
                     RecordingId::new(),
-                    MIN_V2_SEGMENT_BYTES,
+                    MIN_SEGMENT_BYTES,
                     total,
                     1,
                     0,
@@ -3758,7 +3270,7 @@ mod tests {
         let segments = directory.join("segments");
         let recording_id = RecordingId::new();
         let payload_len = usize::try_from(
-            MIN_V2_SEGMENT_BYTES
+            MIN_SEGMENT_BYTES
                 - SEGMENT_HEADER_LEN_U64
                 - u64::try_from(ENVELOPE_HEADER_LEN).unwrap()
                 - u64::try_from(COMMIT_MARKER_FRAME_LEN).unwrap(),
@@ -3767,8 +3279,8 @@ mod tests {
         let mut writer = GroupCommitWalWriter::create_with_total_limit(
             &directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES,
-            MIN_V2_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
             1,
             0,
         )
@@ -3777,10 +3289,10 @@ mod tests {
             .append(RecordKind::CaptureEvent, 1, 0, vec![0; payload_len], 0)
             .unwrap();
         assert_eq!(result.durable_batches.len(), 1);
-        assert_eq!(writer.writer.physical_bytes, MIN_V2_SEGMENT_BYTES);
+        assert_eq!(writer.writer.physical_bytes, MIN_SEGMENT_BYTES);
         assert_eq!(
             directory_physical_bytes(&segments).unwrap(),
-            MIN_V2_SEGMENT_BYTES
+            MIN_SEGMENT_BYTES
         );
         assert_eq!(writer.shutdown(1).unwrap(), None);
         drop(writer);
@@ -3788,13 +3300,13 @@ mod tests {
 
         fs::create_dir_all(&segments).unwrap();
         let temp = File::create(segments.join(".stale.tmp")).unwrap();
-        temp.set_len(MIN_V2_SEGMENT_BYTES - 100).unwrap();
+        temp.set_len(MIN_SEGMENT_BYTES - 100).unwrap();
         drop(temp);
         let mut writer = GroupCommitWalWriter::create_with_total_limit(
             &directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES,
-            MIN_V2_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
             1,
             0,
         )
@@ -3805,9 +3317,9 @@ mod tests {
         ));
         assert_eq!(
             directory_physical_bytes(&segments).unwrap(),
-            MIN_V2_SEGMENT_BYTES - 100
+            MIN_SEGMENT_BYTES - 100
         );
-        assert!(!segments.join(v2_segment_file_name(1)).exists());
+        assert!(!segments.join(segment_file_name(1)).exists());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3817,7 +3329,7 @@ mod tests {
         let directory = discovery_directory();
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         let appended = writer
             .append(RecordKind::CaptureEvent, 1, 0, b"data".to_vec(), 0)
@@ -3834,7 +3346,7 @@ mod tests {
         assert_eq!(writer.next_sequence(), 3);
         let physical_before = directory_physical_bytes(&directory.join("segments")).unwrap();
         assert!(matches!(
-            GroupCommitWalWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES, 3, 10),
+            GroupCommitWalWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES, 3, 10),
             Err(WalError::RecordingLockHeld)
         ));
         assert_eq!(
@@ -3843,11 +3355,18 @@ mod tests {
         );
         drop(writer);
 
-        let bytes = fs::read(directory.join("segments").join(v2_segment_file_name(1))).unwrap();
-        let mut reader = VersionedWalReader::new(Cursor::new(bytes), recording_id, 0, 1).unwrap();
+        let bytes = fs::read(directory.join("segments").join(segment_file_name(1))).unwrap();
+        let mut reader = WalReader::new(
+            Cursor::new(bytes),
+            recording_id,
+            0,
+            1,
+            DEFAULT_MAX_RECORD_BYTES,
+        )
+        .unwrap();
         assert!(matches!(
             reader.next_record().unwrap(),
-            VersionedReadOutcome::Record(WalRecordEnvelope {
+            ReadOutcome::Record(WalRecordEnvelope {
                 kind: RecordKind::CaptureEvent,
                 sequence: 1,
                 ..
@@ -3855,13 +3374,13 @@ mod tests {
         ));
         assert!(matches!(
             reader.next_record().unwrap(),
-            VersionedReadOutcome::Record(WalRecordEnvelope {
+            ReadOutcome::Record(WalRecordEnvelope {
                 kind: RecordKind::CommitMarker,
                 sequence: 2,
                 ..
             })
         ));
-        assert_eq!(reader.next_record().unwrap(), VersionedReadOutcome::End);
+        assert_eq!(reader.next_record().unwrap(), ReadOutcome::End);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3871,7 +3390,7 @@ mod tests {
         let directory = discovery_directory();
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         assert_eq!(writer.flush(0).unwrap(), None);
         assert_eq!(writer.data_sync_count(), 0);
@@ -3903,7 +3422,7 @@ mod tests {
         let directory = discovery_directory();
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         let payload = vec![0; 3 * 1024 * 1024];
         let mut acknowledgements = Vec::new();
@@ -3920,7 +3439,7 @@ mod tests {
         assert_eq!(writer.data_sync_count(), 4);
         drop(writer);
 
-        let discovered = discover_v2_segments(directory.join("segments"), recording_id).unwrap();
+        let discovered = discover_segments(directory.join("segments"), recording_id).unwrap();
         assert_eq!(discovered.len(), 2);
         assert_eq!(discovered[0].header.segment_ordinal, 0);
         assert_eq!(discovered[1].header.segment_ordinal, 1);
@@ -3933,7 +3452,7 @@ mod tests {
         let directory = discovery_directory();
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"data".to_vec(), 0)
@@ -3947,7 +3466,7 @@ mod tests {
     }
 
     #[test]
-    fn discovers_v2_segments_in_numeric_order_and_ignores_temps() {
+    fn discovers_wal_segments_in_numeric_order_and_ignores_temps() {
         let directory = discovery_directory();
         let recording_id = RecordingId::new();
         write_discovery_segment(&directory, 20, recording_id, 1, 20);
@@ -3958,7 +3477,7 @@ mod tests {
         )
         .unwrap();
 
-        let discovered = discover_v2_segments(&directory, recording_id).unwrap();
+        let discovered = discover_segments(&directory, recording_id).unwrap();
         assert_eq!(
             discovered
                 .iter()
@@ -3976,7 +3495,7 @@ mod tests {
         write_discovery_segment(&directory, 10, recording_id, 0, 10);
         write_discovery_segment(&directory, 20, recording_id, 2, 20);
         assert!(matches!(
-            discover_v2_segments(&directory, recording_id),
+            discover_segments(&directory, recording_id),
             Err(WalError::MissingSegmentOrdinal {
                 expected: 1,
                 actual: 2
@@ -3987,7 +3506,7 @@ mod tests {
         write_discovery_segment(&directory, 10, recording_id, 0, 10);
         write_discovery_segment(&directory, 20, recording_id, 0, 20);
         assert!(matches!(
-            discover_v2_segments(&directory, recording_id),
+            discover_segments(&directory, recording_id),
             Err(WalError::DuplicateSegmentOrdinal(0))
         ));
         fs::remove_dir_all(directory).unwrap();
@@ -4000,7 +3519,7 @@ mod tests {
         write_discovery_segment(&directory, 10, recording_id, 0, 10);
         write_discovery_segment(&directory, 20, recording_id, 1, 10);
         assert!(matches!(
-            discover_v2_segments(&directory, recording_id),
+            discover_segments(&directory, recording_id),
             Err(WalError::DuplicateSegmentFirstSequence(10))
         ));
         fs::remove_dir_all(&directory).unwrap();
@@ -4008,7 +3527,7 @@ mod tests {
         write_discovery_segment(&directory, 10, recording_id, 0, 20);
         write_discovery_segment(&directory, 20, recording_id, 1, 10);
         assert!(matches!(
-            discover_v2_segments(&directory, recording_id),
+            discover_segments(&directory, recording_id),
             Err(WalError::NonIncreasingSegmentFirstSequence {
                 previous: 20,
                 current: 10
@@ -4018,7 +3537,7 @@ mod tests {
 
         write_discovery_segment(&directory, 10, recording_id, 0, 11);
         assert!(matches!(
-            discover_v2_segments(&directory, recording_id),
+            discover_segments(&directory, recording_id),
             Err(WalError::SegmentFileNameMismatch {
                 file_first_sequence: 10,
                 header_first_sequence: 11
@@ -4029,21 +3548,21 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
-    fn v2_writer_enforces_bounds_exact_boundary_and_private_modes() {
+    fn segmented_writer_enforces_bounds_exact_boundary_and_private_modes() {
         use std::os::unix::fs::PermissionsExt;
 
-        assert_eq!(DEFAULT_V2_SEGMENT_BYTES, 256 * 1024 * 1024);
-        for size in [MIN_V2_SEGMENT_BYTES - 1, MAX_V2_SEGMENT_BYTES + 1] {
+        assert_eq!(DEFAULT_SEGMENT_BYTES, 256 * 1024 * 1024);
+        for size in [MIN_SEGMENT_BYTES - 1, MAX_SEGMENT_BYTES + 1] {
             assert!(matches!(
                 SegmentedEnvelopeWriter::create(discovery_directory(), RecordingId::new(), size),
-                Err(WalError::InvalidV2SegmentSize)
+                Err(WalError::InvalidSegmentSizeRange)
             ));
         }
 
         let directory = discovery_directory();
         let recording_id = RecordingId::new();
         let payload_len = usize::try_from(
-            MIN_V2_SEGMENT_BYTES
+            MIN_SEGMENT_BYTES
                 - SEGMENT_HEADER_LEN_U64
                 - u64::try_from(ENVELOPE_HEADER_LEN).unwrap(),
         )
@@ -4057,8 +3576,7 @@ mod tests {
             vec![0x5a; payload_len],
         );
         let mut writer =
-            SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES)
-                .unwrap();
+            SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES).unwrap();
         assert_eq!(
             writer.append(&envelope).unwrap(),
             WalRecordProvenance {
@@ -4070,8 +3588,8 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
 
-        let segment = directory.join(v2_segment_file_name(7));
-        assert_eq!(segment.metadata().unwrap().len(), MIN_V2_SEGMENT_BYTES);
+        let segment = directory.join(segment_file_name(7));
+        assert_eq!(segment.metadata().unwrap().len(), MIN_SEGMENT_BYTES);
         assert_eq!(
             directory.metadata().unwrap().permissions().mode() & 0o777,
             0o700
@@ -4085,13 +3603,12 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
-    fn v2_writer_rotates_before_overflow_and_rejects_oversized_frame() {
+    fn segmented_writer_rotates_before_overflow_and_rejects_oversized_frame() {
         let directory = discovery_directory();
         let recording_id = RecordingId::new();
-        let payload_len = usize::try_from(MIN_V2_SEGMENT_BYTES / 2).unwrap();
+        let payload_len = usize::try_from(MIN_SEGMENT_BYTES / 2).unwrap();
         let mut writer =
-            SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES)
-                .unwrap();
+            SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES).unwrap();
         let first = WalRecordEnvelope::unplaced(
             recording_id,
             1,
@@ -4113,23 +3630,20 @@ mod tests {
         writer.flush().unwrap();
         drop(writer);
         assert_eq!(
-            discover_v2_segments(&directory, recording_id)
-                .unwrap()
-                .len(),
+            discover_segments(&directory, recording_id).unwrap().len(),
             2
         );
         fs::remove_dir_all(&directory).unwrap();
 
         let oversized_payload = usize::try_from(
-            MIN_V2_SEGMENT_BYTES
+            MIN_SEGMENT_BYTES
                 - SEGMENT_HEADER_LEN_U64
                 - u64::try_from(ENVELOPE_HEADER_LEN).unwrap()
                 + 1,
         )
         .unwrap();
         let mut writer =
-            SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES)
-                .unwrap();
+            SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES).unwrap();
         let oversized = WalRecordEnvelope::unplaced(
             recording_id,
             1,
@@ -4146,7 +3660,7 @@ mod tests {
         fs::remove_dir_all(&directory).unwrap();
 
         let mut writer =
-            SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES * 2)
+            SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES * 2)
                 .unwrap();
         let too_large = WalRecordEnvelope::unplaced(
             recording_id,
@@ -4166,7 +3680,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
-    fn v2_header_publication_faults_never_expose_partial_header() {
+    fn segment_header_publication_faults_never_expose_partial_header() {
         for fault in [
             SegmentPublishFault::BeforeHeaderSync,
             SegmentPublishFault::BeforeRename,
@@ -4175,7 +3689,7 @@ mod tests {
             let directory = discovery_directory();
             let recording_id = RecordingId::new();
             let mut writer =
-                SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_V2_SEGMENT_BYTES)
+                SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES)
                     .unwrap();
             writer.inject_publish_fault(fault);
             let envelope = WalRecordEnvelope::unplaced(
@@ -4192,8 +3706,8 @@ mod tests {
                 .map(|entry| entry.unwrap().file_name().into_string().unwrap())
                 .collect();
             if fault == SegmentPublishFault::AfterRename {
-                assert_eq!(entries, vec![v2_segment_file_name(1)]);
-                let bytes = fs::read(directory.join(v2_segment_file_name(1))).unwrap();
+                assert_eq!(entries, vec![segment_file_name(1)]);
+                let bytes = fs::read(directory.join(segment_file_name(1))).unwrap();
                 assert!(decode_segment_header(&bytes).is_ok());
             } else {
                 assert!(entries.is_empty());
@@ -4203,7 +3717,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_envelope_round_trip_dispatches_all_kinds_with_derived_provenance() {
+    fn envelope_round_trip_dispatches_all_kinds_with_derived_provenance() {
         let header = segment_header();
         let envelopes: Vec<_> = RecordKind::ALL
             .into_iter()
@@ -4219,12 +3733,13 @@ mod tests {
                 )
             })
             .collect();
-        let bytes = v2_segment(&header, &envelopes);
-        let mut reader = VersionedWalReader::new(
+        let bytes = wal_segment(&header, &envelopes);
+        let mut reader = WalReader::new(
             Cursor::new(bytes),
             header.recording_id,
             header.segment_ordinal,
             header.first_sequence,
+            DEFAULT_MAX_RECORD_BYTES,
         )
         .unwrap();
         let mut offset = SEGMENT_HEADER_LEN as u64;
@@ -4235,47 +3750,14 @@ mod tests {
                 segment_first_sequence: header.first_sequence,
                 byte_offset: offset,
             });
-            assert_eq!(
-                reader.next_record().unwrap(),
-                VersionedReadOutcome::Record(expected)
-            );
+            assert_eq!(reader.next_record().unwrap(), ReadOutcome::Record(expected));
             offset += encoded_len;
         }
-        assert_eq!(reader.next_record().unwrap(), VersionedReadOutcome::End);
+        assert_eq!(reader.next_record().unwrap(), ReadOutcome::End);
     }
 
     #[test]
-    fn versioned_reader_retains_p0_v1_dispatch() {
-        let recording_id = RecordingId::new();
-        let mut reader = VersionedWalReader::new(
-            Cursor::new(encode_record(&record()).unwrap()),
-            recording_id,
-            9,
-            7,
-        )
-        .unwrap();
-        let expected = WalRecordEnvelope::unplaced(
-            recording_id,
-            7,
-            RecordKind::CaptureEvent,
-            1,
-            2,
-            b"payload".to_vec(),
-        )
-        .with_provenance(WalRecordProvenance {
-            segment_ordinal: 9,
-            segment_first_sequence: 7,
-            byte_offset: 0,
-        });
-        assert_eq!(
-            reader.next_record().unwrap(),
-            VersionedReadOutcome::Record(expected)
-        );
-        assert_eq!(reader.next_record().unwrap(), VersionedReadOutcome::End);
-    }
-
-    #[test]
-    fn v2_reader_rejects_invalid_envelope_fields() {
+    fn reader_rejects_invalid_envelope_fields() {
         let header = segment_header();
         let envelope = WalRecordEnvelope::unplaced(
             header.recording_id,
@@ -4285,13 +3767,14 @@ mod tests {
             0,
             b"payload".to_vec(),
         );
-        let encoded = v2_segment(&header, &[envelope]);
+        let encoded = wal_segment(&header, &[envelope]);
         let read_error = |bytes: Vec<u8>| {
-            VersionedWalReader::new(
+            WalReader::new(
                 Cursor::new(bytes),
                 header.recording_id,
                 header.segment_ordinal,
                 header.first_sequence,
+                DEFAULT_MAX_RECORD_BYTES,
             )
             .unwrap()
             .next_record()
@@ -4319,6 +3802,26 @@ mod tests {
         assert!(matches!(
             read_error(invalid),
             WalError::UnknownRecordKind(5)
+        ));
+
+        let mut invalid = encoded.clone();
+        invalid[frame + 10..frame + 12]
+            .copy_from_slice(&(WAL_RECORD_SCHEMA_VERSION + 1).to_le_bytes());
+        assert!(matches!(
+            read_error(invalid),
+            WalError::UnsupportedRecordSchemaVersion { version, .. }
+                if version == WAL_RECORD_SCHEMA_VERSION + 1
+        ));
+        assert!(matches!(
+            encode_envelope(&WalRecordEnvelope::unplaced(
+                header.recording_id,
+                header.first_sequence,
+                RecordKind::CaptureEvent,
+                WAL_RECORD_SCHEMA_VERSION + 1,
+                0,
+                Vec::new(),
+            )),
+            Err(WalError::UnsupportedRecordSchemaVersion { .. })
         ));
 
         let mut invalid = encoded.clone();
@@ -4351,7 +3854,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_reader_checks_record_limit_before_payload_allocation() {
+    fn reader_checks_record_limit_before_payload_allocation() {
         let header = segment_header();
         let envelope = WalRecordEnvelope::unplaced(
             header.recording_id,
@@ -4361,10 +3864,10 @@ mod tests {
             0,
             Vec::new(),
         );
-        let mut bytes = v2_segment(&header, &[envelope]);
+        let mut bytes = wal_segment(&header, &[envelope]);
         bytes[SEGMENT_HEADER_LEN + 16..SEGMENT_HEADER_LEN + 20]
             .copy_from_slice(&1_000_u32.to_le_bytes());
-        let mut reader = VersionedWalReader::with_max_record_bytes(
+        let mut reader = WalReader::new(
             Cursor::new(bytes),
             header.recording_id,
             header.segment_ordinal,
@@ -4445,8 +3948,8 @@ mod tests {
         let mut writer = GroupCommitWalWriter::create_with_total_limit(
             &directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES,
-            MIN_V2_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
             1,
             0,
         )
@@ -4464,18 +3967,10 @@ mod tests {
         writer.shutdown(1).unwrap();
         drop(writer);
 
-        let scan = scan_v2_wal(&directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        let scan = scan_wal(&directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(scan.terminal_wal_losses.len(), 1);
         assert_eq!(scan.terminal_wal_losses[0].loss, loss);
         std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn record_round_trip() {
-        let encoded = encode_record(&record()).unwrap();
-        let mut reader = WalReader::new(Cursor::new(encoded), 7);
-        assert_eq!(reader.next_record().unwrap(), ReadOutcome::Record(record()));
-        assert_eq!(reader.next_record().unwrap(), ReadOutcome::End);
     }
 
     #[test]
@@ -4503,27 +3998,6 @@ mod tests {
     }
 
     #[test]
-    fn p0_v1_dispatch_remains_capture_event_only() {
-        for kind in [
-            RecordKind::LossWindow,
-            RecordKind::CommitMarker,
-            RecordKind::TerminalWalLoss,
-        ] {
-            assert!(matches!(
-                encode_record(&WalRecord { kind, ..record() }),
-                Err(WalError::UnknownRecordKind(actual)) if actual == kind as u16
-            ));
-
-            let mut encoded = encode_record(&record()).unwrap();
-            encoded[6..8].copy_from_slice(&(kind as u16).to_le_bytes());
-            assert!(matches!(
-                WalReader::new(Cursor::new(encoded), 7).next_record(),
-                Err(WalError::UnknownRecordKind(actual)) if actual == kind as u16
-            ));
-        }
-    }
-
-    #[test]
     fn record_kind_dispatch_is_exhaustive() {
         for kind in RecordKind::ALL {
             assert_eq!(RecordKind::try_from(kind as u16).unwrap(), kind);
@@ -4538,106 +4012,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn dispatches_only_implemented_wal_v1() {
-        assert_eq!(
-            WalFormatVersion::try_from(WAL_FORMAT_V1).unwrap(),
-            WalFormatVersion::V1
-        );
-        assert_eq!(
-            WalFormatVersion::try_from(WAL_FORMAT_V2).unwrap(),
-            WalFormatVersion::V2
-        );
-
-        for version in [0, WAL_FORMAT_V2, WAL_FORMAT_V2 + 1] {
-            let mut encoded = encode_record(&record()).unwrap();
-            encoded[4..6].copy_from_slice(&version.to_le_bytes());
-            assert!(matches!(
-                WalReader::new(Cursor::new(encoded), 7).next_record(),
-                Err(WalError::UnsupportedVersion(actual)) if actual == version
-            ));
-        }
-    }
-
-    #[test]
-    fn detects_corruption() {
-        let mut encoded = encode_record(&record()).unwrap();
-        *encoded.last_mut().unwrap() ^= 0xff;
-        let error = WalReader::new(Cursor::new(encoded), 7)
-            .next_record()
-            .unwrap_err();
-        assert!(matches!(error, WalError::Checksum { sequence: 7, .. }));
-    }
-
-    #[test]
-    fn reports_partial_tail_without_advancing_checkpoint() {
-        let mut encoded = encode_record(&record()).unwrap();
-        encoded.pop();
-        let mut reader = WalReader::new(Cursor::new(encoded), 7);
-        assert_eq!(
-            reader.next_record().unwrap(),
-            ReadOutcome::PartialTail { offset: 0 }
-        );
-        assert_eq!(reader.checkpoint().byte_offset, 0);
-    }
-
-    #[test]
-    fn rejects_record_larger_than_reader_limit_before_allocation() {
-        let encoded = encode_record(&record()).unwrap();
-        let mut reader = WalReader::with_max_record_bytes(Cursor::new(encoded), 7, HEADER_LEN + 6);
-        let error = reader.next_record().unwrap_err();
-        assert!(matches!(
-            error,
-            WalError::RecordTooLarge {
-                record_bytes,
-                max_record_bytes
-            } if record_bytes == HEADER_LEN + 7 && max_record_bytes == HEADER_LEN + 6
-        ));
-    }
-
-    #[test]
-    fn reader_rejects_unexpected_sequence() {
-        let error = WalReader::new(Cursor::new(encode_record(&record()).unwrap()), 6)
-            .next_record()
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            WalError::UnexpectedSequence {
-                expected: 6,
-                actual: 7
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_exhausted_sequence_space() {
-        let exhausted = WalRecord {
-            sequence: u64::MAX,
-            ..record()
-        };
-        let reader_error =
-            WalReader::new(Cursor::new(encode_record(&exhausted).unwrap()), u64::MAX)
-                .next_record()
-                .unwrap_err();
-        assert!(matches!(
-            reader_error,
-            WalError::SequenceExhausted { sequence: u64::MAX }
-        ));
-
-        let mut writer = SegmentedWalWriter {
-            directory: PathBuf::new(),
-            max_segment_bytes: 1_024,
-            file: None,
-            segment_first_sequence: 0,
-            segment_bytes: 0,
-            last_sequence: None,
-        };
-        assert!(matches!(
-            writer.append(&exhausted),
-            Err(WalError::SequenceExhausted { sequence: u64::MAX })
-        ));
-    }
-
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn group_writer_rejects_sequence_exhaustion_before_any_frame_write() {
@@ -4646,7 +4020,7 @@ mod tests {
         let mut writer = GroupCommitWalWriter::create(
             &wal_directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
             u64::MAX - 1,
             0,
         )
@@ -4668,7 +4042,7 @@ mod tests {
         let mut writer = GroupCommitWalWriter::create(
             &wal_directory,
             recording_id,
-            MIN_V2_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
             u64::MAX - 2,
             0,
         )
@@ -4678,7 +4052,7 @@ mod tests {
             .unwrap();
         let segment_path = wal_directory
             .join("segments")
-            .join(v2_segment_file_name(u64::MAX - 2));
+            .join(segment_file_name(u64::MAX - 2));
         let before = fs::read(&segment_path).unwrap();
         assert!(matches!(
             writer.append(RecordKind::CaptureEvent, 1, 0, b"rejected".to_vec(), 20),
@@ -4686,7 +4060,7 @@ mod tests {
         ));
         assert_eq!(fs::read(&segment_path).unwrap(), before);
         drop(writer);
-        let scan = scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        let scan = scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert!(scan.final_marker.is_none());
         assert_eq!(scan.uncommitted.len(), 1);
         fs::remove_dir_all(wal_directory).unwrap();
@@ -4698,21 +4072,18 @@ mod tests {
         let wal_directory = discovery_directory();
         let segments = wal_directory.join("segments");
         fs::create_dir_all(&segments).unwrap();
-        let stale = segments.join(format!(".{}.tmp-stale", v2_segment_file_name(1)));
+        let stale = segments.join(format!(".{}.tmp-stale", segment_file_name(1)));
         fs::write(&stale, b"stale").unwrap();
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"data".to_vec(), 0)
             .unwrap();
         writer.flush(1).unwrap();
         drop(writer);
-        assert_eq!(
-            discover_v2_segments(&segments, recording_id).unwrap().len(),
-            1
-        );
+        assert_eq!(discover_segments(&segments, recording_id).unwrap().len(), 1);
         assert!(stale.exists());
         fs::remove_dir_all(wal_directory).unwrap();
     }
@@ -4730,8 +4101,19 @@ mod tests {
             "chronicle-wal-permissions-{}-{unique}",
             std::process::id()
         ));
-        let mut writer = SegmentedWalWriter::create(&directory, 1024).unwrap();
-        writer.append(&record()).unwrap();
+        let recording_id = RecordingId::new();
+        let mut writer =
+            SegmentedEnvelopeWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES).unwrap();
+        writer
+            .append(&WalRecordEnvelope::unplaced(
+                recording_id,
+                7,
+                RecordKind::CaptureEvent,
+                WAL_RECORD_SCHEMA_VERSION,
+                0,
+                Vec::new(),
+            ))
+            .unwrap();
         writer.flush().unwrap();
 
         let directory_mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;

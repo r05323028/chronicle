@@ -41,56 +41,51 @@ fn record(root: &std::path::Path) -> String {
 
 fn production_wal(directory: &std::path::Path) {
     use chronicle_application::{
-        RECORDING_METADATA_SCHEMA_V1, RecordByteCount, RecordingCommitBoundary, RecordingCounters,
-        RecordingMetadataV1, RecordingStatus, ShutdownReason, write_recording_metadata,
+        RECORDING_METADATA_SCHEMA_VERSION, RecordByteCount, RecordingCommitBoundary,
+        RecordingCounters, RecordingMetadata, RecordingStatus, ShutdownReason,
+        write_recording_metadata,
     };
     use chronicle_capture::{
-        CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureEventV1, CaptureFlags, encode_event,
+        CAPTURE_EVENT_SCHEMA_VERSION, CaptureEventKind, CaptureSource, FixtureCaptureSource,
+        encode_event,
     };
-    use chronicle_common::{ConnectionKey, Direction, Endpoint, RecordingId, TransportProtocol};
+    use chronicle_common::RecordingId;
     use chronicle_wal::{
-        DEFAULT_MAX_RECORD_BYTES, GroupCommitWalWriter, MIN_V2_SEGMENT_BYTES, RecordKind,
-        scan_v2_wal,
+        DEFAULT_MAX_RECORD_BYTES, GroupCommitWalWriter, MIN_SEGMENT_BYTES, RecordKind, scan_wal,
     };
 
     let recording_id = RecordingId::new();
-    let event = CaptureEvent::V1(CaptureEventV1 {
-        schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-        monotonic_sequence: 1,
-        wall_time: None,
-        connection: ConnectionKey::new(
-            Endpoint::new("client", 1234),
-            Endpoint::new("server", 8080),
-            TransportProtocol::Tcp,
-        ),
-        direction: Direction::ClientToServer,
-        payload: b"opaque".to_vec(),
-        process: None,
-        container: None,
-        file_descriptor: None,
-        truncated: false,
-        flags: CaptureFlags::default(),
-    });
-    let mut writer =
-        GroupCommitWalWriter::create(directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
-            .expect("create production WAL");
-    writer
-        .append(
-            RecordKind::CaptureEvent,
-            CAPTURE_EVENT_SCHEMA_VERSION,
-            0,
-            encode_event(&event).expect("encode capture"),
-            0,
-        )
-        .expect("append capture");
+    let fixture = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/http/basic-session.json"
+    ))
+    .unwrap();
+    let mut source = FixtureCaptureSource::from_json(&fixture).unwrap();
+    let mut writer = GroupCommitWalWriter::create(directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
+        .expect("create production WAL");
+    while let Some(event) = source.next_event().unwrap() {
+        let flags = match &event.kind {
+            CaptureEventKind::PayloadFragment(fragment) => u16::try_from(fragment.flags.0).unwrap(),
+            _ => 0,
+        };
+        writer
+            .append(
+                RecordKind::CaptureEvent,
+                CAPTURE_EVENT_SCHEMA_VERSION,
+                flags,
+                encode_event(&event).expect("encode capture"),
+                0,
+            )
+            .expect("append capture");
+    }
     writer.flush(1).expect("flush WAL").expect("durable batch");
     drop(writer);
-    let scan = scan_v2_wal(directory, recording_id, DEFAULT_MAX_RECORD_BYTES).expect("scan WAL");
+    let scan = scan_wal(directory, recording_id, DEFAULT_MAX_RECORD_BYTES).expect("scan WAL");
     let authority = scan.authority;
     write_recording_metadata(
         directory,
-        &RecordingMetadataV1 {
-            version: RECORDING_METADATA_SCHEMA_V1,
+        &RecordingMetadata {
+            version: RECORDING_METADATA_SCHEMA_VERSION,
             recording_id,
             selector: None,
             status: RecordingStatus::Completed,
@@ -193,7 +188,13 @@ fn cli_record_inspect_replay_and_exit_contract() {
     assert!(inspect.status.success());
     let (inspect_stdout, _) = output_text(&inspect);
     let inspected: serde_json::Value = serde_json::from_str(&inspect_stdout).expect("inspect JSON");
-    let operation = &inspected["connections"][0]["operations"][0];
+    assert_eq!(inspected["version"], 1);
+    let connection = &inspected["connections"][0];
+    assert_eq!(connection["client"]["host"], "192.0.2.10");
+    assert_eq!(connection["client"]["port"], 41_000);
+    assert_eq!(connection["server"]["host"], "192.0.2.20");
+    assert_eq!(connection["server"]["port"], 8_080);
+    let operation = &connection["operations"][0];
     assert_eq!(operation["method"], "GET");
     assert_eq!(operation["target"], "/hello");
     assert_eq!(operation["response_status"], "200");

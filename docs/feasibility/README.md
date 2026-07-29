@@ -9,6 +9,21 @@ sudo -E cargo test -p chronicle-capture-ebpf --test privileged_feasibility -- --
 
 Retained machine evidence: `gate-a-ubuntu-24.04-kernel-6.8-aarch64.json`.
 
+## Endpoint-evidence acceptance
+
+Verified 2026-07-29 in Multipass VM `chronicle-ubuntu`: Ubuntu 24.04.4 LTS (`ubuntu:24.04`), Linux `6.8.0-136-generic`, `aarch64`, cgroup v2 (`cgroup2fs`), readable `/sys/kernel/btf/vmlinux`, privileged root, bpftool 7.4.0, Cargo 1.97.1, and rustc 1.97.1. Embedded eBPF object SHA-256: `db025f8055b27b7281cf6b6271c4ec0b1040452d8a4afe28be2cbeebd14ef32bc`.
+
+```bash
+CARGO_TARGET_DIR=/tmp/chronicle-target-ubuntu \
+  cargo test -p chronicle-capture-ebpf --features linux-ebpf \
+  --test privileged_adapter --no-run
+sudo "$(find /tmp/chronicle-target-ubuntu/debug/deps -type f -executable \
+  -name 'privileged_adapter-*' | head -1)" \
+  --ignored --nocapture --test-threads=1
+```
+
+Result: 3 passed—IPv4 active establishment, IPv4 passive establishment, and IPv6 active establishment. This adds no compatibility claim for any other environment.
+
 ## Verified matrix
 
 Only `ubuntu:24.04`, Linux `6.8.0-136-generic`, `aarch64`, cgroup v2, and BTF is verified. The report encodes this in `verified_environment` and marks every other target, including `x86_64`, `not_verified` in `target_compatibility_matrix`.

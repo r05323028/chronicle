@@ -6,6 +6,12 @@
 - **Planned MVP:** intended before MVP acceptance.
 - **Future:** explicit extension point, not a current promise.
 
+## MVP versioning policy
+
+Until explicit compatibility freeze, every internal artifact domain has one mutable schema or format: v1. Capture events, private eBPF ABI records, WAL, canonical sessions, manifests, recording metadata, ETL checkpoints, fixtures, and machine-readable reports evolve by updating current v1 plus repository fixtures, tests, and documentation in same change.
+
+Readers reject values other than 1. Chronicle does not retain V1/V2/V3 dispatch enums, migration adapters, dual writers, or compatibility readers for repository history. A version increase requires explicit OpenSpec change declaring compatibility freeze, frozen contract scope, supported reader/writer combinations, migration policy, and deprecation policy.
+
 ## Boundaries
 
 ```text
@@ -28,9 +34,13 @@ Thirteen crates consolidate real protocol modules into `chronicle-protocol-built
 
 ## Current vertical slice
 
-`FixtureCaptureSource` emits ordered socket-byte chunks. JSON capture envelopes are framed in WAL v1 records, then ETL validates, assembles, detects, decodes, and canonicalizes bounded plaintext HTTP/1.1 traffic into Canonical Session v2. `FilesystemSessionStore` atomically writes a manifest, session JSON, and SHA-256-addressed payloads. Replay hydrates only persisted artifacts and requires explicit loopback target, matching allow-host, effect flag, and `--execute`; dry-run stays default. Fake protocol remains available for boundary tests.
+Fixture and eBPF sources emit same `CaptureEvent` v1 model. `SocketConnected` carries stable socket identity, local/remote IP endpoints, and active/passive role before endpoint-free payload fragments. Capture adapter caches complete evidence by socket identity and rejects conflicting tuple or role.
 
-JSON is only current capture-envelope payload encoding; WAL framing does not depend on JSON and any replacement requires its own schema/version migration plan.
+Segmented, group-committed WAL v1 frames capture JSON payloads, then shared reconstruction validates, groups by socket generation, orders bytes, detects protocol, decodes, and canonicalizes bounded plaintext HTTP/1.1 traffic into `CanonicalSession` v1. Active maps local→client and remote→server; passive maps remote→client and local→server. Ingress/egress controls byte direction only. Missing or conflicting evidence is typed failure; production never fabricates `unknown:0`.
+
+`FilesystemSessionStore` atomically writes sole-v1 manifest, session JSON, and SHA-256-addressed payloads. Replay hydrates only persisted artifacts and requires explicit loopback target, matching allow-host, effect flag, and `--execute`; dry-run stays default. Fake protocol remains available for boundary tests.
+
+JSON is current capture-event payload encoding; WAL framing remains encoding-independent.
 
 ## Ownership and backpressure
 
@@ -40,19 +50,18 @@ Capture owns event production. WAL append/flush is local durability boundary. ET
 
 Rust standard library does not provide derive-based wire serialization, UUIDs, wall-clock serialization, CRC32C, typed error derives, TOML parsing, CLI derivation, async test runtime, or structured diagnostics. Chronicle therefore uses `serde`/`serde_json`, `uuid`, `time`, `crc32c`, `thiserror`, `toml`, `clap`, `tokio`, and `tracing`. `tracing-subscriber` is confined to CLI setup. `tokio` is used only where async execution is exercised.
 
-`httparse` provides bounded HTTP head parsing and `sha2` identifies filesystem payloads. `sqlx`, `object_store`, and `aya` remain absent until PostgreSQL, S3, and eBPF adapters have real behavior. `bytes`, `blake3`, `anyhow`, plugin loaders, queues, and embedded databases remain unnecessary.
+`httparse` provides bounded HTTP head parsing and `sha2` identifies filesystem payloads. `aya` is isolated in `chronicle-capture-ebpf`; kernel ABI types never cross capture boundary. `sqlx` and `object_store` remain absent until PostgreSQL and S3 adapters have real behavior. `bytes`, `blake3`, `anyhow`, plugin loaders, queues, and embedded databases remain unnecessary.
 
 ## Planned implementations
 
-- Linux eBPF adapter isolated in `chronicle-capture-ebpf`.
-- PostgreSQL metadata repository and ETL checkpoints.
+- PostgreSQL metadata repository.
 - S3-compatible artifact store and WAL archival.
-- Protocol decoders/canonicalizers/adapters/verifiers.
-- Restart repair, segment retention, scheduling, redaction policies, inspect/doctor probes.
+- Additional protocol decoders/canonicalizers/adapters/verifiers.
+- Segment retention, scheduling, redaction policies, and expanded inspect/doctor probes.
 
 ## Capture semantics and TLS
 
-Capture events are ordered socket byte chunks, not packets. Exact ordering and missing-data semantics depend on chosen eBPF hooks. TCP sequence reconstruction must not be claimed unless packet/sequence information is actually captured.
+Capture events are socket lifecycle evidence plus ordered socket byte fragments, not application operations. Private eBPF ABI v1 emits active connect intent before autobind and complete active/passive endpoint evidence at establishment. Payload carries TCP/continuation sequence evidence but never duplicates endpoint tuple or role. Exact ordering and missing-data semantics remain bounded by selected hooks and explicit loss windows.
 
 Plaintext only is supported by target design. TCP payload capture cannot decode arbitrary TLS ciphertext. Unknown and encrypted payloads remain opaque. Future uprobes may observe bytes before encryption or after decryption without weakening TLS or exporting production certificates.
 

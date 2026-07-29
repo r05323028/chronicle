@@ -2,12 +2,14 @@
   "schema_version": 1,
   "connections": [{
     "id": "basic",
+    "socket_cookie": 1,
+    "first_seen_ns": 0,
     "network_namespace": null,
-    "client": {"host": "fixture-client", "port": 41000},
-    "server": {"host": "recorded.invalid", "port": 8080},
+    "local_endpoint": {"host": "192.0.2.10", "port": 41000},
+    "remote_endpoint": {"host": "192.0.2.20", "port": 8080},
+    "role": "active",
     "transport": "tcp",
-    "process": {"pid": 4242, "tid": null, "executable": "fixture-client"},
-    "file_descriptor": 7
+    "process": {"pid": 4242, "tid": null, "executable": "fixture-client"}
   }],
   "events": [
     {"sequence": 1, "timestamp": "2026-01-01T00:00:00Z", "connection_id": "basic", "direction": "client_to_server", "payload_hex": "474554202f68656c6c6f204854", "truncated": false, "flags": 0},

@@ -30,6 +30,10 @@ pub enum EbpfCaptureError {
     },
     #[error("eBPF observation lacks required identity: {0}")]
     MissingIdentity(&'static str),
+    #[error("eBPF socket evidence is invalid: {0}")]
+    InvalidSocketEvidence(String),
+    #[error("eBPF socket evidence conflicts with cached identity")]
+    ConflictingSocketEvidence,
     #[error("eBPF ring-loss evidence is incomplete: {0}")]
     RingLoss(&'static str),
     #[error("eBPF cleanup failed: {0}")]

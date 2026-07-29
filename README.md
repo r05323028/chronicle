@@ -2,13 +2,15 @@
 
 # Chronicle
 
-Chronicle records versioned fixture socket-byte chunks through a local WAL, reconstructs bounded HTTP/1.1 sessions, persists them locally, inspects them safely, and replays only to an explicitly authorized loopback target. eBPF, PostgreSQL, S3, TLS, and protocols other than HTTP/1.1 remain planned.
+Chronicle records fixture or Linux eBPF socket evidence through local segmented WAL, reconstructs bounded HTTP/1.1 sessions, persists them locally, inspects them safely, and replays only to explicitly authorized loopback target. PostgreSQL, S3, TLS, and protocols other than HTTP/1.1 remain planned.
 
 > **Safety:** production capture can contain credentials and personal data. Replay can execute writes and publish messages. Current replay policy defaults to dry-run and denies every operation. Never point replay at a recorded production destination.
 
 ## Current implementation
 
-Current HTTP/1.1 slice provides fixture capture, CRC32C WAL, bounded ordered socket-chunk assembly, canonical schema v2, atomic filesystem sessions, safe inspect output, strict loopback replay, fixed-header verification, and `record`, `inspect`, and `replay` CLI commands. Fake remains available for boundary tests.
+Current HTTP/1.1 slice provides fixture/eBPF Capture Event v1, endpoint and active/passive role provenance, CRC32C segmented group-commit WAL v1, bounded socket reconstruction, Canonical Session v1, atomic filesystem sessions, safe inspect output, strict loopback replay, fixed-header verification, and `record`, `inspect`, and `replay` CLI commands. Fake remains available for boundary tests.
+
+All internal MVP artifacts use one mutable v1 until explicit compatibility freeze. Repository readers reject other versions; changes rewrite repository fixtures, tests, and docs together rather than adding compatibility dispatch.
 
 HTTP support is deliberately narrow: plaintext HTTP/1.1, origin-form requests, fixed `Content-Length` framing, sequential exchanges, and immediate timing. Chunked/close-delimited messages, HTTP/2+, TLS, redirects, connection reuse, pipelined replay, and recorded credentials are unsupported.
 

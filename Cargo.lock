@@ -185,6 +185,7 @@ dependencies = [
  "aya",
  "aya-obj",
  "chronicle-capture",
+ "chronicle-common",
  "libc",
  "serde",
  "serde_json",

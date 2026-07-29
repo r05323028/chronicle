@@ -1,84 +1,104 @@
+use chronicle_application::{process_fixture_wal, write_capture_to_wal};
 use chronicle_canonical::PayloadRef;
 use chronicle_capture::{
-    CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureEventV1, CaptureFlags, CaptureSource,
-    InMemoryCaptureSource, encode_event,
+    CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureEventKind, CaptureFlags, ClockIdentity,
+    FragmentSequenceEvidence, InMemoryCaptureSource, MonotonicTimestamp, NetworkFamily,
+    PayloadDirection, PayloadFragment, RecordingScopeIdentity, SocketEvidence, SocketIdentity,
+    SocketRole, TruncationMetadata, TruncationState,
 };
-use chronicle_common::{
-    ConnectionKey, Direction, Endpoint, ProtocolId, SessionId, TransportProtocol,
-};
-use chronicle_etl::EtlPipeline;
+use chronicle_common::{ConnectionKey, Endpoint, ProtocolId, SessionId, TransportProtocol};
 use chronicle_protocol::{ReplayContext, VerificationStatus};
 use chronicle_replay::{
     ReplayExecutor, ReplayPlanner, ReplayPolicy, TargetMap, TargetRule, TimingMode,
 };
-use chronicle_session::SessionLimits;
 use chronicle_storage::{
     ArtifactObject, ArtifactStore, InMemoryArtifactStore, InMemoryMetadataRepository,
     MetadataRepository,
 };
-use chronicle_wal::{
-    RecordKind, SegmentedWalWriter, WalReader, WalRecord, WalWriter, segment_file_name,
-};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use time::OffsetDateTime;
+use std::fs;
 use uuid::Uuid;
 
-fn capture_event(
-    connection: &ConnectionKey,
-    sequence: u64,
-    direction: Direction,
-    payload: &[u8],
-) -> CaptureEvent {
-    CaptureEvent::V1(CaptureEventV1 {
+fn capture_events(connection: &ConnectionKey) -> Vec<CaptureEvent> {
+    let first_seen = MonotonicTimestamp {
+        clock: ClockIdentity {
+            boot_id: "test-boot".into(),
+        },
+        nanoseconds: 1,
+    };
+    let socket = SocketIdentity {
+        socket_cookie: 1,
+        first_seen: first_seen.clone(),
+        network_namespace: connection.network_namespace,
+    };
+    let scope = RecordingScopeIdentity {
+        cgroup_id: 1,
+        canonical_path: "/test".into(),
+        namespace: None,
+    };
+    let payload = |sequence, direction, bytes: &[u8]| CaptureEvent {
         schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-        monotonic_sequence: sequence,
-        wall_time: Some(
-            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i64::try_from(sequence).unwrap()),
-        ),
-        connection: connection.clone(),
-        direction,
-        payload: payload.to_vec(),
-        process: None,
-        container: None,
-        file_descriptor: Some(7),
-        truncated: false,
-        flags: CaptureFlags::default(),
-    })
+        kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+            timestamp: MonotonicTimestamp {
+                nanoseconds: sequence,
+                ..first_seen.clone()
+            },
+            socket: socket.clone(),
+            recording_scope: scope.clone(),
+            network_family: NetworkFamily::Ipv4,
+            direction,
+            sequence: FragmentSequenceEvidence {
+                tcp_sequence: u32::try_from(sequence).unwrap(),
+                continuation_position: 0,
+            },
+            payload: bytes.to_vec(),
+            truncation: TruncationMetadata {
+                captured_length: u32::try_from(bytes.len()).unwrap(),
+                observed_length: Some(u32::try_from(bytes.len()).unwrap()),
+                state: TruncationState::Complete,
+                reason: None,
+            },
+            flags: CaptureFlags::default(),
+        }),
+    };
+    vec![
+        CaptureEvent {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            kind: CaptureEventKind::SocketConnected(SocketEvidence {
+                timestamp: first_seen.clone(),
+                socket: socket.clone(),
+                recording_scope: scope.clone(),
+                network_family: NetworkFamily::Ipv4,
+                local_endpoint: connection.client.clone(),
+                remote_endpoint: connection.server.clone(),
+                role: SocketRole::Active,
+                process: None,
+                observed_cgroup_id: 1,
+            }),
+        },
+        payload(2, PayloadDirection::Egress, b"FAKE request"),
+        payload(3, PayloadDirection::Ingress, b"FAKE response"),
+    ]
 }
 
 #[tokio::test]
 async fn fake_capture_wal_etl_storage_replay_verify() {
     let directory = std::env::temp_dir().join(format!("chronicle-test-{}", Uuid::new_v4()));
     let connection = ConnectionKey::new(
-        Endpoint::new("captured-client", 41_000),
-        Endpoint::new("production.invalid", 7_001),
+        Endpoint::new("192.0.2.10", 41_000),
+        Endpoint::new("192.0.2.20", 7_001),
         TransportProtocol::Tcp,
     );
-    let mut source = InMemoryCaptureSource::new([
-        capture_event(&connection, 1, Direction::ClientToServer, b"FAKE request"),
-        capture_event(&connection, 2, Direction::ServerToClient, b"FAKE response"),
-    ]);
-    let mut writer = SegmentedWalWriter::create(&directory, 1024 * 1024).unwrap();
-    while let Some(event) = source.next_event().unwrap() {
-        let event_v1 = event.as_v1().unwrap();
-        writer
-            .append(&WalRecord {
-                kind: RecordKind::CaptureEvent,
-                flags: u16::try_from(event_v1.flags.0).unwrap(),
-                sequence: event_v1.monotonic_sequence,
-                payload: encode_event(&event).unwrap(),
-            })
-            .unwrap();
-    }
-    writer.flush().unwrap();
-
-    let file = File::open(directory.join(segment_file_name(1))).unwrap();
-    let mut reader = WalReader::new(file, 1);
+    let mut source = InMemoryCaptureSource::new(capture_events(&connection));
+    let recorded = write_capture_to_wal(&mut source, &directory, 1024 * 1024).unwrap();
     let registry = chronicle_protocol_builtins::registry().unwrap();
-    let output = EtlPipeline::new(SessionLimits::default())
-        .process(&mut reader, &registry, SessionId::new())
-        .unwrap();
+    let (output, _) = process_fixture_wal(
+        &directory,
+        recorded.recording_id,
+        &registry,
+        SessionId::new(),
+    )
+    .unwrap();
     assert!(output.issues.is_empty());
     assert_eq!(output.session.connections.len(), 1);
     assert_eq!(output.session.connections[0].protocol.as_str(), "fake");
@@ -108,7 +128,7 @@ async fn fake_capture_wal_etl_storage_replay_verify() {
     let targets = TargetMap {
         rules: vec![TargetRule {
             protocol: Some(ProtocolId::new("fake")),
-            host: Some("production.invalid".into()),
+            host: Some("192.0.2.20".into()),
             port: Some(7_001),
             connection_id: Some(canonical_connection.id),
             target: Endpoint::new("replay.invalid", 17_001),

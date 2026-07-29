@@ -16,6 +16,11 @@ const SIGNAL_ACTIVE_ESTABLISHED: u8 = 1;
 const SIGNAL_CLOSE: u8 = 2;
 const SIGNAL_RESET: u8 = 3;
 const SIGNAL_AMBIGUOUS: u8 = 4;
+const SIGNAL_PASSIVE_ESTABLISHED: u8 = 5;
+
+const SOCKET_BYTES: usize = 48;
+const CONNECT_INTENT_BYTES: usize = 20;
+const ESTABLISHED_ENDPOINT_BYTES: usize = 38;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RawNetworkFamily {
@@ -32,9 +37,30 @@ pub(crate) enum RawDirection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RawLifecycleSignal {
     ActiveEstablished,
+    PassiveEstablished,
     Close,
     Reset,
     Ambiguous(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawSocketRole {
+    Active,
+    Passive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawEndpoint {
+    pub address: [u8; 16],
+    pub port: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawEstablishedSocketEvidence {
+    pub family: RawNetworkFamily,
+    pub local_endpoint: RawEndpoint,
+    pub remote_endpoint: RawEndpoint,
+    pub role: RawSocketRole,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,12 +78,14 @@ pub(crate) struct RawSocketObservation {
 pub(crate) struct RawConnectObservation {
     pub socket: RawSocketObservation,
     pub family: RawNetworkFamily,
+    pub remote_endpoint: RawEndpoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RawLifecycleObservation {
     pub socket: RawSocketObservation,
     pub signal: RawLifecycleSignal,
+    pub established: Option<RawEstablishedSocketEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,16 +144,27 @@ pub(crate) fn decode_raw_kernel_observation(
     let body = &bytes[ABI_HEADER_BYTES..];
     match kind {
         KIND_CONNECT4 | KIND_CONNECT6 => {
-            if body.len() != 48 {
+            if body.len() != SOCKET_BYTES + CONNECT_INTENT_BYTES {
                 return Err(decode_error("connect", "invalid connect item size"));
+            }
+            let family = if kind == KIND_CONNECT4 {
+                RawNetworkFamily::Ipv4
+            } else {
+                RawNetworkFamily::Ipv6
+            };
+            if decode_family(body[SOCKET_BYTES], "connect")? != family {
+                return Err(decode_error(
+                    "connect",
+                    "discriminant and network family disagree",
+                ));
+            }
+            if body[SOCKET_BYTES + 19] != 1 {
+                return Err(decode_error("connect", "connect intent role is not active"));
             }
             Ok(RawKernelObservation::Connect(RawConnectObservation {
                 socket: decode_socket(body, "connect")?,
-                family: if kind == KIND_CONNECT4 {
-                    RawNetworkFamily::Ipv4
-                } else {
-                    RawNetworkFamily::Ipv6
-                },
+                family,
+                remote_endpoint: decode_endpoint(body, SOCKET_BYTES + 1, family, "connect")?,
             }))
         }
         KIND_SOCKOPS => decode_lifecycle(body),
@@ -139,7 +178,6 @@ fn decode_socket(
     bytes: &[u8],
     source: &'static str,
 ) -> Result<RawSocketObservation, EbpfCaptureError> {
-    const SOCKET_BYTES: usize = 48;
     if bytes.len() < SOCKET_BYTES {
         return Err(decode_error(source, "item is shorter than socket evidence"));
     }
@@ -166,12 +204,12 @@ fn decode_socket(
 }
 
 fn decode_lifecycle(bytes: &[u8]) -> Result<RawKernelObservation, EbpfCaptureError> {
-    const SOCKET_BYTES: usize = 48;
-    if bytes.len() != SOCKET_BYTES + 5 {
+    if bytes.len() < SOCKET_BYTES + 5 {
         return Err(decode_error("sockops", "invalid lifecycle item size"));
     }
     let signal = match bytes[SOCKET_BYTES] {
         SIGNAL_ACTIVE_ESTABLISHED => RawLifecycleSignal::ActiveEstablished,
+        SIGNAL_PASSIVE_ESTABLISHED => RawLifecycleSignal::PassiveEstablished,
         SIGNAL_CLOSE => RawLifecycleSignal::Close,
         SIGNAL_RESET => RawLifecycleSignal::Reset,
         SIGNAL_AMBIGUOUS => {
@@ -179,10 +217,81 @@ fn decode_lifecycle(bytes: &[u8]) -> Result<RawKernelObservation, EbpfCaptureErr
         }
         _ => return Err(decode_error("sockops", "unknown lifecycle signal")),
     };
+    let established = match signal {
+        RawLifecycleSignal::ActiveEstablished | RawLifecycleSignal::PassiveEstablished => {
+            if bytes.len() != SOCKET_BYTES + 5 + ESTABLISHED_ENDPOINT_BYTES {
+                return Err(decode_error(
+                    "sockops",
+                    "invalid established lifecycle item size",
+                ));
+            }
+            let offset = SOCKET_BYTES + 5;
+            let family = decode_family(bytes[offset], "sockops")?;
+            let role = match bytes[offset + 37] {
+                1 => RawSocketRole::Active,
+                2 => RawSocketRole::Passive,
+                _ => return Err(decode_error("sockops", "unknown socket role")),
+            };
+            if !matches!(
+                (signal, role),
+                (RawLifecycleSignal::ActiveEstablished, RawSocketRole::Active)
+                    | (
+                        RawLifecycleSignal::PassiveEstablished,
+                        RawSocketRole::Passive
+                    )
+            ) {
+                return Err(decode_error("sockops", "signal and socket role disagree"));
+            }
+            Some(RawEstablishedSocketEvidence {
+                family,
+                local_endpoint: decode_endpoint(bytes, offset + 1, family, "sockops")?,
+                remote_endpoint: decode_endpoint(bytes, offset + 19, family, "sockops")?,
+                role,
+            })
+        }
+        RawLifecycleSignal::Close
+        | RawLifecycleSignal::Reset
+        | RawLifecycleSignal::Ambiguous(_) => {
+            if bytes.len() != SOCKET_BYTES + 5 {
+                return Err(decode_error("sockops", "invalid lifecycle item size"));
+            }
+            None
+        }
+    };
     Ok(RawKernelObservation::Lifecycle(RawLifecycleObservation {
         socket: decode_socket(bytes, "sockops")?,
         signal,
+        established,
     }))
+}
+
+fn decode_family(value: u8, source: &'static str) -> Result<RawNetworkFamily, EbpfCaptureError> {
+    match value {
+        4 => Ok(RawNetworkFamily::Ipv4),
+        6 => Ok(RawNetworkFamily::Ipv6),
+        _ => Err(decode_error(source, "unknown network family")),
+    }
+}
+
+fn decode_endpoint(
+    bytes: &[u8],
+    offset: usize,
+    family: RawNetworkFamily,
+    source: &'static str,
+) -> Result<RawEndpoint, EbpfCaptureError> {
+    let address: [u8; 16] = bytes
+        .get(offset..offset + 16)
+        .ok_or_else(|| decode_error(source, "endpoint address exceeds item bounds"))?
+        .try_into()
+        .map_err(|_| decode_error(source, "invalid endpoint address"))?;
+    if family == RawNetworkFamily::Ipv4 && address[4..].iter().any(|byte| *byte != 0) {
+        return Err(decode_error(source, "IPv4 endpoint padding is not zero"));
+    }
+    let port = read_u16(bytes, offset + 16, source)?;
+    if port == 0 {
+        return Err(decode_error(source, "endpoint port is zero"));
+    }
+    Ok(RawEndpoint { address, port })
 }
 
 fn decode_payload(bytes: &[u8], kind: u8) -> Result<RawKernelObservation, EbpfCaptureError> {
@@ -302,6 +411,58 @@ mod tests {
         body
     }
 
+    fn connect_body(family: RawNetworkFamily) -> Vec<u8> {
+        let mut body = socket_body();
+        body.push(match family {
+            RawNetworkFamily::Ipv4 => 4,
+            RawNetworkFamily::Ipv6 => 6,
+        });
+        match family {
+            RawNetworkFamily::Ipv4 => {
+                body.extend_from_slice(&[192, 0, 2, 20]);
+                body.extend_from_slice(&[0; 12]);
+            }
+            RawNetworkFamily::Ipv6 => body.extend_from_slice(&[2; 16]),
+        }
+        body.extend_from_slice(&8_080_u16.to_le_bytes());
+        body.push(1);
+        body
+    }
+
+    fn established_body(family: RawNetworkFamily, role: RawSocketRole) -> Vec<u8> {
+        let mut body = socket_body();
+        body.push(match role {
+            RawSocketRole::Active => SIGNAL_ACTIVE_ESTABLISHED,
+            RawSocketRole::Passive => SIGNAL_PASSIVE_ESTABLISHED,
+        });
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.push(match family {
+            RawNetworkFamily::Ipv4 => 4,
+            RawNetworkFamily::Ipv6 => 6,
+        });
+        for local in [true, false] {
+            match family {
+                RawNetworkFamily::Ipv4 => {
+                    body.extend_from_slice(if local {
+                        &[192, 0, 2, 10]
+                    } else {
+                        &[192, 0, 2, 20]
+                    });
+                    body.extend_from_slice(&[0; 12]);
+                }
+                RawNetworkFamily::Ipv6 => {
+                    body.extend_from_slice(if local { &[1; 16] } else { &[2; 16] });
+                }
+            }
+            body.extend_from_slice(&(if local { 41_000_u16 } else { 8_080_u16 }).to_le_bytes());
+        }
+        body.push(match role {
+            RawSocketRole::Active => 1,
+            RawSocketRole::Passive => 2,
+        });
+        body
+    }
+
     fn abi_item(kind: u8, body: Vec<u8>) -> Vec<u8> {
         let mut item = Vec::with_capacity(ABI_HEADER_BYTES + body.len());
         item.extend_from_slice(&ABI_MAGIC);
@@ -324,11 +485,13 @@ mod tests {
             (KIND_CONNECT6, RawNetworkFamily::Ipv6),
         ] {
             let observation =
-                decode_raw_kernel_observation(&abi_item(kind, socket_body())).unwrap();
+                decode_raw_kernel_observation(&abi_item(kind, connect_body(expected_family)))
+                    .unwrap();
             assert!(matches!(
                 observation,
                 RawKernelObservation::Connect(RawConnectObservation {
                     family,
+                    remote_endpoint: RawEndpoint { port: 8_080, .. },
                     socket: RawSocketObservation {
                         socket_cookie: 20,
                         first_seen_ns: 5,
@@ -340,8 +503,53 @@ mod tests {
     }
 
     #[test]
+    fn established_ipv4_and_ipv6_endpoints_and_roles_decode() {
+        for (family, role) in [
+            (RawNetworkFamily::Ipv4, RawSocketRole::Active),
+            (RawNetworkFamily::Ipv6, RawSocketRole::Passive),
+        ] {
+            let observation = decode_raw_kernel_observation(&abi_item(
+                KIND_SOCKOPS,
+                established_body(family, role),
+            ))
+            .unwrap();
+            assert!(matches!(
+                observation,
+                RawKernelObservation::Lifecycle(RawLifecycleObservation {
+                    established: Some(RawEstablishedSocketEvidence {
+                        family: decoded_family,
+                        local_endpoint: RawEndpoint { port: 41_000, .. },
+                        remote_endpoint: RawEndpoint { port: 8_080, .. },
+                        role: decoded_role,
+                    }),
+                    ..
+                }) if decoded_family == family && decoded_role == role
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_connect_endpoint_and_role_are_rejected() {
+        let body = connect_body(RawNetworkFamily::Ipv4);
+        for (offset, value, expected) in [
+            (SOCKET_BYTES + 5, 1, "IPv4 endpoint padding is not zero"),
+            (SOCKET_BYTES + 17, 0, "endpoint port is zero"),
+            (SOCKET_BYTES + 19, 2, "connect intent role is not active"),
+        ] {
+            let mut invalid = body.clone();
+            invalid[offset] = value;
+            if offset == SOCKET_BYTES + 17 {
+                invalid[offset + 1] = 0;
+            }
+            let error =
+                decode_raw_kernel_observation(&abi_item(KIND_CONNECT4, invalid)).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn exact_item_and_connect_sizes_are_enforced() {
-        let mut wrong_declared_size = abi_item(KIND_CONNECT4, socket_body());
+        let mut wrong_declared_size = abi_item(KIND_CONNECT4, connect_body(RawNetworkFamily::Ipv4));
         wrong_declared_size[8] = 1;
         let error = decode_raw_kernel_observation(&wrong_declared_size).unwrap_err();
         assert!(
@@ -352,12 +560,12 @@ mod tests {
 
         for invalid_body in [
             {
-                let mut body = socket_body();
+                let mut body = connect_body(RawNetworkFamily::Ipv6);
                 body.pop();
                 body
             },
             {
-                let mut body = socket_body();
+                let mut body = connect_body(RawNetworkFamily::Ipv6);
                 body.push(0);
                 body
             },
@@ -370,7 +578,7 @@ mod tests {
 
     #[test]
     fn invalid_magic_version_kind_and_endianness_are_rejected() {
-        let item = abi_item(KIND_CONNECT4, socket_body());
+        let item = abi_item(KIND_CONNECT4, connect_body(RawNetworkFamily::Ipv4));
         for (offset, replacement, expected) in [
             (0, b'X', "invalid ABI magic"),
             (4, 2, "unsupported ABI version"),

@@ -1,13 +1,15 @@
 //! Protocol-neutral capture boundary. Events model ordered socket byte chunks, not packets.
 
-use chronicle_common::{ConnectionKey, Direction, Timestamp};
+use chronicle_common::{Endpoint, Timestamp};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    net::IpAddr,
+};
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 
 pub const CAPTURE_EVENT_SCHEMA_VERSION: u16 = 1;
-pub const CAPTURE_EVENT_V2_SCHEMA_VERSION: u16 = 2;
 pub const FIXTURE_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,30 +19,8 @@ pub struct ProcessMetadata {
     pub executable: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContainerMetadata {
-    pub id: String,
-    pub name: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureFlags(pub u32);
-
-/// Capture Event v1. Retained for fixtures and existing WAL readers.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CaptureEventV1 {
-    pub schema_version: u16,
-    pub monotonic_sequence: u64,
-    pub wall_time: Option<Timestamp>,
-    pub connection: ConnectionKey,
-    pub direction: Direction,
-    pub payload: Vec<u8>,
-    pub process: Option<ProcessMetadata>,
-    pub container: Option<ContainerMetadata>,
-    pub file_descriptor: Option<i32>,
-    pub truncated: bool,
-    pub flags: CaptureFlags,
-}
 
 /// Monotonic clock domain. Values from distinct boot identities are never correlated.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -75,14 +55,115 @@ pub enum NetworkFamily {
     Ipv6,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SocketRole {
+    Active,
+    Passive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketConnectIntent {
+    pub timestamp: MonotonicTimestamp,
+    pub socket: SocketIdentity,
+    pub recording_scope: RecordingScopeIdentity,
+    pub network_family: NetworkFamily,
+    pub remote_endpoint: Endpoint,
+    pub role: SocketRole,
+    pub process: Option<ProcessMetadata>,
+    pub observed_cgroup_id: u64,
+}
+
+impl SocketConnectIntent {
+    pub fn validate(&self) -> Result<(), SocketEvidenceError> {
+        if self.role != SocketRole::Active {
+            return Err(SocketEvidenceError::InvalidConnectRole(self.role));
+        }
+        let remote = validate_endpoint("remote", &self.remote_endpoint)?;
+        if !matches!(
+            (self.network_family, remote),
+            (NetworkFamily::Ipv4, IpAddr::V4(_)) | (NetworkFamily::Ipv6, IpAddr::V6(_))
+        ) {
+            return Err(SocketEvidenceError::FamilyMismatch(self.network_family));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SocketEvidence {
     pub timestamp: MonotonicTimestamp,
     pub socket: SocketIdentity,
     pub recording_scope: RecordingScopeIdentity,
     pub network_family: NetworkFamily,
+    pub local_endpoint: Endpoint,
+    pub remote_endpoint: Endpoint,
+    pub role: SocketRole,
     pub process: Option<ProcessMetadata>,
     pub observed_cgroup_id: u64,
+}
+
+impl SocketEvidence {
+    pub fn validate(&self) -> Result<(), SocketEvidenceError> {
+        let local = validate_endpoint("local", &self.local_endpoint)?;
+        let remote = validate_endpoint("remote", &self.remote_endpoint)?;
+        let matches_family = |address: IpAddr| {
+            matches!(
+                (self.network_family, address),
+                (NetworkFamily::Ipv4, IpAddr::V4(_)) | (NetworkFamily::Ipv6, IpAddr::V6(_))
+            )
+        };
+        if !matches_family(local) || !matches_family(remote) {
+            return Err(SocketEvidenceError::FamilyMismatch(self.network_family));
+        }
+        Ok(())
+    }
+}
+
+fn validate_endpoint(
+    name: &'static str,
+    endpoint: &Endpoint,
+) -> Result<IpAddr, SocketEvidenceError> {
+    if endpoint.port == 0 {
+        return Err(SocketEvidenceError::ZeroPort(name));
+    }
+    let address: IpAddr =
+        endpoint
+            .host
+            .parse()
+            .map_err(|_| SocketEvidenceError::InvalidAddress {
+                endpoint: name,
+                value: endpoint.host.clone(),
+            })?;
+    if endpoint.host != address.to_string() {
+        return Err(SocketEvidenceError::NonCanonicalAddress {
+            endpoint: name,
+            value: endpoint.host.clone(),
+            canonical: address.to_string(),
+        });
+    }
+    Ok(address)
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum SocketEvidenceError {
+    #[error("{0} socket endpoint has zero port")]
+    ZeroPort(&'static str),
+    #[error("{endpoint} socket endpoint address {value:?} is not an IP literal")]
+    InvalidAddress {
+        endpoint: &'static str,
+        value: String,
+    },
+    #[error("{endpoint} socket endpoint address {value:?} is not canonical; use {canonical:?}")]
+    NonCanonicalAddress {
+        endpoint: &'static str,
+        value: String,
+        canonical: String,
+    },
+    #[error("socket endpoints do not match declared network family {0:?}")]
+    FamilyMismatch(NetworkFamily),
+    #[error("connect intent must have active role, got {0:?}")]
+    InvalidConnectRole(SocketRole),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +209,7 @@ pub struct PayloadFragment {
     pub sequence: FragmentSequenceEvidence,
     pub payload: Vec<u8>,
     pub truncation: TruncationMetadata,
+    pub flags: CaptureFlags,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,7 +326,7 @@ impl LossWindowSampler {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "evidence", rename_all = "snake_case")]
 pub enum CaptureEventKind {
-    SocketConnectObserved(SocketEvidence),
+    SocketConnectObserved(SocketConnectIntent),
     SocketConnected(SocketEvidence),
     SocketClosedObserved(SocketEvidence),
     SocketResetObserved(SocketEvidence),
@@ -254,68 +336,42 @@ pub enum CaptureEventKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CaptureEventV2 {
+pub struct CaptureEvent {
     pub schema_version: u16,
     #[serde(flatten)]
     pub kind: CaptureEventKind,
 }
 
-/// Versioned capture stream. V1 serializes to its original flat JSON shape.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum CaptureEvent {
-    V2(CaptureEventV2),
-    V1(CaptureEventV1),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum V2FixtureObservation {
-    Event(CaptureEventV2),
-    LossWindow(LossWindowObserved),
-}
-
-#[derive(Debug)]
-pub struct V2FixtureSource {
-    observations: VecDeque<V2FixtureObservation>,
-}
-
-impl V2FixtureSource {
-    pub fn new(
-        observations: impl IntoIterator<Item = V2FixtureObservation>,
-    ) -> Result<Self, CaptureError> {
-        let observations: VecDeque<_> = observations.into_iter().collect();
-        for observation in &observations {
-            if let V2FixtureObservation::Event(event) = observation
-                && event.schema_version != CAPTURE_EVENT_V2_SCHEMA_VERSION
-            {
-                return Err(CaptureError::UnsupportedSchema(event.schema_version));
-            }
-        }
-        Ok(Self { observations })
-    }
-
-    pub fn next_observation(&mut self) -> Option<V2FixtureObservation> {
-        self.observations.pop_front()
-    }
-}
-
 impl CaptureEvent {
-    pub fn schema_version(&self) -> u16 {
-        match self {
-            Self::V1(event) => event.schema_version,
-            Self::V2(event) => event.schema_version,
+    pub fn validate(&self) -> Result<(), CaptureError> {
+        if self.schema_version != CAPTURE_EVENT_SCHEMA_VERSION {
+            return Err(CaptureError::UnsupportedSchema(self.schema_version));
         }
-    }
-
-    pub fn as_v1(&self) -> Option<&CaptureEventV1> {
-        match self {
-            Self::V1(event) => Some(event),
-            Self::V2(_) => None,
+        match &self.kind {
+            CaptureEventKind::SocketConnectObserved(intent) => intent.validate()?,
+            CaptureEventKind::SocketConnected(evidence)
+            | CaptureEventKind::SocketClosedObserved(evidence)
+            | CaptureEventKind::SocketResetObserved(evidence) => evidence.validate()?,
+            CaptureEventKind::SocketStateChangedObserved(change) => change.socket.validate()?,
+            CaptureEventKind::PayloadFragment(_) | CaptureEventKind::LossWindowObserved(_) => {}
         }
+        Ok(())
     }
 
     pub fn monotonic_sequence(&self) -> Option<u64> {
-        self.as_v1().map(|event| event.monotonic_sequence)
+        match &self.kind {
+            CaptureEventKind::SocketConnectObserved(intent) => Some(intent.timestamp.nanoseconds),
+            CaptureEventKind::SocketConnected(evidence)
+            | CaptureEventKind::SocketClosedObserved(evidence)
+            | CaptureEventKind::SocketResetObserved(evidence) => {
+                Some(evidence.timestamp.nanoseconds)
+            }
+            CaptureEventKind::SocketStateChangedObserved(change) => {
+                Some(change.socket.timestamp.nanoseconds)
+            }
+            CaptureEventKind::PayloadFragment(fragment) => Some(fragment.timestamp.nanoseconds),
+            CaptureEventKind::LossWindowObserved(_) => None,
+        }
     }
 }
 
@@ -338,6 +394,8 @@ pub enum CaptureError {
     Codec(#[from] serde_json::Error),
     #[error("unsupported capture event schema {0}")]
     UnsupportedSchema(u16),
+    #[error(transparent)]
+    InvalidSocketEvidence(#[from] SocketEvidenceError),
     #[error(transparent)]
     Fixture(#[from] FixtureError),
 }
@@ -419,13 +477,14 @@ pub enum FixtureError {
         connection_id: String,
         transport: String,
     },
-    #[error("fixture connection {connection_id:?} has zero {endpoint} port")]
-    ZeroPort {
+    #[error("fixture connection {connection_id:?} has invalid {endpoint} endpoint: {source}")]
+    InvalidEndpoint {
         connection_id: String,
         endpoint: &'static str,
+        source: SocketEvidenceError,
     },
-    #[error("fixture connection {0:?} duplicates an existing connection key")]
-    DuplicateConnectionKey(String),
+    #[error("fixture connection {0:?} duplicates an existing socket identity")]
+    DuplicateSocketIdentity(String),
     #[error("fixture event {sequence} references unknown connection {connection_id:?}")]
     UnknownConnection {
         sequence: u64,
@@ -439,6 +498,8 @@ pub enum FixtureError {
     DecreasingTimestamp { sequence: u64 },
     #[error("fixture event {sequence} payload hex is invalid")]
     InvalidHex { sequence: u64 },
+    #[error("fixture event sequence {sequence} exceeds transport sequence range")]
+    SequenceOverflow { sequence: u64 },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -451,12 +512,14 @@ pub struct Fixture {
 #[derive(Clone, Debug, Deserialize)]
 pub struct FixtureConnection {
     pub id: String,
+    pub socket_cookie: u64,
+    pub first_seen_ns: u64,
     pub network_namespace: Option<u64>,
-    pub client: FixtureEndpoint,
-    pub server: FixtureEndpoint,
+    pub local_endpoint: FixtureEndpoint,
+    pub remote_endpoint: FixtureEndpoint,
+    pub role: SocketRole,
     pub transport: String,
     pub process: Option<ProcessMetadata>,
-    pub file_descriptor: Option<i32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -472,11 +535,13 @@ pub enum FixtureDirection {
     ServerToClient,
 }
 
-impl From<FixtureDirection> for Direction {
-    fn from(value: FixtureDirection) -> Self {
-        match value {
-            FixtureDirection::ClientToServer => Self::ClientToServer,
-            FixtureDirection::ServerToClient => Self::ServerToClient,
+impl FixtureDirection {
+    fn payload_direction(self, role: SocketRole) -> PayloadDirection {
+        match (self, role) {
+            (Self::ClientToServer, SocketRole::Active)
+            | (Self::ServerToClient, SocketRole::Passive) => PayloadDirection::Egress,
+            (Self::ServerToClient, SocketRole::Active)
+            | (Self::ClientToServer, SocketRole::Passive) => PayloadDirection::Ingress,
         }
     }
 }
@@ -509,7 +574,13 @@ impl FixtureCaptureSource {
             return Err(FixtureError::UnsupportedSchema(fixture.schema_version));
         }
 
+        let event_capacity = fixture
+            .connections
+            .len()
+            .saturating_add(fixture.events.len());
+        let mut events = VecDeque::with_capacity(event_capacity);
         let mut connections = BTreeMap::new();
+        let mut socket_ids = BTreeMap::new();
         for connection in fixture.connections {
             if connection.id.is_empty() {
                 return Err(FixtureError::EmptyConnectionId);
@@ -520,54 +591,74 @@ impl FixtureCaptureSource {
                     transport: connection.transport,
                 });
             }
-            if connection.client.port == 0 {
-                return Err(FixtureError::ZeroPort {
-                    connection_id: connection.id,
-                    endpoint: "client",
-                });
-            }
-            if connection.server.port == 0 {
-                return Err(FixtureError::ZeroPort {
-                    connection_id: connection.id,
-                    endpoint: "server",
-                });
-            }
-            let key = ConnectionKey {
-                network_namespace: connection.network_namespace,
-                client: chronicle_common::Endpoint::new(
-                    connection.client.host,
-                    connection.client.port,
-                ),
-                server: chronicle_common::Endpoint::new(
-                    connection.server.host,
-                    connection.server.port,
-                ),
-                transport: chronicle_common::TransportProtocol::Tcp,
+            let first_seen = MonotonicTimestamp {
+                clock: ClockIdentity {
+                    boot_id: "fixture-v1".into(),
+                },
+                nanoseconds: connection.first_seen_ns,
             };
-            if connections
-                .values()
-                .any(|existing: &FixtureConnectionState| existing.key == key)
+            let socket = SocketIdentity {
+                socket_cookie: connection.socket_cookie,
+                first_seen: first_seen.clone(),
+                network_namespace: connection.network_namespace,
+            };
+            if socket_ids
+                .insert(socket.clone(), connection.id.clone())
+                .is_some()
             {
-                return Err(FixtureError::DuplicateConnectionKey(connection.id));
+                return Err(FixtureError::DuplicateSocketIdentity(connection.id));
             }
+            let evidence = SocketEvidence {
+                timestamp: first_seen,
+                socket,
+                recording_scope: RecordingScopeIdentity {
+                    cgroup_id: 0,
+                    canonical_path: "fixture-v1".into(),
+                    namespace: connection.network_namespace,
+                },
+                network_family: fixture_network_family(
+                    &connection.id,
+                    &connection.local_endpoint,
+                    &connection.remote_endpoint,
+                )?,
+                local_endpoint: Endpoint::new(
+                    connection.local_endpoint.host,
+                    connection.local_endpoint.port,
+                ),
+                remote_endpoint: Endpoint::new(
+                    connection.remote_endpoint.host,
+                    connection.remote_endpoint.port,
+                ),
+                role: connection.role,
+                process: connection.process,
+                observed_cgroup_id: 0,
+            };
+            evidence
+                .validate()
+                .map_err(|source| FixtureError::InvalidEndpoint {
+                    connection_id: connection.id.clone(),
+                    endpoint: "socket",
+                    source,
+                })?;
             if connections
                 .insert(
                     connection.id.clone(),
                     FixtureConnectionState {
-                        key,
-                        process: connection.process,
-                        file_descriptor: connection.file_descriptor,
+                        evidence: evidence.clone(),
                     },
                 )
                 .is_some()
             {
                 return Err(FixtureError::DuplicateConnectionId(connection.id));
             }
+            events.push_back(CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                kind: CaptureEventKind::SocketConnected(evidence),
+            });
         }
 
         let mut expected_sequence = 1_u64;
         let mut previous_timestamp = None;
-        let mut events = VecDeque::with_capacity(fixture.events.len());
         for event in fixture.events {
             if event.sequence != expected_sequence {
                 return Err(FixtureError::Sequence {
@@ -593,30 +684,80 @@ impl FixtureCaptureSource {
                     connection_id: event.connection_id.clone(),
                 }
             })?;
-            events.push_back(CaptureEvent::V1(CaptureEventV1 {
-                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-                monotonic_sequence: event.sequence,
-                wall_time: Some(timestamp),
-                connection: state.key.clone(),
-                direction: event.direction.into(),
-                payload: decode_hex(&event.payload_hex).ok_or(FixtureError::InvalidHex {
+            let payload = decode_hex(&event.payload_hex).ok_or(FixtureError::InvalidHex {
+                sequence: event.sequence,
+            })?;
+            let captured_length = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+            let tcp_sequence =
+                u32::try_from(event.sequence).map_err(|_| FixtureError::SequenceOverflow {
                     sequence: event.sequence,
-                })?,
-                process: state.process.clone(),
-                container: None,
-                file_descriptor: state.file_descriptor,
-                truncated: event.truncated,
-                flags: CaptureFlags(event.flags),
-            }));
+                })?;
+            events.push_back(CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+                    timestamp: MonotonicTimestamp {
+                        clock: state.evidence.timestamp.clock.clone(),
+                        nanoseconds: state
+                            .evidence
+                            .timestamp
+                            .nanoseconds
+                            .saturating_add(event.sequence),
+                    },
+                    socket: state.evidence.socket.clone(),
+                    recording_scope: state.evidence.recording_scope.clone(),
+                    network_family: state.evidence.network_family,
+                    direction: event.direction.payload_direction(state.evidence.role),
+                    sequence: FragmentSequenceEvidence {
+                        tcp_sequence,
+                        continuation_position: 0,
+                    },
+                    payload,
+                    truncation: TruncationMetadata {
+                        captured_length,
+                        observed_length: (!event.truncated).then_some(captured_length),
+                        state: if event.truncated {
+                            TruncationState::Truncated
+                        } else {
+                            TruncationState::Complete
+                        },
+                        reason: event
+                            .truncated
+                            .then(|| "fixture source marked payload truncated".into()),
+                    },
+                    flags: CaptureFlags(event.flags),
+                }),
+            });
         }
         Ok(Self { events })
     }
 }
 
 struct FixtureConnectionState {
-    key: ConnectionKey,
-    process: Option<ProcessMetadata>,
-    file_descriptor: Option<i32>,
+    evidence: SocketEvidence,
+}
+
+fn fixture_network_family(
+    connection_id: &str,
+    local: &FixtureEndpoint,
+    remote: &FixtureEndpoint,
+) -> Result<NetworkFamily, FixtureError> {
+    let parse = |endpoint: &'static str, value: &FixtureEndpoint| {
+        let evidence = Endpoint::new(value.host.clone(), value.port);
+        validate_endpoint(endpoint, &evidence).map_err(|source| FixtureError::InvalidEndpoint {
+            connection_id: connection_id.to_owned(),
+            endpoint,
+            source,
+        })
+    };
+    match (parse("local", local)?, parse("remote", remote)?) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => Ok(NetworkFamily::Ipv4),
+        (IpAddr::V6(_), IpAddr::V6(_)) => Ok(NetworkFamily::Ipv6),
+        _ => Err(FixtureError::InvalidEndpoint {
+            connection_id: connection_id.to_owned(),
+            endpoint: "socket",
+            source: SocketEvidenceError::FamilyMismatch(NetworkFamily::Ipv4),
+        }),
+    }
 }
 
 impl CaptureSource for FixtureCaptureSource {
@@ -696,28 +837,14 @@ impl CaptureSource for InMemoryCaptureSource {
 }
 
 pub fn encode_event(event: &CaptureEvent) -> Result<Vec<u8>, CaptureError> {
-    match event {
-        CaptureEvent::V1(event) if event.schema_version == CAPTURE_EVENT_SCHEMA_VERSION => {
-            Ok(serde_json::to_vec(event)?)
-        }
-        CaptureEvent::V2(event) if event.schema_version == CAPTURE_EVENT_V2_SCHEMA_VERSION => {
-            Ok(serde_json::to_vec(event)?)
-        }
-        _ => Err(CaptureError::UnsupportedSchema(event.schema_version())),
-    }
+    event.validate()?;
+    Ok(serde_json::to_vec(event)?)
 }
 
 pub fn decode_event(bytes: &[u8]) -> Result<CaptureEvent, CaptureError> {
     let event: CaptureEvent = serde_json::from_slice(bytes)?;
-    match event {
-        CaptureEvent::V1(event) if event.schema_version == CAPTURE_EVENT_SCHEMA_VERSION => {
-            Ok(CaptureEvent::V1(event))
-        }
-        CaptureEvent::V2(event) if event.schema_version == CAPTURE_EVENT_V2_SCHEMA_VERSION => {
-            Ok(CaptureEvent::V2(event))
-        }
-        event => Err(CaptureError::UnsupportedSchema(event.schema_version())),
-    }
+    event.validate()?;
+    Ok(event)
 }
 
 #[cfg(test)]
@@ -728,12 +855,14 @@ mod tests {
         "schema_version": 1,
         "connections": [{
             "id": "basic",
+            "socket_cookie": 7,
+            "first_seen_ns": 100,
             "network_namespace": null,
-            "client": {"host": "fixture-client", "port": 41000},
-            "server": {"host": "recorded.invalid", "port": 8080},
+            "local_endpoint": {"host": "192.0.2.10", "port": 41000},
+            "remote_endpoint": {"host": "192.0.2.20", "port": 8080},
+            "role": "active",
             "transport": "tcp",
-            "process": {"pid": 7, "tid": null, "executable": "fixture"},
-            "file_descriptor": 3
+            "process": {"pid": 7, "tid": null, "executable": "fixture"}
         }],
         "events": [{
             "sequence": 1,
@@ -747,83 +876,76 @@ mod tests {
     }"#;
 
     #[test]
-    fn fixture_source_preserves_binary_socket_chunk() {
+    fn fixture_source_emits_socket_evidence_before_binary_payload() {
         let mut source = FixtureCaptureSource::from_json(FIXTURE.as_bytes()).unwrap();
-        let event = source.next_event().unwrap().unwrap();
-        let event = event.as_v1().unwrap();
-        assert_eq!(event.payload, [0, 255]);
-        assert_eq!(event.direction, Direction::ClientToServer);
-        assert_eq!(event.connection.server.host, "recorded.invalid");
+        let evidence = source.next_event().unwrap().unwrap();
+        let CaptureEventKind::SocketConnected(evidence) = evidence.kind else {
+            panic!("fixture must emit socket evidence first");
+        };
+        assert_eq!(evidence.local_endpoint, Endpoint::new("192.0.2.10", 41000));
+        assert_eq!(evidence.remote_endpoint, Endpoint::new("192.0.2.20", 8080));
+        assert_eq!(evidence.role, SocketRole::Active);
+
+        let payload = source.next_event().unwrap().unwrap();
+        let CaptureEventKind::PayloadFragment(payload) = payload.kind else {
+            panic!("fixture must emit payload after socket evidence");
+        };
+        assert_eq!(payload.payload, [0, 255]);
+        assert_eq!(payload.direction, PayloadDirection::Egress);
+        assert_eq!(payload.socket, evidence.socket);
         assert!(source.next_event().unwrap().is_none());
     }
 
-    #[test]
-    fn v1_bytes_stay_flat_while_v2_carries_explicit_evidence_version() {
-        let mut source = FixtureCaptureSource::from_json(FIXTURE.as_bytes()).unwrap();
-        let v1 = source.next_event().unwrap().unwrap();
-        let v1_bytes = encode_event(&v1).unwrap();
-        let v1_json: serde_json::Value = serde_json::from_slice(&v1_bytes).unwrap();
-        assert!(v1_json.get("kind").is_none());
-        assert!(matches!(
-            decode_event(&v1_bytes).unwrap(),
-            CaptureEvent::V1(_)
-        ));
-
+    fn socket_evidence() -> SocketEvidence {
         let timestamp = MonotonicTimestamp {
             clock: ClockIdentity {
                 boot_id: "boot-a".into(),
             },
             nanoseconds: 1,
         };
-        let v2 = CaptureEvent::V2(CaptureEventV2 {
-            schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
-            kind: CaptureEventKind::SocketConnectObserved(SocketEvidence {
-                timestamp: timestamp.clone(),
-                socket: SocketIdentity {
-                    socket_cookie: 7,
-                    first_seen: timestamp,
-                    network_namespace: Some(9),
-                },
-                recording_scope: RecordingScopeIdentity {
-                    cgroup_id: 11,
-                    canonical_path: "/scope".into(),
-                    namespace: Some(9),
-                },
-                network_family: NetworkFamily::Ipv4,
-                process: None,
-                observed_cgroup_id: 12,
-            }),
-        });
-        let v2_json = serde_json::to_value(&v2).unwrap();
-        assert_eq!(v2_json["schema_version"], CAPTURE_EVENT_V2_SCHEMA_VERSION);
-        assert_eq!(v2_json["kind"], "socket_connect_observed");
-        let round_trip = decode_event(&encode_event(&v2).unwrap()).unwrap();
-        assert_eq!(round_trip, v2);
+        SocketEvidence {
+            timestamp: timestamp.clone(),
+            socket: SocketIdentity {
+                socket_cookie: 7,
+                first_seen: timestamp,
+                network_namespace: Some(9),
+            },
+            recording_scope: RecordingScopeIdentity {
+                cgroup_id: 11,
+                canonical_path: "/scope".into(),
+                namespace: Some(9),
+            },
+            network_family: NetworkFamily::Ipv4,
+            local_endpoint: Endpoint::new("192.0.2.10", 41000),
+            remote_endpoint: Endpoint::new("192.0.2.20", 8080),
+            role: SocketRole::Active,
+            process: None,
+            observed_cgroup_id: 12,
+        }
     }
 
     #[test]
-    fn v2_payload_round_trips_binary_capture_evidence() {
-        let timestamp = MonotonicTimestamp {
-            clock: ClockIdentity {
-                boot_id: "boot-a".into(),
-            },
-            nanoseconds: 10,
+    fn sole_v1_socket_evidence_round_trips() {
+        let event = CaptureEvent {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            kind: CaptureEventKind::SocketConnected(socket_evidence()),
         };
-        let event = CaptureEvent::V2(CaptureEventV2 {
-            schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["schema_version"], CAPTURE_EVENT_SCHEMA_VERSION);
+        assert_eq!(json["kind"], "socket_connected");
+        assert_eq!(decode_event(&encode_event(&event).unwrap()).unwrap(), event);
+    }
+
+    #[test]
+    fn payload_round_trips_without_endpoint_duplication() {
+        let evidence = socket_evidence();
+        let event = CaptureEvent {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
             kind: CaptureEventKind::PayloadFragment(PayloadFragment {
-                timestamp: timestamp.clone(),
-                socket: SocketIdentity {
-                    socket_cookie: 7,
-                    first_seen: timestamp,
-                    network_namespace: Some(9),
-                },
-                recording_scope: RecordingScopeIdentity {
-                    cgroup_id: 11,
-                    canonical_path: "/scope".into(),
-                    namespace: Some(9),
-                },
-                network_family: NetworkFamily::Ipv6,
+                timestamp: evidence.timestamp.clone(),
+                socket: evidence.socket,
+                recording_scope: evidence.recording_scope,
+                network_family: NetworkFamily::Ipv4,
                 direction: PayloadDirection::Ingress,
                 sequence: FragmentSequenceEvidence {
                     tcp_sequence: 42,
@@ -836,134 +958,66 @@ mod tests {
                     state: TruncationState::Truncated,
                     reason: Some("kernel capture bound".into()),
                 },
+                flags: CaptureFlags(3),
             }),
-        });
+        };
+        let bytes = encode_event(&event).unwrap();
+        let json = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!json.contains("local_endpoint"));
+        assert!(!json.contains("remote_endpoint"));
+        assert!(!json.contains("role"));
+        assert_eq!(decode_event(&bytes).unwrap(), event);
 
-        assert_eq!(decode_event(&encode_event(&event).unwrap()).unwrap(), event);
+        let mut missing_flags = serde_json::to_value(&event).unwrap();
+        missing_flags["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("flags");
+        assert!(matches!(
+            decode_event(&serde_json::to_vec(&missing_flags).unwrap()),
+            Err(CaptureError::Codec(_))
+        ));
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn v2_fixture_source_keeps_lifecycle_payload_and_loss_observations_distinct() {
-        let timestamp = MonotonicTimestamp {
-            clock: ClockIdentity {
-                boot_id: "fixture-boot".into(),
-            },
-            nanoseconds: 100,
+    fn capture_rejects_non_v1_and_invalid_socket_evidence() {
+        let unsupported = CaptureEvent {
+            schema_version: 2,
+            kind: CaptureEventKind::SocketConnected(socket_evidence()),
         };
-        let socket = SocketIdentity {
-            socket_cookie: 7,
-            first_seen: timestamp.clone(),
-            network_namespace: Some(9),
-        };
-        let scope = RecordingScopeIdentity {
-            cgroup_id: 11,
-            canonical_path: "/scope".into(),
-            namespace: Some(9),
-        };
-        let lifecycle = CaptureEventV2 {
-            schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
-            kind: CaptureEventKind::SocketStateChangedObserved(SocketStateChangeObserved {
-                socket: SocketEvidence {
-                    timestamp: timestamp.clone(),
-                    socket: socket.clone(),
-                    recording_scope: scope.clone(),
-                    network_family: NetworkFamily::Ipv4,
-                    process: None,
-                    observed_cgroup_id: 11,
-                },
-                raw_state: 99,
-            }),
-        };
-        let payload = CaptureEventV2 {
-            schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
-            kind: CaptureEventKind::PayloadFragment(PayloadFragment {
-                timestamp: MonotonicTimestamp {
-                    clock: timestamp.clock.clone(),
-                    nanoseconds: 101,
-                },
-                socket,
-                recording_scope: scope,
-                network_family: NetworkFamily::Ipv4,
-                direction: PayloadDirection::Egress,
-                sequence: FragmentSequenceEvidence {
-                    tcp_sequence: 42,
-                    continuation_position: 1,
-                },
-                payload: vec![0, 255],
-                truncation: TruncationMetadata {
-                    captured_length: 2,
-                    observed_length: Some(3),
-                    state: TruncationState::Truncated,
-                    reason: Some("fixture capture bound".into()),
-                },
-            }),
-        };
-        let loss = LossWindowObserved {
-            start: timestamp.clone(),
-            end: MonotonicTimestamp {
-                clock: timestamp.clock,
-                nanoseconds: 200,
-            },
-            drop_delta: Some(2),
-            loss_generation: Some(1),
-            ambiguity: LossAmbiguity {
-                exact_drop_timing_unknown: true,
-                affected_sockets_unknown: true,
-                reason: Some("fixture loss".into()),
-            },
-        };
-        let mut source = V2FixtureSource::new([
-            V2FixtureObservation::Event(lifecycle.clone()),
-            V2FixtureObservation::Event(payload.clone()),
-            V2FixtureObservation::LossWindow(loss.clone()),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            source.next_observation(),
-            Some(V2FixtureObservation::Event(lifecycle))
-        );
-        assert_eq!(
-            source.next_observation(),
-            Some(V2FixtureObservation::Event(payload))
-        );
-        assert_eq!(
-            source.next_observation(),
-            Some(V2FixtureObservation::LossWindow(loss))
-        );
-        assert_eq!(source.next_observation(), None);
         assert!(matches!(
-            V2FixtureSource::new([V2FixtureObservation::Event(CaptureEventV2 {
-                schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION + 1,
-                kind: CaptureEventKind::SocketConnected(SocketEvidence {
-                    timestamp: MonotonicTimestamp {
-                        clock: ClockIdentity {
-                            boot_id: "fixture-boot".into(),
-                        },
-                        nanoseconds: 1,
-                    },
-                    socket: SocketIdentity {
-                        socket_cookie: 1,
-                        first_seen: MonotonicTimestamp {
-                            clock: ClockIdentity {
-                                boot_id: "fixture-boot".into(),
-                            },
-                            nanoseconds: 1,
-                        },
-                        network_namespace: None,
-                    },
-                    recording_scope: RecordingScopeIdentity {
-                        cgroup_id: 1,
-                        canonical_path: "/scope".into(),
-                        namespace: None,
-                    },
-                    network_family: NetworkFamily::Ipv4,
-                    process: None,
-                    observed_cgroup_id: 1,
-                }),
-            })]),
-            Err(CaptureError::UnsupportedSchema(_))
+            encode_event(&unsupported),
+            Err(CaptureError::UnsupportedSchema(2))
+        ));
+
+        let mut invalid = socket_evidence();
+        invalid.remote_endpoint.port = 0;
+        let invalid = CaptureEvent {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            kind: CaptureEventKind::SocketConnected(invalid),
+        };
+        assert!(matches!(
+            encode_event(&invalid),
+            Err(CaptureError::InvalidSocketEvidence(
+                SocketEvidenceError::ZeroPort("remote")
+            ))
+        ));
+
+        let mut noncanonical = socket_evidence();
+        noncanonical.network_family = NetworkFamily::Ipv6;
+        noncanonical.local_endpoint = Endpoint::new("2001:0db8::1", 41_000);
+        noncanonical.remote_endpoint = Endpoint::new("2001:db8::2", 8_080);
+        assert!(matches!(
+            encode_event(&CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                kind: CaptureEventKind::SocketConnected(noncanonical),
+            }),
+            Err(CaptureError::InvalidSocketEvidence(
+                SocketEvidenceError::NonCanonicalAddress {
+                    endpoint: "local",
+                    ..
+                }
+            ))
         ));
     }
 
@@ -1090,7 +1144,7 @@ mod tests {
             ),
             (
                 FIXTURE.replacen("\"port\": 41000", "\"port\": 0", 1),
-                "zero client port",
+                "local socket endpoint has zero port",
             ),
         ] {
             let error = FixtureCaptureSource::from_json(input.as_bytes()).unwrap_err();

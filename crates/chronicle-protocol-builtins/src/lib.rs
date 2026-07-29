@@ -215,27 +215,27 @@ pub mod http {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct HeaderV1 {
+    pub struct Header {
         pub name: String,
         pub value: Vec<u8>,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub enum MessageKindV1 {
+    pub enum MessageKind {
         Request,
         Response,
         Opaque,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct MessageV1 {
-        pub kind: MessageKindV1,
+    pub struct Message {
+        pub kind: MessageKind,
         pub sequence: u64,
         pub method: Option<String>,
         pub target: Option<String>,
         pub status: Option<u16>,
         pub reason: Option<Vec<u8>>,
-        pub headers: Vec<HeaderV1>,
+        pub headers: Vec<Header>,
         pub body: Vec<u8>,
         pub pipeline_depth: usize,
         pub orphan_response: bool,
@@ -244,30 +244,30 @@ pub mod http {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub enum TargetFormV1 {
+    pub enum TargetForm {
         Origin,
         Opaque,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct ReplayAttributesV1 {
-        pub target_form: TargetFormV1,
+    pub struct ReplayAttributes {
+        pub target_form: TargetForm,
         pub captured_sensitive_headers: bool,
         pub replayable: bool,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct VerificationMetadataV1 {
+    pub struct VerificationMetadata {
         pub expected_status: Option<u16>,
         pub expects_response: bool,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct HttpOperationDataV1 {
+    pub struct HttpOperationData {
         pub method: Option<String>,
         pub target: Option<String>,
-        pub request_headers: Vec<HeaderV1>,
-        pub response_headers: Vec<HeaderV1>,
+        pub request_headers: Vec<Header>,
+        pub response_headers: Vec<Header>,
         pub response_status: Option<u16>,
         pub response_reason: Option<Vec<u8>>,
         pub request_sequence: u64,
@@ -275,18 +275,18 @@ pub mod http {
         pub pipeline_depth: usize,
         #[serde(default)]
         pub warnings: Vec<String>,
-        pub replay: ReplayAttributesV1,
-        pub verification: VerificationMetadataV1,
+        pub replay: ReplayAttributes,
+        pub verification: VerificationMetadata,
     }
 
     /// Rewrites captured request headers for an outbound replay request.
     ///
     /// Header values are retained only for end-to-end fields; callers must not render them.
     pub fn sanitize_request_headers(
-        request_headers: &[HeaderV1],
+        request_headers: &[Header],
         target: &Endpoint,
         body_len: usize,
-    ) -> Vec<HeaderV1> {
+    ) -> Vec<Header> {
         let connection_tokens: Vec<String> = request_headers
             .iter()
             .filter(|header| header.name.eq_ignore_ascii_case("connection"))
@@ -294,7 +294,7 @@ pub mod http {
             .filter_map(|token| std::str::from_utf8(token.trim_ascii()).ok())
             .map(str::to_ascii_lowercase)
             .collect();
-        let mut headers = vec![HeaderV1 {
+        let mut headers = vec![Header {
             name: "host".into(),
             value: target_authority(target).into_bytes(),
         }];
@@ -305,13 +305,13 @@ pub mod http {
             {
                 None
             } else {
-                Some(HeaderV1 {
+                Some(Header {
                     name,
                     value: header.value.clone(),
                 })
             }
         }));
-        headers.push(HeaderV1 {
+        headers.push(Header {
             name: "content-length".into(),
             value: body_len.to_string().into_bytes(),
         });
@@ -347,12 +347,12 @@ pub mod http {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct HttpObservedResponseV1 {
+    pub struct HttpObservedResponse {
         pub status: u16,
-        pub headers: Vec<HeaderV1>,
+        pub headers: Vec<Header>,
     }
 
-    impl HttpObservedResponseV1 {
+    impl HttpObservedResponse {
         fn to_protocol_data(&self) -> ProtocolData {
             ProtocolData {
                 schema_version: PROTOCOL_DATA_SCHEMA_VERSION,
@@ -399,7 +399,7 @@ pub mod http {
             operation: &CanonicalOperation,
             observed: &ObservedResponse,
         ) -> VerificationResult {
-            let Ok(expected) = HttpOperationDataV1::from_protocol_data(&operation.protocol_data)
+            let Ok(expected) = HttpOperationData::from_protocol_data(&operation.protocol_data)
             else {
                 return verification(
                     VerificationStatus::Unsupported,
@@ -413,7 +413,7 @@ pub mod http {
                     "unsupported HTTP observed response",
                 );
             };
-            let Ok(observed) = HttpObservedResponseV1::from_protocol_data(protocol_data) else {
+            let Ok(observed) = HttpObservedResponse::from_protocol_data(protocol_data) else {
                 return verification(
                     VerificationStatus::Unsupported,
                     "unsupported HTTP observed response",
@@ -500,7 +500,7 @@ pub mod http {
         }
     }
 
-    fn comparable_headers(headers: &[HeaderV1]) -> Vec<HeaderV1> {
+    fn comparable_headers(headers: &[Header]) -> Vec<Header> {
         headers
             .iter()
             .filter(|header| {
@@ -623,7 +623,7 @@ pub mod http {
         context: &ReplayContext,
         operation: &CanonicalOperation,
     ) -> Result<ObservedResponse, ProtocolError> {
-        let data = HttpOperationDataV1::from_protocol_data(&operation.protocol_data)
+        let data = HttpOperationData::from_protocol_data(&operation.protocol_data)
             .map_err(|_| malformed("invalid HTTP replay operation"))?;
         let method = data
             .method
@@ -647,13 +647,13 @@ pub mod http {
             }
             headers.insert(
                 1,
-                HeaderV1 {
+                Header {
                     name: "authorization".into(),
                     value: authorization.expose().to_vec(),
                 },
             );
         }
-        headers.push(HeaderV1 {
+        headers.push(Header {
             name: "connection".into(),
             value: b"close".to_vec(),
         });
@@ -743,7 +743,7 @@ pub mod http {
                             bytes: bytes[head_len..head_len + body_len].to_vec(),
                         }),
                         protocol_data: Some(
-                            HttpObservedResponseV1 { status, headers }.to_protocol_data(),
+                            HttpObservedResponse { status, headers }.to_protocol_data(),
                         ),
                         attributes: BTreeMap::new(),
                         error_category: None,
@@ -800,7 +800,7 @@ pub mod http {
         Ok(std::net::SocketAddr::new(ip, target.port))
     }
 
-    impl HttpOperationDataV1 {
+    impl HttpOperationData {
         /// # Panics
         ///
         /// Panics if this serializable type cannot be encoded as JSON.
@@ -901,8 +901,8 @@ pub mod http {
         #[allow(clippy::too_many_lines)] // Canonical operation fields stay co-located for schema review.
         fn operation(
             stream: &ProtocolStream<'_>,
-            request: MessageV1,
-            response: Option<MessageV1>,
+            request: Message,
+            response: Option<Message>,
         ) -> CanonicalOperation {
             let (started_at_offset, mut warnings) = Self::offset(stream, request.sequence);
             let completed_at_offset = response
@@ -929,10 +929,10 @@ pub mod http {
             let response_reason = response.as_ref().and_then(|message| message.reason.clone());
             let response_sequence = response.as_ref().map(|message| message.sequence);
             let incomplete = response.is_none()
-                || request.kind == MessageKindV1::Opaque
+                || request.kind == MessageKind::Opaque
                 || response
                     .as_ref()
-                    .is_some_and(|message| message.kind == MessageKindV1::Opaque);
+                    .is_some_and(|message| message.kind == MessageKind::Opaque);
             let truncated = stream.truncated
                 || codes
                     .iter()
@@ -963,7 +963,7 @@ pub mod http {
                     "authorization" | "proxy-authorization"
                 )
             });
-            let protocol_data = HttpOperationDataV1 {
+            let protocol_data = HttpOperationData {
                 method: request.method.clone(),
                 target: request.target.clone(),
                 request_headers: request.headers.clone(),
@@ -974,16 +974,16 @@ pub mod http {
                 response_sequence,
                 pipeline_depth: request.pipeline_depth,
                 warnings: codes,
-                replay: ReplayAttributesV1 {
+                replay: ReplayAttributes {
                     target_form: if request.target.is_some() {
-                        TargetFormV1::Origin
+                        TargetForm::Origin
                     } else {
-                        TargetFormV1::Opaque
+                        TargetForm::Opaque
                     },
                     captured_sensitive_headers,
                     replayable,
                 },
-                verification: VerificationMetadataV1 {
+                verification: VerificationMetadata {
                     expected_status: response_status,
                     expects_response: response.is_some(),
                 },
@@ -1047,13 +1047,12 @@ pub mod http {
             let mut pending = VecDeque::new();
             let mut operations = Vec::new();
             for frame in frames {
-                let message: MessageV1 =
-                    serde_json::from_slice(&frame.payload).map_err(|error| {
-                        ProtocolError::Malformed {
-                            protocol: self.id.clone(),
-                            message: error.to_string(),
-                        }
-                    })?;
+                let message: Message = serde_json::from_slice(&frame.payload).map_err(|error| {
+                    ProtocolError::Malformed {
+                        protocol: self.id.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
                 match frame.direction {
                     Direction::ClientToServer => pending.push_back(message),
                     Direction::ServerToClient => {
@@ -1061,7 +1060,7 @@ pub mod http {
                             operations.push(Self::operation(stream, request, Some(message)));
                         } else {
                             let mut opaque = message.clone();
-                            opaque.kind = MessageKindV1::Opaque;
+                            opaque.kind = MessageKind::Opaque;
                             opaque.method = None;
                             opaque.target = None;
                             opaque.status = None;
@@ -1190,7 +1189,7 @@ pub mod http {
                             .front()
                             .is_some_and(|method| method == "HEAD"),
                     ) {
-                        if message.kind == MessageKindV1::Response {
+                        if message.kind == MessageKind::Response {
                             message.pipeline_depth = self.pending_methods.len();
                             message.orphan_response = self.pending_methods.pop_front().is_none();
                         }
@@ -1239,7 +1238,7 @@ pub mod http {
             self.bytes.extend_from_slice(payload);
         }
 
-        fn decode(&mut self, direction: Direction, head_response: bool) -> Vec<MessageV1> {
+        fn decode(&mut self, direction: Direction, head_response: bool) -> Vec<Message> {
             let mut messages = Vec::new();
             while let Some(message) = self.decode_one(direction, head_response) {
                 messages.push(message);
@@ -1247,7 +1246,7 @@ pub mod http {
             messages
         }
 
-        fn decode_one(&mut self, direction: Direction, head_response: bool) -> Option<MessageV1> {
+        fn decode_one(&mut self, direction: Direction, head_response: bool) -> Option<Message> {
             let sequence = self.start_sequence.unwrap_or_default();
             match parse_message(&self.bytes, direction, sequence, head_response) {
                 Ok(Some((consumed, mut message))) => {
@@ -1261,9 +1260,9 @@ pub mod http {
             }
         }
 
-        fn take_opaque(&mut self, warning: WarningCode) -> Option<MessageV1> {
-            (!self.bytes.is_empty()).then(|| MessageV1 {
-                kind: MessageKindV1::Opaque,
+        fn take_opaque(&mut self, warning: WarningCode) -> Option<Message> {
+            (!self.bytes.is_empty()).then(|| Message {
+                kind: MessageKind::Opaque,
                 sequence: self.start_sequence.unwrap_or_default(),
                 method: None,
                 target: None,
@@ -1280,7 +1279,7 @@ pub mod http {
 
     fn encode_messages(
         direction: Direction,
-        messages: Vec<MessageV1>,
+        messages: Vec<Message>,
     ) -> Result<Vec<chronicle_protocol::DecodedFrame>, chronicle_protocol::ProtocolError> {
         messages
             .into_iter()
@@ -1322,7 +1321,7 @@ pub mod http {
         direction: Direction,
         sequence: u64,
         head_response: bool,
-    ) -> Result<Option<(usize, MessageV1)>, chronicle_protocol::ProtocolError> {
+    ) -> Result<Option<(usize, Message)>, chronicle_protocol::ProtocolError> {
         match direction {
             Direction::ClientToServer => parse_request(bytes, sequence),
             Direction::ServerToClient => parse_response(bytes, sequence, head_response),
@@ -1332,7 +1331,7 @@ pub mod http {
     fn parse_request(
         bytes: &[u8],
         sequence: u64,
-    ) -> Result<Option<(usize, MessageV1)>, chronicle_protocol::ProtocolError> {
+    ) -> Result<Option<(usize, Message)>, chronicle_protocol::ProtocolError> {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
         let mut request = httparse::Request::new(&mut headers);
         let head_bytes = match request
@@ -1372,8 +1371,8 @@ pub mod http {
         }
         Ok(Some((
             total,
-            MessageV1 {
-                kind: MessageKindV1::Request,
+            Message {
+                kind: MessageKind::Request,
                 sequence,
                 method: Some(method.into()),
                 target: Some(target.into()),
@@ -1392,7 +1391,7 @@ pub mod http {
         bytes: &[u8],
         sequence: u64,
         head_response: bool,
-    ) -> Result<Option<(usize, MessageV1)>, chronicle_protocol::ProtocolError> {
+    ) -> Result<Option<(usize, Message)>, chronicle_protocol::ProtocolError> {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
         let mut response = httparse::Response::new(&mut headers);
         let head_bytes = match response
@@ -1449,8 +1448,8 @@ pub mod http {
         };
         Ok(Some((
             total,
-            MessageV1 {
-                kind: MessageKindV1::Response,
+            Message {
+                kind: MessageKind::Response,
                 sequence,
                 method: None,
                 target: None,
@@ -1469,7 +1468,7 @@ pub mod http {
         bytes: &[u8],
         sequence: u64,
         head_response: bool,
-    ) -> Result<Option<(usize, MessageV1)>, chronicle_protocol::ProtocolError> {
+    ) -> Result<Option<(usize, Message)>, chronicle_protocol::ProtocolError> {
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADER_COUNT];
         let mut response = httparse::Response::new(&mut headers);
         let head_bytes = match response
@@ -1498,8 +1497,8 @@ pub mod http {
         }
         Ok(Some((
             bytes.len(),
-            MessageV1 {
-                kind: MessageKindV1::Response,
+            Message {
+                kind: MessageKind::Response,
                 sequence,
                 method: None,
                 target: None,
@@ -1516,7 +1515,7 @@ pub mod http {
 
     fn partial_or_limit(
         bytes: &[u8],
-    ) -> Result<Option<(usize, MessageV1)>, chronicle_protocol::ProtocolError> {
+    ) -> Result<Option<(usize, Message)>, chronicle_protocol::ProtocolError> {
         if bytes.len() >= MAX_HEAD_BYTES {
             Err(malformed("HTTP head exceeds decoder limit"))
         } else {
@@ -1526,14 +1525,14 @@ pub mod http {
 
     fn normalize_headers(
         headers: &[httparse::Header<'_>],
-    ) -> Result<Vec<HeaderV1>, chronicle_protocol::ProtocolError> {
+    ) -> Result<Vec<Header>, chronicle_protocol::ProtocolError> {
         headers
             .iter()
             .map(|header| {
                 if !header.name.is_ascii() {
                     return Err(malformed("HTTP header name is not ASCII"));
                 }
-                Ok(HeaderV1 {
+                Ok(Header {
                     name: header.name.to_ascii_lowercase(),
                     value: header.value.to_vec(),
                 })
@@ -1542,7 +1541,7 @@ pub mod http {
     }
 
     fn reject_unsupported_headers(
-        headers: &[HeaderV1],
+        headers: &[Header],
     ) -> Result<(), chronicle_protocol::ProtocolError> {
         if headers
             .iter()
@@ -1553,9 +1552,7 @@ pub mod http {
         reject_upgrade_headers(headers)
     }
 
-    fn reject_upgrade_headers(
-        headers: &[HeaderV1],
-    ) -> Result<(), chronicle_protocol::ProtocolError> {
+    fn reject_upgrade_headers(headers: &[Header]) -> Result<(), chronicle_protocol::ProtocolError> {
         if headers.iter().any(|header| {
             header.name == "upgrade"
                 || (header.name == "connection"
@@ -1618,7 +1615,7 @@ pub mod http {
         }
     }
 
-    fn content_length(headers: &[HeaderV1]) -> Result<usize, chronicle_protocol::ProtocolError> {
+    fn content_length(headers: &[Header]) -> Result<usize, chronicle_protocol::ProtocolError> {
         let values = headers
             .iter()
             .filter(|header| header.name == "content-length")
@@ -1700,16 +1697,16 @@ pub mod http {
                     bytes: b"expected-body".to_vec(),
                 }),
                 attributes: Attributes::new(),
-                protocol_data: HttpOperationDataV1 {
+                protocol_data: HttpOperationData {
                     method: Some("GET".into()),
                     target: Some("/".into()),
                     request_headers: Vec::new(),
                     response_headers: vec![
-                        HeaderV1 {
+                        Header {
                             name: "date".into(),
                             value: b"recorded-date".to_vec(),
                         },
-                        HeaderV1 {
+                        Header {
                             name: "authorization".into(),
                             value: b"recorded-secret".to_vec(),
                         },
@@ -1720,12 +1717,12 @@ pub mod http {
                     response_sequence: Some(2),
                     pipeline_depth: 1,
                     warnings: Vec::new(),
-                    replay: ReplayAttributesV1 {
-                        target_form: TargetFormV1::Origin,
+                    replay: ReplayAttributes {
+                        target_form: TargetForm::Origin,
                         captured_sensitive_headers: true,
                         replayable: true,
                     },
-                    verification: VerificationMetadataV1 {
+                    verification: VerificationMetadata {
                         expected_status: Some(200),
                         expects_response: true,
                     },
@@ -1736,13 +1733,13 @@ pub mod http {
             }
         }
 
-        fn observed(status: u16, headers: Vec<HeaderV1>, body: &[u8]) -> ObservedResponse {
+        fn observed(status: u16, headers: Vec<Header>, body: &[u8]) -> ObservedResponse {
             ObservedResponse {
                 payload: Some(PayloadRef::Inline {
                     content_type: None,
                     bytes: body.to_vec(),
                 }),
-                protocol_data: Some(HttpObservedResponseV1 { status, headers }.to_protocol_data()),
+                protocol_data: Some(HttpObservedResponse { status, headers }.to_protocol_data()),
                 attributes: BTreeMap::new(),
                 error_category: None,
             }
@@ -1755,11 +1752,11 @@ pub mod http {
             let passed = observed(
                 200,
                 vec![
-                    HeaderV1 {
+                    Header {
                         name: "date".into(),
                         value: b"new-date".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "authorization".into(),
                         value: b"recorded-secret".to_vec(),
                     },
@@ -1779,7 +1776,7 @@ pub mod http {
                 &operation,
                 &observed(
                     200,
-                    vec![HeaderV1 {
+                    vec![Header {
                         name: "authorization".into(),
                         value: b"changed-secret".to_vec(),
                     }],
@@ -1794,7 +1791,7 @@ pub mod http {
                 &operation,
                 &observed(
                     200,
-                    vec![HeaderV1 {
+                    vec![Header {
                         name: "authorization".into(),
                         value: b"recorded-secret".to_vec(),
                     }],
@@ -1808,20 +1805,20 @@ pub mod http {
 
         #[test]
         fn http_operation_data_round_trips_binary_duplicate_headers() {
-            let data = HttpOperationDataV1 {
+            let data = HttpOperationData {
                 method: Some("GET".into()),
                 target: Some("/bytes".into()),
                 request_headers: vec![
-                    HeaderV1 {
+                    Header {
                         name: "x-test".into(),
                         value: vec![0, 0xff],
                     },
-                    HeaderV1 {
+                    Header {
                         name: "x-test".into(),
                         value: b"second".to_vec(),
                     },
                 ],
-                response_headers: vec![HeaderV1 {
+                response_headers: vec![Header {
                     name: "content-type".into(),
                     value: b"application/octet-stream".to_vec(),
                 }],
@@ -1831,18 +1828,18 @@ pub mod http {
                 response_sequence: Some(5),
                 pipeline_depth: 2,
                 warnings: vec![WarningCode::Pipelined.as_str().into()],
-                replay: ReplayAttributesV1 {
-                    target_form: TargetFormV1::Origin,
+                replay: ReplayAttributes {
+                    target_form: TargetForm::Origin,
                     captured_sensitive_headers: false,
                     replayable: false,
                 },
-                verification: VerificationMetadataV1 {
+                verification: VerificationMetadata {
                     expected_status: Some(200),
                     expects_response: true,
                 },
             };
             assert_eq!(
-                HttpOperationDataV1::from_protocol_data(&data.into_protocol_data()).unwrap(),
+                HttpOperationData::from_protocol_data(&data.into_protocol_data()).unwrap(),
                 data
             );
         }
@@ -1931,47 +1928,47 @@ pub mod http {
         fn sanitizer_replaces_host_and_strips_sensitive_hop_by_hop_headers() {
             let headers = sanitize_request_headers(
                 &[
-                    HeaderV1 {
+                    Header {
                         name: "host".into(),
                         value: b"recorded.invalid".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "host".into(),
                         value: b"duplicate.invalid".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "connection".into(),
                         value: b"x-remove, Keep-Alive".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "x-remove".into(),
                         value: b"gone".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "authorization".into(),
                         value: b"captured-secret".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "cookie".into(),
                         value: b"captured-cookie".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "x-forwarded-for".into(),
                         value: b"198.51.100.10".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "transfer-encoding".into(),
                         value: b"chunked".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "content-length".into(),
                         value: b"99".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "x-tag".into(),
                         value: b"one".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "x-tag".into(),
                         value: b"two".to_vec(),
                     },
@@ -1983,19 +1980,19 @@ pub mod http {
             assert_eq!(
                 headers,
                 vec![
-                    HeaderV1 {
+                    Header {
                         name: "host".into(),
                         value: b"127.0.0.1:8080".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "x-tag".into(),
                         value: b"one".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "x-tag".into(),
                         value: b"two".to_vec(),
                     },
-                    HeaderV1 {
+                    Header {
                         name: "content-length".into(),
                         value: b"3".to_vec(),
                     },
@@ -2057,19 +2054,19 @@ pub mod http {
         #[test]
         fn canonicalizer_maps_http_exchange_and_missing_response() {
             let canonicalizer = Canonicalizer::new();
-            let request = MessageV1 {
-                kind: MessageKindV1::Request,
+            let request = Message {
+                kind: MessageKind::Request,
                 sequence: 1,
                 method: Some("GET".into()),
                 target: Some("/items".into()),
                 status: None,
                 reason: None,
                 headers: vec![
-                    HeaderV1 {
+                    Header {
                         name: "x-duplicate".into(),
                         value: vec![1],
                     },
-                    HeaderV1 {
+                    Header {
                         name: "x-duplicate".into(),
                         value: vec![2],
                     },
@@ -2079,8 +2076,8 @@ pub mod http {
                 orphan_response: false,
                 warnings: Vec::new(),
             };
-            let response = MessageV1 {
-                kind: MessageKindV1::Response,
+            let response = Message {
+                kind: MessageKind::Response,
                 sequence: 2,
                 method: None,
                 target: None,
@@ -2092,7 +2089,7 @@ pub mod http {
                 orphan_response: false,
                 warnings: Vec::new(),
             };
-            let missing = MessageV1 {
+            let missing = Message {
                 sequence: 3,
                 method: Some("TRACE".into()),
                 target: Some("/missing".into()),
@@ -2127,8 +2124,7 @@ pub mod http {
                 operations[0].recorded_response.as_ref(),
                 Some(PayloadRef::Inline { bytes, .. }) if bytes == b"response"
             ));
-            let data =
-                HttpOperationDataV1::from_protocol_data(&operations[0].protocol_data).unwrap();
+            let data = HttpOperationData::from_protocol_data(&operations[0].protocol_data).unwrap();
             assert_eq!(data.response_status, Some(201));
             assert_eq!(data.request_headers.len(), 2);
             assert_eq!(operations[1].effect, OperationEffect::Unknown);
@@ -2137,14 +2133,14 @@ pub mod http {
 
         #[test]
         fn canonicalizer_preserves_orphan_response_as_incomplete_evidence() {
-            let response = MessageV1 {
-                kind: MessageKindV1::Response,
+            let response = Message {
+                kind: MessageKind::Response,
                 sequence: 1,
                 method: None,
                 target: None,
                 status: Some(200),
                 reason: Some(b"OK".to_vec()),
-                headers: vec![HeaderV1 {
+                headers: vec![Header {
                     name: "x-test".into(),
                     value: b"value".to_vec(),
                 }],
@@ -2210,7 +2206,7 @@ pub mod http {
                 })
                 .unwrap();
             assert_eq!(responses.len(), 2);
-            let second: MessageV1 = serde_json::from_slice(&responses[1].payload).unwrap();
+            let second: Message = serde_json::from_slice(&responses[1].payload).unwrap();
             assert_eq!(second.body, b"OK");
         }
 
@@ -2238,7 +2234,7 @@ pub mod http {
                     attributes: Default::default(),
                 })
                 .unwrap();
-            let request: MessageV1 = serde_json::from_slice(&request[0].payload).unwrap();
+            let request: Message = serde_json::from_slice(&request[0].payload).unwrap();
             assert_eq!(request.method.as_deref(), Some("POST"));
             assert_eq!(request.body, [0, 255, 128]);
 
@@ -2250,7 +2246,7 @@ pub mod http {
                     attributes: Default::default(),
                 })
                 .unwrap();
-            let response: MessageV1 = serde_json::from_slice(&response[0].payload).unwrap();
+            let response: Message = serde_json::from_slice(&response[0].payload).unwrap();
             assert_eq!(response.status, Some(200));
             assert_eq!(response.body, b"OK");
         }
@@ -2331,7 +2327,7 @@ pub mod http {
                     attributes: Default::default(),
                 })
                 .unwrap();
-            let response: MessageV1 = serde_json::from_slice(&response[0].payload).unwrap();
+            let response: Message = serde_json::from_slice(&response[0].payload).unwrap();
             assert_eq!(response.body, [0, 255]);
             assert_eq!(parse_chunked_body(b"1\r\na\r\n0\r\n").unwrap(), None);
             assert!(parse_chunked_body(b"1\r\naX\r\n0\r\n\r\n").is_err());
@@ -2350,7 +2346,7 @@ pub mod http {
                     attributes: Default::default(),
                 })
                 .unwrap();
-            let request: MessageV1 = serde_json::from_slice(&request[0].payload).unwrap();
+            let request: Message = serde_json::from_slice(&request[0].payload).unwrap();
             assert_eq!(request.body, b"");
 
             for (method, status) in [("HEAD", 200), ("GET", 204), ("GET", 304)] {
@@ -2372,7 +2368,7 @@ pub mod http {
                         attributes: Default::default(),
                     })
                     .unwrap();
-                let response: MessageV1 = serde_json::from_slice(&response[0].payload).unwrap();
+                let response: Message = serde_json::from_slice(&response[0].payload).unwrap();
                 assert_eq!(response.status, Some(status));
                 assert_eq!(response.body, b"");
             }
@@ -2380,7 +2376,7 @@ pub mod http {
 
         #[test]
         fn content_length_accepts_only_one_unsigned_decimal_field() {
-            let header = |value: &[u8]| HeaderV1 {
+            let header = |value: &[u8]| Header {
                 name: "content-length".into(),
                 value: value.to_vec(),
             };
@@ -2411,8 +2407,8 @@ pub mod http {
                     attributes: Default::default(),
                 })
                 .unwrap();
-            let message: MessageV1 = serde_json::from_slice(&frames[0].payload).unwrap();
-            assert_eq!(message.kind, MessageKindV1::Opaque);
+            let message: Message = serde_json::from_slice(&frames[0].payload).unwrap();
+            assert_eq!(message.kind, MessageKind::Opaque);
             assert_eq!(message.body, payload);
             assert_eq!(message.warnings, [WarningCode::Malformed.as_str()]);
         }
@@ -2460,7 +2456,7 @@ pub mod http {
                         attributes: Default::default(),
                     })
                     .unwrap();
-                let message: MessageV1 = serde_json::from_slice(&frames[0].payload).unwrap();
+                let message: Message = serde_json::from_slice(&frames[0].payload).unwrap();
                 assert_eq!(message.body, payload);
                 assert_eq!(message.warnings, [warning.as_str()]);
             }
@@ -2475,7 +2471,7 @@ pub mod http {
                 })
                 .unwrap();
             let frames = decoder.finish().unwrap();
-            let message: MessageV1 = serde_json::from_slice(&frames[0].payload).unwrap();
+            let message: Message = serde_json::from_slice(&frames[0].payload).unwrap();
             assert_eq!(message.warnings, [WarningCode::TruncatedMessage.as_str()]);
 
             let mut over_limit = b"GET / HTTP/1.1\r\n".to_vec();
@@ -2488,7 +2484,7 @@ pub mod http {
                     attributes: Default::default(),
                 })
                 .unwrap();
-            let message: MessageV1 = serde_json::from_slice(&frames[0].payload).unwrap();
+            let message: Message = serde_json::from_slice(&frames[0].payload).unwrap();
             assert_eq!(message.body, over_limit);
             assert_eq!(message.warnings, [WarningCode::Malformed.as_str()]);
 
@@ -2518,10 +2514,10 @@ pub mod http {
                 })
                 .unwrap();
             assert_eq!(
-                serde_json::from_slice::<MessageV1>(&complete[0].payload)
+                serde_json::from_slice::<Message>(&complete[0].payload)
                     .unwrap()
                     .kind,
-                MessageKindV1::Request
+                MessageKind::Request
             );
             let opaque = decoder
                 .push(DecodedFrame {
@@ -2532,10 +2528,10 @@ pub mod http {
                 })
                 .unwrap();
             assert_eq!(
-                serde_json::from_slice::<MessageV1>(&opaque[0].payload)
+                serde_json::from_slice::<Message>(&opaque[0].payload)
                     .unwrap()
                     .kind,
-                MessageKindV1::Opaque
+                MessageKind::Opaque
             );
         }
 
@@ -2560,7 +2556,7 @@ pub mod http {
                     attributes: Default::default(),
                 })
                 .unwrap();
-            let response: MessageV1 = serde_json::from_slice(&response[0].payload).unwrap();
+            let response: Message = serde_json::from_slice(&response[0].payload).unwrap();
             assert!(response.body.is_empty());
         }
 
@@ -2593,7 +2589,7 @@ pub mod http {
                 .unwrap();
             let messages = responses
                 .iter()
-                .map(|frame| serde_json::from_slice::<MessageV1>(&frame.payload).unwrap())
+                .map(|frame| serde_json::from_slice::<Message>(&frame.payload).unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(messages[0].pipeline_depth, 2);
             assert_eq!(messages[1].pipeline_depth, 1);
@@ -2607,7 +2603,7 @@ pub mod http {
                     attributes: Default::default(),
                 })
                 .unwrap();
-            let orphan: MessageV1 = serde_json::from_slice(&orphan[0].payload).unwrap();
+            let orphan: Message = serde_json::from_slice(&orphan[0].payload).unwrap();
             assert!(orphan.orphan_response);
         }
     }

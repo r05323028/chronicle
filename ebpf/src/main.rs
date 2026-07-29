@@ -7,7 +7,8 @@
 use aya_ebpf::{
     EbpfContext,
     bindings::{
-        BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB, BPF_SOCK_OPS_STATE_CB, BPF_SOCK_OPS_STATE_CB_FLAG,
+        BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB,
+        BPF_SOCK_OPS_STATE_CB, BPF_SOCK_OPS_STATE_CB_FLAG, bpf_sock_addr,
     },
     helpers::{bpf_get_current_pid_tgid, generated},
     macros::{cgroup_skb, cgroup_sock_addr, map, sock_ops},
@@ -33,6 +34,12 @@ const EGRESS: u8 = 5;
 
 const SIGNAL_ACTIVE_ESTABLISHED: u8 = 1;
 const SIGNAL_AMBIGUOUS: u8 = 4;
+const SIGNAL_PASSIVE_ESTABLISHED: u8 = 5;
+
+const ROLE_ACTIVE: u8 = 1;
+const ROLE_PASSIVE: u8 = 2;
+const AF_INET_FAMILY: u32 = 2;
+const AF_INET6_FAMILY: u32 = 10;
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(8 * 1024 * 1024, 0);
@@ -48,46 +55,149 @@ static FIRST_SEQUENCE: HashMap<u64, u32> = HashMap::with_max_entries(65_536, 0);
 
 #[cgroup_sock_addr(connect4)]
 pub fn connect4(ctx: SockAddrContext) -> i32 {
-    emit_connect(&ctx, CONNECT4);
+    let raw = unsafe { &*ctx.as_ptr().cast::<bpf_sock_addr>() };
+    emit_connect(
+        &ctx,
+        CONNECT4,
+        u16::from_be(raw.user_port as u16),
+        [raw.user_ip4, 0, 0, 0],
+    );
     1
 }
 
 #[cgroup_sock_addr(connect6)]
 pub fn connect6(ctx: SockAddrContext) -> i32 {
-    emit_connect(&ctx, CONNECT6);
+    let raw = unsafe { &*ctx.as_ptr().cast::<bpf_sock_addr>() };
+    let remote_address = [
+        raw.user_ip6[0],
+        raw.user_ip6[1],
+        raw.user_ip6[2],
+        raw.user_ip6[3],
+    ];
+    emit_connect(
+        &ctx,
+        CONNECT6,
+        u16::from_be(raw.user_port as u16),
+        remote_address,
+    );
     1
 }
 
-fn emit_connect(ctx: &SockAddrContext, kind: u8) {
+fn emit_connect(ctx: &SockAddrContext, kind: u8, port: u16, remote_address: [u32; 4]) {
+    if port == 0 {
+        return;
+    }
+    let observed_cgroup_id = unsafe { generated::bpf_get_current_cgroup_id() };
     let mut item = [0_u8; MAX_ITEM_BYTES];
-    let len = write_common(&mut item, kind, ctx.as_ptr(), true);
+    let mut len = write_common(
+        &mut item,
+        kind,
+        ctx.as_ptr(),
+        true,
+        true,
+        observed_cgroup_id,
+    );
+    item[len] = if kind == CONNECT4 { 4 } else { 6 };
+    len += 1;
+    if kind == CONNECT4 {
+        write_ipv4(&mut item, len, remote_address[0]);
+    } else {
+        write_ipv6(&mut item, len, remote_address);
+    }
+    len += 16;
+    write_u16(&mut item, len, port);
+    len += 2;
+    item[len] = ROLE_ACTIVE;
+    len += 1;
     submit(&item, len);
 }
 
 #[sock_ops]
 pub fn socket_lifecycle(ctx: SockOpsContext) -> u32 {
     let op = ctx.op();
-    if op == BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB || op == BPF_SOCK_OPS_STATE_CB {
+    let established =
+        op == BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB || op == BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB;
+    if established || op == BPF_SOCK_OPS_STATE_CB {
         let _ = ctx.set_cb_flags(BPF_SOCK_OPS_STATE_CB_FLAG as i32);
     }
-    if op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB && op != BPF_SOCK_OPS_STATE_CB {
+    if !established && op != BPF_SOCK_OPS_STATE_CB {
         return 0;
     }
-    let mut item = [0_u8; MAX_ITEM_BYTES];
-    let mut len = write_common(&mut item, SOCKOPS, ctx.as_ptr(), false);
-    item[len] = if op == BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB {
-        SIGNAL_ACTIVE_ESTABLISHED
-    } else {
-        SIGNAL_AMBIGUOUS
-    };
-    len += 1;
     let state = if op == BPF_SOCK_OPS_STATE_CB {
         ctx.arg(1)
     } else {
         0
     };
+    let (family, local_port, remote_port, local_address, remote_address) = if established {
+        let raw = unsafe { &*ctx.ops };
+        let family = raw.family;
+        let local_port = raw.local_port as u16;
+        let remote_port = u16::from_be((raw.remote_port >> 16) as u16);
+        if local_port == 0 || remote_port == 0 {
+            return 0;
+        }
+        let (local_address, remote_address) = match family {
+            AF_INET_FAMILY => ([raw.local_ip4, 0, 0, 0], [raw.remote_ip4, 0, 0, 0]),
+            AF_INET6_FAMILY => (
+                [
+                    raw.local_ip6[0],
+                    raw.local_ip6[1],
+                    raw.local_ip6[2],
+                    raw.local_ip6[3],
+                ],
+                [
+                    raw.remote_ip6[0],
+                    raw.remote_ip6[1],
+                    raw.remote_ip6[2],
+                    raw.remote_ip6[3],
+                ],
+            ),
+            _ => return 0,
+        };
+        (
+            family,
+            local_port,
+            remote_port,
+            local_address,
+            remote_address,
+        )
+    } else {
+        (0, 0, 0, [0; 4], [0; 4])
+    };
+    let mut item = [0_u8; MAX_ITEM_BYTES];
+    // SockOps may run in peer task context; zero tells userspace to use attachment scope.
+    let mut len = write_common(&mut item, SOCKOPS, ctx.as_ptr(), false, established, 0);
+    item[len] = match op {
+        BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB => SIGNAL_ACTIVE_ESTABLISHED,
+        BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB => SIGNAL_PASSIVE_ESTABLISHED,
+        _ => SIGNAL_AMBIGUOUS,
+    };
+    len += 1;
     write_u32(&mut item, len, state);
     len += 4;
+    if established {
+        match family {
+            AF_INET_FAMILY => {
+                item[len] = 4;
+                write_ipv4(&mut item, len + 1, local_address[0]);
+                write_ipv4(&mut item, len + 19, remote_address[0]);
+            }
+            AF_INET6_FAMILY => {
+                item[len] = 6;
+                write_ipv6(&mut item, len + 1, local_address);
+                write_ipv6(&mut item, len + 19, remote_address);
+            }
+            _ => return 0,
+        }
+        write_u16(&mut item, len + 17, local_port);
+        write_u16(&mut item, len + 35, remote_port);
+        item[len + 37] = if op == BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB {
+            ROLE_ACTIVE
+        } else {
+            ROLE_PASSIVE
+        };
+        len += 38;
+    }
     submit(&item, len);
     0
 }
@@ -140,17 +250,18 @@ fn emit_skb(ctx: &SkBuffContext, kind: u8) {
     }
     let captured_length = payload_load_length(observed_length);
     let mut item = [0_u8; MAX_ITEM_BYTES];
-    let mut len = write_common(&mut item, kind, ctx.as_ptr(), false);
+    // Ingress processing may run in peer task context; attachment proves scope.
+    let mut len = write_common(&mut item, kind, ctx.as_ptr(), false, false, 0);
     item[len] = family;
     len += 1;
     let tcp_sequence = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
     write_u32(&mut item, len, tcp_sequence);
     len += 4;
     let socket_cookie = unsafe { generated::bpf_get_socket_cookie(ctx.as_ptr()) };
-    let continuation_position = match unsafe { FIRST_SEQUENCE.get(&socket_cookie) } {
+    let continuation_position = match unsafe { FIRST_SEQUENCE.get(socket_cookie) } {
         Some(first_sequence) => tcp_sequence.wrapping_sub(*first_sequence),
         None => {
-            let _ = FIRST_SEQUENCE.insert(&socket_cookie, &tcp_sequence, 0);
+            let _ = FIRST_SEQUENCE.insert(socket_cookie, tcp_sequence, 0);
             0
         }
     };
@@ -176,6 +287,8 @@ fn write_common(
     kind: u8,
     context: *mut core::ffi::c_void,
     include_process: bool,
+    initialize_identity: bool,
+    observed_cgroup_id: u64,
 ) -> usize {
     let size = HEADER_BYTES + COMMON_SOCKET_BYTES;
     item[0..4].copy_from_slice(&MAGIC);
@@ -188,19 +301,17 @@ fn write_common(
     write_u64(item, HEADER_BYTES, timestamp);
     let socket_cookie = unsafe { generated::bpf_get_socket_cookie(context) };
     write_u64(item, HEADER_BYTES + 8, socket_cookie);
-    let first_seen = if include_process {
-        let _ = FIRST_SEEN.insert(&socket_cookie, &timestamp, 0);
-        timestamp
-    } else {
-        unsafe { FIRST_SEEN.get(&socket_cookie) }
-            .copied()
-            .unwrap_or(0)
+    let first_seen = match unsafe { FIRST_SEEN.get(socket_cookie) }.copied() {
+        Some(first_seen) => first_seen,
+        None if initialize_identity => {
+            let _ = FIRST_SEEN.insert(socket_cookie, timestamp, 0);
+            timestamp
+        }
+        None => 0,
     };
     write_u64(item, HEADER_BYTES + 16, first_seen);
     write_u64(item, HEADER_BYTES + 24, 0);
-    write_u64(item, HEADER_BYTES + 32, unsafe {
-        generated::bpf_get_current_cgroup_id()
-    });
+    write_u64(item, HEADER_BYTES + 32, observed_cgroup_id);
     let pid_tgid = if include_process {
         bpf_get_current_pid_tgid()
     } else {
@@ -258,6 +369,20 @@ fn skb_load<const LENGTH: usize>(ctx: &SkBuffContext, offset: usize, destination
             destination.cast(),
             LENGTH as u32,
         ) == 0
+    }
+}
+
+fn write_ipv4(item: &mut [u8], offset: usize, address: u32) {
+    item[offset..offset + 4].copy_from_slice(&address.to_ne_bytes());
+    item[offset + 4..offset + 16].fill(0);
+}
+
+fn write_ipv6(item: &mut [u8], offset: usize, address: [u32; 4]) {
+    let mut word = 0;
+    while word < 4 {
+        let start = offset + word * 4;
+        item[start..start + 4].copy_from_slice(&address[word].to_ne_bytes());
+        word += 1;
     }
 }
 

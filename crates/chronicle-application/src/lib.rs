@@ -11,8 +11,8 @@ use chronicle_canonical::{
     Completeness, ProvenanceEntry, ProvenanceKind, SourceProvenance, SourceStatus,
 };
 use chronicle_capture::{
-    CaptureError, CaptureEvent, CaptureEventKind, CaptureSource, CaptureSourceSummary,
-    ClockIdentity, FixtureCaptureSource, MonotonicTimestamp, encode_event,
+    CAPTURE_EVENT_SCHEMA_VERSION, CaptureError, CaptureEvent, CaptureEventKind, CaptureSource,
+    CaptureSourceSummary, ClockIdentity, FixtureCaptureSource, MonotonicTimestamp, encode_event,
 };
 use chronicle_common::RecordingId;
 use chronicle_etl::{
@@ -27,13 +27,13 @@ use chronicle_replay::{
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
 use chronicle_wal::{
-    DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_WAL_BYTES, DEFAULT_V2_SEGMENT_BYTES,
-    GroupCommitWalWriter, MAX_V2_SEGMENT_BYTES, MIN_V2_SEGMENT_BYTES, RecordKind, RecordingLock,
-    RecoveryReopenPreview, RecoveryReopenReport, RecoveryRepair, RecoveryScan, SegmentedWalWriter,
-    TERMINAL_WAL_LOSS_SCHEMA_VERSION, TerminalWalLoss, TerminalWalLossAmbiguity,
-    TerminalWalLossInterval, TerminalWalLossReason, WalCheckpoint, WalError, WalReader, WalRecord,
-    WalWriter, encode_record, encode_terminal_wal_loss, prepare_group_commit_reopen_from_scan,
-    verified_snapshot_sha256,
+    COMMIT_MARKER_FRAME_LEN, DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_WAL_BYTES,
+    DEFAULT_SEGMENT_BYTES, GroupCommitWalWriter, MAX_SEGMENT_BYTES, MIN_SEGMENT_BYTES, RecordKind,
+    RecordingLock, RecoveryReopenPreview, RecoveryReopenReport, RecoveryRepair, RecoveryScan,
+    SEGMENT_HEADER_LEN, TERMINAL_WAL_LOSS_SCHEMA_VERSION, TerminalWalLoss,
+    TerminalWalLossAmbiguity, TerminalWalLossInterval, TerminalWalLossReason, WalCheckpoint,
+    WalError, WalRecordEnvelope, encode_envelope, encode_terminal_wal_loss,
+    prepare_group_commit_reopen_from_scan, verified_snapshot_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -52,12 +52,12 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-pub const RECORDING_METADATA_SCHEMA_V1: u16 = 1;
-pub const RECORDING_COUNTERS_SCHEMA_V1: u16 = 1;
-pub const RECORDING_CAPTURE_METADATA_SCHEMA_V1: u16 = 1;
+pub const RECORDING_METADATA_SCHEMA_VERSION: u16 = 1;
+pub const RECORDING_COUNTERS_SCHEMA_VERSION: u16 = 1;
+pub const RECORDING_CAPTURE_METADATA_SCHEMA_VERSION: u16 = 1;
 pub const MAX_RECORDING_CAPTURE_ERRORS: usize = 64;
 pub const MAX_RECORDING_CAPABILITIES: usize = 32;
-pub const REPLAY_REPORT_VERSION: u16 = 2;
+pub const REPLAY_REPORT_VERSION: u16 = 1;
 pub const RECOVERY_REPORT_VERSION: u16 = 1;
 pub const DEFAULT_RECORDING_DURATION_SECONDS: u64 = 600;
 pub const MAX_RECORDING_DURATION_SECONDS: u64 = 3_600;
@@ -74,7 +74,7 @@ impl Default for ProductionRecordingBounds {
     fn default() -> Self {
         Self {
             duration_seconds: DEFAULT_RECORDING_DURATION_SECONDS,
-            segment_bytes: DEFAULT_V2_SEGMENT_BYTES,
+            segment_bytes: DEFAULT_SEGMENT_BYTES,
             max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
         }
     }
@@ -118,7 +118,7 @@ pub fn validate_production_recording_bounds(
             "duration bound invalid",
         ));
     }
-    if !(MIN_V2_SEGMENT_BYTES..=MAX_V2_SEGMENT_BYTES).contains(&bounds.segment_bytes)
+    if !(MIN_SEGMENT_BYTES..=MAX_SEGMENT_BYTES).contains(&bounds.segment_bytes)
         || bounds.max_wal_bytes < bounds.segment_bytes
         || bounds.max_wal_bytes > DEFAULT_MAX_WAL_BYTES
     {
@@ -223,8 +223,8 @@ pub fn record_live_ebpf(
             .map_err(|_| ApplicationError::ProductionPreflight("cgroup selection invalid"))?,
     };
     let capture_metadata = live_capture_metadata(&selection, bounds)?;
-    let mut metadata = RecordingMetadataV1 {
-        version: RECORDING_METADATA_SCHEMA_V1,
+    let mut metadata = RecordingMetadata {
+        version: RECORDING_METADATA_SCHEMA_VERSION,
         recording_id: RecordingId::new(),
         selector: Some(RecordingSelectorIdentity {
             canonical_cgroup_path: selection.canonical_path.display().to_string(),
@@ -252,7 +252,7 @@ pub fn record_live_ebpf(
 fn live_capture_metadata(
     selection: &CgroupSelection,
     bounds: ProductionRecordingBounds,
-) -> Result<RecordingCaptureMetadataV1, ApplicationError> {
+) -> Result<RecordingCaptureMetadata, ApplicationError> {
     let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")
         .map_err(|_| ApplicationError::ProductionPreflight("kernel identity unavailable"))?
         .trim()
@@ -270,8 +270,8 @@ fn live_capture_metadata(
         segment_bytes: bounds.segment_bytes,
         ring_bytes: 8 * 1024 * 1024,
     };
-    Ok(RecordingCaptureMetadataV1 {
-        version: RECORDING_CAPTURE_METADATA_SCHEMA_V1,
+    Ok(RecordingCaptureMetadata {
+        version: RECORDING_CAPTURE_METADATA_SCHEMA_VERSION,
         build: RecordingBuildIdentity {
             chronicle_version: env!("CARGO_PKG_VERSION").into(),
             aya_version: "0.14.0".into(),
@@ -902,7 +902,7 @@ pub struct RecordingCaptureError {
 
 /// Capture-specific fields appended to core metadata after feasibility validation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordingCaptureMetadataV1 {
+pub struct RecordingCaptureMetadata {
     pub version: u16,
     pub build: RecordingBuildIdentity,
     pub host: RecordingHostIdentity,
@@ -914,7 +914,7 @@ pub struct RecordingCaptureMetadataV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordingMetadataV1 {
+pub struct RecordingMetadata {
     pub version: u16,
     pub recording_id: RecordingId,
     pub selector: Option<RecordingSelectorIdentity>,
@@ -925,14 +925,14 @@ pub struct RecordingMetadataV1 {
     #[serde(default)]
     pub terminal_wal_loss: Option<TerminalWalLossSummary>,
     #[serde(default)]
-    pub capture: Option<RecordingCaptureMetadataV1>,
+    pub capture: Option<RecordingCaptureMetadata>,
 }
 
-impl RecordingMetadataV1 {
+impl RecordingMetadata {
     /// Persist feasibility-checked capture context before live eBPF work starts.
     pub fn transition_to_recording(
         &mut self,
-        capture: RecordingCaptureMetadataV1,
+        capture: RecordingCaptureMetadata,
     ) -> Result<(), ApplicationError> {
         if self.status != RecordingStatus::Starting || self.shutdown_reason.is_some() {
             return Err(ApplicationError::RecordingMetadataValidation(
@@ -971,11 +971,6 @@ impl RecordingMetadataV1 {
         self.shutdown_reason = Some(reason);
         validate_recording_metadata(self)
     }
-}
-
-#[derive(Deserialize)]
-struct RecordingMetadataDiscriminator {
-    version: u16,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1160,16 +1155,8 @@ pub enum ApplicationError {
     NotImplemented(&'static str),
 }
 
-pub fn decode_recording_metadata(bytes: &[u8]) -> Result<RecordingMetadataV1, ApplicationError> {
-    let discriminator: RecordingMetadataDiscriminator = serde_json::from_slice(bytes)
-        .map_err(|error| ApplicationError::RecordingMetadataValidation(error.to_string()))?;
-    if discriminator.version != RECORDING_METADATA_SCHEMA_V1 {
-        return Err(ApplicationError::RecordingMetadataValidation(format!(
-            "unsupported recording metadata version {}",
-            discriminator.version
-        )));
-    }
-    let metadata: RecordingMetadataV1 = serde_json::from_slice(bytes)
+pub fn decode_recording_metadata(bytes: &[u8]) -> Result<RecordingMetadata, ApplicationError> {
+    let metadata: RecordingMetadata = serde_json::from_slice(bytes)
         .map_err(|error| ApplicationError::RecordingMetadataValidation(error.to_string()))?;
     validate_recording_metadata(&metadata)?;
     Ok(metadata)
@@ -1177,7 +1164,7 @@ pub fn decode_recording_metadata(bytes: &[u8]) -> Result<RecordingMetadataV1, Ap
 
 pub fn load_recording_metadata(
     wal_directory: impl AsRef<Path>,
-) -> Result<Option<RecordingMetadataV1>, ApplicationError> {
+) -> Result<Option<RecordingMetadata>, ApplicationError> {
     match fs::read(wal_directory.as_ref().join("recording.json")) {
         Ok(bytes) => decode_recording_metadata(&bytes).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1187,7 +1174,7 @@ pub fn load_recording_metadata(
 
 pub fn write_recording_metadata(
     wal_directory: impl AsRef<Path>,
-    metadata: &RecordingMetadataV1,
+    metadata: &RecordingMetadata,
 ) -> Result<(), ApplicationError> {
     write_recording_metadata_inner(wal_directory.as_ref(), metadata, None)
 }
@@ -1216,7 +1203,7 @@ impl RecordingIngestResult {
     pub fn persist_metadata(
         &self,
         wal_directory: impl AsRef<Path>,
-        metadata: &mut RecordingMetadataV1,
+        metadata: &mut RecordingMetadata,
     ) -> Result<(), ApplicationError> {
         metadata.status = self.status;
         metadata.shutdown_reason = Some(self.shutdown_reason);
@@ -1233,8 +1220,8 @@ impl RecordingIngestResult {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn record_production<S, Build, Now, Stop>(
     wal_directory: impl AsRef<Path>,
-    metadata: &mut RecordingMetadataV1,
-    capture_metadata: RecordingCaptureMetadataV1,
+    metadata: &mut RecordingMetadata,
+    capture_metadata: RecordingCaptureMetadata,
     bounds: ProductionRecordingBounds,
     build_source: Build,
     mut now_millis: Now,
@@ -1454,8 +1441,8 @@ pub fn load_production_ebpf_source(
 
 fn persist_pre_attach_failure(
     wal_directory: &Path,
-    metadata: &mut RecordingMetadataV1,
-    mut capture_metadata: RecordingCaptureMetadataV1,
+    metadata: &mut RecordingMetadata,
+    mut capture_metadata: RecordingCaptureMetadata,
     error: RecordingCaptureErrorCode,
 ) -> Result<(), ApplicationError> {
     if capture_metadata.errors.len() < MAX_RECORDING_CAPTURE_ERRORS {
@@ -1470,7 +1457,7 @@ fn persist_pre_attach_failure(
 
 fn persist_live_failure(
     wal_directory: &Path,
-    metadata: &mut RecordingMetadataV1,
+    metadata: &mut RecordingMetadata,
     error: RecordingCaptureErrorCode,
     reason: ShutdownReason,
     original: ApplicationError,
@@ -1491,7 +1478,7 @@ fn recording_failure_reason(error: &ApplicationError) -> ShutdownReason {
     }
 }
 
-fn append_capture_error(metadata: &mut RecordingMetadataV1, error: RecordingCaptureErrorCode) {
+fn append_capture_error(metadata: &mut RecordingMetadata, error: RecordingCaptureErrorCode) {
     if let Some(capture) = &mut metadata.capture
         && capture.errors.len() < MAX_RECORDING_CAPTURE_ERRORS
     {
@@ -1504,48 +1491,46 @@ fn persist_capture_event(
     event: &CaptureEvent,
     now_millis: u64,
 ) -> Result<(), ApplicationError> {
-    let (kind, capture_timestamp, kernel_drops) = match event {
-        CaptureEvent::V1(_event) => (RecordKind::CaptureEvent, None, None),
-        CaptureEvent::V2(event) => match &event.kind {
-            CaptureEventKind::LossWindowObserved(window) => (
-                RecordKind::LossWindow,
-                Some(window.end.clone()),
-                window.drop_delta,
-            ),
-            CaptureEventKind::SocketConnectObserved(evidence)
-            | CaptureEventKind::SocketConnected(evidence)
-            | CaptureEventKind::SocketClosedObserved(evidence)
-            | CaptureEventKind::SocketResetObserved(evidence) => (
-                RecordKind::CaptureEvent,
-                Some(evidence.timestamp.clone()),
-                None,
-            ),
-            CaptureEventKind::SocketStateChangedObserved(observed) => (
-                RecordKind::CaptureEvent,
-                Some(observed.socket.timestamp.clone()),
-                None,
-            ),
-            CaptureEventKind::PayloadFragment(fragment) => (
-                RecordKind::CaptureEvent,
-                Some(fragment.timestamp.clone()),
-                None,
-            ),
-        },
+    let (kind, capture_timestamp, kernel_drops) = match &event.kind {
+        CaptureEventKind::LossWindowObserved(window) => (
+            RecordKind::LossWindow,
+            Some(window.end.clone()),
+            window.drop_delta,
+        ),
+        CaptureEventKind::SocketConnectObserved(intent) => (
+            RecordKind::CaptureEvent,
+            Some(intent.timestamp.clone()),
+            None,
+        ),
+        CaptureEventKind::SocketConnected(evidence)
+        | CaptureEventKind::SocketClosedObserved(evidence)
+        | CaptureEventKind::SocketResetObserved(evidence) => (
+            RecordKind::CaptureEvent,
+            Some(evidence.timestamp.clone()),
+            None,
+        ),
+        CaptureEventKind::SocketStateChangedObserved(observed) => (
+            RecordKind::CaptureEvent,
+            Some(observed.socket.timestamp.clone()),
+            None,
+        ),
+        CaptureEventKind::PayloadFragment(fragment) => (
+            RecordKind::CaptureEvent,
+            Some(fragment.timestamp.clone()),
+            None,
+        ),
     };
     if let Some(drops) = kernel_drops {
         ingest.record_kernel_or_backend_drop(drops, 0);
     }
     let mut record = QueuedWalRecord {
         kind,
-        schema_version: event.schema_version(),
-        flags: event
-            .as_v1()
-            .map(|event| {
-                u16::try_from(event.flags.0)
-                    .map_err(|_| ApplicationError::CaptureFlagsOutOfRange(event.flags.0))
-            })
-            .transpose()?
-            .unwrap_or(0),
+        schema_version: event.schema_version,
+        flags: match &event.kind {
+            CaptureEventKind::PayloadFragment(fragment) => u16::try_from(fragment.flags.0)
+                .map_err(|_| ApplicationError::CaptureFlagsOutOfRange(fragment.flags.0))?,
+            _ => 0,
+        },
         payload: encode_event(event)?,
         capture_timestamp,
     };
@@ -1621,8 +1606,8 @@ fn shutdown_source_without_wal(source: &mut impl CaptureSource) -> Result<(), Ca
     finalized.map(|_| ())
 }
 
-fn validate_recording_metadata(metadata: &RecordingMetadataV1) -> Result<(), ApplicationError> {
-    if metadata.version != RECORDING_METADATA_SCHEMA_V1 {
+fn validate_recording_metadata(metadata: &RecordingMetadata) -> Result<(), ApplicationError> {
+    if metadata.version != RECORDING_METADATA_SCHEMA_VERSION {
         return Err(ApplicationError::RecordingMetadataValidation(format!(
             "unsupported recording metadata version {}",
             metadata.version
@@ -1638,7 +1623,7 @@ fn validate_recording_metadata(metadata: &RecordingMetadataV1) -> Result<(), App
         ));
     }
     if let Some(capture) = &metadata.capture {
-        if capture.version != RECORDING_CAPTURE_METADATA_SCHEMA_V1 {
+        if capture.version != RECORDING_CAPTURE_METADATA_SCHEMA_VERSION {
             return Err(ApplicationError::RecordingMetadataValidation(format!(
                 "unsupported recording capture metadata version {}",
                 capture.version
@@ -1678,7 +1663,7 @@ fn validate_recording_metadata(metadata: &RecordingMetadataV1) -> Result<(), App
 
 fn write_recording_metadata_inner(
     wal_directory: &Path,
-    metadata: &RecordingMetadataV1,
+    metadata: &RecordingMetadata,
     fault: Option<RecordingMetadataWriteFault>,
 ) -> Result<(), ApplicationError> {
     validate_recording_metadata(metadata)?;
@@ -1736,7 +1721,7 @@ fn write_private_atomic_json<T: Serialize + ?Sized>(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordingRecoveryReconciliation {
-    pub metadata: RecordingMetadataV1,
+    pub metadata: RecordingMetadata,
     pub scan: RecoveryScan,
     pub metadata_updated: bool,
 }
@@ -1748,7 +1733,7 @@ pub fn reconcile_recording_metadata(
 ) -> Result<RecordingRecoveryReconciliation, ApplicationError> {
     let wal_directory = wal_directory.as_ref();
     let lock = RecordingLock::acquire(wal_directory)?;
-    let scan = lock.scan_v2(wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES)?;
+    let scan = lock.scan(wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES)?;
     reconcile_recording_metadata_with_scan(
         &lock,
         wal_directory,
@@ -1767,8 +1752,8 @@ pub fn reconcile_recording_metadata_with_scan(
 ) -> Result<RecordingRecoveryReconciliation, ApplicationError> {
     let wal_directory = wal_directory.as_ref();
     let original = load_recording_metadata(wal_directory)?;
-    let mut metadata = original.clone().unwrap_or_else(|| RecordingMetadataV1 {
-        version: RECORDING_METADATA_SCHEMA_V1,
+    let mut metadata = original.clone().unwrap_or_else(|| RecordingMetadata {
+        version: RECORDING_METADATA_SCHEMA_VERSION,
         recording_id,
         selector: expected_selector.cloned(),
         status: RecordingStatus::Aborted,
@@ -1882,7 +1867,7 @@ pub struct PostMarkerUncertainty {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecoveryReportV1 {
+pub struct RecoveryReport {
     pub version: u16,
     pub recording_id: RecordingId,
     pub status: RecordingStatus,
@@ -1942,7 +1927,7 @@ pub fn build_recovery_report(
     reconciliation: &RecordingRecoveryReconciliation,
     repair: Option<&RecoveryRepair>,
     additional_issues: impl IntoIterator<Item = RecoveryIssueCode>,
-) -> Result<RecoveryReportV1, ApplicationError> {
+) -> Result<RecoveryReport, ApplicationError> {
     let uncommitted_bytes =
         reconciliation
             .scan
@@ -1977,7 +1962,7 @@ pub fn build_recovery_report(
     {
         issue_codes.insert(RecoveryIssueCode::WalLimitLoss);
     }
-    Ok(RecoveryReportV1 {
+    Ok(RecoveryReport {
         version: RECOVERY_REPORT_VERSION,
         recording_id: reconciliation.metadata.recording_id,
         status: reconciliation.metadata.status,
@@ -2025,7 +2010,7 @@ pub fn build_recovery_report_for_reopen(
     reconciliation: &RecordingRecoveryReconciliation,
     preview: &RecoveryReopenPreview,
     additional_issues: impl IntoIterator<Item = RecoveryIssueCode>,
-) -> Result<RecoveryReportV1, ApplicationError> {
+) -> Result<RecoveryReport, ApplicationError> {
     let mut report = build_recovery_report(reconciliation, None, additional_issues)?;
     if preview.truncated_bytes > 0 || preview.removed_segments > 0 {
         report.repaired_tail = Some(RecoveryTailRepairSummary {
@@ -2044,13 +2029,13 @@ pub fn build_recovery_report_for_reopen(
     Ok(report)
 }
 
-pub fn render_recovery_report_json(report: &RecoveryReportV1) -> Result<String, ApplicationError> {
+pub fn render_recovery_report_json(report: &RecoveryReport) -> Result<String, ApplicationError> {
     render_json(report)
 }
 
 pub fn persist_recovery_report(
     wal_directory: impl AsRef<Path>,
-    report: &RecoveryReportV1,
+    report: &RecoveryReport,
 ) -> Result<(), ApplicationError> {
     if report.version != RECOVERY_REPORT_VERSION {
         return Err(ApplicationError::RecordingMetadataValidation(format!(
@@ -2066,7 +2051,7 @@ pub fn persist_recovery_report(
     )
 }
 
-pub fn decode_recovery_report(bytes: &[u8]) -> Result<RecoveryReportV1, ApplicationError> {
+pub fn decode_recovery_report(bytes: &[u8]) -> Result<RecoveryReport, ApplicationError> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     let version = value
         .get("version")
@@ -2087,7 +2072,7 @@ pub fn decode_recovery_report(bytes: &[u8]) -> Result<RecoveryReportV1, Applicat
 pub struct RecoveredRecordingForAppend {
     pub writer: GroupCommitWalWriter,
     pub reconciliation: RecordingRecoveryReconciliation,
-    pub recovery_report: RecoveryReportV1,
+    pub recovery_report: RecoveryReport,
     pub reopen_report: RecoveryReopenReport,
 }
 
@@ -2102,10 +2087,10 @@ pub fn recover_recording_for_append(
 ) -> Result<RecoveredRecordingForAppend, ApplicationError> {
     let wal_directory = wal_directory.as_ref();
     let lock = RecordingLock::acquire(wal_directory)?;
-    let scan = match lock.scan_v2(wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES) {
+    let scan = match lock.scan(wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES) {
         Ok(scan) => scan,
         Err(error) => {
-            let failure_report = RecoveryReportV1 {
+            let failure_report = RecoveryReport {
                 version: RECOVERY_REPORT_VERSION,
                 recording_id,
                 status: RecordingStatus::Failed,
@@ -2162,6 +2147,7 @@ pub fn recover_recording_for_append(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedWal {
+    pub recording_id: RecordingId,
     pub first_sequence: Option<u64>,
     pub checkpoint: Option<WalCheckpoint>,
     pub record_count: usize,
@@ -2179,23 +2165,38 @@ pub fn write_capture_to_wal(
         ));
     }
 
+    let recording_id = RecordingId::new();
     let mut records = Vec::new();
-    let mut encoded_bytes = 0_u64;
+    let mut encoded_bytes =
+        u64::try_from(SEGMENT_HEADER_LEN + COMMIT_MARKER_FRAME_LEN).unwrap_or(u64::MAX);
     while let Some(event) = source.next_event()? {
-        let event_v1 = event
-            .as_v1()
-            .ok_or(CaptureError::UnsupportedSchema(event.schema_version()))?;
-        let flags = u16::try_from(event_v1.flags.0)
-            .map_err(|_| ApplicationError::CaptureFlagsOutOfRange(event_v1.flags.0))?;
-        let record = WalRecord {
-            kind: RecordKind::CaptureEvent,
-            flags,
-            sequence: event_v1.monotonic_sequence,
-            payload: encode_event(&event)?,
+        let flags = match &event.kind {
+            CaptureEventKind::PayloadFragment(fragment) => u16::try_from(fragment.flags.0)
+                .map_err(|_| ApplicationError::CaptureFlagsOutOfRange(fragment.flags.0))?,
+            _ => 0,
         };
-        encoded_bytes = encoded_bytes
-            .saturating_add(u64::try_from(encode_record(&record)?.len()).unwrap_or(u64::MAX));
-        records.push(record);
+        let kind = if matches!(event.kind, CaptureEventKind::LossWindowObserved(_)) {
+            RecordKind::LossWindow
+        } else {
+            RecordKind::CaptureEvent
+        };
+        let payload = encode_event(&event)?;
+        let sequence = u64::try_from(records.len() + 1).unwrap_or(u64::MAX);
+        encoded_bytes = encoded_bytes.saturating_add(
+            u64::try_from(
+                encode_envelope(&WalRecordEnvelope::unplaced(
+                    recording_id,
+                    sequence,
+                    kind,
+                    CAPTURE_EVENT_SCHEMA_VERSION,
+                    flags,
+                    payload.clone(),
+                ))?
+                .len(),
+            )
+            .unwrap_or(u64::MAX),
+        );
+        records.push((kind, flags, payload));
     }
     if encoded_bytes > max_segment_bytes {
         return Err(ApplicationError::FixtureWalTooLarge {
@@ -2204,30 +2205,66 @@ pub fn write_capture_to_wal(
         });
     }
 
-    let mut writer = SegmentedWalWriter::create(directory, max_segment_bytes)?;
-    let first_sequence = records.first().map(|record| record.sequence);
-    let mut checkpoint = None;
-    for record in &records {
-        checkpoint = Some(writer.append(record)?);
+    let mut writer = GroupCommitWalWriter::create(
+        directory,
+        recording_id,
+        max_segment_bytes.max(MIN_SEGMENT_BYTES),
+        1,
+        0,
+    )?;
+    for (kind, flags, payload) in records.iter().cloned() {
+        writer.append(kind, CAPTURE_EVENT_SCHEMA_VERSION, flags, payload, 0)?;
     }
-    writer.flush()?;
+    writer.flush(0)?;
+    drop(writer);
+    let scan = chronicle_wal::scan_wal(directory, recording_id, DEFAULT_MAX_RECORD_BYTES)?;
+    let checkpoint = if let Some(marker) = scan.final_marker.as_ref() {
+        let encoded_len = u64::try_from(encode_envelope(marker)?.len()).unwrap_or(u64::MAX);
+        marker.provenance.as_ref().map(|provenance| WalCheckpoint {
+            segment_first_sequence: provenance.segment_first_sequence,
+            byte_offset: provenance.byte_offset.saturating_add(encoded_len),
+            next_sequence: marker.sequence.saturating_add(1),
+        })
+    } else {
+        None
+    };
     Ok(RecordedWal {
-        first_sequence,
+        recording_id,
+        first_sequence: (!records.is_empty()).then_some(1),
         checkpoint,
         record_count: records.len(),
     })
 }
 
-pub fn process_single_wal(
-    path: impl AsRef<Path>,
-    first_sequence: u64,
+pub fn process_fixture_wal(
+    directory: impl AsRef<Path>,
+    recording_id: RecordingId,
     registry: &ProtocolRegistry,
     session_id: chronicle_common::SessionId,
 ) -> Result<(EtlOutput, WalCheckpoint), ApplicationError> {
-    let mut reader = WalReader::new(fs::File::open(path)?, first_sequence);
-    let output =
-        EtlPipeline::new(SessionLimits::default()).process(&mut reader, registry, session_id)?;
-    Ok((output, reader.checkpoint()))
+    let scan = chronicle_wal::scan_wal(directory, recording_id, DEFAULT_MAX_RECORD_BYTES)?;
+    let marker = scan
+        .final_marker
+        .as_ref()
+        .ok_or(WalError::NoAuthoritativeCommit)?;
+    let provenance = marker
+        .provenance
+        .as_ref()
+        .ok_or(WalError::MissingProvenance {
+            sequence: marker.sequence,
+        })?;
+    let checkpoint = WalCheckpoint {
+        segment_first_sequence: provenance.segment_first_sequence,
+        byte_offset: provenance.byte_offset
+            + u64::try_from(encode_envelope(marker)?.len()).unwrap_or(u64::MAX),
+        next_sequence: marker.sequence.saturating_add(1),
+    };
+    let output = EtlPipeline::new(SessionLimits::default()).process_envelopes(
+        &scan.committed,
+        registry,
+        session_id,
+    )?;
+    Ok((output, checkpoint))
 }
 
 #[derive(Clone, Debug)]
@@ -2266,7 +2303,7 @@ pub fn process_recording_wal(
             ));
         }
     };
-    let scan = lock.scan_v2(
+    let scan = lock.scan(
         wal_directory,
         metadata.recording_id,
         DEFAULT_MAX_RECORD_BYTES,
@@ -2404,7 +2441,7 @@ pub fn process_recording_wal(
 pub const RECORDING_ETL_CHECKPOINT_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordingEtlCheckpointV1 {
+pub struct RecordingEtlCheckpoint {
     pub version: u16,
     pub recording_id: RecordingId,
     pub commit_marker_segment_ordinal: u64,
@@ -2469,7 +2506,7 @@ pub fn process_and_publish_recording_wal(
         },
     };
     let inspection = store.verify_existing_manifest(session_id)?;
-    let checkpoint = RecordingEtlCheckpointV1 {
+    let checkpoint = RecordingEtlCheckpoint {
         version: RECORDING_ETL_CHECKPOINT_VERSION,
         recording_id: processed.recording_id,
         commit_marker_segment_ordinal: processed.commit_boundary.segment_ordinal,
@@ -2477,7 +2514,7 @@ pub fn process_and_publish_recording_wal(
         commit_marker_sequence: processed.commit_boundary.marker_sequence,
         wal_snapshot_sha256: sha256_string(&processed.wal_snapshot_sha256),
         recovery_sha256: sha256_string(&processed.recovery_sha256),
-        wal_format_version: chronicle_wal::WAL_FORMAT_V2,
+        wal_format_version: chronicle_wal::WAL_FORMAT_VERSION,
         pipeline_version: ETL_PIPELINE_VERSION.into(),
         canonical_schema_version: chronicle_canonical::CANONICAL_SCHEMA_VERSION,
         session_id,
@@ -2497,10 +2534,10 @@ pub fn process_and_publish_recording_wal(
 
 fn load_recording_etl_checkpoint(
     wal_directory: &Path,
-) -> Result<Option<RecordingEtlCheckpointV1>, ApplicationError> {
+) -> Result<Option<RecordingEtlCheckpoint>, ApplicationError> {
     match fs::read(wal_directory.join("etl-checkpoint.json")) {
         Ok(bytes) => {
-            let checkpoint: RecordingEtlCheckpointV1 = serde_json::from_slice(&bytes)?;
+            let checkpoint: RecordingEtlCheckpoint = serde_json::from_slice(&bytes)?;
             if checkpoint.version != RECORDING_ETL_CHECKPOINT_VERSION {
                 return Err(ApplicationError::RecordingMetadataValidation(format!(
                     "unsupported recording ETL checkpoint version {}",
@@ -2701,11 +2738,9 @@ pub fn record_fixture(
     let session_id = chronicle_common::SessionId::new();
     let wal_directory = root.join("wal").join(session_id.to_string());
     let recorded = write_capture_to_wal(source, &wal_directory, max_segment_bytes)?;
-    let (output, checkpoint) = process_single_wal(
-        wal_directory.join(chronicle_wal::segment_file_name(
-            recorded.first_sequence.unwrap_or(1),
-        )),
-        recorded.first_sequence.unwrap_or(1),
+    let (output, checkpoint) = process_fixture_wal(
+        &wal_directory,
+        recorded.recording_id,
         &chronicle_protocol_builtins::registry()?,
         session_id,
     )?;
@@ -2749,7 +2784,6 @@ fn issue_summaries(issues: &[EtlIssue]) -> Vec<RecordIssueSummary> {
         .map(|issue| RecordIssueSummary {
             code: match issue.kind {
                 chronicle_etl::EtlIssueKind::MalformedCaptureEvent => "malformed_capture_event",
-                chronicle_etl::EtlIssueKind::CaptureSequenceMismatch => "capture_sequence_mismatch",
                 chronicle_etl::EtlIssueKind::PartialWalTail => "partial_wal_tail",
                 chronicle_etl::EtlIssueKind::UnknownProtocol => "unknown_protocol",
                 chronicle_etl::EtlIssueKind::ProtocolDecode => "protocol_decode",
@@ -2789,7 +2823,9 @@ fn replayability_reasons(output: &EtlOutput) -> Vec<String> {
                 reasons.insert("missing_recorded_response".into());
             }
             for warning in &operation.warnings {
-                reasons.insert(format!("warning:{}", warning.code));
+                if warning.code != "missing_timestamp" {
+                    reasons.insert(format!("warning:{}", warning.code));
+                }
             }
         }
     }
@@ -2829,7 +2865,9 @@ pub fn inspect_session(
                 blockers.insert("missing_recorded_response".into());
             }
             for warning in &operation.warnings {
-                blockers.insert(format!("warning:{}", warning.code));
+                if warning.code != "missing_timestamp" {
+                    blockers.insert(format!("warning:{}", warning.code));
+                }
             }
         }
     }
@@ -2881,7 +2919,7 @@ pub fn inspect_session(
 }
 
 #[derive(Serialize)]
-struct InspectJsonV1<'a> {
+struct InspectJson<'a> {
     version: u8,
     #[serde(flatten)]
     result: &'a InspectSessionResult,
@@ -2936,7 +2974,7 @@ pub fn render_json<T: Serialize + ?Sized>(value: &T) -> Result<String, Applicati
 
 /// Renders stable inspect JSON v1 containing only summary metadata.
 pub fn render_inspect_json(inspected: &InspectSessionResult) -> Result<String, ApplicationError> {
-    render_json(&InspectJsonV1 {
+    render_json(&InspectJson {
         version: 1,
         result: inspected,
     })
@@ -3148,9 +3186,11 @@ impl ChronicleApplication {
     }
 
     fn validate(&self) -> Result<(), ApplicationError> {
-        if self.config.wal.segment_size_bytes <= chronicle_wal::HEADER_LEN as u64 {
+        if !(chronicle_wal::MIN_SEGMENT_BYTES..=chronicle_wal::MAX_SEGMENT_BYTES)
+            .contains(&self.config.wal.segment_size_bytes)
+        {
             return Err(ApplicationError::InvalidConfig(
-                "WAL segment size must exceed record header".into(),
+                "WAL segment size must be between 16 MiB and 4 GiB".into(),
             ));
         }
         if self.config.wal.disk_limit_bytes < self.config.wal.segment_size_bytes {
@@ -3165,6 +3205,76 @@ impl ChronicleApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_capture_events(payload: Vec<u8>) -> Vec<CaptureEvent> {
+        use chronicle_capture::{
+            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEventKind, CaptureFlags, ClockIdentity,
+            FragmentSequenceEvidence, MonotonicTimestamp, NetworkFamily, PayloadDirection,
+            PayloadFragment, RecordingScopeIdentity, SocketEvidence, SocketIdentity, SocketRole,
+            TruncationMetadata, TruncationState,
+        };
+        use chronicle_common::Endpoint;
+
+        let timestamp = MonotonicTimestamp {
+            clock: ClockIdentity {
+                boot_id: "test-boot".into(),
+            },
+            nanoseconds: 1,
+        };
+        let socket = SocketIdentity {
+            socket_cookie: 1,
+            first_seen: timestamp.clone(),
+            network_namespace: None,
+        };
+        let scope = RecordingScopeIdentity {
+            cgroup_id: 1,
+            canonical_path: "/test".into(),
+            namespace: None,
+        };
+        let evidence = SocketEvidence {
+            timestamp: timestamp.clone(),
+            socket: socket.clone(),
+            recording_scope: scope.clone(),
+            network_family: NetworkFamily::Ipv4,
+            local_endpoint: Endpoint::new("192.0.2.10", 41_000),
+            remote_endpoint: Endpoint::new("192.0.2.20", 8_080),
+            role: SocketRole::Active,
+            process: None,
+            observed_cgroup_id: 1,
+        };
+        let captured_length = u32::try_from(payload.len()).unwrap();
+        vec![
+            CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                kind: CaptureEventKind::SocketConnected(evidence),
+            },
+            CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+                    timestamp: MonotonicTimestamp {
+                        nanoseconds: 2,
+                        ..timestamp
+                    },
+                    socket,
+                    recording_scope: scope,
+                    network_family: NetworkFamily::Ipv4,
+                    direction: PayloadDirection::Egress,
+                    sequence: FragmentSequenceEvidence {
+                        tcp_sequence: 1,
+                        continuation_position: 0,
+                    },
+                    payload,
+                    truncation: TruncationMetadata {
+                        captured_length,
+                        observed_length: Some(captured_length),
+                        state: TruncationState::Complete,
+                        reason: None,
+                    },
+                    flags: CaptureFlags::default(),
+                }),
+            },
+        ]
+    }
 
     #[test]
     fn production_signal_stop_keeps_first_signal_and_flags_second() {
@@ -3214,8 +3324,8 @@ mod tests {
             GroupCommitWalWriter::create_with_total_limit(
                 directory,
                 RecordingId::new(),
-                chronicle_wal::MIN_V2_SEGMENT_BYTES,
-                chronicle_wal::MIN_V2_SEGMENT_BYTES,
+                chronicle_wal::MIN_SEGMENT_BYTES,
+                chronicle_wal::MIN_SEGMENT_BYTES,
                 1,
                 0,
             )
@@ -3304,7 +3414,7 @@ mod tests {
     fn ingest_discards_only_wal_limit_suffix_and_wal_limit_wins_duration_tie() {
         let directory = ingest_directory("limit");
         let mut ingest = ingest(&directory);
-        let frame_bytes = (chronicle_wal::MIN_V2_SEGMENT_BYTES
+        let frame_bytes = (chronicle_wal::MIN_SEGMENT_BYTES
             - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap())
             / 2
             + 1;
@@ -3365,7 +3475,7 @@ mod tests {
     fn ingest_emits_one_terminal_loss_per_incompatible_clock() {
         let directory = ingest_directory("limit-clocks");
         let mut ingest = ingest(&directory);
-        let frame_bytes = (chronicle_wal::MIN_V2_SEGMENT_BYTES
+        let frame_bytes = (chronicle_wal::MIN_SEGMENT_BYTES
             - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap())
             / 2
             + 1;
@@ -3397,7 +3507,7 @@ mod tests {
     fn ingest_missing_timestamp_uses_only_last_persisted_clock_as_metadata_fallback() {
         let directory = ingest_directory("limit-missing-time");
         let mut ingest = ingest(&directory);
-        let frame_bytes = (chronicle_wal::MIN_V2_SEGMENT_BYTES
+        let frame_bytes = (chronicle_wal::MIN_SEGMENT_BYTES
             - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap())
             / 2
             + 1;
@@ -3430,7 +3540,7 @@ mod tests {
     fn ingest_uses_metadata_only_when_terminal_frame_cannot_fit() {
         let directory = ingest_directory("limit-no-terminal-room");
         let mut ingest = ingest(&directory);
-        let frame_bytes = chronicle_wal::MIN_V2_SEGMENT_BYTES
+        let frame_bytes = chronicle_wal::MIN_SEGMENT_BYTES
             - u64::try_from(chronicle_wal::SEGMENT_HEADER_LEN).unwrap()
             - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap();
         let payload_bytes = usize::try_from(
@@ -3466,7 +3576,7 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().metadata().unwrap().len())
             .sum();
-        assert_eq!(physical_bytes, chronicle_wal::MIN_V2_SEGMENT_BYTES);
+        assert_eq!(physical_bytes, chronicle_wal::MIN_SEGMENT_BYTES);
         drop(ingest);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -3475,7 +3585,7 @@ mod tests {
     fn ingest_terminal_sync_failure_does_not_claim_terminal_persistence() {
         let directory = ingest_directory("limit-terminal-sync-failure");
         let mut ingest = ingest(&directory);
-        let frame_bytes = (chronicle_wal::MIN_V2_SEGMENT_BYTES
+        let frame_bytes = (chronicle_wal::MIN_SEGMENT_BYTES
             - u64::try_from(chronicle_wal::COMMIT_MARKER_FRAME_LEN).unwrap())
             / 2
             + 1;
@@ -3591,7 +3701,7 @@ mod tests {
 
         let inspected = inspect_session(&root, recorded.session_id).unwrap();
         assert!(inspected.complete);
-        assert!(inspected.replayable);
+        assert!(inspected.replayable, "{:?}", inspected.blockers);
         assert!(inspected.blockers.is_empty());
         assert_eq!(inspected.connections[0].operations.len(), 1);
         std::fs::remove_dir_all(root).unwrap();
@@ -3740,87 +3850,46 @@ mod tests {
 
     #[test]
     fn capture_source_is_written_and_read_back_through_wal() {
-        use chronicle_capture::{
-            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureFlags, InMemoryCaptureSource,
-        };
-        use chronicle_common::{ConnectionKey, Direction, Endpoint, TransportProtocol};
-        use chronicle_wal::{ReadOutcome, WalReader, segment_file_name};
-        use std::fs::File;
+        use chronicle_capture::InMemoryCaptureSource;
+        use chronicle_wal::{DEFAULT_MAX_RECORD_BYTES, scan_wal};
 
         let directory =
             std::env::temp_dir().join(format!("chronicle-app-wal-{}", uuid::Uuid::new_v4()));
-        let event = CaptureEvent::V1(chronicle_capture::CaptureEventV1 {
-            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-            monotonic_sequence: 1,
-            wall_time: None,
-            connection: ConnectionKey::new(
-                Endpoint::new("fixture-client", 41000),
-                Endpoint::new("recorded.invalid", 8080),
-                TransportProtocol::Tcp,
-            ),
-            direction: Direction::ClientToServer,
-            payload: b"fixture".to_vec(),
-            process: None,
-            container: None,
-            file_descriptor: Some(7),
-            truncated: false,
-            flags: CaptureFlags::default(),
-        });
-        let mut source = InMemoryCaptureSource::new([event]);
-        let recorded = write_capture_to_wal(&mut source, &directory, 1024).unwrap();
-        assert_eq!(recorded.record_count, 1);
+        let mut source = InMemoryCaptureSource::new(test_capture_events(b"fixture".to_vec()));
+        let recorded = write_capture_to_wal(&mut source, &directory, 2048).unwrap();
+        assert_eq!(recorded.record_count, 2);
         assert_eq!(recorded.first_sequence, Some(1));
 
-        let mut reader =
-            WalReader::new(File::open(directory.join(segment_file_name(1))).unwrap(), 1);
-        assert!(
-            matches!(reader.next_record().unwrap(), ReadOutcome::Record(record) if record.sequence == 1)
-        );
+        let scan = scan_wal(&directory, recorded.recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        assert_eq!(scan.committed[0].sequence, 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn corrupt_wal_prevents_processing_before_session_publication() {
-        use chronicle_capture::{
-            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureFlags, InMemoryCaptureSource,
-        };
-        use chronicle_common::{ConnectionKey, Direction, Endpoint, SessionId, TransportProtocol};
+        use chronicle_capture::InMemoryCaptureSource;
+        use chronicle_common::SessionId;
         use chronicle_wal::segment_file_name;
 
         let root =
             std::env::temp_dir().join(format!("chronicle-app-corrupt-{}", uuid::Uuid::new_v4()));
         let wal_directory = root.join("wal");
-        let event = CaptureEvent::V1(chronicle_capture::CaptureEventV1 {
-            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-            monotonic_sequence: 1,
-            wall_time: None,
-            connection: ConnectionKey::new(
-                Endpoint::new("fixture-client", 41000),
-                Endpoint::new("recorded.invalid", 8080),
-                TransportProtocol::Tcp,
-            ),
-            direction: Direction::ClientToServer,
-            payload: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
-            process: None,
-            container: None,
-            file_descriptor: None,
-            truncated: false,
-            flags: CaptureFlags::default(),
-        });
-        write_capture_to_wal(
-            &mut InMemoryCaptureSource::new([event]),
+        let recorded = write_capture_to_wal(
+            &mut InMemoryCaptureSource::new(test_capture_events(
+                b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            )),
             &wal_directory,
-            1024,
+            2048,
         )
         .unwrap();
-        let segment = wal_directory.join(segment_file_name(1));
+        let segment = wal_directory.join("segments").join(segment_file_name(1));
         let mut bytes = std::fs::read(&segment).unwrap();
         *bytes.last_mut().unwrap() ^= 1;
         std::fs::write(&segment, bytes).unwrap();
         assert!(
-            process_single_wal(
-                segment,
-                1,
+            process_fixture_wal(
+                &wal_directory,
+                recorded.recording_id,
                 &chronicle_protocol_builtins::registry().unwrap(),
                 SessionId::new(),
             )
@@ -3832,80 +3901,39 @@ mod tests {
 
     #[test]
     fn oversized_capture_is_rejected_before_wal_directory_creation() {
-        use chronicle_capture::{
-            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureFlags, InMemoryCaptureSource,
-        };
-        use chronicle_common::{ConnectionKey, Direction, Endpoint, TransportProtocol};
+        use chronicle_capture::InMemoryCaptureSource;
 
         let directory =
             std::env::temp_dir().join(format!("chronicle-app-wal-limit-{}", uuid::Uuid::new_v4()));
-        let event = CaptureEvent::V1(chronicle_capture::CaptureEventV1 {
-            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-            monotonic_sequence: 1,
-            wall_time: None,
-            connection: ConnectionKey::new(
-                Endpoint::new("fixture-client", 41000),
-                Endpoint::new("recorded.invalid", 8080),
-                TransportProtocol::Tcp,
-            ),
-            direction: Direction::ClientToServer,
-            payload: vec![0; 128],
-            process: None,
-            container: None,
-            file_descriptor: None,
-            truncated: false,
-            flags: CaptureFlags::default(),
-        });
-        let mut source = InMemoryCaptureSource::new([event]);
+        let mut source = InMemoryCaptureSource::new(test_capture_events(vec![0; 128]));
         let error = write_capture_to_wal(&mut source, &directory, 64).unwrap_err();
         assert!(matches!(error, ApplicationError::FixtureWalTooLarge { .. }));
         assert!(!directory.exists());
     }
 
     #[test]
-    fn single_wal_process_returns_checkpoint_after_last_valid_record() {
-        use chronicle_capture::{
-            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureFlags, InMemoryCaptureSource,
-        };
-        use chronicle_common::{ConnectionKey, Direction, Endpoint, SessionId, TransportProtocol};
-        use chronicle_wal::segment_file_name;
-
+    fn fixture_wal_process_returns_checkpoint_after_commit_marker() {
+        use chronicle_capture::InMemoryCaptureSource;
+        use chronicle_common::SessionId;
         let directory =
             std::env::temp_dir().join(format!("chronicle-app-etl-{}", uuid::Uuid::new_v4()));
-        let event = CaptureEvent::V1(chronicle_capture::CaptureEventV1 {
-            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-            monotonic_sequence: 1,
-            wall_time: None,
-            connection: ConnectionKey::new(
-                Endpoint::new("fixture-client", 41000),
-                Endpoint::new("recorded.invalid", 8080),
-                TransportProtocol::Tcp,
-            ),
-            direction: Direction::ClientToServer,
-            payload: b"FAKE request".to_vec(),
-            process: None,
-            container: None,
-            file_descriptor: None,
-            truncated: false,
-            flags: CaptureFlags::default(),
-        });
-        let mut source = InMemoryCaptureSource::new([event]);
-        write_capture_to_wal(&mut source, &directory, 1024).unwrap();
-        let (output, checkpoint) = process_single_wal(
-            directory.join(segment_file_name(1)),
-            1,
+        let mut source = InMemoryCaptureSource::new(test_capture_events(b"FAKE request".to_vec()));
+        let recorded = write_capture_to_wal(&mut source, &directory, 2048).unwrap();
+        let (output, checkpoint) = process_fixture_wal(
+            &directory,
+            recorded.recording_id,
             &chronicle_protocol_builtins::registry().unwrap(),
             SessionId::new(),
         )
         .unwrap();
-        assert_eq!(checkpoint.next_sequence, 2);
+        assert_eq!(checkpoint.next_sequence, 4);
         assert_eq!(output.session.connections.len(), 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    fn recording_metadata(status: RecordingStatus) -> RecordingMetadataV1 {
-        RecordingMetadataV1 {
-            version: RECORDING_METADATA_SCHEMA_V1,
+    fn recording_metadata(status: RecordingStatus) -> RecordingMetadata {
+        RecordingMetadata {
+            version: RECORDING_METADATA_SCHEMA_VERSION,
             recording_id: RecordingId::new(),
             selector: Some(RecordingSelectorIdentity {
                 canonical_cgroup_path: "/sys/fs/cgroup/workload".into(),
@@ -3920,9 +3948,9 @@ mod tests {
         }
     }
 
-    fn capture_metadata() -> RecordingCaptureMetadataV1 {
-        RecordingCaptureMetadataV1 {
-            version: RECORDING_CAPTURE_METADATA_SCHEMA_V1,
+    fn capture_metadata() -> RecordingCaptureMetadata {
+        RecordingCaptureMetadata {
+            version: RECORDING_CAPTURE_METADATA_SCHEMA_VERSION,
             build: RecordingBuildIdentity {
                 chronicle_version: "0.1.0".into(),
                 aya_version: "0.14.0".into(),
@@ -3963,31 +3991,12 @@ mod tests {
 
     #[test]
     fn production_recording_persists_starting_before_source_and_finalizes_committed_prefix() {
-        use chronicle_capture::{
-            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEventV1, CaptureFlags, InMemoryCaptureSource,
-        };
-        use chronicle_common::{ConnectionKey, Direction, Endpoint, TransportProtocol};
+        use chronicle_capture::InMemoryCaptureSource;
         use std::cell::Cell;
 
         let directory = ingest_directory("production-lifecycle");
         let mut metadata = recording_metadata(RecordingStatus::Starting);
-        let event = CaptureEvent::V1(CaptureEventV1 {
-            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-            monotonic_sequence: 1,
-            wall_time: None,
-            connection: ConnectionKey::new(
-                Endpoint::new("client", 1234),
-                Endpoint::new("server", 8080),
-                TransportProtocol::Tcp,
-            ),
-            direction: Direction::ClientToServer,
-            payload: b"payload".to_vec(),
-            process: None,
-            container: None,
-            file_descriptor: None,
-            truncated: false,
-            flags: CaptureFlags::default(),
-        });
+        let events = test_capture_events(b"payload".to_vec());
         let stop_checks = Cell::new(0_u8);
         let result = record_production(
             &directory,
@@ -3995,13 +4004,13 @@ mod tests {
             capture_metadata(),
             ProductionRecordingBounds {
                 duration_seconds: 60,
-                segment_bytes: MIN_V2_SEGMENT_BYTES,
-                max_wal_bytes: MIN_V2_SEGMENT_BYTES,
+                segment_bytes: MIN_SEGMENT_BYTES,
+                max_wal_bytes: MIN_SEGMENT_BYTES,
             },
             || {
                 let persisted = load_recording_metadata(&directory).unwrap().unwrap();
                 assert_eq!(persisted.status, RecordingStatus::Starting);
-                Ok(InMemoryCaptureSource::new([event]))
+                Ok(InMemoryCaptureSource::new(events))
             },
             || 1,
             || {
@@ -4014,44 +4023,26 @@ mod tests {
 
         assert_eq!(result.status, RecordingStatus::Completed);
         assert_eq!(result.shutdown_reason, ShutdownReason::SourceCompleted);
-        assert_eq!(result.counters.committed.records, 1);
+        assert_eq!(result.counters.committed.records, 2);
         assert!(result.last_valid_commit.is_some());
         let persisted = load_recording_metadata(&directory).unwrap().unwrap();
         assert_eq!(persisted.status, RecordingStatus::Completed);
         assert!(persisted.last_valid_commit.is_some());
-        assert_eq!(persisted.counters.committed.records, 1);
+        assert_eq!(persisted.counters.committed.records, 2);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     #[allow(clippy::too_many_lines)] // Lifecycle variants share one recovered WAL fixture.
     fn recording_scoped_etl_preserves_finalized_source_provenance() {
-        use chronicle_capture::{
-            CAPTURE_EVENT_SCHEMA_VERSION, CaptureEventV1, CaptureFlags, InMemoryCaptureSource,
-        };
-        use chronicle_common::{ConnectionKey, Direction, Endpoint, SessionId, TransportProtocol};
+        use chronicle_capture::InMemoryCaptureSource;
+        use chronicle_common::SessionId;
         use std::cell::Cell;
 
         let directory = ingest_directory("recording-etl");
         let mut metadata = recording_metadata(RecordingStatus::Starting);
         metadata.recording_id = RecordingId(uuid::Uuid::from_u128(1));
-        let event = CaptureEvent::V1(CaptureEventV1 {
-            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-            monotonic_sequence: 1,
-            wall_time: None,
-            connection: ConnectionKey::new(
-                Endpoint::new("client", 1234),
-                Endpoint::new("server", 8080),
-                TransportProtocol::Tcp,
-            ),
-            direction: Direction::ClientToServer,
-            payload: b"opaque".to_vec(),
-            process: None,
-            container: None,
-            file_descriptor: None,
-            truncated: false,
-            flags: CaptureFlags::default(),
-        });
+        let events = test_capture_events(b"opaque".to_vec());
         let stop_checks = Cell::new(0_u8);
         let recorded = record_production(
             &directory,
@@ -4059,10 +4050,10 @@ mod tests {
             capture_metadata(),
             ProductionRecordingBounds {
                 duration_seconds: 60,
-                segment_bytes: MIN_V2_SEGMENT_BYTES,
-                max_wal_bytes: MIN_V2_SEGMENT_BYTES,
+                segment_bytes: MIN_SEGMENT_BYTES,
+                max_wal_bytes: MIN_SEGMENT_BYTES,
             },
-            || Ok(InMemoryCaptureSource::new([event])),
+            || Ok(InMemoryCaptureSource::new(events)),
             || 1,
             || {
                 let checks = stop_checks.get();
@@ -4084,7 +4075,7 @@ mod tests {
             .open(
                 directory
                     .join("segments")
-                    .join(chronicle_wal::v2_segment_file_name(1)),
+                    .join(chronicle_wal::segment_file_name(1)),
             )
             .unwrap()
             .write_all(&chronicle_wal::encode_envelope(&suffix).unwrap())
@@ -4116,18 +4107,18 @@ mod tests {
             processed.output.session.source_provenance.evidence,
             [
                 ProvenanceEntry {
-                    kind: ProvenanceKind::Connection,
-                    sequence_range: Some((1, 1)),
+                    kind: ProvenanceKind::WalEnvelope,
+                    sequence_range: Some((1, 3)),
                     reason: None,
                 },
                 ProvenanceEntry {
-                    kind: ProvenanceKind::WalEnvelope,
-                    sequence_range: Some((1, 2)),
+                    kind: ProvenanceKind::Connection,
+                    sequence_range: Some((2, 2)),
                     reason: None,
                 },
                 ProvenanceEntry {
                     kind: ProvenanceKind::CommitMarker,
-                    sequence_range: Some((2, 2)),
+                    sequence_range: Some((3, 3)),
                     reason: None,
                 },
             ]
@@ -4159,7 +4150,7 @@ mod tests {
         let checkpoint_path = directory.join("etl-checkpoint.json");
         let first_checkpoint = load_recording_etl_checkpoint(&directory).unwrap().unwrap();
         assert_eq!(first_checkpoint.session_id, first.session_id);
-        assert_eq!(first_checkpoint.commit_marker_sequence, 2);
+        assert_eq!(first_checkpoint.commit_marker_sequence, 3);
         assert_eq!(first_checkpoint.status, RecordingStatus::Completed);
         std::fs::remove_file(&checkpoint_path).unwrap();
         let same_root = process_and_publish_recording_wal(
@@ -4242,7 +4233,7 @@ mod tests {
         }
         let segment = directory
             .join("segments")
-            .join(chronicle_wal::v2_segment_file_name(1));
+            .join(chronicle_wal::segment_file_name(1));
         let mut bytes = std::fs::read(&segment).unwrap();
         bytes[64] ^= 0xff; // First committed envelope magic; never accepted as a recoverable tail.
         std::fs::write(&segment, bytes).unwrap();
@@ -4362,8 +4353,8 @@ mod tests {
             capture_metadata(),
             ProductionRecordingBounds {
                 duration_seconds: 60,
-                segment_bytes: MIN_V2_SEGMENT_BYTES,
-                max_wal_bytes: MIN_V2_SEGMENT_BYTES,
+                segment_bytes: MIN_SEGMENT_BYTES,
+                max_wal_bytes: MIN_SEGMENT_BYTES,
             },
             {
                 let finalized = Arc::clone(&finalized);
@@ -4438,7 +4429,7 @@ mod tests {
             ProductionRecordingBounds::default(),
             ProductionRecordingBounds {
                 duration_seconds: DEFAULT_RECORDING_DURATION_SECONDS,
-                segment_bytes: DEFAULT_V2_SEGMENT_BYTES,
+                segment_bytes: DEFAULT_SEGMENT_BYTES,
                 max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
             }
         );
@@ -4452,11 +4443,11 @@ mod tests {
                 ..ProductionRecordingBounds::default()
             },
             ProductionRecordingBounds {
-                segment_bytes: MIN_V2_SEGMENT_BYTES - 1,
+                segment_bytes: MIN_SEGMENT_BYTES - 1,
                 ..ProductionRecordingBounds::default()
             },
             ProductionRecordingBounds {
-                max_wal_bytes: MIN_V2_SEGMENT_BYTES - 1,
+                max_wal_bytes: MIN_SEGMENT_BYTES - 1,
                 ..ProductionRecordingBounds::default()
             },
         ] {
@@ -4490,8 +4481,8 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Full metadata-lag and mismatch flow stays auditable together.
     fn recovery_reconciles_wal_authority_without_acknowledgement_claim() {
         use chronicle_wal::{
-            GroupCommitWalWriter, MIN_V2_SEGMENT_BYTES, WalRecordEnvelope, encode_envelope,
-            scan_v2_wal, v2_segment_file_name,
+            GroupCommitWalWriter, MIN_SEGMENT_BYTES, WalRecordEnvelope, encode_envelope, scan_wal,
+            segment_file_name,
         };
 
         let wal_directory =
@@ -4502,7 +4493,7 @@ mod tests {
             cgroup_id: 42,
         };
         let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
@@ -4519,7 +4510,7 @@ mod tests {
         );
         OpenOptions::new()
             .append(true)
-            .open(wal_directory.join("segments").join(v2_segment_file_name(1)))
+            .open(wal_directory.join("segments").join(segment_file_name(1)))
             .unwrap()
             .write_all(&encode_envelope(&uncertain).unwrap())
             .unwrap();
@@ -4533,7 +4524,7 @@ mod tests {
         };
         write_recording_metadata(&wal_directory, &metadata).unwrap();
         let before_read_only_scan = fs::read(wal_directory.join("recording.json")).unwrap();
-        let scan = scan_v2_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        let scan = scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(scan.uncommitted.len(), 1);
         assert_eq!(
             fs::read(wal_directory.join("recording.json")).unwrap(),
@@ -4742,21 +4733,21 @@ mod tests {
     #[test]
     fn recovery_transaction_reports_before_discard_and_hands_off_lock() {
         use chronicle_wal::{
-            MIN_V2_SEGMENT_BYTES, WalRecordEnvelope, encode_envelope, v2_segment_file_name,
+            MIN_SEGMENT_BYTES, WalRecordEnvelope, encode_envelope, segment_file_name,
         };
 
         let wal_directory =
             std::env::temp_dir().join(format!("chronicle-recover-{}", uuid::Uuid::new_v4()));
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
             .unwrap();
         writer.flush(1).unwrap();
         drop(writer);
-        let segment_path = wal_directory.join("segments").join(v2_segment_file_name(1));
+        let segment_path = wal_directory.join("segments").join(segment_file_name(1));
         let uncertain = WalRecordEnvelope::unplaced(
             recording_id,
             3,
@@ -4779,8 +4770,8 @@ mod tests {
             &wal_directory,
             recording_id,
             None,
-            MIN_V2_SEGMENT_BYTES,
-            MIN_V2_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
             1,
         )
         .unwrap();
@@ -4810,20 +4801,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn corruption_failure_report_is_specific_body_safe_and_non_destructive() {
-        use chronicle_wal::{MIN_V2_SEGMENT_BYTES, SEGMENT_HEADER_LEN, v2_segment_file_name};
+        use chronicle_wal::{MIN_SEGMENT_BYTES, SEGMENT_HEADER_LEN, segment_file_name};
 
         let wal_directory =
             std::env::temp_dir().join(format!("chronicle-corrupt-{}", uuid::Uuid::new_v4()));
         let recording_id = RecordingId::new();
         let mut writer =
-            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_V2_SEGMENT_BYTES, 1, 0)
+            GroupCommitWalWriter::create(&wal_directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
                 .unwrap();
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"secret-body".to_vec(), 0)
             .unwrap();
         writer.flush(1).unwrap();
         drop(writer);
-        let segment_path = wal_directory.join("segments").join(v2_segment_file_name(1));
+        let segment_path = wal_directory.join("segments").join(segment_file_name(1));
         let mut corrupted = fs::read(&segment_path).unwrap();
         corrupted[SEGMENT_HEADER_LEN + chronicle_wal::ENVELOPE_HEADER_LEN] ^= 0xff;
         fs::write(&segment_path, &corrupted).unwrap();
@@ -4833,8 +4824,8 @@ mod tests {
                 &wal_directory,
                 recording_id,
                 None,
-                MIN_V2_SEGMENT_BYTES,
-                MIN_V2_SEGMENT_BYTES,
+                MIN_SEGMENT_BYTES,
+                MIN_SEGMENT_BYTES,
                 1,
             ),
             Err(ApplicationError::Wal(WalError::EnvelopeChecksum { .. }))
@@ -4890,7 +4881,7 @@ mod tests {
 
         let bytes = fs::read(directory.join("recording.json")).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        for version in [0, RECORDING_METADATA_SCHEMA_V1 + 1] {
+        for version in [0, RECORDING_METADATA_SCHEMA_VERSION + 1] {
             let mut invalid = value.clone();
             invalid["version"] = version.into();
             assert!(matches!(

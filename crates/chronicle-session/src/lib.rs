@@ -1,12 +1,12 @@
 //! Bounded reconstruction of ordered bidirectional socket byte streams.
 
 use chronicle_capture::{
-    CAPTURE_EVENT_SCHEMA_VERSION, CAPTURE_EVENT_V2_SCHEMA_VERSION, CaptureEvent, CaptureEventKind,
-    CaptureEventV1, ClockIdentity, FragmentSequenceEvidence, LossWindowObserved,
-    MonotonicTimestamp, PayloadDirection, PayloadFragment, RecordingScopeIdentity, SocketEvidence,
-    SocketIdentity, SocketStateChangeObserved, TruncationMetadata, V2FixtureObservation,
+    CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureEventKind, CaptureFlags,
+    FragmentSequenceEvidence, LossWindowObserved, MonotonicTimestamp, PayloadDirection,
+    PayloadFragment, RecordingScopeIdentity, SocketConnectIntent, SocketEvidence, SocketIdentity,
+    SocketRole, SocketStateChangeObserved, TruncationMetadata, TruncationState,
 };
-use chronicle_common::{ConnectionKey, Direction};
+use chronicle_common::{ConnectionKey, Direction, Timestamp, TransportProtocol};
 use chronicle_wal::TerminalWalLoss;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -29,9 +29,19 @@ impl Default for SessionLimits {
 }
 
 #[derive(Clone, Debug)]
+pub struct CaptureChunk {
+    pub monotonic_sequence: u64,
+    pub wall_time: Option<Timestamp>,
+    pub direction: Direction,
+    pub payload: Vec<u8>,
+    pub truncated: bool,
+    pub flags: CaptureFlags,
+}
+
+#[derive(Clone, Debug)]
 pub struct ConnectionStream {
     pub key: ConnectionKey,
-    pub chunks: Vec<CaptureEventV1>,
+    pub chunks: Vec<CaptureChunk>,
     pub total_bytes: usize,
     pub truncated: bool,
 }
@@ -52,6 +62,10 @@ pub enum SessionError {
     UnsupportedCaptureEvent { schema_version: u16 },
     #[error("connection chunk limit {limit} exceeded")]
     ChunkLimit { limit: usize },
+    #[error("payload references socket without complete endpoint evidence")]
+    MissingSocketEvidence,
+    #[error("socket identity has conflicting endpoint evidence")]
+    ConflictingSocketEvidence,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -105,9 +119,11 @@ pub struct ReconstructionEvent {
     pub wal_sequence: Option<u64>,
     pub timestamp: ReconstructionTimestamp,
     pub recording_scope: Option<RecordingScopeIdentity>,
+    pub socket_evidence: Option<SocketEvidence>,
     pub evidence: ReconstructionEvidence,
 }
 
+#[allow(clippy::large_enum_variant)] // Event retains complete endpoint provenance; input is not queue-stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReconstructionInput {
     Event(ReconstructionEvent),
@@ -196,8 +212,8 @@ pub struct TcpOverlap {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolNeutralConnection {
     pub identity: ReconstructionConnectionIdentity,
-    pub ingress: TcpPayloadOrdering,
-    pub egress: TcpPayloadOrdering,
+    pub client_to_server: TcpPayloadOrdering,
+    pub server_to_client: TcpPayloadOrdering,
     /// `None` means directions have incomparable clocks or missing completion evidence.
     pub cross_direction_completion: Option<Vec<DirectionCompletion>>,
     pub termination: DerivedTermination,
@@ -215,11 +231,29 @@ pub struct DirectionCompletion {
 
 impl ReconstructionConnection {
     pub fn protocol_neutral(&self) -> ProtocolNeutralConnection {
-        let ingress = self.ordered_payloads(ReconstructionDirection::Ingress);
-        let egress = self.ordered_payloads(ReconstructionDirection::Egress);
+        let role = self
+            .events
+            .iter()
+            .find_map(|event| event.socket_evidence.as_ref().map(|evidence| evidence.role));
+        let (client_direction, server_direction) = match (&self.identity, role) {
+            (ReconstructionConnectionIdentity::Socket(_), Some(SocketRole::Passive)) => (
+                ReconstructionDirection::Ingress,
+                ReconstructionDirection::Egress,
+            ),
+            (ReconstructionConnectionIdentity::Socket(_), _) => (
+                ReconstructionDirection::Egress,
+                ReconstructionDirection::Ingress,
+            ),
+            (ReconstructionConnectionIdentity::Fixture(_), _) => (
+                ReconstructionDirection::ClientToServer,
+                ReconstructionDirection::ServerToClient,
+            ),
+        };
+        let client_to_server = self.ordered_payloads(client_direction);
+        let server_to_client = self.ordered_payloads(server_direction);
         let completions = [
-            (ReconstructionDirection::Ingress, ingress.fragments.last()),
-            (ReconstructionDirection::Egress, egress.fragments.last()),
+            (client_direction, client_to_server.fragments.last()),
+            (server_direction, server_to_client.fragments.last()),
         ];
         let mut completion: Vec<_> = completions
             .into_iter()
@@ -252,8 +286,8 @@ impl ReconstructionConnection {
         });
         ProtocolNeutralConnection {
             identity: self.identity.clone(),
-            ingress,
-            egress,
+            client_to_server,
+            server_to_client,
             cross_direction_completion,
             termination: self.termination,
             loss_windows: self.loss_windows.clone(),
@@ -607,6 +641,7 @@ impl ReconstructionAssembler {
                 wal_sequence: event.wal_sequence,
                 timestamp: event.timestamp.clone(),
                 recording_scope: event.recording_scope.clone(),
+                socket_evidence: None,
                 evidence: ReconstructionEvidence::Lifecycle(RawLifecycleEvidence::MissingOpen),
             });
         }
@@ -703,77 +738,18 @@ pub enum ReconstructionInputError {
 
 impl ReconstructionInput {
     pub fn from_capture_event(event: CaptureEvent) -> Result<Self, ReconstructionInputError> {
-        match event {
-            CaptureEvent::V1(event) if event.schema_version == CAPTURE_EVENT_SCHEMA_VERSION => {
-                Ok(Self::Event(fixture_input(event)))
-            }
-            CaptureEvent::V2(event) if event.schema_version == CAPTURE_EVENT_V2_SCHEMA_VERSION => {
-                Ok(v2_input(event.kind))
-            }
-            event => Err(ReconstructionInputError::UnsupportedCaptureSchema(
-                event.schema_version(),
-            )),
+        if event.schema_version != CAPTURE_EVENT_SCHEMA_VERSION {
+            return Err(ReconstructionInputError::UnsupportedCaptureSchema(
+                event.schema_version,
+            ));
         }
-    }
-
-    pub fn from_v2_fixture_observation(
-        observation: V2FixtureObservation,
-    ) -> Result<Self, ReconstructionInputError> {
-        match observation {
-            V2FixtureObservation::Event(event)
-                if event.schema_version == CAPTURE_EVENT_V2_SCHEMA_VERSION =>
-            {
-                Ok(v2_input(event.kind))
-            }
-            V2FixtureObservation::Event(event) => Err(
-                ReconstructionInputError::UnsupportedCaptureSchema(event.schema_version),
-            ),
-            V2FixtureObservation::LossWindow(window) => Ok(Self::LossWindow(window)),
-        }
+        Ok(capture_input(event.kind))
     }
 }
 
-fn fixture_input(event: CaptureEventV1) -> ReconstructionEvent {
-    let captured_length = u32::try_from(event.payload.len()).unwrap_or(u32::MAX);
-    ReconstructionEvent {
-        connection: ReconstructionConnectionIdentity::Fixture(event.connection),
-        wal_sequence: None,
-        timestamp: ReconstructionTimestamp {
-            monotonic: MonotonicTimestamp {
-                clock: ClockIdentity {
-                    boot_id: "fixture-v1".into(),
-                },
-                nanoseconds: event.monotonic_sequence,
-            },
-            fixture_derived: true,
-        },
-        recording_scope: None,
-        evidence: ReconstructionEvidence::Payload(ReconstructionPayload {
-            direction: match event.direction {
-                Direction::ClientToServer => ReconstructionDirection::ClientToServer,
-                Direction::ServerToClient => ReconstructionDirection::ServerToClient,
-            },
-            tcp_position: None,
-            bytes: event.payload,
-            truncation: TruncationMetadata {
-                captured_length,
-                observed_length: None,
-                state: if event.truncated {
-                    chronicle_capture::TruncationState::Truncated
-                } else {
-                    chronicle_capture::TruncationState::Complete
-                },
-                reason: None,
-            },
-        }),
-    }
-}
-
-fn v2_input(kind: CaptureEventKind) -> ReconstructionInput {
+fn capture_input(kind: CaptureEventKind) -> ReconstructionInput {
     match kind {
-        CaptureEventKind::SocketConnectObserved(evidence) => {
-            lifecycle_input(evidence, RawLifecycleEvidence::ConnectObserved)
-        }
+        CaptureEventKind::SocketConnectObserved(intent) => connect_intent_input(intent),
         CaptureEventKind::SocketConnected(evidence) => {
             lifecycle_input(evidence, RawLifecycleEvidence::Established)
         }
@@ -792,15 +768,27 @@ fn v2_input(kind: CaptureEventKind) -> ReconstructionInput {
     }
 }
 
+fn connect_intent_input(intent: SocketConnectIntent) -> ReconstructionInput {
+    ReconstructionInput::Event(ReconstructionEvent {
+        connection: ReconstructionConnectionIdentity::Socket(intent.socket),
+        wal_sequence: None,
+        timestamp: reconstruction_timestamp(intent.timestamp),
+        recording_scope: Some(intent.recording_scope),
+        socket_evidence: None,
+        evidence: ReconstructionEvidence::Lifecycle(RawLifecycleEvidence::ConnectObserved),
+    })
+}
+
 fn lifecycle_input(
     evidence: SocketEvidence,
     lifecycle: RawLifecycleEvidence,
 ) -> ReconstructionInput {
     ReconstructionInput::Event(ReconstructionEvent {
-        connection: ReconstructionConnectionIdentity::Socket(evidence.socket),
+        connection: ReconstructionConnectionIdentity::Socket(evidence.socket.clone()),
         wal_sequence: None,
-        timestamp: production_timestamp(evidence.timestamp),
-        recording_scope: Some(evidence.recording_scope),
+        timestamp: reconstruction_timestamp(evidence.timestamp.clone()),
+        recording_scope: Some(evidence.recording_scope.clone()),
+        socket_evidence: Some(evidence),
         evidence: ReconstructionEvidence::Lifecycle(lifecycle),
     })
 }
@@ -809,8 +797,9 @@ fn payload_input(fragment: PayloadFragment) -> ReconstructionInput {
     ReconstructionInput::Event(ReconstructionEvent {
         connection: ReconstructionConnectionIdentity::Socket(fragment.socket),
         wal_sequence: None,
-        timestamp: production_timestamp(fragment.timestamp),
+        timestamp: reconstruction_timestamp(fragment.timestamp),
         recording_scope: Some(fragment.recording_scope),
+        socket_evidence: None,
         evidence: ReconstructionEvidence::Payload(ReconstructionPayload {
             direction: match fragment.direction {
                 PayloadDirection::Ingress => ReconstructionDirection::Ingress,
@@ -823,15 +812,17 @@ fn payload_input(fragment: PayloadFragment) -> ReconstructionInput {
     })
 }
 
-fn production_timestamp(monotonic: MonotonicTimestamp) -> ReconstructionTimestamp {
+fn reconstruction_timestamp(monotonic: MonotonicTimestamp) -> ReconstructionTimestamp {
+    let fixture_derived = monotonic.clock.boot_id == "fixture-v1";
     ReconstructionTimestamp {
         monotonic,
-        fixture_derived: false,
+        fixture_derived,
     }
 }
 
 pub struct SessionAssembler {
     limits: SessionLimits,
+    sockets: BTreeMap<SocketIdentity, SocketEvidence>,
     streams: BTreeMap<ConnectionKey, ConnectionStream>,
 }
 
@@ -839,24 +830,54 @@ impl SessionAssembler {
     pub fn new(limits: SessionLimits) -> Self {
         Self {
             limits,
+            sockets: BTreeMap::new(),
             streams: BTreeMap::new(),
         }
     }
 
     pub fn push(&mut self, event: CaptureEvent) -> Result<(), SessionError> {
-        let event = match event {
-            CaptureEvent::V1(event) => event,
-            event @ CaptureEvent::V2(_) => {
-                return Err(SessionError::UnsupportedCaptureEvent {
-                    schema_version: event.schema_version(),
-                });
+        if event.schema_version != CAPTURE_EVENT_SCHEMA_VERSION {
+            return Err(SessionError::UnsupportedCaptureEvent {
+                schema_version: event.schema_version,
+            });
+        }
+        match event.kind {
+            CaptureEventKind::SocketConnected(evidence)
+            | CaptureEventKind::SocketClosedObserved(evidence)
+            | CaptureEventKind::SocketResetObserved(evidence) => self.cache_evidence(evidence),
+            CaptureEventKind::SocketStateChangedObserved(change) => {
+                self.cache_evidence(change.socket)
             }
-        };
+            CaptureEventKind::PayloadFragment(fragment) => self.push_payload(fragment),
+            CaptureEventKind::SocketConnectObserved(_)
+            | CaptureEventKind::LossWindowObserved(_) => Ok(()),
+        }
+    }
+
+    fn cache_evidence(&mut self, evidence: SocketEvidence) -> Result<(), SessionError> {
+        if let Some(existing) = self.sockets.get(&evidence.socket)
+            && (existing.network_family != evidence.network_family
+                || existing.local_endpoint != evidence.local_endpoint
+                || existing.remote_endpoint != evidence.remote_endpoint
+                || existing.role != evidence.role)
+        {
+            return Err(SessionError::ConflictingSocketEvidence);
+        }
+        self.sockets.insert(evidence.socket.clone(), evidence);
+        Ok(())
+    }
+
+    fn push_payload(&mut self, fragment: PayloadFragment) -> Result<(), SessionError> {
+        let evidence = self
+            .sockets
+            .get(&fragment.socket)
+            .ok_or(SessionError::MissingSocketEvidence)?;
+        let key = connection_key(evidence);
         let existing_bytes = self
             .streams
-            .get(&event.connection)
+            .get(&key)
             .map_or(0, |stream| stream.total_bytes);
-        let attempted = existing_bytes.saturating_add(event.payload.len());
+        let attempted = existing_bytes.saturating_add(fragment.payload.len());
         if attempted > self.limits.max_bytes_per_connection {
             return Err(SessionError::ByteLimit {
                 limit: self.limits.max_bytes_per_connection,
@@ -865,32 +886,44 @@ impl SessionAssembler {
         }
         let existing_chunks = self
             .streams
-            .get(&event.connection)
+            .get(&key)
             .map_or(0, |stream| stream.chunks.len());
         if existing_chunks >= self.limits.max_chunks_per_connection {
             return Err(SessionError::ChunkLimit {
                 limit: self.limits.max_chunks_per_connection,
             });
         }
-        if !self.streams.contains_key(&event.connection)
-            && self.streams.len() >= self.limits.max_connections
-        {
+        if !self.streams.contains_key(&key) && self.streams.len() >= self.limits.max_connections {
             return Err(SessionError::ConnectionLimit {
                 limit: self.limits.max_connections,
             });
         }
+        let direction = match (evidence.role, fragment.direction) {
+            (SocketRole::Active, PayloadDirection::Egress)
+            | (SocketRole::Passive, PayloadDirection::Ingress) => Direction::ClientToServer,
+            (SocketRole::Active, PayloadDirection::Ingress)
+            | (SocketRole::Passive, PayloadDirection::Egress) => Direction::ServerToClient,
+        };
+        let truncated = fragment.truncation.state != TruncationState::Complete;
         let stream = self
             .streams
-            .entry(event.connection.clone())
+            .entry(key.clone())
             .or_insert_with(|| ConnectionStream {
-                key: event.connection.clone(),
+                key,
                 chunks: Vec::new(),
                 total_bytes: 0,
                 truncated: false,
             });
         stream.total_bytes = attempted;
-        stream.truncated |= event.truncated;
-        stream.chunks.push(event);
+        stream.truncated |= truncated;
+        stream.chunks.push(CaptureChunk {
+            monotonic_sequence: fragment.timestamp.nanoseconds,
+            wall_time: None,
+            direction,
+            payload: fragment.payload,
+            truncated,
+            flags: fragment.flags,
+        });
         Ok(())
     }
 
@@ -904,46 +937,152 @@ impl SessionAssembler {
     }
 }
 
+fn connection_key(evidence: &SocketEvidence) -> ConnectionKey {
+    let (client, server) = match evidence.role {
+        SocketRole::Active => (
+            evidence.local_endpoint.clone(),
+            evidence.remote_endpoint.clone(),
+        ),
+        SocketRole::Passive => (
+            evidence.remote_endpoint.clone(),
+            evidence.local_endpoint.clone(),
+        ),
+    };
+    ConnectionKey {
+        network_namespace: evidence.socket.network_namespace,
+        client,
+        server,
+        transport: TransportProtocol::Tcp,
+    }
+}
+
 #[cfg(test)]
-#[allow(unused_must_use)] // Legacy success-path tests predate typed reconstruction push failures.
+#[allow(unused_must_use)] // Success-path tests omit typed push results.
 mod tests {
     use super::*;
-    use chronicle_capture::{CAPTURE_EVENT_SCHEMA_VERSION, CaptureEventV1, CaptureFlags};
-    use chronicle_common::{Direction, Endpoint, TransportProtocol};
+    use chronicle_capture::{
+        CAPTURE_EVENT_SCHEMA_VERSION, CaptureFlags, ClockIdentity, NetworkFamily,
+    };
+    use chronicle_common::{Direction, Endpoint};
 
     fn event(sequence: u64) -> CaptureEvent {
         event_for(sequence, "client", 1)
     }
 
+    fn fixture_socket(client: &str) -> SocketIdentity {
+        SocketIdentity {
+            socket_cookie: client.bytes().map(u64::from).sum::<u64>().max(1),
+            first_seen: MonotonicTimestamp {
+                clock: ClockIdentity {
+                    boot_id: "fixture-v1".into(),
+                },
+                nanoseconds: 1,
+            },
+            network_namespace: None,
+        }
+    }
+
     fn event_for(sequence: u64, client: &str, payload_bytes: usize) -> CaptureEvent {
-        CaptureEvent::V1(CaptureEventV1 {
+        let timestamp = MonotonicTimestamp {
+            clock: ClockIdentity {
+                boot_id: "fixture-v1".into(),
+            },
+            nanoseconds: sequence,
+        };
+        CaptureEvent {
             schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-            monotonic_sequence: sequence,
-            wall_time: None,
-            connection: ConnectionKey::new(
-                Endpoint::new(client, 10),
-                Endpoint::new("server", 20),
-                TransportProtocol::Tcp,
-            ),
-            direction: Direction::ClientToServer,
-            payload: vec![u8::try_from(sequence).unwrap(); payload_bytes],
+            kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+                timestamp: timestamp.clone(),
+                socket: fixture_socket(client),
+                recording_scope: RecordingScopeIdentity {
+                    cgroup_id: 0,
+                    canonical_path: client.into(),
+                    namespace: None,
+                },
+                network_family: NetworkFamily::Ipv4,
+                direction: PayloadDirection::Egress,
+                sequence: FragmentSequenceEvidence {
+                    tcp_sequence: u32::try_from(sequence).unwrap(),
+                    continuation_position: 0,
+                },
+                payload: vec![u8::try_from(sequence).unwrap(); payload_bytes],
+                truncation: TruncationMetadata {
+                    captured_length: u32::try_from(payload_bytes).unwrap(),
+                    observed_length: Some(u32::try_from(payload_bytes).unwrap()),
+                    state: TruncationState::Complete,
+                    reason: None,
+                },
+                flags: CaptureFlags::default(),
+            }),
+        }
+    }
+
+    fn fixture_evidence(client: &str) -> CaptureEvent {
+        let socket = fixture_socket(client);
+        CaptureEvent {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            kind: CaptureEventKind::SocketConnected(SocketEvidence {
+                timestamp: socket.first_seen.clone(),
+                socket,
+                recording_scope: RecordingScopeIdentity {
+                    cgroup_id: 0,
+                    canonical_path: client.into(),
+                    namespace: None,
+                },
+                network_family: NetworkFamily::Ipv4,
+                local_endpoint: Endpoint::new(client, 10),
+                remote_endpoint: Endpoint::new("server", 20),
+                role: SocketRole::Active,
+                process: None,
+                observed_cgroup_id: 0,
+            }),
+        }
+    }
+
+    fn push_fixture(
+        assembler: &mut SessionAssembler,
+        sequence: u64,
+        client: &str,
+        payload_bytes: usize,
+    ) -> Result<(), SessionError> {
+        assembler.push(fixture_evidence(client))?;
+        assembler.push(event_for(sequence, client, payload_bytes))
+    }
+
+    fn socket_evidence(role: SocketRole) -> SocketEvidence {
+        let timestamp = MonotonicTimestamp {
+            clock: ClockIdentity {
+                boot_id: "boot-a".into(),
+            },
+            nanoseconds: 12,
+        };
+        SocketEvidence {
+            timestamp: timestamp.clone(),
+            socket: SocketIdentity {
+                socket_cookie: 8,
+                first_seen: timestamp,
+                network_namespace: None,
+            },
+            recording_scope: RecordingScopeIdentity {
+                cgroup_id: 12,
+                canonical_path: "/scope".into(),
+                namespace: None,
+            },
+            network_family: NetworkFamily::Ipv4,
+            local_endpoint: Endpoint::new("192.0.2.10", 41_000),
+            remote_endpoint: Endpoint::new("192.0.2.20", 8_080),
+            role,
             process: None,
-            container: None,
-            file_descriptor: None,
-            truncated: false,
-            flags: CaptureFlags::default(),
-        })
+            observed_cgroup_id: 12,
+        }
     }
 
     #[test]
-    fn fixture_v1_adapts_to_fixture_derived_reconstruction_input() {
-        let fixture = event_for(7, "fixture-client", 2);
-        let CaptureEvent::V1(v1) = fixture.clone() else {
-            panic!("fixture event must be v1");
-        };
-        let input = ReconstructionInput::from_capture_event(fixture).unwrap();
+    fn fixture_capture_uses_same_socket_reconstruction_input() {
+        let input =
+            ReconstructionInput::from_capture_event(event_for(7, "fixture-client", 2)).unwrap();
         let ReconstructionInput::Event(ReconstructionEvent {
-            connection: ReconstructionConnectionIdentity::Fixture(connection),
+            connection: ReconstructionConnectionIdentity::Socket(socket),
             timestamp,
             recording_scope,
             evidence:
@@ -959,60 +1098,56 @@ mod tests {
             panic!("expected fixture reconstruction payload");
         };
 
-        assert_eq!(connection, v1.connection);
+        assert_ne!(socket.socket_cookie, 0);
         assert_eq!(timestamp.monotonic.clock.boot_id, "fixture-v1");
         assert_eq!(timestamp.monotonic.nanoseconds, 7);
         assert!(timestamp.fixture_derived);
-        assert_eq!(recording_scope, None);
-        assert_eq!(direction, ReconstructionDirection::ClientToServer);
-        assert_eq!(tcp_position, None);
-        assert_eq!(bytes, v1.payload);
+        assert_eq!(recording_scope.unwrap().canonical_path, "fixture-client");
+        assert_eq!(direction, ReconstructionDirection::Egress);
+        assert_eq!(tcp_position.unwrap().tcp_sequence, 7);
+        assert_eq!(bytes, [7, 7]);
         assert_eq!(truncation.captured_length, 2);
-        assert_eq!(
-            truncation.state,
-            chronicle_capture::TruncationState::Complete
-        );
+        assert_eq!(truncation.state, TruncationState::Complete);
     }
 
     #[test]
-    fn v2_payload_adapts_without_legacy_connection_or_wal_provenance() {
+    fn capture_payload_adapts_without_fixture_connection_or_wal_provenance() {
         let timestamp = MonotonicTimestamp {
             clock: ClockIdentity {
                 boot_id: "boot-a".into(),
             },
             nanoseconds: 11,
         };
-        let input = ReconstructionInput::from_capture_event(CaptureEvent::V2(
-            chronicle_capture::CaptureEventV2 {
-                schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
-                kind: CaptureEventKind::PayloadFragment(PayloadFragment {
-                    timestamp: timestamp.clone(),
-                    socket: SocketIdentity {
-                        socket_cookie: 7,
-                        first_seen: timestamp,
-                        network_namespace: Some(9),
-                    },
-                    recording_scope: RecordingScopeIdentity {
-                        cgroup_id: 11,
-                        canonical_path: "/scope".into(),
-                        namespace: Some(9),
-                    },
-                    network_family: chronicle_capture::NetworkFamily::Ipv6,
-                    direction: PayloadDirection::Egress,
-                    sequence: FragmentSequenceEvidence {
-                        tcp_sequence: 42,
-                        continuation_position: 1,
-                    },
-                    payload: vec![0, 255],
-                    truncation: TruncationMetadata {
-                        captured_length: 2,
-                        observed_length: Some(3),
-                        state: chronicle_capture::TruncationState::Truncated,
-                        reason: Some("capture bound".into()),
-                    },
-                }),
-            },
-        ))
+        let input = ReconstructionInput::from_capture_event(CaptureEvent {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+                timestamp: timestamp.clone(),
+                socket: SocketIdentity {
+                    socket_cookie: 7,
+                    first_seen: timestamp,
+                    network_namespace: Some(9),
+                },
+                recording_scope: RecordingScopeIdentity {
+                    cgroup_id: 11,
+                    canonical_path: "/scope".into(),
+                    namespace: Some(9),
+                },
+                network_family: chronicle_capture::NetworkFamily::Ipv6,
+                direction: PayloadDirection::Egress,
+                sequence: FragmentSequenceEvidence {
+                    tcp_sequence: 42,
+                    continuation_position: 1,
+                },
+                payload: vec![0, 255],
+                truncation: TruncationMetadata {
+                    captured_length: 2,
+                    observed_length: Some(3),
+                    state: chronicle_capture::TruncationState::Truncated,
+                    reason: Some("capture bound".into()),
+                },
+                flags: CaptureFlags::default(),
+            }),
+        })
         .unwrap();
         let ReconstructionInput::Event(event) = input else {
             panic!("expected production reconstruction payload");
@@ -1038,41 +1173,20 @@ mod tests {
     }
 
     #[test]
-    fn v2_lifecycle_adapts_as_raw_evidence() {
-        let timestamp = MonotonicTimestamp {
-            clock: ClockIdentity {
-                boot_id: "boot-a".into(),
-            },
-            nanoseconds: 12,
-        };
-        let input = ReconstructionInput::from_capture_event(CaptureEvent::V2(
-            chronicle_capture::CaptureEventV2 {
-                schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
-                kind: CaptureEventKind::SocketStateChangedObserved(SocketStateChangeObserved {
-                    socket: SocketEvidence {
-                        timestamp: timestamp.clone(),
-                        socket: SocketIdentity {
-                            socket_cookie: 8,
-                            first_seen: timestamp,
-                            network_namespace: None,
-                        },
-                        recording_scope: RecordingScopeIdentity {
-                            cgroup_id: 12,
-                            canonical_path: "/scope".into(),
-                            namespace: None,
-                        },
-                        network_family: chronicle_capture::NetworkFamily::Ipv4,
-                        process: None,
-                        observed_cgroup_id: 12,
-                    },
-                    raw_state: 99,
-                }),
-            },
-        ))
+    fn lifecycle_preserves_complete_socket_evidence() {
+        let evidence = socket_evidence(SocketRole::Passive);
+        let input = ReconstructionInput::from_capture_event(CaptureEvent {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            kind: CaptureEventKind::SocketStateChangedObserved(SocketStateChangeObserved {
+                socket: evidence.clone(),
+                raw_state: 99,
+            }),
+        })
         .unwrap();
         let ReconstructionInput::Event(event) = input else {
             panic!("expected lifecycle evidence");
         };
+        assert_eq!(event.socket_evidence, Some(evidence));
         assert_eq!(
             event.evidence,
             ReconstructionEvidence::Lifecycle(RawLifecycleEvidence::StateChanged { raw_state: 99 })
@@ -1080,7 +1194,61 @@ mod tests {
     }
 
     #[test]
-    fn v2_loss_window_stays_separate_reconstruction_input() {
+    fn same_egress_direction_maps_by_active_or_passive_role() {
+        for (role, expected_client_fragments, expected_server_fragments) in
+            [(SocketRole::Active, 1, 0), (SocketRole::Passive, 0, 1)]
+        {
+            let evidence = socket_evidence(role);
+            let payload = CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+                    timestamp: evidence.timestamp.clone(),
+                    socket: evidence.socket.clone(),
+                    recording_scope: evidence.recording_scope.clone(),
+                    network_family: evidence.network_family,
+                    direction: PayloadDirection::Egress,
+                    sequence: FragmentSequenceEvidence {
+                        tcp_sequence: 1,
+                        continuation_position: 0,
+                    },
+                    payload: vec![1],
+                    truncation: TruncationMetadata {
+                        captured_length: 1,
+                        observed_length: Some(1),
+                        state: TruncationState::Complete,
+                        reason: None,
+                    },
+                    flags: CaptureFlags::default(),
+                }),
+            };
+            let mut assembler = ReconstructionAssembler::default();
+            assembler
+                .push(
+                    ReconstructionInput::from_capture_event(CaptureEvent {
+                        schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                        kind: CaptureEventKind::SocketConnected(evidence),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            assembler
+                .push(ReconstructionInput::from_capture_event(payload).unwrap())
+                .unwrap();
+            let connection = assembler.finish().connections.pop().unwrap();
+            let neutral = connection.protocol_neutral();
+            assert_eq!(
+                neutral.client_to_server.fragments.len(),
+                expected_client_fragments
+            );
+            assert_eq!(
+                neutral.server_to_client.fragments.len(),
+                expected_server_fragments
+            );
+        }
+    }
+
+    #[test]
+    fn capture_loss_window_stays_separate_reconstruction_input() {
         let timestamp = MonotonicTimestamp {
             clock: ClockIdentity {
                 boot_id: "boot-a".into(),
@@ -1101,9 +1269,10 @@ mod tests {
                 reason: Some("between samples".into()),
             },
         };
-        let input = ReconstructionInput::from_v2_fixture_observation(
-            V2FixtureObservation::LossWindow(window.clone()),
-        )
+        let input = ReconstructionInput::from_capture_event(CaptureEvent {
+            schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+            kind: CaptureEventKind::LossWindowObserved(window.clone()),
+        })
         .unwrap();
         assert_eq!(input, ReconstructionInput::LossWindow(window));
     }
@@ -1111,12 +1280,10 @@ mod tests {
     #[test]
     fn reconstruction_input_rejects_unknown_capture_schema() {
         let mut event = event_for(1, "client", 1);
-        if let CaptureEvent::V1(event) = &mut event {
-            event.schema_version = CAPTURE_EVENT_V2_SCHEMA_VERSION + 1;
-        }
+        event.schema_version = 2;
         assert_eq!(
             ReconstructionInput::from_capture_event(event),
-            Err(ReconstructionInputError::UnsupportedCaptureSchema(3))
+            Err(ReconstructionInputError::UnsupportedCaptureSchema(2))
         );
     }
 
@@ -1142,6 +1309,7 @@ mod tests {
                 fixture_derived: false,
             },
             recording_scope: None,
+            socket_evidence: None,
             evidence: ReconstructionEvidence::Lifecycle(RawLifecycleEvidence::Established),
         })
     }
@@ -1156,10 +1324,10 @@ mod tests {
         assembler.push(ReconstructionInput::from_capture_event(event(1)).unwrap());
         let assembly = assembler.finish();
         assert_eq!(assembly.connections.len(), 4);
-        assert!(matches!(
-            assembly.connections[0].identity,
-            ReconstructionConnectionIdentity::Fixture(_)
-        ));
+        assert!(assembly.connections.iter().all(|connection| matches!(
+            connection.identity,
+            ReconstructionConnectionIdentity::Socket(_)
+        )));
         assert!(assembly.connections.iter().any(|connection| matches!(
             &connection.identity,
             ReconstructionConnectionIdentity::Socket(socket)
@@ -1556,8 +1724,8 @@ mod tests {
             .pop()
             .unwrap()
             .protocol_neutral();
-        assert_eq!(output.ingress.fragments.len(), 1);
-        assert_eq!(output.egress.fragments.len(), 1);
+        assert_eq!(output.client_to_server.fragments.len(), 1);
+        assert_eq!(output.server_to_client.fragments.len(), 1);
         assert_eq!(output.wal_sequence_range, Some((3, 7)));
         assert_eq!(
             output
@@ -1705,8 +1873,8 @@ mod tests {
     #[test]
     fn orders_chunks_by_monotonic_sequence() {
         let mut assembler = SessionAssembler::new(SessionLimits::default());
-        assembler.push(event(2)).unwrap();
-        assembler.push(event(1)).unwrap();
+        push_fixture(&mut assembler, 2, "client", 1).unwrap();
+        push_fixture(&mut assembler, 1, "client", 1).unwrap();
         let stream = assembler.finish().pop().unwrap();
         let sequences: Vec<_> = stream
             .chunks
@@ -1725,10 +1893,10 @@ mod tests {
         };
         let mut assembler = SessionAssembler::new(limits);
         assert!(matches!(
-            assembler.push(event_for(1, "oversized", 2)),
+            push_fixture(&mut assembler, 1, "oversized", 2),
             Err(SessionError::ByteLimit { .. })
         ));
-        assembler.push(event_for(2, "accepted", 1)).unwrap();
+        push_fixture(&mut assembler, 2, "accepted", 1).unwrap();
         let streams = assembler.finish();
         assert_eq!(streams.len(), 1);
         assert_eq!(streams[0].key.client.host, "accepted");
@@ -1742,13 +1910,13 @@ mod tests {
             max_chunks_per_connection: 2,
         };
         let mut assembler = SessionAssembler::new(limits);
-        assembler.push(event_for(1, "first", 1)).unwrap();
+        push_fixture(&mut assembler, 1, "first", 1).unwrap();
         assert!(matches!(
-            assembler.push(event_for(2, "first", 1)),
+            push_fixture(&mut assembler, 2, "first", 1),
             Err(SessionError::ByteLimit { .. })
         ));
         assert!(matches!(
-            assembler.push(event_for(3, "second", 1)),
+            push_fixture(&mut assembler, 3, "second", 1),
             Err(SessionError::ConnectionLimit { limit: 1 })
         ));
     }
@@ -1761,9 +1929,9 @@ mod tests {
             max_chunks_per_connection: 1,
         };
         let mut assembler = SessionAssembler::new(limits);
-        assembler.push(event_for(1, "first", 0)).unwrap();
+        push_fixture(&mut assembler, 1, "first", 0).unwrap();
         assert!(matches!(
-            assembler.push(event_for(2, "first", 0)),
+            push_fixture(&mut assembler, 2, "first", 0),
             Err(SessionError::ChunkLimit { limit: 1 })
         ));
     }
@@ -1772,12 +1940,13 @@ mod tests {
     fn preserves_direction_order_and_truncation() {
         let mut assembler = SessionAssembler::new(SessionLimits::default());
         let mut response = event_for(2, "client", 1);
-        if let CaptureEvent::V1(event) = &mut response {
-            event.direction = Direction::ServerToClient;
-            event.truncated = true;
+        if let CaptureEventKind::PayloadFragment(fragment) = &mut response.kind {
+            fragment.direction = PayloadDirection::Ingress;
+            fragment.truncation.state = TruncationState::Truncated;
         }
+        assembler.push(fixture_evidence("client")).unwrap();
         assembler.push(response).unwrap();
-        assembler.push(event_for(1, "client", 1)).unwrap();
+        push_fixture(&mut assembler, 1, "client", 1).unwrap();
 
         let stream = assembler.finish().pop().unwrap();
         assert_eq!(

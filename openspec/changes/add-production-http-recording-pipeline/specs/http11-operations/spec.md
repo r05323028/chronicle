@@ -125,7 +125,7 @@ Each decoded exchange SHALL become `CanonicalOperation` with protocol `http/1.1`
 - **THEN** operation offsets are deterministic relative to session start and cannot become negative
 
 ### Requirement: Canonical MVP schema
-Writer SHALL emit Canonical Session MVP v1 with backend-neutral Artifact payload refs, structured warnings, typed completeness, and typed recording/WAL provenance. Reader SHALL accept only `schema_version == 1` and reject every other value. Canonical v1 is evolving during MVP: append optional fields without a schema-version change. Canonical v2 is reserved for first stable-release breaking change in semantics, required fields, payload meaning, or replay behavior. `PayloadRef::Object` remains supported. WAL, protocol payload, and manifest versions remain independent.
+Writer SHALL emit sole mutable Canonical Session v1 with backend-neutral Artifact payload refs, structured warnings, typed completeness, endpoint evidence, and typed recording/WAL provenance. Reader SHALL accept only `schema_version == 1` and reject every other value. Rust model SHALL remain unversioned and SHALL NOT retain version dispatch or migration defaults before explicit compatibility freeze. `PayloadRef::Object` remains supported. WAL, protocol payload, and manifest remain separate mutable-v1 domains.
 
 `CanonicalSession` SHALL own source provenance, connection/operation completeness maps, and replay attributes directly. Completeness maps SHALL be authoritative; connection/operation flags SHALL not duplicate them. Timeline SHALL be sole authoritative operation order.
 

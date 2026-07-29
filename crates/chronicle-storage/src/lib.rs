@@ -18,9 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
-pub const MANIFEST_SCHEMA_V1: u8 = 1;
-pub const MANIFEST_SCHEMA_V2: u8 = 2;
-pub const MANIFEST_SCHEMA_VERSION: u8 = MANIFEST_SCHEMA_V1;
+pub const MANIFEST_SCHEMA_VERSION: u8 = 1;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -154,32 +152,8 @@ pub struct StoredSessionInspection {
     pub complete: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ManifestSchemaVersion {
-    V1 = MANIFEST_SCHEMA_V1,
-    V2 = MANIFEST_SCHEMA_V2,
-}
-
-impl TryFrom<u8> for ManifestSchemaVersion {
-    type Error = u8;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            MANIFEST_SCHEMA_V1 => Ok(Self::V1),
-            MANIFEST_SCHEMA_V2 => Ok(Self::V2),
-            other => Err(other),
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct ManifestDiscriminator {
-    version: u8,
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ManifestV1 {
+struct SessionManifest {
     version: u8,
     session_id: SessionId,
     canonical_schema_version: u16,
@@ -194,17 +168,16 @@ struct ManifestV1 {
     complete: bool,
 }
 
-fn decode_manifest(bytes: &[u8]) -> Result<ManifestV1, StorageError> {
-    let discriminator: ManifestDiscriminator = serde_json::from_slice(bytes)
+fn decode_manifest(bytes: &[u8]) -> Result<SessionManifest, StorageError> {
+    let manifest: SessionManifest = serde_json::from_slice(bytes)
         .map_err(|error| StorageError::Validation(error.to_string()))?;
-    match ManifestSchemaVersion::try_from(discriminator.version) {
-        Ok(ManifestSchemaVersion::V1) => serde_json::from_slice(bytes)
-            .map_err(|error| StorageError::Validation(error.to_string())),
-        Ok(ManifestSchemaVersion::V2) | Err(_) => Err(StorageError::Validation(format!(
+    if manifest.version != MANIFEST_SCHEMA_VERSION {
+        return Err(StorageError::Validation(format!(
             "unsupported session manifest version {}",
-            discriminator.version
-        ))),
+            manifest.version
+        )));
     }
+    Ok(manifest)
 }
 
 pub struct FilesystemSessionStore {
@@ -341,7 +314,7 @@ impl FilesystemSessionStore {
             serde_json::to_vec(&session).map_err(|e| StorageError::Backend(e.to_string()))?;
         let checksum = digest(&bytes);
         write_private_new(&directory.join("session.json"), &bytes)?;
-        let manifest = ManifestV1 {
+        let manifest = SessionManifest {
             version: MANIFEST_SCHEMA_VERSION,
             session_id: id,
             canonical_schema_version: session.schema_version,
@@ -513,7 +486,7 @@ impl FilesystemSessionStore {
     fn load_with_manifest(
         &self,
         id: SessionId,
-    ) -> Result<(CanonicalSession, ManifestV1), StorageError> {
+    ) -> Result<(CanonicalSession, SessionManifest), StorageError> {
         let directory = self.session_dir(id);
         let manifest = decode_manifest(
             &std::fs::read(directory.join("manifest.json"))
@@ -905,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_dispatch_preserves_v1_and_rejects_reserved_or_unknown_versions() {
+    fn manifest_accepts_only_current_v1_without_fallback() {
         let root = root();
         let store = FilesystemSessionStore::new(&root);
         let original = session(Vec::new());
@@ -922,10 +895,10 @@ mod tests {
         let manifest_path = store.session_dir(id).join("manifest.json");
         let original_bytes = std::fs::read(&manifest_path).unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&original_bytes).unwrap();
-        assert_eq!(manifest["version"], MANIFEST_SCHEMA_V1);
+        assert_eq!(manifest["version"], MANIFEST_SCHEMA_VERSION);
         assert!(store.load(id).is_ok());
 
-        for version in [0, MANIFEST_SCHEMA_V2, MANIFEST_SCHEMA_V2 + 1] {
+        for version in [0, MANIFEST_SCHEMA_VERSION + 1, u8::MAX] {
             let mut manifest = manifest.clone();
             manifest["version"] = version.into();
             std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();

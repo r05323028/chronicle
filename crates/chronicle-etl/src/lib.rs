@@ -5,26 +5,27 @@ pub use chronicle_protocol::ProtocolNeutralConnection;
 
 use chronicle_canonical::{
     Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalOperation,
-    CanonicalSession, Completeness, OperationEffect, OperationKind, PayloadRef, ProtocolData,
-    RelativeTimeNanos, ReplayMetadata, SourceMetadata, TimelineEntry,
+    CanonicalSession, Completeness, OperationEffect, OperationKind, PROTOCOL_DATA_SCHEMA_VERSION,
+    PayloadRef, ProtocolData, RelativeTimeNanos, ReplayMetadata, SourceMetadata, TimelineEntry,
 };
-use chronicle_capture::{CaptureEvent, CaptureEventKind, LossWindowObserved, decode_event};
+use chronicle_capture::{
+    CaptureEvent, CaptureEventKind, LossWindowObserved, SocketRole, decode_event,
+};
 use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId, SessionId};
 use chronicle_protocol::{
     DecodedFrame, ProtocolRegistry, ProtocolStream, StreamChunk, reconstructed_frames,
 };
 use chronicle_session::{
-    ConnectionStream, LossWindowClassification, ReconstructionAssembler, ReconstructionConnection,
+    LossWindowClassification, ReconstructionAssembler, ReconstructionConnection,
     ReconstructionConnectionIdentity, ReconstructionEvidence, ReconstructionInput,
-    ReconstructionLimits, ReconstructionPushError, SessionAssembler, SessionError, SessionLimits,
+    ReconstructionLimits, ReconstructionPushError, SessionError, SessionLimits,
 };
 use chronicle_wal::{
-    COMMIT_MARKER_VERSION, ReadOutcome, RecordKind, TerminalWalLoss, WalError, WalReader,
-    WalRecord, WalRecordEnvelope, decode_commit_marker, decode_terminal_wal_loss, encode_envelope,
+    COMMIT_MARKER_VERSION, RecordKind, TerminalWalLoss, WalError, WalRecordEnvelope,
+    decode_commit_marker, decode_terminal_wal_loss, encode_envelope,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::Read;
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -37,7 +38,6 @@ pub const MAX_CANONICAL_OPERATIONS: usize = 10_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EtlIssueKind {
     MalformedCaptureEvent,
-    CaptureSequenceMismatch,
     PartialWalTail,
     UnknownProtocol,
     ProtocolDecode,
@@ -183,6 +183,10 @@ pub enum EtlError {
     TimelineReference,
     #[error("ETL issue limit {limit} exceeded")]
     IssueLimit { limit: usize },
+    #[error("reconstruction connection lacks complete socket endpoint evidence")]
+    MissingSocketEvidence,
+    #[error("reconstruction connection has conflicting socket endpoint evidence")]
+    ConflictingSocketEvidence,
 }
 
 pub struct EtlPipeline {
@@ -197,54 +201,6 @@ impl EtlPipeline {
 
     pub fn with_max_issues(limits: SessionLimits, max_issues: usize) -> Self {
         Self { limits, max_issues }
-    }
-
-    #[allow(clippy::too_many_lines)] // ETL stays linear: WAL scan, canonicalization, and session assembly share one error boundary.
-    pub fn process<R: Read>(
-        &self,
-        reader: &mut WalReader<R>,
-        registry: &ProtocolRegistry,
-        session_id: SessionId,
-    ) -> Result<EtlOutput, EtlError> {
-        let mut assembler = SessionAssembler::new(self.limits);
-        let mut issues = Vec::new();
-        let mut batch = Vec::with_capacity(ENVELOPE_BATCH_SIZE);
-        let partial_tail = loop {
-            match reader.next_record()? {
-                ReadOutcome::Record(record) => {
-                    batch.push(record);
-                    if batch.len() == ENVELOPE_BATCH_SIZE {
-                        for record in batch.drain(..) {
-                            ingest_record(&record, &mut assembler, &mut issues, self.max_issues)?;
-                        }
-                    }
-                }
-                ReadOutcome::End => break None,
-                ReadOutcome::PartialTail { offset } => break Some(offset),
-            }
-        };
-        for record in batch {
-            ingest_record(&record, &mut assembler, &mut issues, self.max_issues)?;
-        }
-        if let Some(offset) = partial_tail {
-            record_issue(
-                &mut issues,
-                self.max_issues,
-                EtlIssue {
-                    sequence: None,
-                    kind: EtlIssueKind::PartialWalTail,
-                    message: format!("partial WAL record at byte offset {offset}"),
-                },
-            )?;
-        }
-
-        self.finish(
-            assembler,
-            issues,
-            EtlEvidence::default(),
-            registry,
-            session_id,
-        )
     }
 
     /// Processes only recovery-authoritative v2 envelopes. Commit markers remain
@@ -277,34 +233,7 @@ impl EtlPipeline {
                 .collect(),
             ..EtlEvidence::default()
         };
-        if envelopes.iter().any(envelope_is_v2_capture) {
-            self.process_reconstructed_envelopes(envelopes, evidence, registry, session_id)
-        } else {
-            self.process_fixture_envelopes(envelopes, evidence, registry, session_id)
-        }
-    }
-
-    fn process_fixture_envelopes(
-        &self,
-        envelopes: &[WalRecordEnvelope],
-        mut evidence: EtlEvidence,
-        registry: &ProtocolRegistry,
-        session_id: SessionId,
-    ) -> Result<EtlOutput, EtlError> {
-        let mut assembler = SessionAssembler::new(self.limits);
-        let mut issues = Vec::new();
-        for batch in envelopes.chunks(ENVELOPE_BATCH_SIZE) {
-            for envelope in batch {
-                ingest_envelope(
-                    envelope,
-                    &mut assembler,
-                    &mut evidence,
-                    &mut issues,
-                    self.max_issues,
-                )?;
-            }
-        }
-        self.finish(assembler, issues, evidence, registry, session_id)
+        self.process_reconstructed_envelopes(envelopes, evidence, registry, session_id)
     }
 
     fn process_reconstructed_envelopes(
@@ -338,116 +267,6 @@ impl EtlPipeline {
         self.finish_reconstructed(assembler.finish(), issues, evidence, registry, session_id)
     }
 
-    fn finish(
-        &self,
-        assembler: SessionAssembler,
-        mut issues: Vec<EtlIssue>,
-        evidence: EtlEvidence,
-        registry: &ProtocolRegistry,
-        session_id: SessionId,
-    ) -> Result<EtlOutput, EtlError> {
-        let streams = assembler.finish();
-        let started_at = streams
-            .iter()
-            .flat_map(|stream| stream.chunks.iter().filter_map(|event| event.wall_time))
-            .min()
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        let ended_at = streams
-            .iter()
-            .flat_map(|stream| stream.chunks.iter().filter_map(|event| event.wall_time))
-            .max();
-        let mut connections = Vec::with_capacity(streams.len());
-        let mut connection_completeness = BTreeMap::new();
-        let mut operation_completeness = BTreeMap::new();
-        let mut timeline = Vec::new();
-        let mut operation_count = 0;
-
-        for stream in streams {
-            let connection_id = ConnectionId::new();
-            let protocol_stream = protocol_stream(&stream, started_at);
-            let (protocol, operations) =
-                if let Some((registration, _)) = registry.detect(&protocol_stream, None) {
-                    match decode_and_canonicalize(registration, &protocol_stream) {
-                        Ok(operations) => (registration.id.clone(), operations),
-                        Err(error) => {
-                            record_issue(
-                                &mut issues,
-                                self.max_issues,
-                                EtlIssue {
-                                    sequence: stream.first_sequence(),
-                                    kind: EtlIssueKind::ProtocolDecode,
-                                    message: error,
-                                },
-                            )?;
-                            (registration.id.clone(), vec![opaque_operation(&stream)])
-                        }
-                    }
-                } else {
-                    record_issue(
-                        &mut issues,
-                        self.max_issues,
-                        EtlIssue {
-                            sequence: stream.first_sequence(),
-                            kind: EtlIssueKind::UnknownProtocol,
-                            message: "traffic preserved as opaque bytes".into(),
-                        },
-                    )?;
-                    (ProtocolId::unknown(), vec![opaque_operation(&stream)])
-                };
-            operation_count = bounded_operation_count(operation_count, operations.len())?;
-            for operation in &operations {
-                timeline.push((
-                    operation.sequence,
-                    TimelineEntry {
-                        connection_id,
-                        operation_id: operation.id,
-                        offset: operation.started_at_offset,
-                    },
-                ));
-                operation_completeness.insert(
-                    operation.id,
-                    derive_operation_completeness(operation, stream.truncated),
-                );
-            }
-            connection_completeness.insert(
-                connection_id,
-                if stream.chunks.is_empty() || stream.truncated {
-                    Completeness::Partial
-                } else {
-                    Completeness::Complete
-                },
-            );
-            connections.push(CanonicalConnection {
-                id: connection_id,
-                protocol,
-                client: stream.key.client.clone(),
-                server: stream.key.server.clone(),
-                attributes: Attributes::new(),
-                operations,
-            });
-        }
-        timeline.sort_by_key(|(sequence, _)| *sequence);
-        let timeline = timeline.into_iter().map(|(_, entry)| entry).collect();
-        Ok(EtlOutput {
-            session: CanonicalSession {
-                schema_version: CANONICAL_SCHEMA_VERSION,
-                id: session_id,
-                started_at,
-                ended_at,
-                source: SourceMetadata::default(),
-                source_provenance: Default::default(),
-                connections,
-                connection_completeness,
-                operation_completeness,
-                timeline,
-                replay: ReplayMetadata::default(),
-                replay_attributes: Attributes::new(),
-            },
-            issues,
-            evidence,
-        })
-    }
-
     #[allow(clippy::too_many_lines)] // Reconstruction preserves same bounded ETL error boundary as fixture assembly.
     fn finish_reconstructed(
         &self,
@@ -468,6 +287,7 @@ impl EtlPipeline {
             let connection_id = ConnectionId::new();
             let incomplete =
                 reconstructed_connection_incomplete(&connection, &assembly.terminal_wal_losses);
+            let (client, server, attributes) = reconstructed_connection_identity(&connection)?;
             let neutral = connection.protocol_neutral();
             let mut frames = reconstructed_frames(&neutral);
             sort_reconstructed_frames(&connection, &mut frames);
@@ -535,8 +355,6 @@ impl EtlPipeline {
                     derive_operation_completeness(operation, incomplete),
                 );
             }
-            let (client, server, attributes) =
-                reconstructed_connection_identity(&connection.identity);
             connection_completeness.insert(
                 connection_id,
                 if protocol_stream.chunks.is_empty() || incomplete {
@@ -602,11 +420,6 @@ fn derive_operation_completeness(
     }
 }
 
-fn envelope_is_v2_capture(envelope: &WalRecordEnvelope) -> bool {
-    envelope.kind == RecordKind::CaptureEvent
-        && matches!(decode_event(&envelope.payload), Ok(CaptureEvent::V2(_)))
-}
-
 fn sort_reconstructed_frames(connection: &ReconstructionConnection, frames: &mut [DecodedFrame]) {
     let timestamps: BTreeMap<_, _> = connection
         .events
@@ -632,13 +445,31 @@ fn sort_reconstructed_frames(connection: &ReconstructionConnection, frames: &mut
 }
 
 fn reconstructed_connection_identity(
-    identity: &ReconstructionConnectionIdentity,
-) -> (Endpoint, Endpoint, Attributes) {
-    match identity {
+    connection: &ReconstructionConnection,
+) -> Result<(Endpoint, Endpoint, Attributes), EtlError> {
+    match &connection.identity {
         ReconstructionConnectionIdentity::Fixture(key) => {
-            (key.client.clone(), key.server.clone(), Attributes::new())
+            Ok((key.client.clone(), key.server.clone(), Attributes::new()))
         }
         ReconstructionConnectionIdentity::Socket(socket) => {
+            let evidence = connection
+                .events
+                .iter()
+                .find_map(|event| event.socket_evidence.as_ref())
+                .ok_or(EtlError::MissingSocketEvidence)?;
+            if connection
+                .events
+                .iter()
+                .filter_map(|event| event.socket_evidence.as_ref())
+                .any(|candidate| {
+                    candidate.network_family != evidence.network_family
+                        || candidate.local_endpoint != evidence.local_endpoint
+                        || candidate.remote_endpoint != evidence.remote_endpoint
+                        || candidate.role != evidence.role
+                })
+            {
+                return Err(EtlError::ConflictingSocketEvidence);
+            }
             let mut attributes = Attributes::new();
             attributes.insert(
                 "chronicle.socket_cookie".into(),
@@ -652,14 +483,28 @@ fn reconstructed_connection_identity(
                 "chronicle.socket_boot_id".into(),
                 socket.first_seen.clock.boot_id.clone(),
             );
+            attributes.insert(
+                "chronicle.socket_role".into(),
+                match evidence.role {
+                    SocketRole::Active => "active",
+                    SocketRole::Passive => "passive",
+                }
+                .into(),
+            );
             if let Some(namespace) = socket.network_namespace {
                 attributes.insert("chronicle.network_namespace".into(), namespace.to_string());
             }
-            (
-                Endpoint::new("unknown", 0),
-                Endpoint::new("unknown", 0),
-                attributes,
-            )
+            let (client, server) = match evidence.role {
+                SocketRole::Active => (
+                    evidence.local_endpoint.clone(),
+                    evidence.remote_endpoint.clone(),
+                ),
+                SocketRole::Passive => (
+                    evidence.remote_endpoint.clone(),
+                    evidence.local_endpoint.clone(),
+                ),
+            };
+            Ok((client, server, attributes))
         }
     }
 }
@@ -717,126 +562,12 @@ fn opaque_operation_from_protocol_stream(stream: &ProtocolStream<'_>) -> Canonic
         recorded_response: None,
         attributes: Attributes::new(),
         protocol_data: ProtocolData {
-            schema_version: 1,
+            schema_version: PROTOCOL_DATA_SCHEMA_VERSION,
             media_type: Some("application/octet-stream".into()),
             bytes,
         },
         redactions: Vec::new(),
         warnings: Vec::new(),
-    }
-}
-
-fn ingest_record(
-    record: &WalRecord,
-    assembler: &mut SessionAssembler,
-    issues: &mut Vec<EtlIssue>,
-    max_issues: usize,
-) -> Result<(), EtlError> {
-    match decode_event(&record.payload) {
-        Ok(event) if event.monotonic_sequence() == Some(record.sequence) => {
-            assembler.push(event)?;
-            Ok(())
-        }
-        Ok(event) => record_issue(
-            issues,
-            max_issues,
-            EtlIssue {
-                sequence: Some(record.sequence),
-                kind: EtlIssueKind::CaptureSequenceMismatch,
-                message: format!(
-                    "capture sequence {} does not match WAL sequence {}",
-                    event.monotonic_sequence().unwrap_or_default(),
-                    record.sequence
-                ),
-            },
-        ),
-        Err(error) => record_issue(
-            issues,
-            max_issues,
-            EtlIssue {
-                sequence: Some(record.sequence),
-                kind: EtlIssueKind::MalformedCaptureEvent,
-                message: error.to_string(),
-            },
-        ),
-    }
-}
-
-fn ingest_envelope(
-    envelope: &WalRecordEnvelope,
-    assembler: &mut SessionAssembler,
-    evidence: &mut EtlEvidence,
-    issues: &mut Vec<EtlIssue>,
-    max_issues: usize,
-) -> Result<(), EtlError> {
-    match envelope.kind {
-        RecordKind::CaptureEvent => ingest_record(
-            &WalRecord {
-                kind: envelope.kind,
-                flags: envelope.flags,
-                sequence: envelope.sequence,
-                payload: envelope.payload.clone(),
-            },
-            assembler,
-            issues,
-            max_issues,
-        ),
-        RecordKind::LossWindow => match decode_event(&envelope.payload) {
-            Ok(CaptureEvent::V2(
-                event @ chronicle_capture::CaptureEventV2 {
-                    kind: CaptureEventKind::LossWindowObserved(_),
-                    ..
-                },
-            )) => {
-                let CaptureEventKind::LossWindowObserved(window) = event.kind else {
-                    unreachable!("matched loss-window event");
-                };
-                evidence.loss_windows.push(SequencedEvidence {
-                    sequence: Some(envelope.sequence),
-                    value: window,
-                });
-                Ok(())
-            }
-            Ok(_) => record_issue(
-                issues,
-                max_issues,
-                EtlIssue {
-                    sequence: Some(envelope.sequence),
-                    kind: EtlIssueKind::MalformedLossWindow,
-                    message: "LossWindow envelope did not contain a v2 loss window".into(),
-                },
-            ),
-            Err(error) => record_issue(
-                issues,
-                max_issues,
-                EtlIssue {
-                    sequence: Some(envelope.sequence),
-                    kind: EtlIssueKind::MalformedLossWindow,
-                    message: error.to_string(),
-                },
-            ),
-        },
-        RecordKind::TerminalWalLoss => {
-            match decode_terminal_wal_loss(envelope.schema_version, &envelope.payload) {
-                Ok(loss) => {
-                    evidence.terminal_wal_losses.push(SequencedEvidence {
-                        sequence: Some(envelope.sequence),
-                        value: loss,
-                    });
-                    Ok(())
-                }
-                Err(error) => record_issue(
-                    issues,
-                    max_issues,
-                    EtlIssue {
-                        sequence: Some(envelope.sequence),
-                        kind: EtlIssueKind::MalformedTerminalWalLoss,
-                        message: error.to_string(),
-                    },
-                ),
-            }
-        }
-        RecordKind::CommitMarker => ingest_commit_marker(envelope, evidence, issues, max_issues),
     }
 }
 
@@ -850,25 +581,6 @@ fn ingest_reconstructed_envelope(
 ) -> Result<(), EtlError> {
     match envelope.kind {
         RecordKind::CaptureEvent => match decode_event(&envelope.payload) {
-            Ok(event)
-                if event
-                    .monotonic_sequence()
-                    .is_some_and(|sequence| sequence != envelope.sequence) =>
-            {
-                record_issue(
-                    issues,
-                    max_issues,
-                    EtlIssue {
-                        sequence: Some(envelope.sequence),
-                        kind: EtlIssueKind::CaptureSequenceMismatch,
-                        message: format!(
-                            "capture sequence {} does not match WAL sequence {}",
-                            event.monotonic_sequence().unwrap_or_default(),
-                            envelope.sequence
-                        ),
-                    },
-                )
-            }
             Ok(event) => match ReconstructionInput::from_capture_event(event) {
                 Ok(ReconstructionInput::Event(mut event)) => {
                     event.wal_sequence = Some(envelope.sequence);
@@ -900,15 +612,10 @@ fn ingest_reconstructed_envelope(
             ),
         },
         RecordKind::LossWindow => match decode_event(&envelope.payload) {
-            Ok(CaptureEvent::V2(
-                event @ chronicle_capture::CaptureEventV2 {
-                    kind: CaptureEventKind::LossWindowObserved(_),
-                    ..
-                },
-            )) => {
-                let CaptureEventKind::LossWindowObserved(window) = event.kind else {
-                    unreachable!("matched loss-window event");
-                };
+            Ok(CaptureEvent {
+                kind: CaptureEventKind::LossWindowObserved(window),
+                ..
+            }) => {
                 assembler.push(ReconstructionInput::LossWindow(window.clone()))?;
                 evidence.loss_windows.push(SequencedEvidence {
                     sequence: Some(envelope.sequence),
@@ -922,7 +629,7 @@ fn ingest_reconstructed_envelope(
                 EtlIssue {
                     sequence: Some(envelope.sequence),
                     kind: EtlIssueKind::MalformedLossWindow,
-                    message: "LossWindow envelope did not contain a v2 loss window".into(),
+                    message: "LossWindow envelope did not contain a loss window".into(),
                 },
             ),
             Err(error) => record_issue(
@@ -996,23 +703,6 @@ fn record_issue(
     Ok(())
 }
 
-fn protocol_stream(stream: &ConnectionStream, started_at: OffsetDateTime) -> ProtocolStream<'_> {
-    ProtocolStream {
-        started_at: Some(started_at),
-        chunks: stream
-            .chunks
-            .iter()
-            .map(|event| StreamChunk {
-                direction: event.direction,
-                sequence: event.monotonic_sequence,
-                timestamp: event.wall_time,
-                payload: &event.payload,
-            })
-            .collect(),
-        truncated: stream.truncated,
-    }
-}
-
 fn decode_and_canonicalize(
     registration: &chronicle_protocol::ProtocolRegistration,
     stream: &ProtocolStream<'_>,
@@ -1045,50 +735,23 @@ fn decode_and_canonicalize(
         .map_err(|error| error.to_string())
 }
 
-fn opaque_operation(stream: &ConnectionStream) -> CanonicalOperation {
-    let bytes: Vec<u8> = stream
-        .chunks
-        .iter()
-        .flat_map(|event| event.payload.iter().copied())
-        .collect();
-    CanonicalOperation {
-        id: OperationId::new(),
-        sequence: stream.first_sequence().unwrap_or_default(),
-        started_at_offset: RelativeTimeNanos(0),
-        completed_at_offset: None,
-        kind: OperationKind::Opaque,
-        effect: OperationEffect::Unknown,
-        request: PayloadRef::Inline {
-            content_type: Some("application/octet-stream".into()),
-            bytes: bytes.clone(),
-        },
-        recorded_response: None,
-        attributes: Attributes::new(),
-        protocol_data: ProtocolData {
-            schema_version: 1,
-            media_type: Some("application/octet-stream".into()),
-            bytes,
-        },
-        redactions: Vec::new(),
-        warnings: Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chronicle_capture::{
-        CAPTURE_EVENT_SCHEMA_VERSION, CAPTURE_EVENT_V2_SCHEMA_VERSION, CaptureEvent,
-        CaptureEventKind, CaptureEventV1, CaptureEventV2, CaptureFlags, ClockIdentity,
+        CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureEventKind, CaptureFlags, ClockIdentity,
         FragmentSequenceEvidence, LossAmbiguity, LossWindowObserved, MonotonicTimestamp,
-        NetworkFamily, PayloadDirection, PayloadFragment, RecordingScopeIdentity, SocketIdentity,
-        TruncationMetadata, TruncationState, encode_event,
+        NetworkFamily, PayloadDirection, PayloadFragment, RecordingScopeIdentity, SocketEvidence,
+        SocketIdentity, SocketRole, TruncationMetadata, TruncationState, encode_event,
     };
-    use chronicle_common::{ConnectionKey, Direction, Endpoint, RecordingId, TransportProtocol};
-    use chronicle_wal::{RecordKind, WalRecord, WalRecordEnvelope, encode_record};
-    use std::io::Cursor;
+    use chronicle_common::{Endpoint, RecordingId};
+    use chronicle_wal::{RecordKind, WalRecordEnvelope};
 
-    fn v2_payload(recording_id: RecordingId, sequence: u64, nanoseconds: u64) -> WalRecordEnvelope {
+    fn payload_envelope(
+        recording_id: RecordingId,
+        sequence: u64,
+        nanoseconds: u64,
+    ) -> WalRecordEnvelope {
         let timestamp = MonotonicTimestamp {
             clock: ClockIdentity {
                 boot_id: "boot".into(),
@@ -1099,10 +762,10 @@ mod tests {
             recording_id,
             sequence,
             RecordKind::CaptureEvent,
-            CAPTURE_EVENT_V2_SCHEMA_VERSION,
+            CAPTURE_EVENT_SCHEMA_VERSION,
             0,
-            encode_event(&CaptureEvent::V2(CaptureEventV2 {
-                schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
+            encode_event(&CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
                 kind: CaptureEventKind::PayloadFragment(PayloadFragment {
                     timestamp: timestamp.clone(),
                     socket: SocketIdentity {
@@ -1128,30 +791,172 @@ mod tests {
                         state: TruncationState::Complete,
                         reason: None,
                     },
+                    flags: CaptureFlags::default(),
                 }),
-            }))
+            })
+            .unwrap(),
+        )
+    }
+
+    fn socket_envelope(
+        recording_id: RecordingId,
+        sequence: u64,
+        nanoseconds: u64,
+    ) -> WalRecordEnvelope {
+        let timestamp = MonotonicTimestamp {
+            clock: ClockIdentity {
+                boot_id: "boot".into(),
+            },
+            nanoseconds,
+        };
+        WalRecordEnvelope::unplaced(
+            recording_id,
+            sequence,
+            RecordKind::CaptureEvent,
+            CAPTURE_EVENT_SCHEMA_VERSION,
+            0,
+            encode_event(&CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                kind: CaptureEventKind::SocketConnected(SocketEvidence {
+                    timestamp: timestamp.clone(),
+                    socket: SocketIdentity {
+                        socket_cookie: 7,
+                        first_seen: timestamp,
+                        network_namespace: None,
+                    },
+                    recording_scope: RecordingScopeIdentity {
+                        cgroup_id: 1,
+                        canonical_path: "/scope".into(),
+                        namespace: None,
+                    },
+                    network_family: NetworkFamily::Ipv4,
+                    local_endpoint: Endpoint::new("192.0.2.10", 41_000),
+                    remote_endpoint: Endpoint::new("192.0.2.20", 8_080),
+                    role: SocketRole::Active,
+                    process: None,
+                    observed_cgroup_id: 1,
+                }),
+            })
             .unwrap(),
         )
     }
 
     fn event(sequence: u64) -> CaptureEvent {
-        CaptureEvent::V1(CaptureEventV1 {
+        let timestamp = MonotonicTimestamp {
+            clock: ClockIdentity {
+                boot_id: "boot".into(),
+            },
+            nanoseconds: sequence,
+        };
+        CaptureEvent {
             schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
-            monotonic_sequence: sequence,
-            wall_time: None,
-            connection: ConnectionKey::new(
-                Endpoint::new("client", 1),
-                Endpoint::new("server", 2),
-                TransportProtocol::Tcp,
+            kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+                timestamp: timestamp.clone(),
+                socket: SocketIdentity {
+                    socket_cookie: 7,
+                    first_seen: timestamp,
+                    network_namespace: None,
+                },
+                recording_scope: RecordingScopeIdentity {
+                    cgroup_id: 1,
+                    canonical_path: "/scope".into(),
+                    namespace: None,
+                },
+                network_family: NetworkFamily::Ipv4,
+                direction: PayloadDirection::Egress,
+                sequence: FragmentSequenceEvidence {
+                    tcp_sequence: u32::try_from(sequence).unwrap(),
+                    continuation_position: 0,
+                },
+                payload: b"opaque bytes".to_vec(),
+                truncation: TruncationMetadata {
+                    captured_length: 12,
+                    observed_length: Some(12),
+                    state: TruncationState::Truncated,
+                    reason: Some("test".into()),
+                },
+                flags: CaptureFlags::default(),
+            }),
+        }
+    }
+
+    fn endpoint_envelopes(
+        recording_id: RecordingId,
+        family: NetworkFamily,
+        role: SocketRole,
+        direction: PayloadDirection,
+        local: Endpoint,
+        remote: Endpoint,
+    ) -> [WalRecordEnvelope; 2] {
+        let timestamp = MonotonicTimestamp {
+            clock: ClockIdentity {
+                boot_id: "endpoint-test".into(),
+            },
+            nanoseconds: 1,
+        };
+        let socket = SocketIdentity {
+            socket_cookie: 42,
+            first_seen: timestamp.clone(),
+            network_namespace: None,
+        };
+        let scope = RecordingScopeIdentity {
+            cgroup_id: 1,
+            canonical_path: "/scope".into(),
+            namespace: None,
+        };
+        let event = |kind| {
+            encode_event(&CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                kind,
+            })
+            .unwrap()
+        };
+        [
+            WalRecordEnvelope::unplaced(
+                recording_id,
+                1,
+                RecordKind::CaptureEvent,
+                CAPTURE_EVENT_SCHEMA_VERSION,
+                0,
+                event(CaptureEventKind::SocketConnected(SocketEvidence {
+                    timestamp: timestamp.clone(),
+                    socket: socket.clone(),
+                    recording_scope: scope.clone(),
+                    network_family: family,
+                    local_endpoint: local,
+                    remote_endpoint: remote,
+                    role,
+                    process: None,
+                    observed_cgroup_id: 1,
+                })),
             ),
-            direction: Direction::ClientToServer,
-            payload: b"opaque bytes".to_vec(),
-            process: None,
-            container: None,
-            file_descriptor: None,
-            truncated: true,
-            flags: CaptureFlags::default(),
-        })
+            WalRecordEnvelope::unplaced(
+                recording_id,
+                2,
+                RecordKind::CaptureEvent,
+                CAPTURE_EVENT_SCHEMA_VERSION,
+                0,
+                event(CaptureEventKind::PayloadFragment(PayloadFragment {
+                    timestamp,
+                    socket,
+                    recording_scope: scope,
+                    network_family: family,
+                    direction,
+                    sequence: FragmentSequenceEvidence {
+                        tcp_sequence: 1,
+                        continuation_position: 0,
+                    },
+                    payload: vec![1],
+                    truncation: TruncationMetadata {
+                        captured_length: 1,
+                        observed_length: Some(1),
+                        state: TruncationState::Complete,
+                        reason: None,
+                    },
+                    flags: CaptureFlags::default(),
+                })),
+            ),
+        ]
     }
 
     fn commit_marker_payload() -> Vec<u8> {
@@ -1167,132 +972,92 @@ mod tests {
     }
 
     #[test]
-    fn unknown_traffic_is_preserved_as_opaque() {
-        let event = event(1);
-        let record = WalRecord {
-            kind: RecordKind::CaptureEvent,
-            flags: 0,
-            sequence: 1,
-            payload: encode_event(&event).unwrap(),
-        };
-        let mut reader = WalReader::new(Cursor::new(encode_record(&record).unwrap()), 1);
-        let output = EtlPipeline::new(SessionLimits::default())
-            .process(&mut reader, &ProtocolRegistry::new(), SessionId::new())
-            .unwrap();
-
-        assert_eq!(output.issues[0].kind, EtlIssueKind::UnknownProtocol);
-        let connection = &output.session.connections[0];
-        assert_eq!(connection.protocol, ProtocolId::unknown());
-        assert_eq!(
-            output.session.connection_state(&connection.id),
-            Completeness::Partial
-        );
-        assert_eq!(
-            connection.operations[0].protocol_data.bytes,
-            b"opaque bytes"
-        );
+    fn role_and_family_derive_real_canonical_endpoints() {
+        for (family, role, direction, local, remote, expected_client, expected_server) in [
+            (
+                NetworkFamily::Ipv4,
+                SocketRole::Active,
+                PayloadDirection::Egress,
+                Endpoint::new("192.0.2.10", 41_000),
+                Endpoint::new("192.0.2.20", 8_080),
+                Endpoint::new("192.0.2.10", 41_000),
+                Endpoint::new("192.0.2.20", 8_080),
+            ),
+            (
+                NetworkFamily::Ipv6,
+                SocketRole::Passive,
+                PayloadDirection::Ingress,
+                Endpoint::new("2001:db8::20", 8_080),
+                Endpoint::new("2001:db8::10", 41_000),
+                Endpoint::new("2001:db8::10", 41_000),
+                Endpoint::new("2001:db8::20", 8_080),
+            ),
+        ] {
+            let envelopes =
+                endpoint_envelopes(RecordingId::new(), family, role, direction, local, remote);
+            let output = EtlPipeline::new(SessionLimits::default())
+                .process_envelopes(&envelopes, &ProtocolRegistry::new(), SessionId::new())
+                .unwrap();
+            let connection = &output.session.connections[0];
+            assert_eq!(connection.client, expected_client);
+            assert_eq!(connection.server, expected_server);
+            assert_ne!(connection.client.host, "unknown");
+            assert_ne!(connection.server.host, "unknown");
+            assert_ne!(connection.client.port, 0);
+            assert_ne!(connection.server.port, 0);
+        }
     }
 
     #[test]
-    fn rejects_1025th_active_connection_without_omission() {
-        let bytes: Vec<_> = (1..=1_025)
-            .flat_map(|sequence| {
-                let mut capture = event(sequence);
-                let CaptureEvent::V1(event) = &mut capture else {
-                    unreachable!("v1 test fixture")
-                };
-                event.connection = ConnectionKey::new(
-                    Endpoint::new(format!("client-{sequence}"), 1),
-                    Endpoint::new("server", 2),
-                    TransportProtocol::Tcp,
-                );
-                encode_record(&WalRecord {
-                    kind: RecordKind::CaptureEvent,
-                    flags: 0,
-                    sequence,
-                    payload: encode_event(&capture).unwrap(),
-                })
-                .unwrap()
-            })
-            .collect();
-        let mut reader = WalReader::new(Cursor::new(bytes), 1);
-
+    fn missing_and_conflicting_socket_evidence_are_typed_failures() {
+        let recording_id = RecordingId::new();
+        let active = endpoint_envelopes(
+            recording_id,
+            NetworkFamily::Ipv4,
+            SocketRole::Active,
+            PayloadDirection::Egress,
+            Endpoint::new("192.0.2.10", 41_000),
+            Endpoint::new("192.0.2.20", 8_080),
+        );
+        let pipeline = EtlPipeline::new(SessionLimits::default());
         assert!(matches!(
-            EtlPipeline::new(SessionLimits::default()).process(
-                &mut reader,
+            pipeline.process_envelopes(
+                &[active[1].clone()],
                 &ProtocolRegistry::new(),
                 SessionId::new(),
             ),
-            Err(EtlError::Session(SessionError::ConnectionLimit {
-                limit: 1_024
-            }))
+            Err(EtlError::MissingSocketEvidence)
         ));
-    }
 
-    #[test]
-    fn rejects_10001st_operation_without_output() {
-        let payload = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".repeat(10_001);
-        let mut capture = event(1);
-        let CaptureEvent::V1(event) = &mut capture else {
-            unreachable!("v1 test fixture")
-        };
-        event.truncated = false;
-        event.payload = payload;
-        let record = WalRecord {
-            kind: RecordKind::CaptureEvent,
-            flags: 0,
-            sequence: 1,
-            payload: encode_event(&capture).unwrap(),
-        };
-        let mut reader = WalReader::new(Cursor::new(encode_record(&record).unwrap()), 1);
-
+        let mut conflicting = endpoint_envelopes(
+            recording_id,
+            NetworkFamily::Ipv4,
+            SocketRole::Passive,
+            PayloadDirection::Egress,
+            Endpoint::new("192.0.2.10", 41_000),
+            Endpoint::new("192.0.2.30", 9_090),
+        );
+        conflicting[0].sequence = 2;
+        let mut payload = active[1].clone();
+        payload.sequence = 3;
         assert!(matches!(
-            EtlPipeline::new(SessionLimits::default()).process(
-                &mut reader,
-                &chronicle_protocol_builtins::registry().unwrap(),
+            pipeline.process_envelopes(
+                &[active[0].clone(), conflicting[0].clone(), payload],
+                &ProtocolRegistry::new(),
                 SessionId::new(),
             ),
-            Err(EtlError::OperationLimit {
-                limit: MAX_CANONICAL_OPERATIONS
-            })
+            Err(EtlError::ConflictingSocketEvidence)
         ));
-    }
-
-    #[test]
-    fn legacy_v1_records_cross_batch_boundary() {
-        let bytes: Vec<_> = (1..=u64::try_from(ENVELOPE_BATCH_SIZE).unwrap() + 1)
-            .flat_map(|sequence| {
-                encode_record(&WalRecord {
-                    kind: RecordKind::CaptureEvent,
-                    flags: 0,
-                    sequence,
-                    payload: encode_event(&event(sequence)).unwrap(),
-                })
-                .unwrap()
-            })
-            .collect();
-        let mut reader = WalReader::new(Cursor::new(bytes), 1);
-        let output = EtlPipeline::new(SessionLimits::default())
-            .process(&mut reader, &ProtocolRegistry::new(), SessionId::new())
-            .unwrap();
-
-        assert_eq!(output.session.connections.len(), 1);
-        assert_eq!(output.session.timeline.len(), 1);
-        assert!(
-            output
-                .issues
-                .iter()
-                .any(|issue| issue.kind == EtlIssueKind::UnknownProtocol)
-        );
     }
 
     #[test]
     fn recovery_envelopes_exclude_commit_marker_from_protocol_input() {
         let recording_id = RecordingId::new();
         let envelopes = [
+            socket_envelope(recording_id, 1, 1),
             WalRecordEnvelope::unplaced(
                 recording_id,
-                1,
+                2,
                 RecordKind::CaptureEvent,
                 1,
                 0,
@@ -1300,7 +1065,7 @@ mod tests {
             ),
             WalRecordEnvelope::unplaced(
                 recording_id,
-                2,
+                3,
                 RecordKind::CommitMarker,
                 1,
                 0,
@@ -1355,12 +1120,12 @@ mod tests {
                 recording_id,
                 1,
                 RecordKind::LossWindow,
-                CAPTURE_EVENT_V2_SCHEMA_VERSION,
+                CAPTURE_EVENT_SCHEMA_VERSION,
                 0,
-                encode_event(&CaptureEvent::V2(CaptureEventV2 {
-                    schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
+                encode_event(&CaptureEvent {
+                    schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
                     kind: CaptureEventKind::LossWindowObserved(loss.clone()),
-                }))
+                })
                 .unwrap(),
             ),
             WalRecordEnvelope::unplaced(
@@ -1419,8 +1184,8 @@ mod tests {
     fn reconstructed_loss_windows_only_degrade_overlapping_connections() {
         let recording_id = RecordingId::new();
         let loss = |start, end| {
-            encode_event(&CaptureEvent::V2(CaptureEventV2 {
-                schema_version: CAPTURE_EVENT_V2_SCHEMA_VERSION,
+            encode_event(&CaptureEvent {
+                schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
                 kind: CaptureEventKind::LossWindowObserved(LossWindowObserved {
                     start: MonotonicTimestamp {
                         clock: ClockIdentity {
@@ -1442,27 +1207,29 @@ mod tests {
                         reason: None,
                     },
                 }),
-            }))
+            })
             .unwrap()
         };
         let outside = [
-            v2_payload(recording_id, 1, 10),
+            socket_envelope(recording_id, 1, 10),
+            payload_envelope(recording_id, 2, 10),
             WalRecordEnvelope::unplaced(
                 recording_id,
-                2,
+                3,
                 RecordKind::LossWindow,
-                CAPTURE_EVENT_V2_SCHEMA_VERSION,
+                CAPTURE_EVENT_SCHEMA_VERSION,
                 0,
                 loss(20, 30),
             ),
         ];
         let overlapping = [
-            v2_payload(recording_id, 1, 25),
+            socket_envelope(recording_id, 1, 25),
+            payload_envelope(recording_id, 2, 25),
             WalRecordEnvelope::unplaced(
                 recording_id,
-                2,
+                3,
                 RecordKind::LossWindow,
-                CAPTURE_EVENT_V2_SCHEMA_VERSION,
+                CAPTURE_EVENT_SCHEMA_VERSION,
                 0,
                 loss(20, 30),
             ),
@@ -1533,7 +1300,7 @@ mod tests {
                 recording_id,
                 1,
                 RecordKind::LossWindow,
-                CAPTURE_EVENT_V2_SCHEMA_VERSION,
+                CAPTURE_EVENT_SCHEMA_VERSION,
                 0,
                 b"malformed".to_vec(),
             ),
@@ -1590,14 +1357,22 @@ mod tests {
         let pipeline = EtlPipeline::new(SessionLimits::default());
         let outside = pipeline
             .process_envelopes(
-                &[v2_payload(recording_id, 1, 10), terminal_envelope(2)],
+                &[
+                    socket_envelope(recording_id, 1, 10),
+                    payload_envelope(recording_id, 2, 10),
+                    terminal_envelope(3),
+                ],
                 &ProtocolRegistry::new(),
                 SessionId::new(),
             )
             .unwrap();
         let overlapping = pipeline
             .process_envelopes(
-                &[v2_payload(recording_id, 1, 25), terminal_envelope(2)],
+                &[
+                    socket_envelope(recording_id, 1, 25),
+                    payload_envelope(recording_id, 2, 25),
+                    terminal_envelope(3),
+                ],
                 &ProtocolRegistry::new(),
                 SessionId::new(),
             )
@@ -1647,41 +1422,5 @@ mod tests {
             output.evidence.commit_marker_sequences.last(),
             Some(&(u64::try_from(ENVELOPE_BATCH_SIZE).unwrap() + 1))
         );
-    }
-
-    #[test]
-    fn rejects_capture_sequence_that_differs_from_wal_sequence() {
-        let record = WalRecord {
-            kind: RecordKind::CaptureEvent,
-            flags: 0,
-            sequence: 1,
-            payload: encode_event(&event(2)).unwrap(),
-        };
-        let mut reader = WalReader::new(Cursor::new(encode_record(&record).unwrap()), 1);
-        let output = EtlPipeline::new(SessionLimits::default())
-            .process(&mut reader, &ProtocolRegistry::new(), SessionId::new())
-            .unwrap();
-
-        assert!(output.session.connections.is_empty());
-        assert_eq!(output.issues.len(), 1);
-        assert_eq!(output.issues[0].kind, EtlIssueKind::CaptureSequenceMismatch);
-    }
-
-    #[test]
-    fn stops_when_issue_limit_is_reached() {
-        let malformed = |sequence| WalRecord {
-            kind: RecordKind::CaptureEvent,
-            flags: 0,
-            sequence,
-            payload: b"not-json".to_vec(),
-        };
-        let mut bytes = encode_record(&malformed(1)).unwrap();
-        bytes.extend(encode_record(&malformed(2)).unwrap());
-        let mut reader = WalReader::new(Cursor::new(bytes), 1);
-        let error = EtlPipeline::with_max_issues(SessionLimits::default(), 1)
-            .process(&mut reader, &ProtocolRegistry::new(), SessionId::new())
-            .unwrap_err();
-
-        assert!(matches!(error, EtlError::IssueLimit { limit: 1 }));
     }
 }
