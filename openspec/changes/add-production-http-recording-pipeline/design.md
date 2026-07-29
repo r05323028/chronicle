@@ -9,7 +9,7 @@ FixtureCaptureSource
   -> WalReader checkpoint
   -> SessionAssembler
   -> built-in HTTP detector/decoder/canonicalizer
-  -> Canonical Session v2
+  -> Canonical Session v1
   -> FilesystemSessionStore
   -> inspect OR replay planner/executor/verifier
 ```

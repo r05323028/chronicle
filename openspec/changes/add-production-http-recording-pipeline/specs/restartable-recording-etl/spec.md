@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Recording-scoped ETL input
-ETL SHALL accept one recording WAL directory, recover and validate metadata/segments, and process exactly recovered committed snapshot through last valid v2 `CommitMarker` (or unchanged declared P0 v1 boundary). It SHALL process `completed`, `failed`, and recovered `aborted` recordings when committed prefix is valid, preserving source status/reason; it SHALL reject active `starting`/`recording`, unsupported versions, corrupt committed prefix/marker reference, contradictory metadata, or WAL digest conflict. Complete frames after final valid marker SHALL remain written-not-durable uncertainty and SHALL NOT be promoted.
+ETL SHALL accept one recording WAL directory, recover and validate metadata/segments, and process exactly recovered committed snapshot through last valid v1 `CommitMarker` (or unchanged declared P0 v1 boundary). It SHALL process `completed`, `failed`, and recovered `aborted` recordings when committed prefix is valid, preserving source status/reason; it SHALL reject active `starting`/`recording`, unsupported versions, corrupt committed prefix/marker reference, contradictory metadata, or WAL digest conflict. Complete frames after final valid marker SHALL remain written-not-durable uncertainty and SHALL NOT be promoted.
 
 #### Scenario: Completed recording input
 - **WHEN** valid stopped recording is supplied

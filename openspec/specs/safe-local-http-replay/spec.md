@@ -134,7 +134,7 @@ HTTP adapter SHALL use sequential one-request-per-connection Tokio TCP with `Con
 - **THEN** execution is unsupported rather than silently replaying with changed semantics
 
 ### Requirement: Deterministic HTTP verification
-Verifier SHALL compare exact status, exact body size/SHA-256, and recorded end-to-end response headers except fixed case-insensitive ignore set `date`, `server`, `content-length`, `connection`, `transfer-encoding`, `keep-alive`, and `set-cookie`. `ObservedResponse` SHALL carry versioned protocol data; HTTP adapter SHALL encode `HttpObservedResponseV1` with status and ordered raw-byte headers while body remains payload ref. Duplicate compared values SHALL preserve order. It SHALL not perform heuristic semantic diff.
+Verifier SHALL compare exact status, exact body size/SHA-256, and recorded end-to-end response headers except fixed case-insensitive ignore set `date`, `server`, `content-length`, `connection`, `transfer-encoding`, `keep-alive`, and `set-cookie`. `ObservedResponse` SHALL carry sole active protocol-data schema v1; HTTP adapter SHALL encode `HttpObservedResponse` with status and ordered raw-byte headers while body remains payload ref. Duplicate compared values SHALL preserve order. It SHALL not perform heuristic semantic diff.
 
 #### Scenario: Verification pass
 - **WHEN** status, compared headers, and body bytes match

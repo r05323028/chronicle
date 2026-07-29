@@ -104,7 +104,7 @@ Decoder SHALL NOT silently claim support for chunked transfer coding, ordinary c
 - **THEN** decoder may correlate FIFO for inspection but records pipeline depth and marks connection non-replayable
 
 ### Requirement: Typed canonical HTTP operation
-Each supported exchange SHALL become `CanonicalOperation` with protocol `http/1.1`, request kind, classified effect, request/response body refs, offsets, endpoints at connection level, truncation/incomplete state, stable warnings, replay attributes, and verification expectation. Essential HTTP semantics SHALL live in typed versioned `HttpOperationDataV1`, not solely string attributes.
+Each supported exchange SHALL become `CanonicalOperation` with protocol `http/1.1`, request kind, classified effect, request/response body refs, offsets, endpoints at connection level, truncation/incomplete state, stable warnings, replay attributes, and verification expectation. Essential HTTP semantics SHALL live in typed `HttpOperationData` using the sole active protocol-data schema v1, not solely string attributes.
 
 #### Scenario: Canonical GET
 - **WHEN** complete GET exchange is decoded

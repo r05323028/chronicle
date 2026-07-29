@@ -4956,7 +4956,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_report_v2_serializes_outcome_and_operation_state() {
+    fn replay_report_v1_serializes_outcome_and_operation_state() {
         let result = ReplaySessionResult {
             session_id: "session".into(),
             outcome: ReplayOutcome::DryRun,
