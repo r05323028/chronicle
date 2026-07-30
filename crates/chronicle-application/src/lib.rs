@@ -8,7 +8,8 @@ pub use cgroup_selection::{
 };
 
 use chronicle_canonical::{
-    Completeness, ProvenanceEntry, ProvenanceKind, SourceProvenance, SourceStatus,
+    CommitMarkerProvenance, Completeness, ProvenanceEntry, ProvenanceKind, SourceProvenance,
+    SourceStatus,
 };
 use chronicle_capture::{
     CAPTURE_EVENT_SCHEMA_VERSION, CaptureError, CaptureEvent, CaptureEventKind, CaptureSource,
@@ -22,7 +23,8 @@ use chronicle_etl::{
 use chronicle_protocol::{ProtocolError, ProtocolRegistry, ReplayContext, SecretBytes};
 use chronicle_replay::{
     LoopbackReplayOptions, OperationExecutionState, ReplayError, ReplayExecutor, ReplayOutcome,
-    ReplayPlan, ReplayPlanner, ReplayPolicy, ReplayTargetError, TargetMap, TimingMode,
+    ReplayPlan, ReplayPlanner, ReplayPolicy, ReplayTargetError, Replayability, TargetMap,
+    TimingMode,
 };
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
@@ -62,6 +64,220 @@ pub const RECOVERY_REPORT_VERSION: u16 = 1;
 pub const DEFAULT_RECORDING_DURATION_SECONDS: u64 = 600;
 pub const MAX_RECORDING_DURATION_SECONDS: u64 = 3_600;
 pub const RECORDING_FINALIZATION_GRACE_MILLIS: u64 = 5_000;
+pub const DOCTOR_REPORT_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorStatus {
+    Supported,
+    SupportedWithWarnings,
+    Unsupported,
+    NotChecked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DoctorProbe {
+    pub required: bool,
+    pub status: DoctorStatus,
+    pub code: String,
+    pub message: String,
+    pub remediation: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DoctorReport {
+    pub version: u16,
+    pub status: DoctorStatus,
+    pub probes: Vec<DoctorProbe>,
+}
+
+impl DoctorReport {
+    pub fn new(probes: Vec<DoctorProbe>) -> Self {
+        let status = aggregate_doctor_status(&probes);
+        Self {
+            version: DOCTOR_REPORT_VERSION,
+            status,
+            probes,
+        }
+    }
+
+    pub const fn exit_code(&self) -> i32 {
+        doctor_exit_code(self.status)
+    }
+}
+
+pub fn aggregate_doctor_status(probes: &[DoctorProbe]) -> DoctorStatus {
+    if probes
+        .iter()
+        .any(|probe| probe.required && probe.status == DoctorStatus::Unsupported)
+    {
+        DoctorStatus::Unsupported
+    } else if probes
+        .iter()
+        .any(|probe| probe.required && probe.status == DoctorStatus::NotChecked)
+    {
+        DoctorStatus::NotChecked
+    } else if probes.iter().any(|probe| {
+        probe.status == DoctorStatus::SupportedWithWarnings
+            || (!probe.required
+                && matches!(
+                    probe.status,
+                    DoctorStatus::Unsupported | DoctorStatus::NotChecked
+                ))
+    }) {
+        DoctorStatus::SupportedWithWarnings
+    } else {
+        DoctorStatus::Supported
+    }
+}
+
+pub const fn doctor_exit_code(status: DoctorStatus) -> i32 {
+    match status {
+        DoctorStatus::Unsupported | DoctorStatus::NotChecked => 4,
+        DoctorStatus::Supported | DoctorStatus::SupportedWithWarnings => 0,
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DoctorOptions {
+    pub wal_dir: Option<PathBuf>,
+    pub output: Option<PathBuf>,
+}
+
+/// Runs only local, non-attaching probes. Supplied paths are inspected but never created.
+pub fn doctor_report(options: &DoctorOptions) -> DoctorReport {
+    let mut probes = capture_doctor_probes();
+    probes.extend([
+        path_doctor_probe(options.wal_dir.as_deref(), "wal_dir", "WAL directory"),
+        path_doctor_probe(options.output.as_deref(), "output", "output path"),
+        protocol_doctor_probe(),
+        DoctorProbe {
+            required: false,
+            status: DoctorStatus::Supported,
+            code: "replay.target_not_checked".into(),
+            message: "replay target is command-specific and was not contacted".into(),
+            remediation: "supply --target to replay; doctor never contacts targets".into(),
+        },
+    ]);
+    DoctorReport::new(probes)
+}
+
+fn protocol_doctor_probe() -> DoctorProbe {
+    let status = if chronicle_protocol_builtins::registry().is_ok() {
+        DoctorStatus::Supported
+    } else {
+        DoctorStatus::Unsupported
+    };
+    DoctorProbe {
+        required: false,
+        status,
+        code: "replay.protocol_capabilities".into(),
+        message: "registered replay protocol capabilities inspected without network access".into(),
+        remediation: "build with supported protocol adapters".into(),
+    }
+}
+
+fn path_doctor_probe(path: Option<&Path>, name: &str, label: &str) -> DoctorProbe {
+    let code = format!("storage.{name}");
+    let Some(path) = path else {
+        return DoctorProbe {
+            required: false,
+            status: DoctorStatus::NotChecked,
+            code,
+            message: format!("{label} was not supplied"),
+            remediation: format!("supply --{} to check this path", name.replace('_', "-")),
+        };
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let status = if path.exists() || parent.is_none_or(|parent| !parent.is_dir()) {
+        DoctorStatus::Unsupported
+    } else {
+        let parent = parent.expect("checked above");
+        rustix::fs::statvfs(parent).map_or(DoctorStatus::Unsupported, |stats| {
+            if stats.f_bavail.saturating_mul(stats.f_frsize) > 0 && probe_parent_write(parent) {
+                DoctorStatus::Supported
+            } else {
+                DoctorStatus::Unsupported
+            }
+        })
+    };
+    DoctorProbe {
+        required: false,
+        status,
+        code,
+        message: format!("{label} inspected without creating or overwriting it"),
+        remediation: "choose a new path below a writable existing directory".into(),
+    }
+}
+
+fn probe_parent_write(parent: &Path) -> bool {
+    let temporary = parent.join(format!(".chronicle-doctor-{}", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let result = options
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.try_lock()?;
+            file.write_all(b"doctor")?;
+            file.sync_all()
+        })
+        .is_ok();
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn capture_doctor_probes() -> Vec<DoctorProbe> {
+    let checks = chronicle_capture_ebpf::probe_embedded();
+    [
+        ("capture.platform", true, checks.platform),
+        ("capture.architecture", true, checks.architecture),
+        ("capture.cgroup_v2", true, checks.cgroup_v2),
+        ("capture.btf", true, checks.btf),
+        ("capture.object", true, checks.embedded_object),
+        ("capture.programs", true, checks.required_programs),
+        ("capture.attach", false, checks.attach),
+        ("capture.cap_bpf", true, checks.cap_bpf),
+        ("capture.cap_net_admin", true, checks.cap_net_admin),
+    ]
+    .into_iter()
+    .map(|(code, required, check)| {
+        let (status, message) = match check {
+            chronicle_capture_ebpf::PreflightCheck::Available => {
+                (DoctorStatus::Supported, "available")
+            }
+            chronicle_capture_ebpf::PreflightCheck::Unavailable(reason) => {
+                (DoctorStatus::Unsupported, reason)
+            }
+            chronicle_capture_ebpf::PreflightCheck::NotChecked(reason) => {
+                (DoctorStatus::NotChecked, reason)
+            }
+        };
+        DoctorProbe {
+            required,
+            status,
+            code: code.into(),
+            message: message.into(),
+            remediation: "resolve this local eBPF prerequisite before recording".into(),
+        }
+    })
+    .collect()
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+fn capture_doctor_probes() -> Vec<DoctorProbe> {
+    vec![DoctorProbe {
+        required: true,
+        status: DoctorStatus::Unsupported,
+        code: "capture.platform".into(),
+        message: "Linux eBPF capture is unavailable in this build".into(),
+        remediation: "run a Linux build with --features linux-ebpf".into(),
+    }]
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProductionRecordingBounds {
@@ -2414,11 +2630,19 @@ pub fn process_recording_wal(
         .collect();
     source_evidence.sort_by_key(|entry| entry.sequence_range);
     output.session.source_provenance = SourceProvenance {
+        recording_id: Some(metadata.recording_id),
         status: source_status,
         reason: metadata
             .shutdown_reason
             .map(shutdown_reason_name)
             .map(str::to_owned),
+        commit_marker: Some(CommitMarkerProvenance {
+            segment_ordinal: boundary.segment_ordinal,
+            byte_offset: marker_provenance.byte_offset,
+            sequence: boundary.marker_sequence,
+        }),
+        wal_snapshot_sha256: Some(sha256_string(&wal_snapshot_sha256)),
+        pipeline_version: Some(ETL_PIPELINE_VERSION.into()),
         evidence: source_evidence,
     };
     Ok(RecordingEtlResult {
@@ -2713,7 +2937,13 @@ pub struct InspectConnectionSummary {
 pub struct InspectSessionResult {
     pub session_id: chronicle_common::SessionId,
     pub complete: bool,
+    /// Retained compatibility flag: true only for fully replayable sessions.
     pub replayable: bool,
+    pub replayability: Replayability,
+    pub executable_operations: usize,
+    pub non_executable_operations: usize,
+    pub integrity_valid: bool,
+    pub source_provenance: SourceProvenance,
     pub blockers: Vec<String>,
     pub issue_codes: Vec<String>,
     pub connections: Vec<InspectConnectionSummary>,
@@ -2847,6 +3077,7 @@ fn canonical_session_complete(session: &chronicle_canonical::CanonicalSession) -
 }
 
 /// Produces inspect-safe metadata without reading artifact body bytes.
+#[allow(clippy::too_many_lines)]
 pub fn inspect_session(
     root: impl AsRef<Path>,
     session_id: chronicle_common::SessionId,
@@ -2875,8 +3106,45 @@ pub fn inspect_session(
     if !complete {
         blockers.insert("incomplete_capture".into());
     }
+    let (executable_operations, non_executable_operations) = stored
+        .session
+        .connections
+        .iter()
+        .flat_map(|connection| &connection.operations)
+        .fold((0, 0), |(executable, non_executable), operation| {
+            if stored.session.operation_state(&operation.id) == Completeness::Complete
+                && operation.recorded_response.is_some()
+                && operation
+                    .warnings
+                    .iter()
+                    .all(|warning| warning.code == "missing_timestamp")
+            {
+                (executable + 1, non_executable)
+            } else {
+                (executable, non_executable + 1)
+            }
+        });
+    let replayability = match (executable_operations, non_executable_operations) {
+        (0, _) => Replayability::NotReplayable,
+        (_, 0) => Replayability::FullyReplayable,
+        _ => Replayability::PartiallyReplayable,
+    };
+    if non_executable_operations > 0 {
+        for entry in &stored.session.source_provenance.evidence {
+            match entry.kind {
+                ProvenanceKind::RingLoss => {
+                    blockers.insert("ring_loss_window".into());
+                }
+                ProvenanceKind::WalLimitLoss => {
+                    blockers.insert("wal_limit_loss_window".into());
+                }
+                _ => {}
+            }
+        }
+    }
     let mut issue_codes = stored.issues;
     issue_codes.sort();
+    let source_provenance = stored.session.source_provenance.clone();
     let connections = stored
         .session
         .connections
@@ -2911,7 +3179,12 @@ pub fn inspect_session(
     Ok(InspectSessionResult {
         session_id,
         complete,
-        replayable: complete && blockers.is_empty(),
+        replayable: replayability == Replayability::FullyReplayable,
+        replayability,
+        executable_operations,
+        non_executable_operations,
+        integrity_valid: true,
+        source_provenance,
         blockers: blockers.into_iter().collect(),
         issue_codes,
         connections,
@@ -2928,10 +3201,20 @@ struct InspectJson<'a> {
 /// Renders stable, body-free inspect output for interactive use.
 pub fn render_inspect_human(inspected: &InspectSessionResult) -> String {
     let mut output = format!(
-        "session_id: {}\ncomplete: {}\nreplayable: {}\nblockers: {}\nissues: {}\n",
+        "session_id: {}\ncomplete: {}\nreplayable: {}\nreplayability: {:?}\noperations: executable={} non_executable={}\nintegrity_valid: {}\nsource_status: {:?}\nsource_reason: {}\nblockers: {}\nissues: {}\n",
         inspected.session_id,
         inspected.complete,
         inspected.replayable,
+        inspected.replayability,
+        inspected.executable_operations,
+        inspected.non_executable_operations,
+        inspected.integrity_valid,
+        inspected.source_provenance.status,
+        inspected
+            .source_provenance
+            .reason
+            .as_deref()
+            .unwrap_or("none"),
         joined_or_none(&inspected.blockers),
         joined_or_none(&inspected.issue_codes),
     );
@@ -3013,13 +3296,60 @@ pub struct ReplayOperationSummary {
     pub transport_error: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ReplayCounts {
+    pub executable: usize,
+    pub non_executable: usize,
+    pub attempted: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub unattempted: usize,
+    pub verification_passed: usize,
+    pub verification_failed: usize,
+    pub verification_skipped: usize,
+    pub verification_inconclusive: usize,
+    pub verification_unsupported: usize,
+    pub verification_not_run: usize,
+}
+
+impl ReplayCounts {
+    fn from_operations(operations: &[ReplayOperationSummary]) -> Self {
+        operations
+            .iter()
+            .fold(Self::default(), |mut counts, operation| {
+                if operation.decision == "allowed" {
+                    counts.executable += 1;
+                } else {
+                    counts.non_executable += 1;
+                }
+                counts.attempted += usize::from(operation.attempted);
+                match operation.state {
+                    OperationExecutionState::Completed => counts.completed += 1,
+                    OperationExecutionState::Failed => counts.failed += 1,
+                    OperationExecutionState::NotAttempted => counts.unattempted += 1,
+                }
+                match operation.verification.as_str() {
+                    "passed" => counts.verification_passed += 1,
+                    "failed" => counts.verification_failed += 1,
+                    "skipped" => counts.verification_skipped += 1,
+                    "inconclusive" => counts.verification_inconclusive += 1,
+                    "unsupported" => counts.verification_unsupported += 1,
+                    _ => counts.verification_not_run += 1,
+                }
+                counts
+            })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReplaySessionResult {
     pub session_id: String,
+    pub replayability: Replayability,
     pub outcome: ReplayOutcome,
     pub dry_run: bool,
     pub preflight_denied: bool,
     pub transport_failed: bool,
+    pub counts: ReplayCounts,
     pub operations: Vec<ReplayOperationSummary>,
 }
 
@@ -3060,46 +3390,64 @@ where
     let execution = ReplayExecutor::new(&chronicle_protocol_builtins::registry()?)
         .execute(&plan, &contexts)
         .await?;
+    let transport_failed = execution
+        .results
+        .iter()
+        .any(|result| result.transport_error.is_some());
+    let operations: Vec<_> = plan
+        .operations()
+        .iter()
+        .zip(execution.results)
+        .map(|(planned, result)| ReplayOperationSummary {
+            operation_id: result.operation_id.to_string(),
+            decision: format!("{:?}", planned.decision()).to_lowercase(),
+            state: result.state,
+            attempted: result.state != OperationExecutionState::NotAttempted,
+            verification: result.verification.as_ref().map_or_else(
+                || "not_run".into(),
+                |verification| format!("{:?}", verification.status).to_lowercase(),
+            ),
+            category: result
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.details.get("category"))
+                .cloned()
+                .unwrap_or_default(),
+            transport_error: result
+                .transport_error
+                .map(|category| format!("{category:?}").to_lowercase())
+                .unwrap_or_default(),
+        })
+        .collect();
     Ok(ReplaySessionResult {
         session_id: session.id.to_string(),
+        replayability: plan.replayability(),
         outcome: execution.outcome,
         dry_run: plan.is_dry_run(),
         preflight_denied: !plan.is_executable(),
-        transport_failed: execution
-            .results
-            .iter()
-            .any(|result| result.transport_error.is_some()),
-        operations: plan
-            .operations()
-            .iter()
-            .zip(execution.results)
-            .map(|(planned, result)| ReplayOperationSummary {
-                operation_id: result.operation_id.to_string(),
-                decision: format!("{:?}", planned.decision()).to_lowercase(),
-                state: result.state,
-                attempted: result.state != OperationExecutionState::NotAttempted,
-                verification: result.verification.as_ref().map_or_else(
-                    || "not_run".into(),
-                    |verification| format!("{:?}", verification.status).to_lowercase(),
-                ),
-                category: result
-                    .verification
-                    .as_ref()
-                    .and_then(|verification| verification.details.get("category"))
-                    .cloned()
-                    .unwrap_or_default(),
-                transport_error: result
-                    .transport_error
-                    .map(|category| format!("{category:?}").to_lowercase())
-                    .unwrap_or_default(),
-            })
-            .collect(),
+        transport_failed,
+        counts: ReplayCounts::from_operations(&operations),
+        operations,
     })
 }
 
 fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> ReplaySessionResult {
+    let operations: Vec<_> = plan
+        .operations()
+        .iter()
+        .map(|planned| ReplayOperationSummary {
+            operation_id: planned.operation().id.to_string(),
+            decision: format!("{:?}", planned.decision()).to_lowercase(),
+            state: OperationExecutionState::NotAttempted,
+            attempted: false,
+            verification: "not_run".into(),
+            category: String::new(),
+            transport_error: String::new(),
+        })
+        .collect();
     ReplaySessionResult {
         session_id,
+        replayability: plan.replayability(),
         outcome: if plan.is_dry_run() {
             ReplayOutcome::DryRun
         } else if plan.is_executable() {
@@ -3110,30 +3458,32 @@ fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> ReplaySessionRes
         dry_run: plan.is_dry_run(),
         preflight_denied: !plan.is_executable(),
         transport_failed: false,
-        operations: plan
-            .operations()
-            .iter()
-            .map(|planned| ReplayOperationSummary {
-                operation_id: planned.operation().id.to_string(),
-                decision: format!("{:?}", planned.decision()).to_lowercase(),
-                state: OperationExecutionState::NotAttempted,
-                attempted: false,
-                verification: "not_run".into(),
-                category: String::new(),
-                transport_error: String::new(),
-            })
-            .collect(),
+        counts: ReplayCounts::from_operations(&operations),
+        operations,
     }
 }
 
 pub fn render_replay_human(result: &ReplaySessionResult) -> String {
     let mut output = format!(
-        "session_id: {}\noutcome: {}\ndry_run: {}\npreflight_denied: {}\ntransport_failed: {}\n",
+        "session_id: {}\nreplayability: {:?}\noutcome: {}\ndry_run: {}\npreflight_denied: {}\ntransport_failed: {}\ncounts: executable={} non_executable={} attempted={} completed={} failed={} unattempted={} verification_passed={} verification_failed={} verification_skipped={} verification_inconclusive={} verification_unsupported={} verification_not_run={}\n",
         result.session_id,
+        result.replayability,
         result.outcome.as_str(),
         result.dry_run,
         result.preflight_denied,
-        result.transport_failed
+        result.transport_failed,
+        result.counts.executable,
+        result.counts.non_executable,
+        result.counts.attempted,
+        result.counts.completed,
+        result.counts.failed,
+        result.counts.unattempted,
+        result.counts.verification_passed,
+        result.counts.verification_failed,
+        result.counts.verification_skipped,
+        result.counts.verification_inconclusive,
+        result.counts.verification_unsupported,
+        result.counts.verification_not_run,
     );
     for operation in &result.operations {
         writeln!(
@@ -3702,6 +4052,10 @@ mod tests {
         let inspected = inspect_session(&root, recorded.session_id).unwrap();
         assert!(inspected.complete);
         assert!(inspected.replayable, "{:?}", inspected.blockers);
+        assert_eq!(inspected.replayability, Replayability::FullyReplayable);
+        assert_eq!(inspected.executable_operations, 1);
+        assert_eq!(inspected.non_executable_operations, 0);
+        assert!(inspected.integrity_valid);
         assert!(inspected.blockers.is_empty());
         assert_eq!(inspected.connections[0].operations.len(), 1);
         std::fs::remove_dir_all(root).unwrap();
@@ -3716,7 +4070,12 @@ mod tests {
             "/../../fixtures/http/duplicate-header.json"
         ))
         .unwrap();
-        let mut source = FixtureCaptureSource::from_json(&fixture).unwrap();
+        let mut fixture: serde_json::Value = serde_json::from_slice(&fixture).unwrap();
+        fixture["events"][0]["payload_hex"] = serde_json::Value::String(
+            "474554202f6865616465727320485454502f312e310d0a486f73743a207265636f726465642e696e76616c69640d0a417574686f72697a6174696f6e3a204265617265722073757065722d7365637265740d0a436f6f6b69653a2073657373696f6e3d7365637265740d0a582d5365637265743a20746f702d7365637265740d0a0d0a".into(),
+        );
+        let mut source =
+            FixtureCaptureSource::from_json(&serde_json::to_vec(&fixture).unwrap()).unwrap();
         let recorded = record_fixture(&mut source, &root, 1024 * 1024).unwrap();
         let inspected = inspect_session(&root, recorded.session_id).unwrap();
 
@@ -3725,8 +4084,16 @@ mod tests {
         assert_eq!(human, render_inspect_human(&inspected));
         assert_eq!(json, render_inspect_json(&inspected).unwrap());
         for rendered in [&human, &json] {
-            assert!(!rendered.contains("x-tag"));
-            assert!(!rendered.contains("two"));
+            for secret in [
+                "authorization",
+                "super-secret",
+                "cookie",
+                "session=secret",
+                "x-secret",
+                "top-secret",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
         }
         assert!(json.starts_with("{\"version\":1,"));
         std::fs::remove_dir_all(root).unwrap();
@@ -3749,6 +4116,8 @@ mod tests {
         let inspected = inspect_session(&root, recorded.session_id).unwrap();
         assert!(!inspected.complete);
         assert!(!inspected.replayable);
+        assert_eq!(inspected.replayability, Replayability::NotReplayable);
+        assert_eq!(inspected.executable_operations, 0);
         assert!(!inspected.blockers.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4956,13 +5325,85 @@ mod tests {
     }
 
     #[test]
+    fn doctor_path_probes_do_not_create_supplied_paths() {
+        let root = std::env::temp_dir().join(format!("chronicle-doctor-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let wal_dir = root.join("wal");
+        let output = root.join("output");
+        let report = doctor_report(&DoctorOptions {
+            wal_dir: Some(wal_dir.clone()),
+            output: Some(output.clone()),
+        });
+        assert!(
+            report
+                .probes
+                .iter()
+                .filter(|probe| probe.code.starts_with("storage."))
+                .all(|probe| probe.status == DoctorStatus::Supported)
+        );
+        assert!(!wal_dir.exists());
+        assert!(!output.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_status_precedence_and_exit_codes_are_stable() {
+        let probe = |required, status| DoctorProbe {
+            required,
+            status,
+            code: "test".into(),
+            message: "test".into(),
+            remediation: "test".into(),
+        };
+        for (probes, expected, exit) in [
+            (
+                vec![
+                    probe(true, DoctorStatus::NotChecked),
+                    probe(true, DoctorStatus::Unsupported),
+                ],
+                DoctorStatus::Unsupported,
+                4,
+            ),
+            (
+                vec![probe(true, DoctorStatus::NotChecked)],
+                DoctorStatus::NotChecked,
+                4,
+            ),
+            (
+                vec![
+                    probe(true, DoctorStatus::Supported),
+                    probe(false, DoctorStatus::Unsupported),
+                ],
+                DoctorStatus::SupportedWithWarnings,
+                0,
+            ),
+            (
+                vec![probe(true, DoctorStatus::Supported)],
+                DoctorStatus::Supported,
+                0,
+            ),
+        ] {
+            let report = DoctorReport::new(probes);
+            assert_eq!(report.status, expected);
+            assert_eq!(report.exit_code(), exit);
+        }
+    }
+
+    #[test]
     fn replay_report_v1_serializes_outcome_and_operation_state() {
         let result = ReplaySessionResult {
             session_id: "session".into(),
+            replayability: Replayability::FullyReplayable,
             outcome: ReplayOutcome::DryRun,
             dry_run: true,
             preflight_denied: false,
             transport_failed: false,
+            counts: ReplayCounts {
+                executable: 1,
+                unattempted: 1,
+                verification_not_run: 1,
+                ..ReplayCounts::default()
+            },
             operations: vec![ReplayOperationSummary {
                 operation_id: "operation".into(),
                 decision: "allowed".into(),
@@ -4977,6 +5418,11 @@ mod tests {
             serde_json::from_str(&render_replay_json(&result).unwrap()).unwrap();
         assert_eq!(value["version"], REPLAY_REPORT_VERSION);
         assert_eq!(value["result"]["outcome"], "dry_run");
+        assert_eq!(value["result"]["counts"]["verification_not_run"], 1);
         assert_eq!(value["result"]["operations"][0]["state"], "not_attempted");
+        assert_eq!(
+            result.counts,
+            ReplayCounts::from_operations(&result.operations)
+        );
     }
 }

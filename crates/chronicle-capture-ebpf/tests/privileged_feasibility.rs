@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 #![allow(unsafe_code)] // Feasibility-only ABI decoding and euid probe.
 
 use aya::{

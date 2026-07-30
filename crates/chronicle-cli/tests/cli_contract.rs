@@ -22,10 +22,17 @@ fn output_text(output: &Output) -> (String, String) {
 }
 
 fn record(root: &std::path::Path) -> String {
-    let fixture = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../fixtures/http/basic-session.json"
-    );
+    record_fixture(
+        root,
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/http/basic-session.json"
+        )),
+    )
+}
+
+fn record_fixture(root: &std::path::Path, fixture: &std::path::Path) -> String {
+    let fixture = fixture.to_str().expect("fixture path is UTF-8");
     let root = root.to_str().expect("test root is UTF-8");
     let output = command(&[
         "record", "--source", "fixture", "--input", fixture, "--root", root,
@@ -122,6 +129,7 @@ fn spawn_server(response: &'static [u8]) -> (String, Arc<Mutex<Vec<u8>>>, thread
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).expect("set blocking stream");
                     stream
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .expect("set read timeout");
@@ -143,6 +151,14 @@ fn spawn_server(response: &'static [u8]) -> (String, Arc<Mutex<Vec<u8>>>, thread
         panic!("test server timed out waiting for request");
     });
     (format!("http://{address}"), request, task)
+}
+
+fn assert_no_connection(listener: &TcpListener) {
+    thread::sleep(Duration::from_millis(50));
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
 }
 
 fn replay_arguments<'a>(
@@ -210,6 +226,26 @@ fn cli_record_inspect_replay_and_exit_contract() {
     assert_eq!(dry_run.status.code(), Some(0));
     assert!(output_text(&dry_run).0.contains("dry_run: true"));
 
+    let json_dry_run = command(&[
+        "--format",
+        "json",
+        "replay",
+        &session_id,
+        "--root",
+        root_text,
+        "--target",
+        "http://127.0.0.1:9",
+        "--allow-host",
+        "127.0.0.1",
+    ]);
+    assert_eq!(json_dry_run.status.code(), Some(0));
+    let (stdout, stderr) = output_text(&json_dry_run);
+    assert!(stderr.is_empty());
+    assert_eq!(stdout.matches('\n').count(), 1);
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("replay JSON");
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["result"]["outcome"], "dry_run");
+
     let denied = command(&replay_arguments(
         &session_id,
         root_text,
@@ -251,6 +287,46 @@ fn cli_record_inspect_replay_and_exit_contract() {
     assert_eq!(mismatch.status.code(), Some(6));
     mismatch_task.join().expect("mismatch server completed");
 
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn cli_replay_never_contacts_recorded_target_or_follows_redirect() {
+    let root = std::env::temp_dir().join(format!("chronicle-cli-target-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create test root");
+    let recorded_target = TcpListener::bind("127.0.0.1:0").expect("bind recorded target");
+    recorded_target
+        .set_nonblocking(true)
+        .expect("set recorded target nonblocking");
+    let recorded_port = recorded_target
+        .local_addr()
+        .expect("recorded address")
+        .port();
+    let fixture = root.join("recorded-target.json");
+    let fixture_json = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/http/basic-session.json"
+    ))
+    .expect("read fixture")
+    .replace(
+        "\"host\": \"192.0.2.20\", \"port\": 8080",
+        &format!("\"host\": \"127.0.0.1\", \"port\": {recorded_port}"),
+    );
+    std::fs::write(&fixture, fixture_json).expect("write fixture");
+    let session_id = record_fixture(&root, &fixture);
+    let response = b"HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/escape\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    let (target, _, target_task) = spawn_server(response);
+
+    let output = command(&replay_arguments(
+        &session_id,
+        root.to_str().expect("root is UTF-8"),
+        &target,
+        true,
+        true,
+    ));
+    assert_eq!(output.status.code(), Some(6));
+    target_task.join().expect("target received replay");
+    assert_no_connection(&recorded_target);
     std::fs::remove_dir_all(root).expect("remove test root");
 }
 
@@ -434,11 +510,16 @@ fn cli_reports_usage_and_data_errors_as_safe_json() {
     assert_eq!(error["code"], 3);
 
     let doctor = command(&["--format", "json", "doctor"]);
-    assert_eq!(doctor.status.code(), Some(0));
+    assert_eq!(doctor.status.code(), Some(4));
     let (doctor_stdout, doctor_stderr) = output_text(&doctor);
     assert!(doctor_stderr.is_empty());
     assert_eq!(doctor_stdout.matches('\n').count(), 1);
-    assert!(serde_json::from_str::<serde_json::Value>(&doctor_stdout).is_ok());
+    let doctor: serde_json::Value = serde_json::from_str(&doctor_stdout).unwrap();
+    assert_eq!(doctor["version"], 1);
+    assert_eq!(doctor["status"], "unsupported");
+    assert!(doctor["probes"].is_array());
+    assert!(doctor_stdout.contains("capture.platform"));
+    assert!(!doctor_stdout.contains("distribution"));
 
     let etl = command(&["--format", "json", "etl"]);
     assert_eq!(etl.status.code(), Some(2));

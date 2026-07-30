@@ -588,6 +588,7 @@ pub mod http {
                     stream,
                     target: target.clone(),
                     context: context.clone(),
+                    used: false,
                 }) as Box<dyn ReplayConnection>)
             })
         }
@@ -597,6 +598,7 @@ pub mod http {
         stream: TcpStream,
         target: Endpoint,
         context: ReplayContext,
+        used: bool,
     }
 
     impl ReplayConnection for HttpReplayConnection {
@@ -604,6 +606,10 @@ pub mod http {
             &'a mut self,
             operation: &'a CanonicalOperation,
         ) -> BoxFuture<'a, Result<ObservedResponse, ProtocolError>> {
+            if self.used {
+                return Box::pin(async { Err(malformed("HTTP replay connection already used")) });
+            }
+            self.used = true;
             Box::pin(async move {
                 timeout(
                     OPERATION_TIMEOUT,
@@ -673,6 +679,7 @@ pub mod http {
         read_response(stream, &method).await
     }
 
+    #[allow(clippy::too_many_lines)] // Response framing keeps fixed-length and chunked paths together.
     async fn read_response(
         stream: &mut TcpStream,
         method: &str,
@@ -701,13 +708,42 @@ pub mod http {
                         ));
                     }
                     let headers = normalize_headers(response.headers)?;
-                    reject_unsupported_headers(&headers).map_err(|_| {
+                    reject_upgrade_headers(&headers).map_err(|_| {
                         transport(
                             TransportErrorCategory::UnsupportedFraming,
                             "upgrade response is unsupported",
                         )
                     })?;
                     let no_body = method == "HEAD" || matches!(status, 204 | 304);
+                    let chunked = !no_body
+                        && headers.iter().any(|header| {
+                            header.name == "transfer-encoding"
+                                && header.value.trim_ascii().eq_ignore_ascii_case(b"chunked")
+                        });
+                    if chunked {
+                        loop {
+                            if let Some((body, _)) = parse_replay_chunked_body(&bytes, head_len)? {
+                                return Ok(ObservedResponse {
+                                    payload: Some(PayloadRef::Inline {
+                                        content_type: None,
+                                        bytes: body,
+                                    }),
+                                    protocol_data: Some(
+                                        HttpObservedResponse { status, headers }.to_protocol_data(),
+                                    ),
+                                    attributes: BTreeMap::new(),
+                                    error_category: None,
+                                });
+                            }
+                            if bytes.len() >= MAX_RESPONSE_BYTES {
+                                return Err(transport(
+                                    TransportErrorCategory::UnsupportedFraming,
+                                    "response exceeds byte limit",
+                                ));
+                            }
+                            read_more(stream, &mut bytes).await?;
+                        }
+                    }
                     let body_len = if no_body {
                         0
                     } else if headers
@@ -751,6 +787,69 @@ pub mod http {
                 }
             }
             read_more(stream, &mut bytes).await?;
+        }
+    }
+
+    fn parse_replay_chunked_body(
+        bytes: &[u8],
+        start: usize,
+    ) -> Result<Option<(Vec<u8>, usize)>, ProtocolError> {
+        let mut cursor = start;
+        let mut body = Vec::new();
+        loop {
+            let Some(line_end) = bytes[cursor..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+            else {
+                return Ok(None);
+            };
+            let line_end = cursor + line_end;
+            let size_text = bytes[cursor..line_end]
+                .split(|byte| *byte == b';')
+                .next()
+                .ok_or_else(|| malformed("missing chunk size"))?;
+            let size_text =
+                std::str::from_utf8(size_text).map_err(|_| malformed("invalid chunk size"))?;
+            let chunk_size = usize::from_str_radix(size_text.trim(), 16)
+                .map_err(|_| malformed("invalid chunk size"))?;
+            cursor = line_end + 2;
+            if chunk_size == 0 {
+                let mut trailer_cursor = cursor;
+                loop {
+                    let Some(line_end) = bytes[trailer_cursor..]
+                        .windows(2)
+                        .position(|window| window == b"\r\n")
+                    else {
+                        return Ok(None);
+                    };
+                    let line_end = trailer_cursor + line_end;
+                    if line_end == trailer_cursor {
+                        return Ok(Some((body, line_end + 2)));
+                    }
+                    if !bytes[trailer_cursor..line_end].contains(&b':') {
+                        return Err(malformed("invalid chunk trailer"));
+                    }
+                    trailer_cursor = line_end + 2;
+                    if trailer_cursor.saturating_sub(cursor) > MAX_HEAD_BYTES {
+                        return Err(malformed("chunk trailers exceed limit"));
+                    }
+                }
+            }
+            if body.len().saturating_add(chunk_size) > MAX_RESPONSE_BYTES {
+                return Err(transport(
+                    TransportErrorCategory::UnsupportedFraming,
+                    "response exceeds byte limit",
+                ));
+            }
+            if bytes.len() < cursor.saturating_add(chunk_size).saturating_add(2) {
+                return Ok(None);
+            }
+            body.extend_from_slice(&bytes[cursor..cursor + chunk_size]);
+            cursor += chunk_size;
+            if &bytes[cursor..cursor + 2] != b"\r\n" {
+                return Err(malformed("invalid chunk terminator"));
+            }
+            cursor += 2;
         }
     }
 
@@ -1746,6 +1845,7 @@ pub mod http {
         }
 
         #[test]
+        #[allow(clippy::too_many_lines)]
         fn verifier_compares_status_headers_and_body_without_values() {
             let operation = verified_operation();
             let verifier = HttpVerifier::new();
@@ -1801,6 +1901,66 @@ pub mod http {
             assert_eq!(body.status, VerificationStatus::Failed);
             assert!(body.details.contains_key("expected_body_sha256"));
             assert!(!format!("{body:?}").contains("changed-body"));
+
+            let mut missing = verified_operation();
+            let mut missing_data =
+                HttpOperationData::from_protocol_data(&missing.protocol_data).unwrap();
+            missing_data.response_status = None;
+            missing.protocol_data = missing_data.into_protocol_data();
+            assert_eq!(
+                verifier
+                    .verify(&missing, &observed(200, Vec::new(), b"expected-body"))
+                    .status,
+                VerificationStatus::Inconclusive
+            );
+
+            let mut incomplete = observed(
+                200,
+                vec![Header {
+                    name: "authorization".into(),
+                    value: b"recorded-secret".to_vec(),
+                }],
+                b"expected-body",
+            );
+            incomplete.payload = None;
+            assert_eq!(
+                verifier.verify(&operation, &incomplete).status,
+                VerificationStatus::Inconclusive
+            );
+
+            let mut ordered = verified_operation();
+            let mut ordered_data =
+                HttpOperationData::from_protocol_data(&ordered.protocol_data).unwrap();
+            ordered_data.response_headers = vec![
+                Header {
+                    name: "x-first".into(),
+                    value: b"one".to_vec(),
+                },
+                Header {
+                    name: "x-second".into(),
+                    value: b"two".to_vec(),
+                },
+            ];
+            ordered.protocol_data = ordered_data.into_protocol_data();
+            let ordered_headers = verifier.verify(
+                &ordered,
+                &observed(
+                    200,
+                    vec![
+                        Header {
+                            name: "x-second".into(),
+                            value: b"two".to_vec(),
+                        },
+                        Header {
+                            name: "x-first".into(),
+                            value: b"one".to_vec(),
+                        },
+                    ],
+                    b"expected-body",
+                ),
+            );
+            assert_eq!(ordered_headers.status, VerificationStatus::Failed);
+            assert_eq!(ordered_headers.details["header"], "x-first");
         }
 
         #[test]
@@ -1913,6 +2073,95 @@ pub mod http {
             assert!(adapter.connect(&endpoint, &context).await.is_ok());
         }
 
+        #[tokio::test]
+        async fn replay_transport_handles_refusal_timeout_and_one_request_per_connection() {
+            let refusal_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let refused = Endpoint::new("127.0.0.1", refusal_listener.local_addr().unwrap().port());
+            drop(refusal_listener);
+            let mut context = ReplayContext::default();
+            context.authorize_execution_for(refused.clone());
+            let Err(error) = HttpReplayAdapter::new().connect(&refused, &context).await else {
+                panic!("refused target unexpectedly connected")
+            };
+            assert!(matches!(
+                error,
+                ProtocolError::Transport {
+                    category: TransportErrorCategory::Refused,
+                    ..
+                }
+            ));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = Endpoint::new("127.0.0.1", listener.local_addr().unwrap().port());
+            tokio::spawn(async move {
+                let (_peer, _) = listener.accept().await.unwrap();
+                tokio::time::sleep(OPERATION_TIMEOUT + Duration::from_millis(20)).await;
+            });
+            let mut context = ReplayContext::default();
+            context.authorize_execution_for(endpoint.clone());
+            let mut connection = HttpReplayAdapter::new()
+                .connect(&endpoint, &context)
+                .await
+                .unwrap();
+            let error = connection.execute(&verified_operation()).await.unwrap_err();
+            assert!(matches!(
+                error,
+                ProtocolError::Transport {
+                    category: TransportErrorCategory::Timeout,
+                    ..
+                }
+            ));
+            assert!(connection.execute(&verified_operation()).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn replay_reader_preserves_3xx_and_rejects_incomplete_or_oversized_responses() {
+            for (response, expect_status, expect_category) in [
+                (
+                    b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n".as_slice(),
+                    Some(302),
+                    None,
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nO".as_slice(),
+                    None,
+                    Some(TransportErrorCategory::Disconnect),
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8388609\r\n\r\n".as_slice(),
+                    None,
+                    Some(TransportErrorCategory::UnsupportedFraming),
+                ),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let response = response.to_vec();
+                tokio::spawn(async move {
+                    let (mut peer, _) = listener.accept().await.unwrap();
+                    peer.write_all(&response).await.unwrap();
+                });
+                let mut client = TcpStream::connect(address).await.unwrap();
+                match (
+                    read_response(&mut client, "GET").await,
+                    expect_status,
+                    expect_category,
+                ) {
+                    (Ok(observed), Some(status), None) => assert_eq!(
+                        HttpObservedResponse::from_protocol_data(
+                            observed.protocol_data.as_ref().unwrap()
+                        )
+                        .unwrap()
+                        .status,
+                        status
+                    ),
+                    (Err(ProtocolError::Transport { category, .. }), None, Some(expected)) => {
+                        assert_eq!(category, expected);
+                    }
+                    result => panic!("unexpected replay reader result: {result:?}"),
+                }
+            }
+        }
+
         #[test]
         fn replay_target_address_requires_loopback_and_supports_ipv6() {
             assert_eq!(
@@ -1949,12 +2198,20 @@ pub mod http {
                         value: b"captured-secret".to_vec(),
                     },
                     Header {
+                        name: "proxy-authorization".into(),
+                        value: b"captured-proxy-secret".to_vec(),
+                    },
+                    Header {
                         name: "cookie".into(),
                         value: b"captured-cookie".to_vec(),
                     },
                     Header {
                         name: "x-forwarded-for".into(),
                         value: b"198.51.100.10".to_vec(),
+                    },
+                    Header {
+                        name: "forwarded".into(),
+                        value: b"for=198.51.100.10".to_vec(),
                     },
                     Header {
                         name: "transfer-encoding".into(),

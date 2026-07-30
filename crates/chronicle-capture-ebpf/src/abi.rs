@@ -310,7 +310,20 @@ fn decode_payload(bytes: &[u8], kind: u8) -> Result<RawKernelObservation, EbpfCa
     };
     let captured_length = usize::try_from(read_u32(bytes, SOCKET_BYTES + 13, "payload")?)
         .map_err(|_| decode_error("payload", "captured length does not fit usize"))?;
-    if bytes.len() != SOCKET_BYTES + PAYLOAD_HEADER_BYTES + captured_length {
+    if captured_length > 16 * 1024 {
+        return Err(EbpfCaptureError::InvalidPayload {
+            context: "payload",
+            reason: "captured length exceeds 16 KiB event bound",
+        });
+    }
+    let payload_end = SOCKET_BYTES
+        .checked_add(PAYLOAD_HEADER_BYTES)
+        .and_then(|header| header.checked_add(captured_length))
+        .ok_or(EbpfCaptureError::InvalidPayload {
+            context: "payload",
+            reason: "captured length exceeds ABI item bounds",
+        })?;
+    if bytes.len() < payload_end || bytes.len() > SOCKET_BYTES + PAYLOAD_HEADER_BYTES + 16 * 1024 {
         return Err(EbpfCaptureError::InvalidPayload {
             context: "payload",
             reason: "captured length exceeds ABI item bounds",
@@ -329,7 +342,7 @@ fn decode_payload(bytes: &[u8], kind: u8) -> Result<RawKernelObservation, EbpfCa
         continuation_position: read_u32(bytes, SOCKET_BYTES + 5, "payload")?,
         observed_length: (observed_length != 0).then_some(observed_length),
         truncated: bytes[SOCKET_BYTES + 17] != 0,
-        payload: bytes[SOCKET_BYTES + PAYLOAD_HEADER_BYTES..].to_vec(),
+        payload: bytes[SOCKET_BYTES + PAYLOAD_HEADER_BYTES..payload_end].to_vec(),
     }))
 }
 

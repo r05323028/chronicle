@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
 
+pub const MAX_REPLAY_OPERATIONS: usize = 10_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimingMode {
     Preserve,
@@ -274,6 +276,10 @@ impl PlannedOperation {
         self.scheduled_offset
     }
 
+    pub fn completeness(&self) -> &Completeness {
+        &self.completeness
+    }
+
     pub fn operation(&self) -> &CanonicalOperation {
         &self.operation
     }
@@ -283,6 +289,7 @@ impl PlannedOperation {
 pub struct ReplayPlan {
     timing: TimingMode,
     dry_run: bool,
+    invalid_session: bool,
     operations: Vec<PlannedOperation>,
 }
 
@@ -299,8 +306,35 @@ impl ReplayPlan {
         &self.operations
     }
 
+    /// True when at least one operation can execute and no executable candidate is policy denied.
     pub fn is_executable(&self) -> bool {
-        self.operations.iter().all(PlannedOperation::is_allowed)
+        !self.invalid_session && self.has_executable() && !self.has_policy_denial()
+    }
+
+    pub fn has_executable(&self) -> bool {
+        self.operations.iter().any(PlannedOperation::is_allowed)
+    }
+
+    pub fn has_policy_denial(&self) -> bool {
+        self.operations
+            .iter()
+            .any(|operation| matches!(operation.decision, ReplayDecision::Denied(_)))
+    }
+
+    pub fn replayability(&self) -> Replayability {
+        if self.invalid_session {
+            return Replayability::NotReplayable;
+        }
+        let executable = self
+            .operations
+            .iter()
+            .filter(|operation| operation.is_allowed())
+            .count();
+        match (executable, self.operations.len()) {
+            (0, _) => Replayability::NotReplayable,
+            (count, total) if count == total => Replayability::FullyReplayable,
+            _ => Replayability::PartiallyReplayable,
+        }
     }
 }
 
@@ -332,6 +366,12 @@ impl ReplayPlanner {
         policy: &ReplayPolicy,
         timing: TimingMode,
     ) -> Result<ReplayPlan, ReplayError> {
+        let invalid_session = session
+            .connections
+            .iter()
+            .map(|connection| connection.operations.len())
+            .sum::<usize>()
+            > MAX_REPLAY_OPERATIONS;
         let mut operations = Vec::new();
         for connection in &session.connections {
             let (target, connection_decision) =
@@ -354,8 +394,17 @@ impl ReplayPlanner {
                 session.connection_state(&connection.id) == Completeness::Complete;
             for operation in &connection.operations {
                 let completeness = session.operation_state(&operation.id);
-                let decision = if connection.protocol.as_str() == "http/1.1"
-                    && !policy.execution_authorized
+                let decision = if invalid_session
+                    || !connection_complete
+                    || completeness != Completeness::Complete
+                    || operation.recorded_response.is_none()
+                    || operation
+                        .attributes
+                        .get("chronicle.replayable")
+                        .is_some_and(|value| value == "false")
+                {
+                    ReplayDecision::Unsupported
+                } else if connection.protocol.as_str() == "http/1.1" && !policy.execution_authorized
                 {
                     ReplayDecision::Denied(ReplayDenial::ExecutionNotAuthorized)
                 } else if operation
@@ -367,15 +416,6 @@ impl ReplayPlanner {
                     ReplayDecision::Denied(ReplayDenial::EffectNotAllowed(
                         OperationEffect::Authentication,
                     ))
-                } else if !connection_complete
-                    || completeness != Completeness::Complete
-                    || operation.recorded_response.is_none()
-                    || operation
-                        .attributes
-                        .get("chronicle.replayable")
-                        .is_some_and(|value| value == "false")
-                {
-                    ReplayDecision::Unsupported
                 } else {
                     connection_decision.clone().unwrap_or_else(|| {
                         if policy.allows(operation.effect) {
@@ -405,6 +445,7 @@ impl ReplayPlanner {
         Ok(ReplayPlan {
             timing,
             dry_run: policy.dry_run,
+            invalid_session,
             operations,
         })
     }
@@ -493,8 +534,10 @@ impl<'a> ReplayExecutor<'a> {
         if plan.dry_run || !plan.is_executable() {
             let (outcome, category) = if plan.dry_run {
                 (ReplayOutcome::DryRun, "dry_run")
-            } else {
+            } else if plan.has_policy_denial() {
                 (ReplayOutcome::StoppedPolicy, "preflight_denied")
+            } else {
+                (ReplayOutcome::StoppedInvalidSession, "non_executable")
             };
             return Ok(ReplayExecution {
                 outcome,
@@ -509,28 +552,15 @@ impl<'a> ReplayExecutor<'a> {
         let mut outcome = ReplayOutcome::Completed;
         let mut stopped = false;
         for planned in &plan.operations {
-            if stopped {
-                results.push(no_run_result(
-                    planned,
-                    "unattempted_after_non_passing_verification",
-                ));
+            if !planned.is_allowed() {
+                results.push(no_run_result(planned, "non_executable"));
+                if outcome == ReplayOutcome::Completed {
+                    outcome = ReplayOutcome::CompletedWithSkips;
+                }
                 continue;
             }
-            if planned.completeness != Completeness::Complete
-                || planned.operation.recorded_response.is_none()
-            {
-                results.push(OperationReplayResult {
-                    operation_id: planned.operation.id,
-                    state: OperationExecutionState::NotAttempted,
-                    verification: Some(verification(
-                        VerificationStatus::Inconclusive,
-                        "recorded response is incomplete or missing",
-                        "incomplete_expectation",
-                    )),
-                    transport_error: None,
-                });
-                outcome = ReplayOutcome::StoppedVerification;
-                stopped = true;
+            if stopped {
+                results.push(no_run_result(planned, "unattempted_after_stop"));
                 continue;
             }
             let target = planned.target.as_ref().ok_or(ReplayError::MissingTarget {
@@ -626,7 +656,14 @@ mod tests {
         PayloadRef, ProtocolData, ReplayMetadata, SourceMetadata,
     };
     use chronicle_common::{OperationId, SessionId};
-    use chronicle_protocol::VerificationStatus;
+    use chronicle_protocol::{
+        CapabilityStatus, ProtocolCapabilities, ProtocolRegistration, ReplayAdapter,
+        VerificationStatus,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use time::OffsetDateTime;
 
     fn session(effect: OperationEffect) -> CanonicalSession {
@@ -950,37 +987,404 @@ mod tests {
         );
     }
 
+    struct ConnectSpy {
+        id: ProtocolId,
+        connects: Arc<AtomicUsize>,
+    }
+
+    struct FailingConnect {
+        id: ProtocolId,
+        connects: Arc<AtomicUsize>,
+        fail_at: usize,
+    }
+
+    impl ReplayAdapter for FailingConnect {
+        fn protocol(&self) -> &ProtocolId {
+            &self.id
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _target: &'a Endpoint,
+            _context: &'a ReplayContext,
+        ) -> chronicle_protocol::BoxFuture<
+            'a,
+            Result<Box<dyn chronicle_protocol::ReplayConnection>, ProtocolError>,
+        > {
+            Box::pin(async move {
+                if self.connects.fetch_add(1, Ordering::Relaxed) == self.fail_at {
+                    return Err(ProtocolError::Transport {
+                        category: chronicle_protocol::TransportErrorCategory::Refused,
+                        message: "scripted refusal".into(),
+                    });
+                }
+                Ok(Box::new(PassingConnection) as Box<dyn chronicle_protocol::ReplayConnection>)
+            })
+        }
+    }
+
+    struct PassingConnection;
+
+    impl chronicle_protocol::ReplayConnection for PassingConnection {
+        fn execute<'a>(
+            &'a mut self,
+            operation: &'a CanonicalOperation,
+        ) -> chronicle_protocol::BoxFuture<
+            'a,
+            Result<chronicle_protocol::ObservedResponse, ProtocolError>,
+        > {
+            Box::pin(async move {
+                Ok(chronicle_protocol::ObservedResponse {
+                    payload: operation.recorded_response.clone(),
+                    protocol_data: None,
+                    attributes: BTreeMap::new(),
+                    error_category: None,
+                })
+            })
+        }
+    }
+
+    struct PassingVerifier {
+        id: ProtocolId,
+    }
+
+    impl chronicle_protocol::Verifier for PassingVerifier {
+        fn protocol(&self) -> &ProtocolId {
+            &self.id
+        }
+
+        fn verify(
+            &self,
+            _operation: &CanonicalOperation,
+            _observed: &chronicle_protocol::ObservedResponse,
+        ) -> VerificationResult {
+            verification(VerificationStatus::Passed, "scripted pass", "passed")
+        }
+    }
+
+    struct FailingSecondVerifier {
+        id: ProtocolId,
+        verifications: Arc<AtomicUsize>,
+    }
+
+    impl chronicle_protocol::Verifier for FailingSecondVerifier {
+        fn protocol(&self) -> &ProtocolId {
+            &self.id
+        }
+
+        fn verify(
+            &self,
+            _operation: &CanonicalOperation,
+            _observed: &chronicle_protocol::ObservedResponse,
+        ) -> VerificationResult {
+            let status = if self.verifications.fetch_add(1, Ordering::Relaxed) == 1 {
+                VerificationStatus::Failed
+            } else {
+                VerificationStatus::Passed
+            };
+            verification(status, "scripted verification", "scripted")
+        }
+    }
+
+    impl ReplayAdapter for ConnectSpy {
+        fn protocol(&self) -> &ProtocolId {
+            &self.id
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _target: &'a Endpoint,
+            _context: &'a ReplayContext,
+        ) -> chronicle_protocol::BoxFuture<
+            'a,
+            Result<Box<dyn chronicle_protocol::ReplayConnection>, ProtocolError>,
+        > {
+            Box::pin(async move {
+                self.connects.fetch_add(1, Ordering::Relaxed);
+                Err(ProtocolError::Replay("connect spy called".into()))
+            })
+        }
+    }
+
     #[tokio::test]
-    async fn denied_preflight_does_not_lookup_or_connect_an_adapter() {
-        let session = session(OperationEffect::Write);
-        let connection = &session.connections[0];
+    async fn denied_preflight_blocks_connects_and_preserves_unsupported_entries() {
+        let mut session = session(OperationEffect::Read);
+        let connection = &mut session.connections[0];
+        connection.protocol = ProtocolId::new("http/1.1");
+        let mut unsupported = connection.operations[0].clone();
+        unsupported.id = OperationId::new();
+        unsupported.sequence = 2;
+        unsupported
+            .attributes
+            .insert("chronicle.replayable".into(), "false".into());
+        let unsupported_id = unsupported.id;
+        connection.operations.push(unsupported);
+        session
+            .operation_completeness
+            .insert(unsupported_id, Completeness::Partial);
         let targets = TargetMap {
             rules: vec![TargetRule {
                 protocol: None,
                 host: None,
                 port: None,
                 connection_id: Some(connection.id),
-                target: Endpoint::new("test", 2),
+                target: Endpoint::new("127.0.0.1", 2),
             }],
         };
-        let policy = ReplayPolicy {
-            dry_run: false,
-            ..ReplayPolicy::default()
-        };
-        let plan = ReplayPlanner::plan(&session, &targets, &policy, TimingMode::Asap).unwrap();
+        let plan = ReplayPlanner::plan(
+            &session,
+            &targets,
+            &ReplayPolicy {
+                dry_run: false,
+                allow_reads: true,
+                ..ReplayPolicy::default()
+            },
+            TimingMode::Asap,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.operations()[0].decision(),
+            &ReplayDecision::Denied(ReplayDenial::ExecutionNotAuthorized)
+        );
+        assert_eq!(
+            plan.operations()[1].decision(),
+            &ReplayDecision::Unsupported
+        );
 
-        let results = ReplayExecutor::new(&ProtocolRegistry::new())
+        let connects = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProtocolRegistry::new();
+        registry
+            .register(ProtocolRegistration {
+                id: ProtocolId::new("http/1.1"),
+                display_name: "connect spy",
+                capabilities: ProtocolCapabilities {
+                    detection: CapabilityStatus::Unavailable,
+                    decoding: CapabilityStatus::Unavailable,
+                    canonicalization: CapabilityStatus::Unavailable,
+                    replay: CapabilityStatus::Available,
+                    verification: CapabilityStatus::Unavailable,
+                },
+                detector: None,
+                decoder_factory: None,
+                canonicalizer: None,
+                replay_adapter: Some(Arc::new(ConnectSpy {
+                    id: ProtocolId::new("http/1.1"),
+                    connects: connects.clone(),
+                })),
+                verifier: None,
+            })
+            .unwrap();
+        let results = ReplayExecutor::new(&registry)
             .execute(&plan, &BTreeMap::new())
             .await
             .unwrap();
         assert_eq!(results.outcome, ReplayOutcome::StoppedPolicy);
-        assert_eq!(results.results.len(), 1);
+        assert_eq!(connects.load(Ordering::Relaxed), 0);
+        assert_eq!(results.results.len(), 2);
+        assert!(
+            results
+                .results
+                .iter()
+                .all(|result| result.state == OperationExecutionState::NotAttempted)
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn execution_stops_on_transport_or_verification_and_accounts_for_skips() {
+        let mut session = session(OperationEffect::Read);
+        let connection = &mut session.connections[0];
+        let mut second = connection.operations[0].clone();
+        second.id = OperationId::new();
+        second.sequence = 2;
+        let second_id = second.id;
+        let mut third = second.clone();
+        third.id = OperationId::new();
+        third.sequence = 3;
+        let third_id = third.id;
+        let mut unsupported = third.clone();
+        unsupported.id = OperationId::new();
+        unsupported.sequence = 4;
+        unsupported
+            .attributes
+            .insert("chronicle.replayable".into(), "false".into());
+        let unsupported_id = unsupported.id;
+        connection.operations.extend([second, third, unsupported]);
+        session.operation_completeness.extend([
+            (second_id, Completeness::Complete),
+            (third_id, Completeness::Complete),
+            (unsupported_id, Completeness::Partial),
+        ]);
+        let targets = TargetMap {
+            rules: vec![TargetRule {
+                protocol: None,
+                host: None,
+                port: None,
+                connection_id: Some(connection.id),
+                target: Endpoint::new("127.0.0.1", 2),
+            }],
+        };
+        let plan = ReplayPlanner::plan(
+            &session,
+            &targets,
+            &ReplayPolicy {
+                dry_run: false,
+                allow_reads: true,
+                ..ReplayPolicy::default()
+            },
+            TimingMode::Asap,
+        )
+        .unwrap();
+        for (fail_at, expected_states) in [
+            (
+                0,
+                [
+                    OperationExecutionState::Failed,
+                    OperationExecutionState::NotAttempted,
+                    OperationExecutionState::NotAttempted,
+                    OperationExecutionState::NotAttempted,
+                ],
+            ),
+            (
+                1,
+                [
+                    OperationExecutionState::Completed,
+                    OperationExecutionState::Failed,
+                    OperationExecutionState::NotAttempted,
+                    OperationExecutionState::NotAttempted,
+                ],
+            ),
+        ] {
+            let connects = Arc::new(AtomicUsize::new(0));
+            let mut registry = ProtocolRegistry::new();
+            registry
+                .register(ProtocolRegistration {
+                    id: ProtocolId::new("fake"),
+                    display_name: "transport spy",
+                    capabilities: ProtocolCapabilities::unavailable(),
+                    detector: None,
+                    decoder_factory: None,
+                    canonicalizer: None,
+                    replay_adapter: Some(Arc::new(FailingConnect {
+                        id: ProtocolId::new("fake"),
+                        connects: connects.clone(),
+                        fail_at,
+                    })),
+                    verifier: Some(Arc::new(PassingVerifier {
+                        id: ProtocolId::new("fake"),
+                    })),
+                })
+                .unwrap();
+
+            let execution = ReplayExecutor::new(&registry)
+                .execute(&plan, &BTreeMap::new())
+                .await
+                .unwrap();
+            assert_eq!(execution.outcome, ReplayOutcome::StoppedTransport);
+            assert_eq!(connects.load(Ordering::Relaxed), fail_at + 1);
+            assert_eq!(execution.results.len(), 4);
+            assert_eq!(
+                execution
+                    .results
+                    .iter()
+                    .map(|result| result.state)
+                    .collect::<Vec<_>>(),
+                expected_states
+            );
+            assert_eq!(
+                execution.results[2]
+                    .verification
+                    .as_ref()
+                    .unwrap()
+                    .details
+                    .get("category"),
+                Some(&"unattempted_after_stop".into())
+            );
+            assert_eq!(
+                execution.results[3]
+                    .verification
+                    .as_ref()
+                    .unwrap()
+                    .details
+                    .get("category"),
+                Some(&"non_executable".into())
+            );
+        }
+
+        let connects = Arc::new(AtomicUsize::new(0));
+        let verifications = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProtocolRegistry::new();
+        registry
+            .register(ProtocolRegistration {
+                id: ProtocolId::new("fake"),
+                display_name: "verification spy",
+                capabilities: ProtocolCapabilities::unavailable(),
+                detector: None,
+                decoder_factory: None,
+                canonicalizer: None,
+                replay_adapter: Some(Arc::new(FailingConnect {
+                    id: ProtocolId::new("fake"),
+                    connects: connects.clone(),
+                    fail_at: usize::MAX,
+                })),
+                verifier: Some(Arc::new(FailingSecondVerifier {
+                    id: ProtocolId::new("fake"),
+                    verifications: verifications.clone(),
+                })),
+            })
+            .unwrap();
+        let execution = ReplayExecutor::new(&registry)
+            .execute(&plan, &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(execution.outcome, ReplayOutcome::StoppedVerification);
+        assert_eq!(connects.load(Ordering::Relaxed), 2);
+        assert_eq!(verifications.load(Ordering::Relaxed), 2);
         assert_eq!(
-            results.results[0].state,
-            OperationExecutionState::NotAttempted
+            execution
+                .results
+                .iter()
+                .map(|result| result.state)
+                .collect::<Vec<_>>(),
+            vec![
+                OperationExecutionState::Completed,
+                OperationExecutionState::Completed,
+                OperationExecutionState::NotAttempted,
+                OperationExecutionState::NotAttempted,
+            ]
+        );
+
+        let mut registry = ProtocolRegistry::new();
+        registry
+            .register(ProtocolRegistration {
+                id: ProtocolId::new("fake"),
+                display_name: "partial replay",
+                capabilities: ProtocolCapabilities::unavailable(),
+                detector: None,
+                decoder_factory: None,
+                canonicalizer: None,
+                replay_adapter: Some(Arc::new(FailingConnect {
+                    id: ProtocolId::new("fake"),
+                    connects: Arc::new(AtomicUsize::new(0)),
+                    fail_at: usize::MAX,
+                })),
+                verifier: Some(Arc::new(PassingVerifier {
+                    id: ProtocolId::new("fake"),
+                })),
+            })
+            .unwrap();
+        let execution = ReplayExecutor::new(&registry)
+            .execute(&plan, &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(execution.outcome, ReplayOutcome::CompletedWithSkips);
+        assert!(
+            execution.results[..3]
+                .iter()
+                .all(|result| result.state == OperationExecutionState::Completed)
         );
         assert_eq!(
-            results.results[0].verification.as_ref().unwrap().status,
+            execution.results[3].verification.as_ref().unwrap().status,
             VerificationStatus::Skipped
         );
     }
@@ -1047,6 +1451,127 @@ mod tests {
             plan.operations()[0].decision(),
             &ReplayDecision::Unsupported
         );
+    }
+
+    #[tokio::test]
+    async fn over_limit_imported_session_never_connects_or_omits_operations() {
+        let mut session = session(OperationEffect::Read);
+        let template = session.connections[0].operations[0].clone();
+        let extra: Vec<_> = (2..=u64::try_from(MAX_REPLAY_OPERATIONS + 1).unwrap())
+            .map(|sequence| {
+                let mut operation = template.clone();
+                operation.id = OperationId::new();
+                operation.sequence = sequence;
+                operation
+            })
+            .collect();
+        session.operation_completeness.extend(
+            extra
+                .iter()
+                .map(|operation| (operation.id, Completeness::Complete)),
+        );
+        session.connections[0].operations.extend(extra);
+        let connection = &session.connections[0];
+        let targets = TargetMap {
+            rules: vec![TargetRule {
+                protocol: None,
+                host: None,
+                port: None,
+                connection_id: Some(connection.id),
+                target: Endpoint::new("127.0.0.1", 2),
+            }],
+        };
+        let plan = ReplayPlanner::plan(
+            &session,
+            &targets,
+            &ReplayPolicy {
+                dry_run: false,
+                allow_reads: true,
+                execution_authorized: true,
+                ..ReplayPolicy::default()
+            },
+            TimingMode::Asap,
+        )
+        .unwrap();
+        assert_eq!(plan.operations().len(), MAX_REPLAY_OPERATIONS + 1);
+        assert!(!plan.is_executable());
+        assert_eq!(plan.replayability(), Replayability::NotReplayable);
+
+        let connects = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProtocolRegistry::new();
+        registry
+            .register(ProtocolRegistration {
+                id: ProtocolId::new("fake"),
+                display_name: "connect spy",
+                capabilities: ProtocolCapabilities::unavailable(),
+                detector: None,
+                decoder_factory: None,
+                canonicalizer: None,
+                replay_adapter: Some(Arc::new(ConnectSpy {
+                    id: ProtocolId::new("fake"),
+                    connects: connects.clone(),
+                })),
+                verifier: None,
+            })
+            .unwrap();
+        let execution = ReplayExecutor::new(&registry)
+            .execute(&plan, &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(execution.outcome, ReplayOutcome::StoppedInvalidSession);
+        assert_eq!(connects.load(Ordering::Relaxed), 0);
+        assert_eq!(execution.results.len(), MAX_REPLAY_OPERATIONS + 1);
+        assert!(
+            execution
+                .results
+                .iter()
+                .all(|result| result.state == OperationExecutionState::NotAttempted)
+        );
+    }
+
+    #[test]
+    fn planner_keeps_complete_sibling_executable_when_other_is_degraded() {
+        let mut session = session(OperationEffect::Read);
+        let connection = &mut session.connections[0];
+        let mut degraded = connection.operations[0].clone();
+        degraded.id = OperationId::new();
+        degraded.sequence = 2;
+        degraded
+            .attributes
+            .insert("chronicle.replayable".into(), "false".into());
+        let degraded_id = degraded.id;
+        connection.operations.push(degraded);
+        session
+            .operation_completeness
+            .insert(degraded_id, Completeness::Partial);
+        let targets = TargetMap {
+            rules: vec![TargetRule {
+                protocol: None,
+                host: None,
+                port: None,
+                connection_id: Some(connection.id),
+                target: Endpoint::new("test", 2),
+            }],
+        };
+        let plan = ReplayPlanner::plan(
+            &session,
+            &targets,
+            &ReplayPolicy {
+                dry_run: false,
+                allow_reads: true,
+                ..ReplayPolicy::default()
+            },
+            TimingMode::Asap,
+        )
+        .unwrap();
+
+        assert_eq!(plan.operations()[0].decision(), &ReplayDecision::Allowed);
+        assert_eq!(
+            plan.operations()[1].decision(),
+            &ReplayDecision::Unsupported
+        );
+        assert!(plan.is_executable());
+        assert_eq!(plan.replayability(), Replayability::PartiallyReplayable);
     }
 
     #[test]

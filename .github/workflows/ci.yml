@@ -64,6 +64,5 @@ jobs:
 
       - name: Compile eBPF capture
         run: |
-          cd ebpf
-          cargo +nightly check --locked
+          cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release --locked
           echo "Compile success is unprivileged only; privileged runtime hook behavior is not checked."

@@ -4,7 +4,9 @@
 //! Serde validates wire shape and schema version; [`CanonicalSession::validate`] checks
 //! cross-field structure before publication.
 
-use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId, SessionId, Timestamp};
+use chronicle_common::{
+    ConnectionId, Endpoint, OperationId, ProtocolId, RecordingId, SessionId, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -47,10 +49,21 @@ pub struct ProvenanceEntry {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitMarkerProvenance {
+    pub segment_ordinal: u64,
+    pub byte_offset: u64,
+    pub sequence: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceProvenance {
+    pub recording_id: Option<RecordingId>,
     pub status: SourceStatus,
     pub reason: Option<String>,
+    pub commit_marker: Option<CommitMarkerProvenance>,
+    pub wal_snapshot_sha256: Option<String>,
+    pub pipeline_version: Option<String>,
     /// Deterministic source evidence order, never a stringly-typed attribute.
     pub evidence: Vec<ProvenanceEntry>,
 }

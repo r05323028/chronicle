@@ -22,9 +22,12 @@ const LITTLE_ENDIAN: u8 = 1;
 const HEADER_BYTES: usize = 12;
 const COMMON_SOCKET_BYTES: usize = 48;
 const PAYLOAD_HEADER_BYTES: usize = 18;
-const MAX_PAYLOAD_BYTES: usize = 64;
-const MAX_ITEM_BYTES: usize =
+const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_PAYLOAD_CONTINUATIONS: usize = 4;
+const MAX_OBSERVED_PAYLOAD_BYTES: usize = MAX_PAYLOAD_BYTES * MAX_PAYLOAD_CONTINUATIONS;
+const PAYLOAD_ITEM_BYTES: usize =
     HEADER_BYTES + COMMON_SOCKET_BYTES + PAYLOAD_HEADER_BYTES + MAX_PAYLOAD_BYTES;
+const MAX_SMALL_ITEM_BYTES: usize = HEADER_BYTES + COMMON_SOCKET_BYTES + 38 + 5;
 
 const CONNECT4: u8 = 1;
 const CONNECT6: u8 = 2;
@@ -88,7 +91,7 @@ fn emit_connect(ctx: &SockAddrContext, kind: u8, port: u16, remote_address: [u32
         return;
     }
     let observed_cgroup_id = unsafe { generated::bpf_get_current_cgroup_id() };
-    let mut item = [0_u8; MAX_ITEM_BYTES];
+    let mut item = [0_u8; MAX_SMALL_ITEM_BYTES];
     let mut len = write_common(
         &mut item,
         kind,
@@ -109,6 +112,7 @@ fn emit_connect(ctx: &SockAddrContext, kind: u8, port: u16, remote_address: [u32
     len += 2;
     item[len] = ROLE_ACTIVE;
     len += 1;
+    write_u32(&mut item, 8, len as u32);
     submit(&item, len);
 }
 
@@ -164,7 +168,7 @@ pub fn socket_lifecycle(ctx: SockOpsContext) -> u32 {
     } else {
         (0, 0, 0, [0; 4], [0; 4])
     };
-    let mut item = [0_u8; MAX_ITEM_BYTES];
+    let mut item = [0_u8; MAX_SMALL_ITEM_BYTES];
     // SockOps may run in peer task context; zero tells userspace to use attachment scope.
     let mut len = write_common(&mut item, SOCKOPS, ctx.as_ptr(), false, established, 0);
     item[len] = match op {
@@ -198,6 +202,7 @@ pub fn socket_lifecycle(ctx: SockOpsContext) -> u32 {
         };
         len += 38;
     }
+    write_u32(&mut item, 8, len as u32);
     submit(&item, len);
     0
 }
@@ -248,15 +253,8 @@ fn emit_skb(ctx: &SkBuffContext, kind: u8) {
     if observed_length == 0 {
         return;
     }
-    let captured_length = payload_load_length(observed_length);
-    let mut item = [0_u8; MAX_ITEM_BYTES];
-    // Ingress processing may run in peer task context; attachment proves scope.
-    let mut len = write_common(&mut item, kind, ctx.as_ptr(), false, false, 0);
-    item[len] = family;
-    len += 1;
+    let captured_length = core::cmp::min(observed_length, MAX_OBSERVED_PAYLOAD_BYTES);
     let tcp_sequence = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
-    write_u32(&mut item, len, tcp_sequence);
-    len += 4;
     let socket_cookie = unsafe { generated::bpf_get_socket_cookie(ctx.as_ptr()) };
     let continuation_position = match unsafe { FIRST_SEQUENCE.get(socket_cookie) } {
         Some(first_sequence) => tcp_sequence.wrapping_sub(*first_sequence),
@@ -265,25 +263,97 @@ fn emit_skb(ctx: &SkBuffContext, kind: u8) {
             0
         }
     };
-    write_u32(&mut item, len, continuation_position);
-    len += 4;
-    write_u32(&mut item, len, observed_length as u32);
-    len += 4;
-    write_u32(&mut item, len, captured_length as u32);
-    len += 4;
-    item[len] = u8::from(observed_length != captured_length);
-    len += 1;
-    if !load_payload(ctx, payload_offset, captured_length, unsafe {
-        item.as_mut_ptr().add(len)
-    }) {
+    if captured_length < MAX_PAYLOAD_BYTES {
+        let short_capture = core::cmp::min(observed_length, 64);
+        emit_payload_chunk::<64>(
+            ctx,
+            kind,
+            family,
+            payload_offset,
+            0,
+            tcp_sequence,
+            continuation_position,
+            observed_length,
+            short_capture,
+        );
         return;
     }
-    len += captured_length;
-    submit(&item, len);
+    let mut chunk_offset = 0_usize;
+    if captured_length >= MAX_PAYLOAD_BYTES {
+        emit_payload_chunk::<MAX_PAYLOAD_BYTES>(
+            ctx,
+            kind,
+            family,
+            payload_offset,
+            chunk_offset,
+            tcp_sequence,
+            continuation_position,
+            observed_length,
+            captured_length,
+        );
+        chunk_offset += MAX_PAYLOAD_BYTES;
+    }
+    if captured_length - chunk_offset >= MAX_PAYLOAD_BYTES {
+        emit_payload_chunk::<MAX_PAYLOAD_BYTES>(
+            ctx,
+            kind,
+            family,
+            payload_offset,
+            chunk_offset,
+            tcp_sequence,
+            continuation_position,
+            observed_length,
+            captured_length,
+        );
+        chunk_offset += MAX_PAYLOAD_BYTES;
+    }
+    if captured_length - chunk_offset >= MAX_PAYLOAD_BYTES {
+        emit_payload_chunk::<MAX_PAYLOAD_BYTES>(
+            ctx,
+            kind,
+            family,
+            payload_offset,
+            chunk_offset,
+            tcp_sequence,
+            continuation_position,
+            observed_length,
+            captured_length,
+        );
+        chunk_offset += MAX_PAYLOAD_BYTES;
+    }
+    if captured_length > chunk_offset {
+        let remaining = captured_length - chunk_offset;
+        if remaining >= MAX_PAYLOAD_BYTES {
+            emit_payload_chunk::<MAX_PAYLOAD_BYTES>(
+                ctx,
+                kind,
+                family,
+                payload_offset,
+                chunk_offset,
+                tcp_sequence,
+                continuation_position,
+                observed_length,
+                captured_length,
+            );
+        } else {
+            let tail_capture = core::cmp::min(remaining, 64);
+            emit_payload_chunk::<64>(
+                ctx,
+                kind,
+                family,
+                payload_offset,
+                chunk_offset,
+                tcp_sequence,
+                continuation_position,
+                observed_length,
+                chunk_offset + tail_capture,
+            );
+        }
+    }
 }
 
 fn write_common(
-    item: &mut [u8; MAX_ITEM_BYTES],
+    item: &mut [u8],
     kind: u8,
     context: *mut core::ffi::c_void,
     include_process: bool,
@@ -322,11 +392,9 @@ fn write_common(
     size
 }
 
-fn submit(item: &[u8; MAX_ITEM_BYTES], size: usize) {
-    let mut copy = *item;
-    write_u32(&mut copy, 8, size as u32);
+fn submit(item: &[u8], size: usize) {
     if let Some(mut entry) = EVENTS.reserve_bytes(size, 0) {
-        unsafe { core::ptr::copy_nonoverlapping(copy.as_ptr(), entry.as_mut_ptr(), size) };
+        unsafe { core::ptr::copy_nonoverlapping(item.as_ptr(), entry.as_mut_ptr(), size) };
         entry.submit(0);
         increment_counter(0);
     } else {
@@ -334,31 +402,161 @@ fn submit(item: &[u8; MAX_ITEM_BYTES], size: usize) {
     }
 }
 
-const fn payload_load_length(observed_length: usize) -> usize {
-    if observed_length >= MAX_PAYLOAD_BYTES {
-        MAX_PAYLOAD_BYTES
-    } else if observed_length >= 32 {
-        32
-    } else if observed_length >= 16 {
-        16
-    } else if observed_length >= 8 {
-        8
-    } else if observed_length >= 4 {
-        4
-    } else {
-        1
+#[inline(always)]
+fn emit_payload_chunk<const CHUNK_BYTES: usize>(
+    ctx: &SkBuffContext,
+    kind: u8,
+    family: u8,
+    payload_offset: usize,
+    chunk_offset: usize,
+    tcp_sequence: u32,
+    continuation_position: u32,
+    observed_length: usize,
+    captured_length: usize,
+) {
+    let remaining = captured_length.saturating_sub(chunk_offset);
+    let chunk_length = core::cmp::min(remaining, CHUNK_BYTES);
+    if chunk_length == 0 {
+        return;
     }
+    let size = PAYLOAD_ITEM_BYTES;
+    let Some(mut entry) = EVENTS.reserve_bytes(size, 0) else {
+        increment_counter(1);
+        return;
+    };
+    let mut header = [0_u8; HEADER_BYTES + COMMON_SOCKET_BYTES + PAYLOAD_HEADER_BYTES];
+    let mut len = write_common(&mut header, kind, ctx.as_ptr(), false, false, 0);
+    header[len] = family;
+    len += 1;
+    write_u32(
+        &mut header,
+        len,
+        tcp_sequence.wrapping_add(chunk_offset as u32),
+    );
+    len += 4;
+    write_u32(
+        &mut header,
+        len,
+        continuation_position.wrapping_add(chunk_offset as u32),
+    );
+    len += 4;
+    let is_final_chunk = chunk_offset + chunk_length == captured_length;
+    let truncated = observed_length > captured_length && is_final_chunk;
+    let chunk_observed_length = if truncated {
+        observed_length.saturating_sub(chunk_offset)
+    } else {
+        chunk_length
+    };
+    write_u32(&mut header, len, chunk_observed_length as u32);
+    len += 4;
+    write_u32(&mut header, len, chunk_length as u32);
+    len += 4;
+    header[len] = u8::from(truncated);
+    len += 1;
+    write_u32(&mut header, 8, size as u32);
+    unsafe {
+        core::ptr::copy_nonoverlapping(header.as_ptr(), entry.as_mut_ptr(), len);
+    }
+    let destination = unsafe { entry.as_mut_ptr().add(len) };
+    let loaded = if CHUNK_BYTES == 64 {
+        load_small_payload(
+            ctx,
+            payload_offset + chunk_offset,
+            destination,
+            chunk_length,
+        )
+    } else {
+        skb_load::<CHUNK_BYTES>(ctx, payload_offset + chunk_offset, destination)
+    };
+    if !loaded {
+        entry.discard(0);
+        return;
+    }
+    entry.submit(0);
+    increment_counter(0);
 }
 
-fn load_payload(ctx: &SkBuffContext, offset: usize, length: usize, destination: *mut u8) -> bool {
-    match length {
-        64 => skb_load::<64>(ctx, offset, destination),
-        32 => skb_load::<32>(ctx, offset, destination),
-        16 => skb_load::<16>(ctx, offset, destination),
-        8 => skb_load::<8>(ctx, offset, destination),
-        4 => skb_load::<4>(ctx, offset, destination),
-        _ => skb_load::<1>(ctx, offset, destination),
+#[inline(always)]
+fn load_small_payload(
+    ctx: &SkBuffContext,
+    offset: usize,
+    destination: *mut u8,
+    length: usize,
+) -> bool {
+    macro_rules! load_byte {
+        ($index:expr) => {
+            if length > $index
+                && !skb_load::<1>(ctx, offset + $index, unsafe { destination.add($index) })
+            {
+                return false;
+            }
+        };
     }
+    load_byte!(0);
+    load_byte!(1);
+    load_byte!(2);
+    load_byte!(3);
+    load_byte!(4);
+    load_byte!(5);
+    load_byte!(6);
+    load_byte!(7);
+    load_byte!(8);
+    load_byte!(9);
+    load_byte!(10);
+    load_byte!(11);
+    load_byte!(12);
+    load_byte!(13);
+    load_byte!(14);
+    load_byte!(15);
+    load_byte!(16);
+    load_byte!(17);
+    load_byte!(18);
+    load_byte!(19);
+    load_byte!(20);
+    load_byte!(21);
+    load_byte!(22);
+    load_byte!(23);
+    load_byte!(24);
+    load_byte!(25);
+    load_byte!(26);
+    load_byte!(27);
+    load_byte!(28);
+    load_byte!(29);
+    load_byte!(30);
+    load_byte!(31);
+    load_byte!(32);
+    load_byte!(33);
+    load_byte!(34);
+    load_byte!(35);
+    load_byte!(36);
+    load_byte!(37);
+    load_byte!(38);
+    load_byte!(39);
+    load_byte!(40);
+    load_byte!(41);
+    load_byte!(42);
+    load_byte!(43);
+    load_byte!(44);
+    load_byte!(45);
+    load_byte!(46);
+    load_byte!(47);
+    load_byte!(48);
+    load_byte!(49);
+    load_byte!(50);
+    load_byte!(51);
+    load_byte!(52);
+    load_byte!(53);
+    load_byte!(54);
+    load_byte!(55);
+    load_byte!(56);
+    load_byte!(57);
+    load_byte!(58);
+    load_byte!(59);
+    load_byte!(60);
+    load_byte!(61);
+    load_byte!(62);
+    load_byte!(63);
+    true
 }
 
 fn skb_load<const LENGTH: usize>(ctx: &SkBuffContext, offset: usize, destination: *mut u8) -> bool {

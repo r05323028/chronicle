@@ -4,7 +4,7 @@
 
 Canonical Session has one active schema: `CANONICAL_SCHEMA_VERSION = 1`. Writer and reader accept only schema value 1. Rust model is unversioned `CanonicalSession`; no DTO dispatch, migration defaults, or compatibility reader exists. Contract remains mutable until explicit compatibility-freeze OpenSpec change.
 
-Model uses strong IDs, timestamps, deterministic operation sequences, relative nanosecond offsets, canonical client/server endpoints, protocol IDs, typed operation kind/effect, request and recorded-response payload references, protocol extension bytes, warnings, redaction records, and source provenance.
+Model uses strong IDs, timestamps, deterministic operation sequences, relative nanosecond offsets, canonical client/server endpoints, protocol IDs, typed operation kind/effect, request and recorded-response payload references, protocol extension bytes, warnings, redaction records, and source provenance. Source status/reason, connection/operation completeness maps, replay attributes, WAL envelope ranges, commit-marker boundary, capture/loss windows, integrity, and recording provenance are direct v1 fields. Completeness maps are authoritative; timeline is the sole operation order.
 
 Canonical endpoints come only from capture socket evidence:
 
@@ -22,6 +22,12 @@ Protocol data declares `PROTOCOL_DATA_SCHEMA_VERSION = 1`; canonical validation 
 Filesystem publication atomically stores `sessions/<id>/manifest.json`, `session.json`, and `payloads/<sha256>`. Artifact keys are session-qualified. Sole mutable manifest v1 records session identity, canonical version, checksum, payload count/size, WAL checkpoint, bounded issues, completeness, and replay blockers. Store stages private `0700` directories and `0600` files on Unix, writes manifest last, and renames only to absent destination. Inspect verifies artifact metadata; replay hydrates and checks SHA-256.
 
 Repository artifacts are rewritten with model changes while compatibility remains unfrozen. Any future version increase requires explicit compatibility-freeze change defining frozen scope, reader/writer matrix, migration, and deprecation policy.
+
+## Replayability and sensitive data
+
+Operations are `complete`, `incomplete`, `truncated`, `malformed`, `unmatched`, or `unsupported`. Intersecting or ambiguous loss never yields a complete executable operation; an operation proven outside a loss window may remain executable in a partially complete session. Inspect reports `fully_replayable`, `partially_replayable`, or `not_replayable` without bodies or arbitrary header values.
+
+WAL and payload artifacts can contain sensitive production headers and bodies. Private filesystem modes and value-safe output are safeguards, not encryption, secret detection, comprehensive redaction, or tenant isolation.
 
 ## Planned MVP
 

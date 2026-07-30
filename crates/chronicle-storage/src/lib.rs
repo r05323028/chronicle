@@ -2,7 +2,9 @@
 //!
 //! `PostgreSQL` and S3-compatible clients are deferred; in-memory adapters exercise contracts.
 
-use chronicle_canonical::{CanonicalSession, CanonicalValidationError, PayloadRef};
+use chronicle_canonical::{
+    CanonicalSession, CanonicalValidationError, Completeness, PayloadRef, SourceProvenance,
+};
 use chronicle_common::SessionId;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, RenameFlags, renameat_with};
@@ -152,7 +154,7 @@ pub struct StoredSessionInspection {
     pub complete: bool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SessionManifest {
     version: u8,
     session_id: SessionId,
@@ -166,6 +168,13 @@ struct SessionManifest {
     replayability: Vec<String>,
     #[serde(default)]
     complete: bool,
+    /// Embedded recording and WAL provenance. `None` preserves portable P0 sessions.
+    #[serde(default)]
+    source_provenance: SourceProvenance,
+    #[serde(default)]
+    connection_completeness: BTreeMap<chronicle_common::ConnectionId, Completeness>,
+    #[serde(default)]
+    operation_completeness: BTreeMap<chronicle_common::OperationId, Completeness>,
 }
 
 fn decode_manifest(bytes: &[u8]) -> Result<SessionManifest, StorageError> {
@@ -326,6 +335,9 @@ impl FilesystemSessionStore {
             issues: publish.issues,
             replayability: publish.replayability,
             complete: publish.complete,
+            source_provenance: session.source_provenance.clone(),
+            connection_completeness: session.connection_completeness.clone(),
+            operation_completeness: session.operation_completeness.clone(),
         };
         // Manifest is last: its presence marks a complete staged session.
         #[cfg(test)]
@@ -636,10 +648,11 @@ mod tests {
     use super::*;
     use chronicle_canonical::{
         Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalOperation,
-        CanonicalValidationError, Completeness, OperationEffect, OperationKind, ProtocolData,
-        RelativeTimeNanos, ReplayMetadata, SourceMetadata, TimelineEntry,
+        CanonicalValidationError, CommitMarkerProvenance, Completeness, OperationEffect,
+        OperationKind, ProtocolData, ProvenanceEntry, ProvenanceKind, RelativeTimeNanos,
+        ReplayMetadata, SourceMetadata, SourceProvenance, SourceStatus, TimelineEntry,
     };
-    use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId};
+    use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId, RecordingId};
     use time::OffsetDateTime;
 
     fn root() -> PathBuf {
@@ -874,6 +887,52 @@ mod tests {
                 .await,
             Err(StorageError::Backend(_))
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_embeds_recording_provenance_and_completeness() {
+        let root = root();
+        let store = FilesystemSessionStore::new(&root);
+        let mut original = session(Vec::new());
+        let provenance = SourceProvenance {
+            recording_id: Some(RecordingId::new()),
+            status: SourceStatus::Completed,
+            reason: Some("duration_limit".into()),
+            commit_marker: Some(CommitMarkerProvenance {
+                segment_ordinal: 2,
+                byte_offset: 64,
+                sequence: 7,
+            }),
+            wal_snapshot_sha256: Some("sha256:wal".into()),
+            pipeline_version: Some("p1".into()),
+            evidence: vec![ProvenanceEntry {
+                kind: ProvenanceKind::CommitMarker,
+                sequence_range: Some((7, 7)),
+                reason: None,
+            }],
+        };
+        original.source_provenance = provenance.clone();
+        let id = original.id;
+        let connection_completeness = original.connection_completeness.clone();
+        let operation_completeness = original.operation_completeness.clone();
+        store
+            .publish(PublishSession {
+                session: original,
+                checkpoint: None,
+                issues: Vec::new(),
+                replayability: vec!["partially_replayable".into()],
+                complete: false,
+            })
+            .unwrap();
+
+        let manifest: SessionManifest = serde_json::from_slice(
+            &std::fs::read(store.session_dir(id).join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.source_provenance, provenance);
+        assert_eq!(manifest.connection_completeness, connection_completeness);
+        assert_eq!(manifest.operation_completeness, operation_completeness);
         std::fs::remove_dir_all(root).unwrap();
     }
 

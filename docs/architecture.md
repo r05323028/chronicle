@@ -32,15 +32,15 @@ Arrows point from dependent crate to its compile-time dependencies. No crate dep
 
 Thirteen crates consolidate real protocol modules into `chronicle-protocol-builtins`; one empty crate per protocol would add coupling and maintenance without behavior. Modules remain independent registration boundaries. Future independently distributed plugins require a versioned ABI/process boundary, not Rust trait objects across dynamic libraries.
 
-## Current vertical slice
+## P1 vertical slice
 
 Fixture and eBPF sources emit same `CaptureEvent` v1 model. `SocketConnected` carries stable socket identity, local/remote IP endpoints, and active/passive role before endpoint-free payload fragments. Capture adapter caches complete evidence by socket identity and rejects conflicting tuple or role.
 
-Segmented, group-committed WAL v1 frames capture JSON payloads, then shared reconstruction validates, groups by socket generation, orders bytes, detects protocol, decodes, and canonicalizes bounded plaintext HTTP/1.1 traffic into `CanonicalSession` v1. Active maps local→client and remote→server; passive maps remote→client and local→server. Ingress/egress controls byte direction only. Missing or conflicting evidence is typed failure; production never fabricates `unknown:0`.
+A bounded 4096-event queue feeds segmented WAL v1. Each group appends data, one in-WAL `CommitMarker`, flushes, and performs one `fdatasync`; recording metadata is non-authoritative and reconciled from validated markers. Recovery mutates only a verified incomplete final tail. ETL consumes the final recovery-authoritative prefix, reconstructs socket generations/TCP positions, decodes bounded HTTP/1.1, and publishes one deterministic Canonical Session v1. Active maps local→client and remote→server; passive maps remote→client and local→server. Ingress/egress controls byte direction only. Missing or conflicting evidence is typed failure; production never fabricates `unknown:0` endpoints.
 
 `FilesystemSessionStore` atomically writes sole-v1 manifest, session JSON, and SHA-256-addressed payloads. Replay hydrates only persisted artifacts and requires explicit loopback target, matching allow-host, effect flag, and `--execute`; dry-run stays default. Fake protocol remains available for boundary tests.
 
-JSON is current capture-event payload encoding; WAL framing remains encoding-independent.
+JSON is current capture-event payload encoding; WAL framing remains encoding-independent. Live capture is bounded to 600 seconds by default (maximum 3600) and a 4 GiB physical WAL ceiling; always-on capture, rotation, and incremental ETL are deferred.
 
 ## Ownership and backpressure
 
@@ -52,12 +52,12 @@ Rust standard library does not provide derive-based wire serialization, UUIDs, w
 
 `httparse` provides bounded HTTP head parsing and `sha2` identifies filesystem payloads. `aya` is isolated in `chronicle-capture-ebpf`; kernel ABI types never cross capture boundary. `sqlx` and `object_store` remain absent until PostgreSQL and S3 adapters have real behavior. `bytes`, `blake3`, `anyhow`, plugin loaders, queues, and embedded databases remain unnecessary.
 
-## Planned implementations
+## Deferred implementations
 
 - PostgreSQL metadata repository.
 - S3-compatible artifact store and WAL archival.
 - Additional protocol decoders/canonicalizers/adapters/verifiers.
-- Segment retention, scheduling, redaction policies, and expanded inspect/doctor probes.
+- Always-on/rotating capture, incremental ETL, segment retention, scheduling, and expanded redaction policies.
 
 ## Capture semantics and TLS
 
@@ -67,4 +67,4 @@ Plaintext only is supported by target design. TCP payload capture cannot decode 
 
 ## Risks
 
-Hook coverage and kernel compatibility; incomplete socket lifecycle observation; Oracle protocol uncertainty; stateful/multiplexed protocol replay; authentication replacement; destructive side effects; and redaction before persistence remain major MVP risks.
+Hook coverage and kernel compatibility; incomplete socket lifecycle observation; temporal loss attribution; disk exhaustion/corruption; sensitive WAL/session data; Oracle protocol uncertainty; stateful/multiplexed replay; authentication replacement; destructive side effects; and redaction before remote persistence remain major risks.

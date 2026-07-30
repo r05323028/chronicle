@@ -4,6 +4,7 @@
 pub enum PreflightCheck {
     Available,
     Unavailable(&'static str),
+    NotChecked(&'static str),
 }
 
 impl PreflightCheck {
@@ -20,6 +21,7 @@ pub struct EbpfPreflight {
     pub btf: PreflightCheck,
     pub embedded_object: PreflightCheck,
     pub required_programs: PreflightCheck,
+    pub attach: PreflightCheck,
     pub cap_bpf: PreflightCheck,
     pub cap_net_admin: PreflightCheck,
 }
@@ -32,6 +34,8 @@ impl EbpfPreflight {
             && self.btf.is_available()
             && self.embedded_object.is_available()
             && self.required_programs.is_available()
+            // Attach requires a caller-supplied selector; static probe leaves it NotChecked.
+            && !matches!(self.attach, PreflightCheck::Unavailable(_))
             && self.cap_bpf.is_available()
             && self.cap_net_admin.is_available()
     }
@@ -69,6 +73,9 @@ pub fn probe_embedded() -> EbpfPreflight {
             btf: required_file("/sys/kernel/btf/vmlinux", "kernel BTF unavailable"),
             embedded_object,
             required_programs,
+            attach: PreflightCheck::NotChecked(
+                "attach feasibility requires an explicit recording selector",
+            ),
             cap_bpf: capability_check(capabilities, CAP_BPF, "CAP_BPF unavailable"),
             cap_net_admin: capability_check(
                 capabilities,
@@ -96,13 +103,15 @@ const fn unavailable_preflight(reason: &'static str) -> EbpfPreflight {
         btf: PreflightCheck::Unavailable(reason),
         embedded_object: PreflightCheck::Unavailable(reason),
         required_programs: PreflightCheck::Unavailable(reason),
+        attach: PreflightCheck::Unavailable(reason),
         cap_bpf: PreflightCheck::Unavailable(reason),
         cap_net_admin: PreflightCheck::Unavailable(reason),
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
-const EMBEDDED_OBJECT: &[u8] = include_bytes!("../objects/chronicle-ebpf-capture-bpfel.o");
+const EMBEDDED_OBJECT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/chronicle-ebpf-capture-bpfel.o"));
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
 fn embedded_object_checks() -> (PreflightCheck, PreflightCheck) {
@@ -158,11 +167,11 @@ fn capability_check(
     capability: u32,
     missing: &'static str,
 ) -> PreflightCheck {
-    capabilities
-        .filter(|value| value & (1_u64 << capability) != 0)
-        .map_or(PreflightCheck::Unavailable(missing), |_| {
-            PreflightCheck::Available
-        })
+    match capabilities {
+        Some(value) if value & (1_u64 << capability) != 0 => PreflightCheck::Available,
+        Some(_) => PreflightCheck::Unavailable(missing),
+        None => PreflightCheck::NotChecked("effective capabilities unavailable"),
+    }
 }
 
 #[cfg(test)]
@@ -181,7 +190,7 @@ mod tests {
         );
         assert_eq!(
             capability_check(None, CAP_BPF, "missing"),
-            PreflightCheck::Unavailable("missing")
+            PreflightCheck::NotChecked("effective capabilities unavailable")
         );
     }
 
@@ -203,10 +212,25 @@ mod tests {
             btf: PreflightCheck::Available,
             embedded_object: PreflightCheck::Available,
             required_programs: PreflightCheck::Available,
+            attach: PreflightCheck::Available,
             cap_bpf: PreflightCheck::Available,
             cap_net_admin: PreflightCheck::Available,
         };
         assert!(ready.is_ready());
+        assert!(
+            EbpfPreflight {
+                attach: PreflightCheck::NotChecked("selector required"),
+                ..ready
+            }
+            .is_ready()
+        );
+        assert!(
+            !EbpfPreflight {
+                attach: PreflightCheck::Unavailable("attach unavailable"),
+                ..ready
+            }
+            .is_ready()
+        );
         assert!(
             !EbpfPreflight {
                 cap_bpf: PreflightCheck::Unavailable("missing"),

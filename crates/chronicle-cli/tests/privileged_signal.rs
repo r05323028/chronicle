@@ -77,13 +77,19 @@ fn recording(cgroup: &CgroupGuard, wal: &Path) -> Child {
 }
 
 fn assert_graceful_signal(signal_name: &str, reason: &str) {
-    assert_eq!(std::env::consts::ARCH, "aarch64");
-    assert_eq!(
-        fs::read_to_string("/proc/sys/kernel/osrelease")
-            .expect("kernel release")
-            .trim(),
-        "6.8.0-136-generic"
-    );
+    assert!(matches!(std::env::consts::ARCH, "x86_64" | "aarch64"));
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease").expect("kernel release");
+    let mut parts = release.trim().split('.');
+    let major: u32 = parts.next().unwrap().parse().expect("kernel major");
+    let minor: u32 = parts
+        .next()
+        .unwrap()
+        .split('-')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("kernel minor");
+    assert!(major > 6 || (major == 6 && minor >= 1), "kernel {release}");
     let cgroup = CgroupGuard::create().expect("create dedicated cgroup");
     let wal = std::env::temp_dir().join(format!("chronicle-signal-wal-{}", uuid::Uuid::new_v4()));
     let chronicle = recording(&cgroup, &wal);

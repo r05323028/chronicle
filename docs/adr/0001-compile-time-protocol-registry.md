@@ -5,11 +5,11 @@
 
 ## Context
 
-MVP needs several protocol boundaries, honest partial capability status, and dispatch without protocol branches in shared core. Rust has no stable trait-object ABI. Dynamic plugin loading would add deployment, safety, and versioning complexity before any real implementation exists.
+MVP needs several protocol boundaries, honest partial capability status, and dispatch without protocol branches in shared core. Rust has no stable trait-object ABI. Dynamic plugin loading would add deployment, safety, and versioning complexity before independently distributed implementations are needed.
 
 ## Decision
 
-Use explicit compile-time `ProtocolRegistration` values with separate detector, decoder factory, canonicalizer, replay adapter, and verifier traits. Consolidate scaffold-only real protocol modules in one builtins crate. Keep fake protocol as only available implementation.
+Use explicit compile-time `ProtocolRegistration` values with separate detector, decoder factory, canonicalizer, replay adapter, and verifier traits. Consolidate built-in protocol modules in one builtins crate. Keep fake protocol as a boundary-test implementation.
 
 ## Consequences
 

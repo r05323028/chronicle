@@ -4,6 +4,8 @@ Replay is primary capability and highest-risk boundary.
 
 ## Current safeguards
 
+Replay planner preserves one result per canonical operation. Complete supported operations can execute while incomplete, truncated, malformed, unmatched, unsupported, pipelined, or ambiguous-loss operations remain visible as not attempted. Aggregate outcomes are `completed`, `completed_with_skips`, `dry_run`, `stopped_policy`, `stopped_invalid_session`, `stopped_transport`, and `stopped_verification`; a transport or verification stop retains prior, current, and later unattempted results.
+
 - Target mapping is mandatory per connection. Missing mapping fails.
 - Recorded production destination is never a fallback.
 - Mapping back to recorded endpoint is blocked by default.
@@ -14,7 +16,11 @@ Replay is primary capability and highest-risk boundary.
 - Protocol adapters receive replay-environment `ReplayContext`; secret bytes render as `<redacted>` in debug output.
 - Verification compares status, body SHA-256/size, and ordered non-ignored headers, producing Passed, Failed, Skipped, Inconclusive, or Unsupported without body/header values in details.
 
-Only bounded plaintext HTTP/1.1 loopback replay is implemented. TLS, DNS targets, preserve timing, connection reuse, and pipelined replay remain unsupported.
+Only bounded plaintext HTTP/1.1 loopback replay is implemented. TLS, DNS targets, preserve timing, connection reuse, pipelined replay, upgrades, and automatic redirects remain unsupported. Replay never falls back to the recorded destination.
+
+## Command and output contract
+
+Replay is dry-run by default. Execution requires an explicit loopback `http://IP:PORT` target, repeated exact `--allow-host`, read/write effect authorization, and `--execute`. Exit 0 covers dry-run and successful complete/partial execution; 4 covers policy or invalid-session denial, 5 transport stop, and 6 executed verification failure. JSON is rendered once after the bounded result is complete, so a render failure never retries network traffic.
 
 ## Planned MVP controls
 

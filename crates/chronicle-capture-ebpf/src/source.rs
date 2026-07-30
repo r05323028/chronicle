@@ -9,7 +9,8 @@ use crate::abi::{RawKernelObservation, RawLossCounters, decode_raw_kernel_observ
 use chronicle_capture::{CaptureEvent, CaptureSourceState, CaptureSourceSummary};
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
-const EMBEDDED_OBJECT: &[u8] = include_bytes!("../objects/chronicle-ebpf-capture-bpfel.o");
+const EMBEDDED_OBJECT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/chronicle-ebpf-capture-bpfel.o"));
 
 /// SHA-256 identity for metadata; unavailable on unsupported object targets.
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
