@@ -7,6 +7,7 @@ use aya::{
     programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, SockOps},
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -381,8 +382,13 @@ fn privileged_feasibility() -> Result<(), Box<dyn Error>> {
     let direct_members = spawn_direct_members(&cgroup.path)?;
     let direct_member_ids: BTreeSet<_> = direct_members.0.iter().map(Child::id).collect();
     let cgroup_file = File::open(&cgroup.path)?;
+    let mode = std::env::var("CHRONICLE_FEASIBILITY_MODE").unwrap_or_else(|_| "baseline".into());
+    println!(
+        "selected_program={mode} object_sha256={}",
+        sha256_file(&object)?
+    );
     let mut ebpf = Ebpf::load_file(&object)?;
-    attach_programs(&mut ebpf, &cgroup_file)?;
+    attach_programs(&mut ebpf, &cgroup_file, &mode)?;
     let mut ring = RingBuf::try_from(
         ebpf.take_map("EVENTS")
             .ok_or_else(|| io::Error::other("EVENTS map missing"))?,
@@ -396,6 +402,16 @@ fn privileged_feasibility() -> Result<(), Box<dyn Error>> {
 
     cgroup.enter()?;
     validate_scope(&cgroup, &direct_member_ids)?;
+    if let Some(cap) = dynamic_cap(&mode) {
+        let matrix = run_dynamic_matrix(&mut ring, cap)?;
+        validate_dynamic_matrix(&matrix, cap)?;
+        println!("program_symbol=dynamic_len_{cap} load_result=ok attach_result=ok");
+        drop(server);
+        drop(ebpf);
+        drop(direct_members);
+        cgroup.cleanup()?;
+        return Ok(());
+    }
     exchange(SocketAddr::from((Ipv4Addr::LOCALHOST, ipv4_port)))?;
     exchange_large(SocketAddr::from((Ipv4Addr::LOCALHOST, ipv4_port)))?;
     exchange(SocketAddr::from((Ipv6Addr::LOCALHOST, ipv6_port)))?;
@@ -406,7 +422,7 @@ fn privileged_feasibility() -> Result<(), Box<dyn Error>> {
     let loss_samples = force_ring_loss_and_sample(&counters, ipv4_port)?;
     let emitted = sum_per_cpu(&counters, 0)?;
     let lost = sum_per_cpu(&counters, 1)?;
-    if lost == 0 {
+    if mode == "baseline" && lost == 0 {
         return Err(
             io::Error::other("forced traffic did not produce ring reservation loss").into(),
         );
@@ -427,8 +443,10 @@ fn privileged_feasibility() -> Result<(), Box<dyn Error>> {
             String::from_utf8_lossy(payload(event)),
         );
     }
-    validate_events(&events, emitted, cgroup.workload.metadata()?.ino())?;
-    validate_continuations(&drained.continuations)?;
+    if mode == "baseline" {
+        validate_events(&events, emitted, cgroup.workload.metadata()?.ino())?;
+        validate_continuations(&drained.continuations)?;
+    }
 
     let report = build_report(
         &events,
@@ -459,7 +477,7 @@ fn privileged_feasibility() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn attach_programs(ebpf: &mut Ebpf, cgroup: &File) -> Result<(), Box<dyn Error>> {
+fn attach_programs(ebpf: &mut Ebpf, cgroup: &File, mode: &str) -> Result<(), Box<dyn Error>> {
     for name in ["connect4", "connect6"] {
         let program: &mut CgroupSockAddr = ebpf
             .program_mut(name)
@@ -474,16 +492,28 @@ fn attach_programs(ebpf: &mut Ebpf, cgroup: &File) -> Result<(), Box<dyn Error>>
         .try_into()?;
     program.load()?;
     program.attach(cgroup, CgroupAttachMode::Single)?;
-    for (name, attach_type) in [
-        ("ingress", CgroupSkbAttachType::Ingress),
-        ("egress", CgroupSkbAttachType::Egress),
-    ] {
+    let skb_programs = if let Some(cap) = dynamic_cap(mode) {
+        vec![(
+            (if cap == 64 {
+                "dynamic_len_64"
+            } else {
+                "dynamic_len_16384"
+            }),
+            CgroupSkbAttachType::Egress,
+        )]
+    } else {
+        vec![
+            ("ingress", CgroupSkbAttachType::Ingress),
+            ("egress", CgroupSkbAttachType::Egress),
+        ]
+    };
+    for (name, attach_type) in &skb_programs {
         let program: &mut CgroupSkb = ebpf
             .program_mut(name)
             .ok_or_else(|| io::Error::other(format!("program {name} missing")))?
             .try_into()?;
         program.load()?;
-        program.attach(cgroup, attach_type, CgroupAttachMode::Single)?;
+        program.attach(cgroup, *attach_type, CgroupAttachMode::Single)?;
     }
     Ok(())
 }
@@ -537,6 +567,118 @@ conn.close()
         ServerGuard(child),
         SocketAddr::from(([10, 231, 0, 2], 18080)),
     ))
+}
+
+fn dynamic_cap(mode: &str) -> Option<usize> {
+    match mode {
+        "dynamic-64" => Some(64),
+        "dynamic-16384" => Some(16 * 1024),
+        _ => None,
+    }
+}
+
+fn dynamic_pattern(length: usize) -> Vec<u8> {
+    (0..length)
+        .map(|index| ((index * 73 + length * 29) % 251 + 1) as u8)
+        .collect()
+}
+
+fn run_dynamic_matrix<T: std::borrow::Borrow<aya::maps::MapData>>(
+    ring: &mut RingBuf<T>,
+    cap: usize,
+) -> Result<Vec<ContinuationEvidence>, Box<dyn Error>> {
+    let lengths: &[usize] = if cap == 64 {
+        &[0, 1, 33, 53, 63, 64, 65]
+    } else {
+        &[
+            0, 1, 53, 64, 65, 255, 256, 1024, 4095, 4096, 8192, 16383, 16384, 16385,
+        ]
+    };
+    let script = format!(
+        r#"import socket
+listener = socket.socket(); listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(('127.0.0.1', 0)); listener.listen({})
+print(listener.getsockname()[1], flush=True)
+for expected in {}:
+    conn, _ = listener.accept()
+    data = b''
+    while len(data) < expected:
+        chunk = conn.recv(expected - len(data))
+        if not chunk: break
+        data += chunk
+    if len(data) != expected: raise RuntimeError((expected, len(data)))
+    conn.close()
+"#,
+        lengths.len(),
+        format!("{:?}", lengths),
+    );
+    let mut server = Command::new("python3")
+        .args(["-u", "-c", &script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = server
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("matrix server stdout unavailable"))?;
+    let mut line = String::new();
+    BufReader::new(stdout).read_line(&mut line)?;
+    let port = line.trim().parse::<u16>()?;
+    for &length in lengths {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
+        let payload = dynamic_pattern(length);
+        if !payload.is_empty() {
+            stream.write_all(&payload)?;
+        }
+        stream.shutdown(std::net::Shutdown::Write)?;
+    }
+    if !server.wait()?.success() {
+        return Err(io::Error::other("matrix server failed").into());
+    }
+    thread::sleep(Duration::from_millis(100));
+    Ok(drain_events(ring)?.continuations)
+}
+
+fn validate_dynamic_matrix(
+    records: &[ContinuationEvidence],
+    cap: usize,
+) -> Result<(), Box<dyn Error>> {
+    let lengths: &[usize] = if cap == 64 {
+        &[1, 33, 53, 63, 64, 65]
+    } else {
+        &[
+            1, 53, 64, 65, 255, 256, 1024, 4095, 4096, 8192, 16383, 16384, 16385,
+        ]
+    };
+    for &length in lengths {
+        let expected = dynamic_pattern(length);
+        let declared = length.min(cap);
+        let record = records
+            .iter()
+            .find(|record| record.payload == expected[..declared])
+            .ok_or_else(|| io::Error::other(format!("matrix payload {length} missing")))?;
+        if record.header.observed_len != length as u32
+            || record.header.payload_len != declared as u32
+            || record.header.payload_offset != 0
+            || record.payload.len() != declared
+        {
+            return Err(io::Error::other(format!("matrix header mismatch for {length}")).into());
+        }
+        if record.payload != expected[..declared] {
+            return Err(io::Error::other(format!("matrix bytes mismatch for {length}")).into());
+        }
+        println!(
+            "dynamic_matrix payload={length} observed={} declared={} truncated={} exact=true",
+            record.header.observed_len,
+            record.header.payload_len,
+            length > cap
+        );
+    }
+    if records.iter().any(|record| record.header.payload_len == 0) {
+        return Err(io::Error::other("zero payload emitted continuation record").into());
+    }
+    println!("dynamic_matrix payload=0 emitted=false");
+    Ok(())
 }
 
 fn start_servers() -> Result<(ServerGuard, u16, u16), Box<dyn Error>> {
@@ -739,15 +881,18 @@ fn drain_events<T: std::borrow::Borrow<aya::maps::MapData>>(
             } else if item.len() == CONTINUATION_HEADER_BYTES + CONTINUATION_BYTES {
                 let header =
                     unsafe { std::ptr::read_unaligned(item.as_ptr().cast::<ContinuationHeader>()) };
+                let payload_len = usize::try_from(header.payload_len)?;
                 if header.magic != CONTINUATION_MAGIC
                     || usize::from(header.header_bytes) != CONTINUATION_HEADER_BYTES
-                    || usize::try_from(header.payload_len)? != CONTINUATION_BYTES
+                    || payload_len > CONTINUATION_BYTES
                 {
                     return Err(io::Error::other("invalid continuation header").into());
                 }
                 continuations.push(ContinuationEvidence {
                     header,
-                    payload: item[CONTINUATION_HEADER_BYTES..].to_vec(),
+                    payload: item
+                        [CONTINUATION_HEADER_BYTES..CONTINUATION_HEADER_BYTES + payload_len]
+                        .to_vec(),
                 });
             } else {
                 return Err(
@@ -1272,6 +1417,13 @@ fn require_supported_host() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("kernel BTF unavailable").into());
     }
     Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
+    Ok(Sha256::digest(fs::read(path)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn feasibility_object() -> PathBuf {

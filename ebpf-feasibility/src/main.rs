@@ -181,6 +181,91 @@ pub fn egress(ctx: SkBuffContext) -> i32 {
     1
 }
 
+/// Isolated exact-length helper feasibility variants. Both retain direct ring
+/// destination, fixed reservation, and a verifier-visible nonzero guard.
+#[cgroup_skb]
+pub fn dynamic_len_64(ctx: SkBuffContext) -> i32 {
+    emit_dynamic_len(&ctx, 64);
+    1
+}
+
+#[cgroup_skb]
+pub fn dynamic_len_16384(ctx: SkBuffContext) -> i32 {
+    emit_dynamic_len(&ctx, 16 * 1024);
+    1
+}
+
+#[inline(always)]
+fn emit_dynamic_len(ctx: &SkBuffContext, cap: usize) {
+    let mut first = [0_u8; 1];
+    if !skb_load::<1>(ctx, 0, first.as_mut_ptr()) || first[0] >> 4 != 4 {
+        return;
+    }
+    let mut ip = [0_u8; 20];
+    if !skb_load::<20>(ctx, 0, ip.as_mut_ptr()) || ip[9] != 6 {
+        return;
+    }
+    let tcp_offset = usize::from(ip[0] & 0x0f) * 4;
+    let mut tcp = [0_u8; 20];
+    if !skb_load::<20>(ctx, tcp_offset, tcp.as_mut_ptr()) {
+        return;
+    }
+    let payload_offset = tcp_offset + usize::from(tcp[12] >> 4) * 4;
+    let total_len = ctx.len() as usize;
+    let observed_len = total_len.saturating_sub(payload_offset);
+    let copy_len = observed_len.min(cap);
+    // Keep this branch visible to BPF verifier: helper rejects a scalar which may be zero.
+    let helper_len = unsafe { core::ptr::read_volatile(&copy_len) };
+    if helper_len == 0 {
+        return;
+    }
+    let Some(mut entry) = EVENTS.reserve_bytes(CONTINUATION_HEADER_BYTES + CONTINUATION_BYTES, 0)
+    else {
+        increment_counter(1);
+        return;
+    };
+    let header = ContinuationHeader {
+        magic: CONTINUATION_MAGIC,
+        header_bytes: CONTINUATION_HEADER_BYTES as u16,
+        family: 2,
+        direction: 0,
+        timestamp_ns: unsafe { generated::bpf_ktime_get_ns() },
+        socket_cookie: unsafe { generated::bpf_get_socket_cookie(ctx.as_ptr()) },
+        cgroup_id: unsafe { generated::bpf_get_current_cgroup_id() },
+        tcp_sequence: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+        observed_len: observed_len as u32,
+        payload_offset: 0,
+        payload_len: helper_len as u32,
+    };
+    unsafe {
+        entry
+            .as_mut_ptr()
+            .cast::<ContinuationHeader>()
+            .write_unaligned(header)
+    };
+    let destination = unsafe { entry.as_mut_ptr().add(CONTINUATION_HEADER_BYTES) };
+    if load_dynamic_nonzero(ctx, payload_offset as u32, destination, helper_len as u32) {
+        entry.submit(0);
+        increment_counter(0);
+    } else {
+        entry.discard(0);
+        increment_counter(1);
+    }
+}
+
+#[inline(never)]
+fn load_dynamic_nonzero(
+    ctx: &SkBuffContext,
+    offset: u32,
+    destination: *mut u8,
+    length: u32,
+) -> bool {
+    if length == 0 {
+        return false;
+    }
+    unsafe { generated::bpf_skb_load_bytes(ctx.as_ptr(), offset, destination.cast(), length) == 0 }
+}
+
 fn emit_skb(ctx: &SkBuffContext, kind: u8, direction: u8) {
     let mut event = common_event(kind, ctx.as_ptr(), false);
     event.direction = direction;
