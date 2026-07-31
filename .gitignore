@@ -27,3 +27,6 @@ Thumbs.db
 **/graphify-out
 .ua
 .pi-subagents
+
+# Local privileged acceptance evidence (keep outside Git)
+evidence/
