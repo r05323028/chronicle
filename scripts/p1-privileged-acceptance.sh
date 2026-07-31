@@ -28,8 +28,11 @@ REPLAY_PID=""
 SHARED_ONE_PID=""
 SHARED_TWO_PID=""
 CURRENT_PHASE="initializing"
-SUMMARY="$ARTIFACT_ROOT/acceptance-summary.json"
+SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
 TOTAL_PHASES=30
+OPENSPEC_RESULT="not_checked"
+EBPF_OBJECT_SHA256="not_checked"
+COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
 
 skip() {
   log "SKIP: $*" >&2
@@ -44,18 +47,61 @@ phase() {
 write_summary() {
   local status=$1
   mkdir -p "$ARTIFACT_ROOT"
-  python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$ARTIFACT_ROOT" "$WAL_DIR" "$SESSION_ROOT" "$VALIDATION_ROOT" <<'PY'
+  local commit_sha kernel architecture cgroup_status btf_status cap_eff working_tree_dirty
+  commit_sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf '%s' 'not_checked')
+  working_tree_dirty=false
+  if [[ -n $(git -C "$ROOT" status --porcelain --untracked-files=all) ]]; then
+    working_tree_dirty=true
+  fi
+  kernel=$(uname -r 2>/dev/null || printf '%s' 'not_checked')
+  architecture=$(uname -m 2>/dev/null || printf '%s' 'not_checked')
+  cgroup_status="unavailable"
+  btf_status="unavailable"
+  cap_eff="unavailable"
+  if [[ -r /proc/self/cgroup ]]; then
+    cgroup_status=$(grep -q '^0::' /proc/self/cgroup && printf '%s' 'available' || printf '%s' 'unavailable')
+  fi
+  [[ -r /sys/kernel/btf/vmlinux ]] && btf_status="available" || true
+  if [[ -r /proc/self/status ]]; then
+    cap_eff=$(awk '/^CapEff:/ { print $2; exit }' /proc/self/status)
+    [[ -n $cap_eff ]] || cap_eff="unavailable"
+  fi
+  if [[ -f "$ROOT/ebpf/target/bpfel-unknown-none/release/chronicle-ebpf-capture" ]]; then
+    EBPF_OBJECT_SHA256=$(sha256sum "$ROOT/ebpf/target/bpfel-unknown-none/release/chronicle-ebpf-capture" | awk '{print $1}')
+  fi
+  python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$ARTIFACT_ROOT" "$WAL_DIR" "$SESSION_ROOT" "$VALIDATION_ROOT" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$OPENSPEC_RESULT" "$working_tree_dirty" "$COMMAND_LOG" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 summary = Path(sys.argv[1])
 status, phase = sys.argv[2:4]
-artifacts, wal, sessions, validation = map(Path, sys.argv[4:])
+artifacts, wal, sessions, validation = map(Path, sys.argv[4:8])
+commit, kernel, architecture, cgroup, btf, cap_eff, object_sha, openspec, dirty, command_log = sys.argv[8:]
 summary.parent.mkdir(parents=True, exist_ok=True)
+result = "passed" if status == "0" else ("not_checked" if status == "77" else "failed")
+commands = []
+if Path(command_log).is_file():
+    commands = [line[2:] if line.startswith("+ ") else line for line in Path(command_log).read_text(encoding="utf-8").splitlines()]
 summary.write_text(json.dumps({
     "version": 1,
-    "status": "passed" if status == "0" else ("skipped" if status == "77" else "failed"),
+    "git_commit_sha": commit,
+    "working_tree_dirty": dirty == "true",
+    "kernel_version": kernel,
+    "architecture": architecture,
+    "cgroup_v2": cgroup,
+    "btf": btf,
+    "capabilities": {
+        "effective_hex": cap_eff,
+        "required": ["CAP_BPF", "CAP_NET_ADMIN", "CAP_SYS_ADMIN"],
+    },
+    "ebpf_object_sha256": object_sha,
+    "commands_executed": commands,
+    "checks": {
+        "privileged_acceptance": result,
+        "openspec_validation": openspec,
+    },
+    "status": result,
     "exit_code": int(status),
     "phase": phase,
     "artifacts": {
@@ -63,6 +109,7 @@ summary.write_text(json.dumps({
         "wal": str(wal),
         "sessions": str(sessions),
         "wal_validation": str(validation),
+        "commands": str(Path(command_log)),
     },
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
@@ -83,6 +130,7 @@ remove_cgroup() {
 }
 
 cleanup_resources() {
+  local failed=0
   stop_process "$RECORDER_PID"
   stop_process "$UPSTREAM_PID"
   stop_process "$REPLAY_PID"
@@ -90,21 +138,34 @@ cleanup_resources() {
   stop_process "$SHARED_TWO_PID"
   RECORDER_PID=""; UPSTREAM_PID=""; REPLAY_PID=""
   SHARED_ONE_PID=""; SHARED_TWO_PID=""
-  remove_cgroup "$DEDICATED_CGROUP" || log "WARN: could not remove dedicated cgroup: $DEDICATED_CGROUP" >&2
-  remove_cgroup "$SHARED_CGROUP" || log "WARN: could not remove shared cgroup: $SHARED_CGROUP" >&2
+  if ! remove_cgroup "$DEDICATED_CGROUP"; then
+    log "ERROR: could not remove dedicated cgroup" >&2
+    failed=1
+  fi
+  if ! remove_cgroup "$SHARED_CGROUP"; then
+    log "ERROR: could not remove shared cgroup" >&2
+    failed=1
+  fi
   [[ -z $TMP_DIR ]] || rm -rf "$TMP_DIR"
+  return "$failed"
 }
 
 on_exit() {
   local status=$?
   set +e
-  cleanup_resources
+  local cleanup_status=0
+  cleanup_resources || cleanup_status=$?
+  if [[ $status -eq 0 && $cleanup_status -ne 0 ]]; then
+    status=1
+  fi
   write_summary "$status"
   exit "$status"
 }
 trap on_exit EXIT
 
 mkdir -p "$ARTIFACT_ROOT"
+: >"$COMMAND_LOG"
+trap 'printf "%s\\n" "$BASH_COMMAND" >>"$COMMAND_LOG"' DEBUG
 TMP_DIR=$(mktemp -d)
 
 phase 1 "Validate environment"
@@ -277,6 +338,7 @@ PY
 phase 27 "Validate stale-language guard"
 if command -v openspec >/dev/null 2>&1; then
   openspec validate add-production-http-recording-pipeline --strict >"$ARTIFACT_ROOT/openspec-validation.log" 2>&1
+  OPENSPEC_RESULT="passed"
 else
   printf '%s\n' 'OpenSpec CLI not installed in VM; validation runs in repository CI.' >"$ARTIFACT_ROOT/openspec-validation.log"
 fi

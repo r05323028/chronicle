@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(decoded, session);
 
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-        assert!(value.get("v3").is_none());
+        assert_eq!(value["schema_version"], CANONICAL_SCHEMA_VERSION);
         assert!(value.get("source_provenance").is_some());
         assert!(value.get("connection_completeness").is_some());
         assert!(value.get("operation_completeness").is_some());

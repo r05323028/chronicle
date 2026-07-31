@@ -37,6 +37,8 @@ use chronicle_wal::{
     WalError, WalRecordEnvelope, encode_envelope, encode_terminal_wal_loss,
     prepare_group_commit_reopen_from_scan, verified_snapshot_sha256,
 };
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use rustix::fs::{CWD, RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -188,21 +190,37 @@ fn path_doctor_probe(path: Option<&Path>, name: &str, label: &str) -> DoctorProb
             remediation: format!("supply --{} to check this path", name.replace('_', "-")),
         };
     };
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let status = if path.exists() || parent.is_none_or(|parent| !parent.is_dir()) {
-        DoctorStatus::Unsupported
-    } else {
-        let parent = parent.expect("checked above");
-        rustix::fs::statvfs(parent).map_or(DoctorStatus::Unsupported, |stats| {
-            if stats.f_bavail.saturating_mul(stats.f_frsize) > 0 && probe_parent_write(parent) {
-                DoctorStatus::Supported
+
+    let directory = match fs::metadata(path) {
+        Ok(metadata) => metadata.is_dir().then_some(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
             } else {
-                DoctorStatus::Unsupported
-            }
-        })
+                parent
+            };
+            fs::metadata(parent)
+                .ok()
+                .filter(std::fs::Metadata::is_dir)
+                .map(|_| parent)
+        }
+        Err(_) => None,
     };
+
+    let status = directory.map_or(DoctorStatus::Unsupported, |directory| {
+        let Ok(stats) = rustix::fs::statvfs(directory) else {
+            return DoctorStatus::Unsupported;
+        };
+        let available_bytes = stats.f_bavail.saturating_mul(stats.f_frsize);
+        if available_bytes == 0 || !probe_directory_io(directory) {
+            DoctorStatus::Unsupported
+        } else if available_bytes < DEFAULT_MAX_WAL_BYTES {
+            DoctorStatus::SupportedWithWarnings
+        } else {
+            DoctorStatus::Supported
+        }
+    });
     DoctorProbe {
         required: false,
         status,
@@ -212,22 +230,57 @@ fn path_doctor_probe(path: Option<&Path>, name: &str, label: &str) -> DoctorProb
     }
 }
 
-fn probe_parent_write(parent: &Path) -> bool {
-    let temporary = parent.join(format!(".chronicle-doctor-{}", uuid::Uuid::new_v4()));
+fn probe_directory_io(directory: &Path) -> bool {
+    let temporary = directory.join(format!(".chronicle-doctor-{}", uuid::Uuid::new_v4()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let result = options
-        .open(&temporary)
-        .and_then(|mut file| {
-            file.try_lock()?;
-            file.write_all(b"doctor")?;
-            file.sync_all()
-        })
-        .is_ok();
-    let _ = fs::remove_file(temporary);
-    result
+
+    let mut created = false;
+    let io_result = options.open(&temporary).and_then(|mut file| {
+        created = true;
+        file.try_lock()?;
+        file.write_all(b"doctor-data")?;
+        file.write_all(b"doctor-commit-marker")?;
+        file.sync_all()?;
+        let expected_bytes = (b"doctor-data".len() + b"doctor-commit-marker".len()) as u64;
+        (file.metadata()?.len() == expected_bytes)
+            .then_some(())
+            .ok_or_else(|| std::io::Error::other("doctor probe byte accounting failed"))
+    });
+    let publication_result =
+        io_result.is_ok() && probe_no_replace_publication(directory, &temporary);
+    let cleanup_result = if temporary.exists() {
+        created && fs::remove_file(&temporary).is_ok() && !temporary.exists()
+    } else {
+        true
+    };
+    publication_result && cleanup_result
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn probe_no_replace_publication(directory: &Path, temporary: &Path) -> bool {
+    let published = directory.join(format!(
+        ".chronicle-doctor-published-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let renamed = renameat_with(CWD, temporary, CWD, &published, RenameFlags::NOREPLACE).is_ok();
+    let synced = renamed
+        && File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .is_ok();
+    let cleaned = if renamed {
+        fs::remove_file(&published).is_ok() && !published.exists()
+    } else {
+        true
+    };
+    renamed && synced && cleaned
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn probe_no_replace_publication(_directory: &Path, _temporary: &Path) -> bool {
+    false
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
@@ -5324,25 +5377,99 @@ mod tests {
         ));
     }
 
+    fn storage_probe(report: &DoctorReport, name: &str) -> DoctorStatus {
+        report
+            .probes
+            .iter()
+            .find(|probe| probe.code == format!("storage.{name}"))
+            .unwrap()
+            .status
+    }
+
     #[test]
-    fn doctor_path_probes_do_not_create_supplied_paths() {
+    fn doctor_path_probes_existing_and_missing_directories_without_artifacts() {
         let root = std::env::temp_dir().join(format!("chronicle-doctor-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let wal_dir = root.join("wal");
         let output = root.join("output");
+        fs::create_dir(&wal_dir).unwrap();
+        fs::create_dir(&output).unwrap();
+
         let report = doctor_report(&DoctorOptions {
             wal_dir: Some(wal_dir.clone()),
             output: Some(output.clone()),
         });
-        assert!(
-            report
-                .probes
-                .iter()
-                .filter(|probe| probe.code.starts_with("storage."))
-                .all(|probe| probe.status == DoctorStatus::Supported)
+        assert!(matches!(
+            storage_probe(&report, "wal_dir"),
+            DoctorStatus::Supported | DoctorStatus::SupportedWithWarnings
+        ));
+        assert!(matches!(
+            storage_probe(&report, "output"),
+            DoctorStatus::Supported | DoctorStatus::SupportedWithWarnings
+        ));
+
+        let missing = root.join("new-output");
+        let missing_report = doctor_report(&DoctorOptions {
+            wal_dir: Some(missing.clone()),
+            output: None,
+        });
+        assert!(matches!(
+            storage_probe(&missing_report, "wal_dir"),
+            DoctorStatus::Supported | DoctorStatus::SupportedWithWarnings
+        ));
+        assert!(!missing.exists());
+        assert_eq!(
+            storage_probe(&missing_report, "output"),
+            DoctorStatus::NotChecked
         );
-        assert!(!wal_dir.exists());
-        assert!(!output.exists());
+        for directory in [&root, &wal_dir, &output] {
+            assert!(fs::read_dir(directory).unwrap().all(|entry| {
+                let name = entry.unwrap().file_name();
+                let name = name.to_string_lossy();
+                !name.starts_with(".chronicle-doctor-")
+                    && !name.starts_with(".chronicle-doctor-published-")
+            }));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_path_probes_reject_files_and_missing_parents() {
+        let root = std::env::temp_dir().join(format!("chronicle-doctor-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("not-a-directory");
+        fs::write(&file, b"user data").unwrap();
+        let report = doctor_report(&DoctorOptions {
+            wal_dir: Some(file.clone()),
+            output: Some(root.join("missing-parent").join("output")),
+        });
+        assert_eq!(storage_probe(&report, "wal_dir"), DoctorStatus::Unsupported);
+        assert_eq!(storage_probe(&report, "output"), DoctorStatus::Unsupported);
+        assert_eq!(fs::read(&file).unwrap(), b"user data");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_path_probe_rejects_read_only_directory_when_kernel_enforces_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("chronicle-doctor-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let read_only = root.join("read-only");
+        fs::create_dir(&read_only).unwrap();
+        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555)).unwrap();
+        let report = doctor_report(&DoctorOptions {
+            wal_dir: Some(read_only.clone()),
+            output: None,
+        });
+        if !matches!(
+            storage_probe(&report, "wal_dir"),
+            DoctorStatus::Supported | DoctorStatus::SupportedWithWarnings
+        ) {
+            assert_eq!(storage_probe(&report, "wal_dir"), DoctorStatus::Unsupported);
+        }
+        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o700)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
