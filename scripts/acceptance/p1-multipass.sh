@@ -35,7 +35,7 @@ multipass exec "$VM" -- bash -lc "
 "
 
 mkdir -p "$DEST"
-multipass transfer --recursive "$VM:$VM_ARTIFACTS" "$DEST/"
+multipass transfer --recursive "$VM:$VM_ARTIFACTS/." "$DEST/"
 printf '%s\n' "$SHA" >"$DEST/tested-commit.txt"
 (
   cd "$DEST"
