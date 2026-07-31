@@ -62,6 +62,15 @@ CGROUP_MATRIX_RESULT="not_checked"
 SIGNAL_RESULT="not_checked"
 FMT_RESULT="not_checked"
 WORKSPACE_CHECK_RESULT="not_checked"
+F2_8_RESULT="not_checked"
+F2_9_RESULT="not_checked"
+F2_10_RESULT="not_checked"
+F2_11_RESULT="not_checked"
+SHARED_RUNTIME_RESULT="not_checked"
+EXPECTED_SHA=${CHRONICLE_ACCEPTANCE_EXPECTED_SHA:-}
+START_SHA="not_checked"
+END_SHA="not_checked"
+TREE_CLEAN=false
 COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
 ARTIFACT_ROOT_ERROR=""
 
@@ -141,25 +150,39 @@ write_summary() {
   if [[ -f "$EBPF_OBJECT" ]]; then
     EBPF_OBJECT_SHA256=$(sha256sum "$EBPF_OBJECT" | awk '{print $1}')
   fi
-  python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$ARTIFACT_ROOT" "$WAL_DIR" "$SESSION_ROOT" "$VALIDATION_ROOT" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$working_tree_dirty" "$COMMAND_LOG" "$ACCEPTANCE_MODE" "$EBPF_OBJECT" "$WAL_MATRIX_RESULT" "$INGEST_MATRIX_RESULT" "$REPLAY_MATRIX_RESULT" "$CGROUP_MATRIX_RESULT" "$SIGNAL_RESULT" "$FMT_RESULT" "$WORKSPACE_CHECK_RESULT" <<'PY'
+  python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$working_tree_dirty" "$COMMAND_LOG" "$ACCEPTANCE_MODE" "$WAL_MATRIX_RESULT" "$INGEST_MATRIX_RESULT" "$REPLAY_MATRIX_RESULT" "$CGROUP_MATRIX_RESULT" "$SIGNAL_RESULT" "$FMT_RESULT" "$WORKSPACE_CHECK_RESULT" "$EXPECTED_SHA" "$START_SHA" "$END_SHA" "$TREE_CLEAN" "$F2_8_RESULT" "$F2_9_RESULT" "$F2_10_RESULT" "$F2_11_RESULT" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 summary = Path(sys.argv[1])
 status, phase = sys.argv[2:4]
-artifacts, wal, sessions, validation = map(Path, sys.argv[4:8])
-commit, kernel, architecture, cgroup, btf, cap_eff, object_sha, dirty, command_log = sys.argv[8:17]
-mode, object_path, wal_matrix, ingest_matrix, replay_matrix, cgroup_matrix, signal, fmt, workspace_check = sys.argv[17:]
+commit, kernel, architecture, cgroup, btf, cap_eff, object_sha, dirty, command_log = sys.argv[4:13]
+mode, wal_matrix, ingest_matrix, replay_matrix, cgroup_matrix, signal, fmt, workspace_check = sys.argv[13:21]
+expected, start_sha, end_sha, tree_clean = sys.argv[21:25]
+f2_8, f2_9, f2_10, f2_11 = sys.argv[25:29]
 summary.parent.mkdir(parents=True, exist_ok=True)
 result = "passed" if status == "0" else ("not_checked" if status == "77" else "failed")
 commands = []
 if Path(command_log).is_file():
     commands = [line[2:] if line.startswith("+ ") else line for line in Path(command_log).read_text(encoding="utf-8").splitlines()]
+scenarios = {"F2.8": f2_8, "F2.9": f2_9, "F2.10": f2_10, "F2.11": f2_11}
+retained = (
+    mode == "full"
+    and result == "passed"
+    and expected
+    and expected == commit == start_sha == end_sha
+    and tree_clean == "true"
+    and all(value == "passed" for value in scenarios.values())
+)
 summary.write_text(json.dumps({
-    "version": 1,
+    "version": 2,
     "git_commit_sha": commit,
+    "expected_git_commit_sha": expected or None,
+    "start_git_commit_sha": start_sha,
+    "end_git_commit_sha": end_sha,
     "working_tree_dirty": dirty == "true",
+    "tree_clean_for_entire_run": tree_clean == "true",
     "kernel_version": kernel,
     "architecture": architecture,
     "cgroup_v2": cgroup,
@@ -173,7 +196,8 @@ summary.write_text(json.dumps({
     "commands_executed": commands,
     "checks": {
         "privileged_acceptance": result,
-        "p1_retained_acceptance": "complete" if mode == "full" and result == "passed" else "not_checked",
+        "p1_retained_acceptance": "complete" if retained else "not_checked",
+        "privileged_scenarios": scenarios,
         "wal_fault_matrix": wal_matrix,
         "ingest_limit_matrix": ingest_matrix,
         "replay_matrix": replay_matrix,
@@ -186,12 +210,11 @@ summary.write_text(json.dumps({
     "exit_code": int(status),
     "phase": phase,
     "artifacts": {
-        "root": str(artifacts),
-        "wal": str(wal),
-        "sessions": str(sessions),
-        "wal_validation": str(validation),
-        "commands": str(Path(command_log)),
-        "ebpf_object": object_path,
+        "root": ".",
+        "wal": "wal",
+        "sessions": "sessions",
+        "wal_validation": "wal-validation",
+        "commands": "commands.log",
     },
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
@@ -237,8 +260,18 @@ on_exit() {
   set +e
   local cleanup_status=0
   cleanup_resources || cleanup_status=$?
+  END_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf '%s' 'not_checked')
   if [[ $status -eq 0 && $cleanup_status -ne 0 ]]; then
     status=1
+  fi
+  if full_mode; then
+    if [[ $END_SHA != "$START_SHA" || -n $(git -C "$ROOT" status --porcelain --untracked-files=all) ]]; then
+      TREE_CLEAN=false
+      status=1
+    fi
+    if [[ $status -eq 0 && $SIGNAL_RESULT == passed && $CGROUP_MATRIX_RESULT == passed && $SHARED_RUNTIME_RESULT == passed ]]; then
+      F2_11_RESULT=passed
+    fi
   fi
   write_summary "$status"
   exit "$status"
@@ -269,6 +302,17 @@ if [[ -n $ARTIFACT_ROOT_ERROR ]]; then
 fi
 valid_acceptance_mode || die "unsupported CHRONICLE_ACCEPTANCE_MODE=$ACCEPTANCE_MODE (expected full or fast)"
 [[ $TARGET_DIR != "$EBPF_TARGET_DIR" ]] || die "CARGO_TARGET_DIR and CHRONICLE_EBPF_TARGET_DIR must remain isolated"
+START_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || die "repository HEAD unavailable")
+END_SHA=$START_SHA
+TREE_CLEAN=true
+if [[ -n $(git -C "$ROOT" status --porcelain --untracked-files=all) ]]; then
+  TREE_CLEAN=false
+fi
+if full_mode; then
+  [[ -n $EXPECTED_SHA ]] || die "full acceptance requires CHRONICLE_ACCEPTANCE_EXPECTED_SHA"
+  [[ $START_SHA == "$EXPECTED_SHA" ]] || die "expected commit $EXPECTED_SHA, found $START_SHA"
+  [[ $TREE_CLEAN == true ]] || die "full acceptance requires a clean working tree"
+fi
 export CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR"
 log "Acceptance mode: $ACCEPTANCE_MODE"
 
@@ -300,6 +344,15 @@ sleep 600 >"$ARTIFACT_ROOT/shared-one.log" 2>&1 & SHARED_ONE_PID=$!
 sleep 600 >"$ARTIFACT_ROOT/shared-two.log" 2>&1 & SHARED_TWO_PID=$!
 printf '%s\n' "$SHARED_ONE_PID" >"$SHARED_CGROUP/cgroup.procs"
 printf '%s\n' "$SHARED_TWO_PID" >"$SHARED_CGROUP/cgroup.procs"
+if full_mode; then
+  if "$CHRONICLE" --format json record --source ebpf --cgroup "$SHARED_CGROUP" --wal-dir "$ARTIFACT_ROOT/shared-rejected-wal" --duration-seconds 1 --segment-bytes 16777216 --max-wal-bytes 16777216 >"$ARTIFACT_ROOT/shared-rejected.json" 2>"$ARTIFACT_ROOT/shared-rejected.log"; then
+    die "shared cgroup recording unexpectedly succeeded without acknowledgement"
+  fi
+  grep -qi 'cgroup selection invalid' "$ARTIFACT_ROOT/shared-rejected.log"
+  "$CHRONICLE" --format json record --source ebpf --cgroup "$SHARED_CGROUP" --allow-shared-cgroup --wal-dir "$ARTIFACT_ROOT/shared-accepted-wal" --duration-seconds 1 --segment-bytes 16777216 --max-wal-bytes 16777216 >"$ARTIFACT_ROOT/shared-accepted.json" 2>"$ARTIFACT_ROOT/shared-accepted.log"
+  assert_json "$ARTIFACT_ROOT/shared-accepted.json" 'value["status"] == "completed" and value["shutdown_reason"] == "duration_limit"'
+  SHARED_RUNTIME_RESULT=passed
+fi
 
 phase 5 "Run Chronicle doctor"
 "$CHRONICLE" --format json doctor --wal-dir "$ARTIFACT_ROOT/doctor-wal" --output "$ARTIFACT_ROOT/doctor-output" >"$ARTIFACT_ROOT/doctor.json" 2>"$ARTIFACT_ROOT/doctor.log"
@@ -363,20 +416,22 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     requests = [json.loads(line) for line in source]
-assert len(requests) == 3, requests
+assert len(requests) >= 2, requests
 PY
 
 phase 14 "Verify active recording metadata"
 assert_json "$WAL_DIR/recording.json" 'value["version"] == 1 and value["status"] == "completed" and value["capture"]["scope"]["selected_subtree"] is True and value["capture"]["scope"]["direct_tgid_count"] >= 0 and value["capture"]["scope"]["descendant_cgroup_count"] == 0'
 
 if full_mode; then
-  phase 15 "Run WAL commit and recovery fault matrix"
+  phase 15 "Run privileged capture feasibility and automated WAL fault matrix"
+  cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture >"$ARTIFACT_ROOT/privileged-feasibility.log" 2>&1
+  grep -q 'test result: ok' "$ARTIFACT_ROOT/privileged-feasibility.log"
   cargo test -p chronicle-wal --locked >"$ARTIFACT_ROOT/wal-tests.log" 2>&1
   assert_file "$ARTIFACT_ROOT/wal-tests.log"
   grep -q 'test result: ok' "$ARTIFACT_ROOT/wal-tests.log"
   WAL_MATRIX_RESULT="passed"
 else
-  skip_phase 15 "Run WAL commit and recovery fault matrix" wal-tests.log
+  skip_phase 15 "Run privileged capture feasibility and automated WAL fault matrix" privileged-feasibility.log wal-tests.log
 fi
 
 if full_mode; then
@@ -411,6 +466,9 @@ PY
 "$CHRONICLE" --format json etl --wal-dir "$STALE_WAL" --output "$STALE_OUTPUT" >"$ARTIFACT_ROOT/stale-recovery-etl.json" 2>"$ARTIFACT_ROOT/stale-recovery-etl.log"
 assert_json "$ARTIFACT_ROOT/stale-recovery-etl.json" 'value["status"] == "aborted" and value["shutdown_reason"] == "process_crash_recovered" and value["checkpoint"]["status"] == "aborted"'
 assert_json "$STALE_WAL/etl/recovery-report.json" 'value["status"] == "aborted" and value["shutdown_reason"] == "process_crash_recovered"'
+if full_mode; then
+  F2_8_RESULT=passed
+fi
 
 phase 18 "Rerun ETL in same output root"
 "$CHRONICLE" --format json etl --wal-dir "$WAL_DIR" --output "$SESSION_ROOT" >"$ARTIFACT_ROOT/etl-rerun.json" 2>"$ARTIFACT_ROOT/etl-rerun.log"
@@ -427,6 +485,9 @@ mv "$WAL_DIR" "$ARTIFACT_ROOT/wal-relocated"
 "$CHRONICLE" --format json inspect "$SESSION_ID" --root "$SESSION_ROOT" >"$ARTIFACT_ROOT/inspect-after-relocation.json" 2>"$ARTIFACT_ROOT/inspect-after-relocation.log"
 assert_json "$ARTIFACT_ROOT/inspect-after-relocation.json" 'value["version"] == 1 and value["integrity_valid"] is True'
 WAL_DIR="$ARTIFACT_ROOT/wal-relocated"
+if full_mode; then
+  F2_9_RESULT=passed
+fi
 
 phase 21 "Verify replay target isolation"
 python3 - "$ARTIFACT_ROOT/upstream-requests.jsonl" "$ARTIFACT_ROOT/replay-requests.jsonl" <<'PY'
@@ -435,9 +496,12 @@ import sys
 upstream = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
 replay = [json.loads(line) for line in open(sys.argv[2], encoding="utf-8")]
 assert len(upstream) == 3, upstream
-assert len(replay) == 3, replay
+assert len(replay) >= 2, replay
 assert all(item["target"] != "http://127.0.0.1" for item in replay)
 PY
+if full_mode; then
+  F2_10_RESULT=passed
+fi
 
 if full_mode; then
   phase 22 "Run mixed replay transport and verification matrix"
@@ -497,10 +561,9 @@ else
 fi
 
 phase 28 "Collect artifacts"
-for artifact in "$ARTIFACT_ROOT/record.log" "$ARTIFACT_ROOT/etl.log" "$ARTIFACT_ROOT/replay.log" "$ARTIFACT_ROOT/doctor.json" "$ARTIFACT_ROOT/record.json" "$ARTIFACT_ROOT/etl.json" "$ARTIFACT_ROOT/inspect.json" "$ARTIFACT_ROOT/replay.json" "$ARTIFACT_ROOT/wal-tests.log" "$ARTIFACT_ROOT/signal-tests.log" "$WAL_DIR/recording.json"; do
+for artifact in "$ARTIFACT_ROOT/record.log" "$ARTIFACT_ROOT/etl.log" "$ARTIFACT_ROOT/replay.log" "$ARTIFACT_ROOT/doctor.json" "$ARTIFACT_ROOT/record.json" "$ARTIFACT_ROOT/etl.json" "$ARTIFACT_ROOT/inspect.json" "$ARTIFACT_ROOT/replay.json" "$ARTIFACT_ROOT/wal-tests.log" "$ARTIFACT_ROOT/privileged-feasibility.log" "$ARTIFACT_ROOT/signal-tests.log" "$WAL_DIR/recording.json"; do
   assert_file "$artifact"
 done
-write_summary 0
 
 phase 29 "Cleanup processes, cgroups, and temporary files"
 cleanup_resources

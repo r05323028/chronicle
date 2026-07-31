@@ -5,7 +5,7 @@
 //! cross-field structure before publication.
 
 use chronicle_common::{
-    ConnectionId, Endpoint, OperationId, ProtocolId, RecordingId, SessionId, Timestamp,
+    ConnectionId, Direction, Endpoint, OperationId, ProtocolId, RecordingId, SessionId, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,13 +15,17 @@ pub const CANONICAL_SCHEMA_VERSION: u16 = 1;
 pub const PROTOCOL_DATA_SCHEMA_VERSION: u16 = 1;
 pub type Attributes = BTreeMap<String, String>;
 
-/// Typed capture completeness. `Partial` never implies replay safety.
+/// Typed capture completeness. Only `Complete` is replayable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Completeness {
     Complete,
-    Partial,
     #[default]
-    Unknown,
+    Incomplete,
+    Truncated,
+    Malformed,
+    Unmatched,
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +165,37 @@ pub trait Redactor: Send + Sync {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SourceConnectionGeneration {
+    Fixture,
+    Socket {
+        socket_cookie: u64,
+        first_seen_boot_id: String,
+        first_seen_nanoseconds: u64,
+        network_namespace: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalByteRange {
+    pub segment_ordinal: u64,
+    pub segment_first_sequence: u64,
+    pub frame_byte_offset: u64,
+    pub wal_sequence: u64,
+    pub direction: Direction,
+    pub payload_byte_offset: u64,
+    pub payload_byte_length: u64,
+    pub gap_before: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationProvenance {
+    pub connection_generation: Option<SourceConnectionGeneration>,
+    pub wal_ranges: Vec<WalByteRange>,
+    pub missing_payload_provenance: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalOperation {
     pub id: OperationId,
     /// Source/WAL provenance sequence; not session presentation order.
@@ -173,6 +208,7 @@ pub struct CanonicalOperation {
     pub recorded_response: Option<PayloadRef>,
     pub attributes: Attributes,
     pub protocol_data: ProtocolData,
+    pub provenance: OperationProvenance,
     pub redactions: Vec<RedactionRecord>,
     pub warnings: Vec<CanonicalWarning>,
 }
@@ -280,14 +316,14 @@ impl CanonicalSession {
         self.connection_completeness
             .get(id)
             .copied()
-            .unwrap_or(Completeness::Unknown)
+            .unwrap_or(Completeness::Incomplete)
     }
 
     pub fn operation_state(&self, id: &OperationId) -> Completeness {
         self.operation_completeness
             .get(id)
             .copied()
-            .unwrap_or(Completeness::Unknown)
+            .unwrap_or(Completeness::Incomplete)
     }
 
     /// Checks cross-field canonical structure. Serde intentionally does not call this,
@@ -448,6 +484,7 @@ mod tests {
                 media_type: None,
                 bytes: Vec::new(),
             },
+            provenance: OperationProvenance::default(),
             redactions: Vec::new(),
             warnings: Vec::new(),
         }
@@ -550,6 +587,7 @@ mod tests {
                 media_type: None,
                 bytes: Vec::new(),
             },
+            provenance: OperationProvenance::default(),
             redactions: Vec::new(),
             warnings: Vec::new(),
         };
@@ -647,6 +685,24 @@ mod tests {
     }
 
     #[test]
+    fn completeness_states_have_stable_typed_names() {
+        for (state, encoded) in [
+            (Completeness::Complete, "\"complete\""),
+            (Completeness::Incomplete, "\"incomplete\""),
+            (Completeness::Truncated, "\"truncated\""),
+            (Completeness::Malformed, "\"malformed\""),
+            (Completeness::Unmatched, "\"unmatched\""),
+            (Completeness::Unsupported, "\"unsupported\""),
+        ] {
+            assert_eq!(serde_json::to_string(&state).unwrap(), encoded);
+            assert_eq!(
+                serde_json::from_str::<Completeness>(encoded).unwrap(),
+                state
+            );
+        }
+    }
+
+    #[test]
     fn rejects_incomplete_or_unknown_completeness() {
         let mut missing_connection = valid_session();
         let id = missing_connection.connections[0].id;
@@ -668,7 +724,7 @@ mod tests {
         let id = ConnectionId::new();
         unknown_connection
             .connection_completeness
-            .insert(id, Completeness::Unknown);
+            .insert(id, Completeness::Incomplete);
         assert_eq!(
             unknown_connection.validate(),
             Err(CanonicalValidationError::UnknownConnectionCompleteness { id })
@@ -678,7 +734,7 @@ mod tests {
         let id = OperationId::new();
         unknown_operation
             .operation_completeness
-            .insert(id, Completeness::Unknown);
+            .insert(id, Completeness::Incomplete);
         assert_eq!(
             unknown_operation.validate(),
             Err(CanonicalValidationError::UnknownOperationCompleteness { id })

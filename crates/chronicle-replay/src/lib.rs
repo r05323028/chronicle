@@ -702,6 +702,7 @@ mod tests {
                         media_type: None,
                         bytes: Vec::new(),
                     },
+                    provenance: Default::default(),
                     redactions: Vec::new(),
                     warnings: Vec::new(),
                 }],
@@ -728,6 +729,32 @@ mod tests {
             plan.operations()[0].decision(),
             &ReplayDecision::Denied(ReplayDenial::MissingTarget)
         );
+    }
+
+    #[test]
+    fn every_non_complete_operation_state_is_non_executable() {
+        for state in [
+            Completeness::Incomplete,
+            Completeness::Truncated,
+            Completeness::Malformed,
+            Completeness::Unmatched,
+            Completeness::Unsupported,
+        ] {
+            let mut session = session(OperationEffect::Read);
+            let operation_id = session.connections[0].operations[0].id;
+            session.operation_completeness.insert(operation_id, state);
+            let plan = ReplayPlanner::plan(
+                &session,
+                &TargetMap::default(),
+                &ReplayPolicy::default(),
+                TimingMode::Asap,
+            )
+            .unwrap();
+            assert_eq!(
+                plan.operations()[0].decision(),
+                &ReplayDecision::Unsupported
+            );
+        }
     }
 
     #[test]
@@ -1121,7 +1148,7 @@ mod tests {
         connection.operations.push(unsupported);
         session
             .operation_completeness
-            .insert(unsupported_id, Completeness::Partial);
+            .insert(unsupported_id, Completeness::Incomplete);
         let targets = TargetMap {
             rules: vec![TargetRule {
                 protocol: None,
@@ -1213,7 +1240,7 @@ mod tests {
         session.operation_completeness.extend([
             (second_id, Completeness::Complete),
             (third_id, Completeness::Complete),
-            (unsupported_id, Completeness::Partial),
+            (unsupported_id, Completeness::Incomplete),
         ]);
         let targets = TargetMap {
             rules: vec![TargetRule {
@@ -1543,7 +1570,7 @@ mod tests {
         connection.operations.push(degraded);
         session
             .operation_completeness
-            .insert(degraded_id, Completeness::Partial);
+            .insert(degraded_id, Completeness::Incomplete);
         let targets = TargetMap {
             rules: vec![TargetRule {
                 protocol: None,

@@ -693,6 +693,7 @@ mod tests {
                         media_type: None,
                         bytes: Vec::new(),
                     },
+                    provenance: Default::default(),
                     redactions: Vec::new(),
                     warnings: Vec::new(),
                 }],

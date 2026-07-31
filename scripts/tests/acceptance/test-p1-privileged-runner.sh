@@ -43,15 +43,29 @@ run_environment_skip() {
   [[ $status -eq 77 ]]
 }
 
-# Default mode is full, and a stable artifact root can be safely reused.
+# Full mode fails before privileged work unless caller binds exact expected commit.
 full_root="$TMP_DIR/full"
-run_environment_skip default "$full_root" "$TMP_DIR/ebpf-target"
+set +e
+env -u CHRONICLE_ACCEPTANCE_MODE \
+  PATH="$TMP_DIR/bin:$PATH" \
+  HOME="$TMP_DIR/home" \
+  CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT="$full_root" \
+  CHRONICLE_EBPF_TARGET_DIR="$TMP_DIR/ebpf-target" \
+  CARGO_TARGET_DIR="$TMP_DIR/workspace-target" \
+  "$SCRIPT" >/dev/null 2>&1
+status=$?
+set -e
+[[ $status -ne 0 ]]
 python3 - "$full_root/acceptance-report.json" <<'PY'
 import json
 import sys
-assert json.load(open(sys.argv[1], encoding="utf-8"))["acceptance_mode"] == "full"
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+assert report["version"] == 2
+assert report["acceptance_mode"] == "full"
+assert report["expected_git_commit_sha"] is None
+assert report["checks"]["p1_retained_acceptance"] == "not_checked"
+assert set(report["checks"]["privileged_scenarios"]) == {"F2.8", "F2.9", "F2.10", "F2.11"}
 PY
-run_environment_skip full "$full_root" "$TMP_DIR/ebpf-target"
 
 # Fast mode is recorded, and SHA calculation follows configured eBPF target.
 ebpf_object="$TMP_DIR/ebpf-target/bpfel-unknown-none/release/chronicle-ebpf-capture"
@@ -67,6 +81,14 @@ object_path = sys.argv[2]
 assert report["acceptance_mode"] == "fast"
 assert report["ebpf_object_sha256"] == hashlib.sha256(open(object_path, "rb").read()).hexdigest()
 assert report["checks"]["p1_retained_acceptance"] == "not_checked"
+assert all(value == "not_checked" for value in report["checks"]["privileged_scenarios"].values())
+assert report["artifacts"] == {
+    "commands": "commands.log",
+    "root": ".",
+    "sessions": "sessions",
+    "wal": "wal",
+    "wal_validation": "wal-validation",
+}
 assert "openspec_validation" not in report["checks"]
 PY
 
@@ -101,7 +123,7 @@ set -e
 
 # Keep fast skips explicit and tied to retained log names.
 grep -Fq 'Skipped in fast mode; covered by full privileged acceptance.' "$SCRIPT"
-for log in wal-tests.log ingest-limit-tests.log replay-tests.log cgroup-tests.log signal-tests.log fmt.log check.log; do
+for log in privileged-feasibility.log wal-tests.log ingest-limit-tests.log replay-tests.log cgroup-tests.log signal-tests.log fmt.log check.log; do
   grep -Fq "$log" "$SCRIPT"
 done
 ! grep -Fq 'openspec-validation.log' "$SCRIPT"
@@ -110,4 +132,7 @@ done
 grep -Fq 'TOTAL_PHASES=29' "$SCRIPT"
 grep -Fq 'phase 29 "Cleanup processes, cgroups, and temporary files"' "$SCRIPT"
 ! grep -Fq 'phase 30' "$SCRIPT"
+grep -Fq 'CHRONICLE_ACCEPTANCE_EXPECTED_SHA' "$SCRIPT"
+grep -Fq 'tree_clean_for_entire_run' "$SCRIPT"
+grep -Fq 'privileged_scenarios' "$SCRIPT"
 printf '%s\n' 'p1 acceptance rootless checks passed'

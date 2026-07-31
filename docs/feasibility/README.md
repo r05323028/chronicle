@@ -93,6 +93,14 @@ sudo -E env \
 
 `fast` mode is for development iteration and is not sufficient retained evidence for completing privileged P1 tasks. Reports record `acceptance_mode`; fast reports mark skipped full-only checks `not_checked`.
 
+For exact-commit evidence from a host checkout, keep host tree clean and run the wrapper from repository root:
+
+```bash
+./scripts/acceptance/p1-multipass.sh chronicle-ubuntu
+```
+
+Wrapper clones detached `HEAD` into VM-local storage, requires `CHRONICLE_ACCEPTANCE_EXPECTED_SHA`, runs full acceptance, copies complete artifacts to `evidence/privileged/<sha>/ubuntu-24.04/`, and verifies artifact hashes. `target/` reports remain transient; only evidence copied outside ignored build output can complete privileged tasks.
+
 ## Unsupported or non-authoritative
 
 - `bpf_get_current_pid_tgid` is unavailable to sock-ops and is not meaningful for cgroup-skb; join process identity from connect evidence by socket cookie.

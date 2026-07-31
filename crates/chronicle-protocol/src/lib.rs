@@ -6,7 +6,10 @@ pub use chronicle_session::{
     ReconstructionFinalization,
 };
 
-use chronicle_canonical::{CanonicalOperation, PayloadRef, ProtocolData};
+use chronicle_canonical::{
+    CanonicalOperation, Completeness, PayloadRef, ProtocolData, SourceConnectionGeneration,
+    WalByteRange,
+};
 use chronicle_common::{Direction, Endpoint, ProtocolId, Timestamp};
 use chronicle_session::{ReconstructionDirection, ReconstructionEvidence};
 use std::collections::BTreeMap;
@@ -92,10 +95,30 @@ pub struct DecodedFrame {
     pub sequence: u64,
     pub payload: Vec<u8>,
     pub attributes: BTreeMap<String, String>,
+    pub connection_generation: Option<SourceConnectionGeneration>,
+    pub provenance: Vec<WalByteRange>,
+    pub missing_payload_provenance: bool,
 }
 
 /// Convert reconstruction fragments to decoder frames without merging bytes or losing provenance.
 pub fn reconstructed_frames(connection: &ProtocolNeutralConnection) -> Vec<DecodedFrame> {
+    let generation = Some(match &connection.identity {
+        chronicle_session::ReconstructionConnectionIdentity::Fixture(_) => {
+            SourceConnectionGeneration::Fixture
+        }
+        chronicle_session::ReconstructionConnectionIdentity::Socket(socket) => {
+            SourceConnectionGeneration::Socket {
+                socket_cookie: socket.socket_cookie,
+                first_seen_boot_id: socket.first_seen.clock.boot_id.clone(),
+                first_seen_nanoseconds: socket.first_seen.nanoseconds,
+                network_namespace: socket.network_namespace,
+            }
+        }
+    });
+    let persisted = matches!(
+        connection.identity,
+        chronicle_session::ReconstructionConnectionIdentity::Socket(_)
+    );
     let mut frames = Vec::new();
     for (direction, fragments) in [
         (
@@ -107,6 +130,7 @@ pub fn reconstructed_frames(connection: &ProtocolNeutralConnection) -> Vec<Decod
             &connection.server_to_client.fragments,
         ),
     ] {
+        let mut previous_tcp_end = None;
         for event in fragments {
             let ReconstructionEvidence::Payload(payload) = &event.evidence else {
                 continue;
@@ -115,6 +139,13 @@ pub fn reconstructed_frames(connection: &ProtocolNeutralConnection) -> Vec<Decod
             if let Some(sequence) = event.wal_sequence {
                 attributes.insert("chronicle.wal_sequence".into(), sequence.to_string());
             }
+            let gap_before = payload.tcp_position.as_ref().is_some_and(|position| {
+                let start =
+                    u64::from(position.tcp_sequence) + u64::from(position.continuation_position);
+                let gap = previous_tcp_end.is_some_and(|end| start > end);
+                previous_tcp_end = Some(start.saturating_add(payload.bytes.len() as u64));
+                gap
+            });
             if let Some(position) = &payload.tcp_position {
                 attributes.insert(
                     "chronicle.tcp_sequence".into(),
@@ -135,6 +166,22 @@ pub fn reconstructed_frames(connection: &ProtocolNeutralConnection) -> Vec<Decod
                 }
                 .into(),
             );
+            let provenance = event
+                .wal_provenance
+                .as_ref()
+                .zip(event.wal_sequence)
+                .map(|(source, wal_sequence)| WalByteRange {
+                    segment_ordinal: source.segment_ordinal,
+                    segment_first_sequence: source.segment_first_sequence,
+                    frame_byte_offset: source.frame_byte_offset,
+                    wal_sequence,
+                    direction,
+                    payload_byte_offset: 0,
+                    payload_byte_length: payload.bytes.len() as u64,
+                    gap_before,
+                })
+                .into_iter()
+                .collect();
             frames.push(DecodedFrame {
                 direction,
                 sequence: event
@@ -142,6 +189,10 @@ pub fn reconstructed_frames(connection: &ProtocolNeutralConnection) -> Vec<Decod
                     .unwrap_or_else(|| u64::try_from(frames.len()).unwrap_or(u64::MAX)),
                 payload: payload.bytes.clone(),
                 attributes,
+                connection_generation: generation.clone(),
+                provenance,
+                missing_payload_provenance: persisted
+                    && (event.wal_provenance.is_none() || payload.tcp_position.is_none()),
             });
         }
     }
@@ -186,13 +237,27 @@ pub trait DecoderFactory: Send + Sync {
     fn create(&self) -> Box<dyn ProtocolDecoder>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalizedOperation {
+    pub operation: CanonicalOperation,
+    pub completeness: Completeness,
+}
+
+impl std::ops::Deref for CanonicalizedOperation {
+    type Target = CanonicalOperation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.operation
+    }
+}
+
 pub trait ProtocolCanonicalizer: Send + Sync {
     fn protocol(&self) -> &ProtocolId;
     fn canonicalize(
         &self,
         stream: &ProtocolStream<'_>,
         frames: Vec<DecodedFrame>,
-    ) -> Result<Vec<CanonicalOperation>, ProtocolError>;
+    ) -> Result<Vec<CanonicalizedOperation>, ProtocolError>;
 }
 
 #[derive(Clone)]

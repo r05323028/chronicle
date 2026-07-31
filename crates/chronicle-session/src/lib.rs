@@ -113,10 +113,19 @@ pub enum ReconstructionEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconstructionWalProvenance {
+    pub segment_ordinal: u64,
+    pub segment_first_sequence: u64,
+    pub frame_byte_offset: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconstructionEvent {
     pub connection: ReconstructionConnectionIdentity,
     /// Persistence sequence is ordering evidence only; absent for live/unpersisted input.
     pub wal_sequence: Option<u64>,
+    /// Exact placement of persisted input; absent for fixtures and live input.
+    pub wal_provenance: Option<ReconstructionWalProvenance>,
     pub timestamp: ReconstructionTimestamp,
     pub recording_scope: Option<RecordingScopeIdentity>,
     pub socket_evidence: Option<SocketEvidence>,
@@ -639,6 +648,7 @@ impl ReconstructionAssembler {
             events.push(ReconstructionEvent {
                 connection: event.connection.clone(),
                 wal_sequence: event.wal_sequence,
+                wal_provenance: event.wal_provenance.clone(),
                 timestamp: event.timestamp.clone(),
                 recording_scope: event.recording_scope.clone(),
                 socket_evidence: None,
@@ -772,6 +782,7 @@ fn connect_intent_input(intent: SocketConnectIntent) -> ReconstructionInput {
     ReconstructionInput::Event(ReconstructionEvent {
         connection: ReconstructionConnectionIdentity::Socket(intent.socket),
         wal_sequence: None,
+        wal_provenance: None,
         timestamp: reconstruction_timestamp(intent.timestamp),
         recording_scope: Some(intent.recording_scope),
         socket_evidence: None,
@@ -786,6 +797,7 @@ fn lifecycle_input(
     ReconstructionInput::Event(ReconstructionEvent {
         connection: ReconstructionConnectionIdentity::Socket(evidence.socket.clone()),
         wal_sequence: None,
+        wal_provenance: None,
         timestamp: reconstruction_timestamp(evidence.timestamp.clone()),
         recording_scope: Some(evidence.recording_scope.clone()),
         socket_evidence: Some(evidence),
@@ -797,6 +809,7 @@ fn payload_input(fragment: PayloadFragment) -> ReconstructionInput {
     ReconstructionInput::Event(ReconstructionEvent {
         connection: ReconstructionConnectionIdentity::Socket(fragment.socket),
         wal_sequence: None,
+        wal_provenance: None,
         timestamp: reconstruction_timestamp(fragment.timestamp),
         recording_scope: Some(fragment.recording_scope),
         socket_evidence: None,
@@ -1301,6 +1314,7 @@ mod tests {
                 network_namespace: Some(1),
             }),
             wal_sequence: None,
+            wal_provenance: None,
             timestamp: ReconstructionTimestamp {
                 monotonic: MonotonicTimestamp {
                     clock,

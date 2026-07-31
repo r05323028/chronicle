@@ -35,15 +35,16 @@ const PLANNED: ProtocolCapabilities = ProtocolCapabilities {
 pub mod http {
     use super::ProtocolRegistration;
     use chronicle_canonical::{
-        Attributes, CanonicalOperation, CanonicalWarning, OperationEffect, OperationKind,
-        PayloadRef, ProtocolData, RelativeTimeNanos,
+        Attributes, CanonicalOperation, CanonicalWarning, Completeness, OperationEffect,
+        OperationKind, OperationProvenance, PayloadRef, ProtocolData, RelativeTimeNanos,
+        SourceConnectionGeneration, WalByteRange,
     };
     use chronicle_common::{Direction, Endpoint, OperationId, ProtocolId};
     use chronicle_protocol::{
-        BoxFuture, CapabilityStatus, DecodedFrame, DetectionInput, DetectionResult,
-        ObservedResponse, ProtocolCanonicalizer, ProtocolCapabilities, ProtocolDetector,
-        ProtocolError, ProtocolStream, ReplayAdapter, ReplayConnection, ReplayContext,
-        TransportErrorCategory, VerificationResult, VerificationStatus, Verifier,
+        BoxFuture, CanonicalizedOperation, CapabilityStatus, DecodedFrame, DetectionInput,
+        DetectionResult, ObservedResponse, ProtocolCanonicalizer, ProtocolCapabilities,
+        ProtocolDetector, ProtocolError, ProtocolStream, ReplayAdapter, ReplayConnection,
+        ReplayContext, TransportErrorCategory, VerificationResult, VerificationStatus, Verifier,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, VecDeque};
@@ -241,6 +242,12 @@ pub mod http {
         pub orphan_response: bool,
         #[serde(default)]
         pub warnings: Vec<String>,
+        #[serde(default)]
+        pub connection_generation: Option<SourceConnectionGeneration>,
+        #[serde(default)]
+        pub provenance: Vec<WalByteRange>,
+        #[serde(default)]
+        pub missing_payload_provenance: bool,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -997,12 +1004,58 @@ pub mod http {
             }
         }
 
+        fn completeness(
+            stream: &ProtocolStream<'_>,
+            request: &Message,
+            response: Option<&Message>,
+            codes: &[String],
+        ) -> Completeness {
+            if codes
+                .iter()
+                .any(|code| code == WarningCode::Malformed.as_str())
+            {
+                return Completeness::Malformed;
+            }
+            if request.pipeline_depth > 1
+                || codes.iter().any(|code| {
+                    code.starts_with("unsupported_") || code == WarningCode::Pipelined.as_str()
+                })
+            {
+                return Completeness::Unsupported;
+            }
+            if stream.truncated
+                || codes
+                    .iter()
+                    .any(|code| code == WarningCode::TruncatedMessage.as_str())
+            {
+                return Completeness::Truncated;
+            }
+            if response.is_none()
+                || request.kind == MessageKind::Opaque
+                || response.is_some_and(|message| {
+                    message.kind == MessageKind::Opaque || message.orphan_response
+                })
+            {
+                return Completeness::Unmatched;
+            }
+            if request.missing_payload_provenance
+                || request.provenance.iter().any(|range| range.gap_before)
+                || response.is_some_and(|message| {
+                    message.missing_payload_provenance
+                        || message.provenance.iter().any(|range| range.gap_before)
+                })
+            {
+                return Completeness::Incomplete;
+            }
+            Completeness::Complete
+        }
+
         #[allow(clippy::too_many_lines)] // Canonical operation fields stay co-located for schema review.
         fn operation(
             stream: &ProtocolStream<'_>,
             request: Message,
             response: Option<Message>,
-        ) -> CanonicalOperation {
+        ) -> CanonicalizedOperation {
             let (started_at_offset, mut warnings) = Self::offset(stream, request.sequence);
             let completed_at_offset = response
                 .as_ref()
@@ -1017,39 +1070,30 @@ pub mod http {
             {
                 codes.push("orphan_response".into());
             }
+            let completeness = Self::completeness(stream, &request, response.as_ref(), &codes);
             warnings.extend(codes.iter().map(|code| CanonicalWarning {
                 code: code.clone(),
                 message: format!("HTTP decoder warning: {code}"),
             }));
+            if completeness == Completeness::Truncated {
+                warnings.push(CanonicalWarning {
+                    code: "truncated_message".into(),
+                    message: "HTTP message was truncated".into(),
+                });
+            }
+            if completeness != Completeness::Complete {
+                warnings.push(CanonicalWarning {
+                    code: "incomplete_exchange".into(),
+                    message: "HTTP exchange is not complete and replayable".into(),
+                });
+            }
             let response_status = response.as_ref().and_then(|message| message.status);
             let response_headers = response
                 .as_ref()
                 .map_or_else(Vec::new, |message| message.headers.clone());
             let response_reason = response.as_ref().and_then(|message| message.reason.clone());
             let response_sequence = response.as_ref().map(|message| message.sequence);
-            let incomplete = response.is_none()
-                || request.kind == MessageKind::Opaque
-                || response
-                    .as_ref()
-                    .is_some_and(|message| message.kind == MessageKind::Opaque);
-            let truncated = stream.truncated
-                || codes
-                    .iter()
-                    .any(|code| code == WarningCode::TruncatedMessage.as_str());
-            if truncated {
-                warnings.push(CanonicalWarning {
-                    code: "truncated_message".into(),
-                    message: "HTTP message was truncated".into(),
-                });
-            }
-            if incomplete {
-                warnings.push(CanonicalWarning {
-                    code: "incomplete_exchange".into(),
-                    message: "HTTP exchange is incomplete".into(),
-                });
-            }
-            let replayable = !incomplete
-                && !truncated
+            let replayable = completeness == Completeness::Complete
                 && request.pipeline_depth <= 1
                 && request.method.is_some();
             let captured_sensitive_headers = request
@@ -1105,25 +1149,46 @@ pub mod http {
                     "true".into(),
                 );
             }
-            CanonicalOperation {
-                id: OperationId::new(),
-                sequence: request.sequence,
-                started_at_offset,
-                completed_at_offset,
-                kind: OperationKind::Request,
-                effect: Self::effect(request.method.as_deref()),
-                request: PayloadRef::Inline {
-                    content_type: None,
-                    bytes: request.body,
+            let mut wal_ranges = request.provenance.clone();
+            if let Some(message) = &response {
+                wal_ranges.extend(message.provenance.clone());
+            }
+            let connection_generation = request.connection_generation.clone().or_else(|| {
+                response
+                    .as_ref()
+                    .and_then(|message| message.connection_generation.clone())
+            });
+            let missing_payload_provenance = request.missing_payload_provenance
+                || response
+                    .as_ref()
+                    .is_some_and(|message| message.missing_payload_provenance);
+            CanonicalizedOperation {
+                completeness,
+                operation: CanonicalOperation {
+                    id: OperationId::new(),
+                    sequence: request.sequence,
+                    started_at_offset,
+                    completed_at_offset,
+                    kind: OperationKind::Request,
+                    effect: Self::effect(request.method.as_deref()),
+                    request: PayloadRef::Inline {
+                        content_type: None,
+                        bytes: request.body,
+                    },
+                    recorded_response: response.map(|message| PayloadRef::Inline {
+                        content_type: None,
+                        bytes: message.body,
+                    }),
+                    attributes,
+                    protocol_data,
+                    provenance: OperationProvenance {
+                        connection_generation,
+                        wal_ranges,
+                        missing_payload_provenance,
+                    },
+                    redactions: Vec::new(),
+                    warnings,
                 },
-                recorded_response: response.map(|message| PayloadRef::Inline {
-                    content_type: None,
-                    bytes: message.body,
-                }),
-                attributes,
-                protocol_data,
-                redactions: Vec::new(),
-                warnings,
             }
         }
     }
@@ -1142,7 +1207,7 @@ pub mod http {
             &self,
             stream: &ProtocolStream<'_>,
             frames: Vec<DecodedFrame>,
-        ) -> Result<Vec<CanonicalOperation>, ProtocolError> {
+        ) -> Result<Vec<CanonicalizedOperation>, ProtocolError> {
             let mut pending = VecDeque::new();
             let mut operations = Vec::new();
             for frame in frames {
@@ -1233,15 +1298,14 @@ pub mod http {
                 .pending_methods
                 .front()
                 .is_some_and(|method| method == "HEAD");
-            let Some((_, mut message)) =
+            let Some((consumed, mut message)) =
                 parse_close_delimited_response(&self.server.bytes, sequence, head)?
             else {
                 return chronicle_protocol::ProtocolDecoder::finish(self);
             };
             message.pipeline_depth = self.pending_methods.len();
             message.orphan_response = self.pending_methods.pop_front().is_none();
-            self.server.bytes.clear();
-            self.server.start_sequence = None;
+            self.server.consume(consumed, &mut message);
             encode_messages(Direction::ServerToClient, vec![message])
         }
     }
@@ -1274,13 +1338,14 @@ pub mod http {
             frame: chronicle_protocol::DecodedFrame,
         ) -> Result<Vec<chronicle_protocol::DecodedFrame>, chronicle_protocol::ProtocolError>
         {
-            let mut messages = match frame.direction {
+            let direction = frame.direction;
+            let mut messages = match direction {
                 Direction::ClientToServer => {
-                    self.client.push(frame.sequence, &frame.payload);
+                    self.client.push(frame);
                     self.client.decode(Direction::ClientToServer, false)
                 }
                 Direction::ServerToClient => {
-                    self.server.push(frame.sequence, &frame.payload);
+                    self.server.push(frame);
                     let mut messages = Vec::new();
                     while let Some(mut message) = self.server.decode_one(
                         Direction::ServerToClient,
@@ -1297,7 +1362,7 @@ pub mod http {
                     messages
                 }
             };
-            if frame.direction == Direction::ClientToServer {
+            if direction == Direction::ClientToServer {
                 for message in &mut messages {
                     if let Some(method) = &message.method {
                         self.pending_methods.push_back(method.clone());
@@ -1305,7 +1370,7 @@ pub mod http {
                     }
                 }
             }
-            encode_messages(frame.direction, messages)
+            encode_messages(direction, messages)
         }
 
         fn finish(
@@ -1327,14 +1392,23 @@ pub mod http {
     struct DirectionBuffer {
         bytes: Vec<u8>,
         start_sequence: Option<u64>,
+        connection_generation: Option<SourceConnectionGeneration>,
+        provenance: VecDeque<WalByteRange>,
+        missing_payload_provenance: bool,
     }
 
     impl DirectionBuffer {
-        fn push(&mut self, sequence: u64, payload: &[u8]) {
+        fn push(&mut self, frame: DecodedFrame) {
             if self.bytes.is_empty() {
-                self.start_sequence = Some(sequence);
+                self.start_sequence = Some(frame.sequence);
+                self.connection_generation
+                    .clone_from(&frame.connection_generation);
+            } else if self.connection_generation != frame.connection_generation {
+                self.missing_payload_provenance = true;
             }
-            self.bytes.extend_from_slice(payload);
+            self.missing_payload_provenance |= frame.missing_payload_provenance;
+            self.provenance.extend(frame.provenance);
+            self.bytes.extend_from_slice(&frame.payload);
         }
 
         fn decode(&mut self, direction: Direction, head_response: bool) -> Vec<Message> {
@@ -1350,8 +1424,7 @@ pub mod http {
             match parse_message(&self.bytes, direction, sequence, head_response) {
                 Ok(Some((consumed, mut message))) => {
                     message.sequence = sequence;
-                    self.bytes.drain(..consumed);
-                    self.start_sequence = (!self.bytes.is_empty()).then_some(sequence);
+                    self.consume(consumed, &mut message);
                     Some(message)
                 }
                 Ok(None) => None,
@@ -1359,20 +1432,73 @@ pub mod http {
             }
         }
 
+        fn consume(&mut self, consumed: usize, message: &mut Message) {
+            message
+                .connection_generation
+                .clone_from(&self.connection_generation);
+            message.missing_payload_provenance = self.missing_payload_provenance;
+            message.provenance = self.take_provenance(consumed);
+            self.bytes.drain(..consumed);
+            if self.bytes.is_empty() {
+                self.start_sequence = None;
+                self.connection_generation = None;
+                self.missing_payload_provenance = false;
+            } else {
+                self.start_sequence = self
+                    .provenance
+                    .front()
+                    .map(|range| range.wal_sequence)
+                    .or(self.start_sequence);
+            }
+        }
+
+        fn take_provenance(&mut self, consumed: usize) -> Vec<WalByteRange> {
+            let mut remaining = consumed as u64;
+            let mut ranges = Vec::new();
+            while remaining > 0 {
+                let Some(mut range) = self.provenance.pop_front() else {
+                    break;
+                };
+                let taken = remaining.min(range.payload_byte_length);
+                let mut emitted = range.clone();
+                emitted.payload_byte_length = taken;
+                ranges.push(emitted);
+                remaining -= taken;
+                if taken < range.payload_byte_length {
+                    range.payload_byte_offset += taken;
+                    range.payload_byte_length -= taken;
+                    range.gap_before = false;
+                    self.provenance.push_front(range);
+                }
+            }
+            ranges
+        }
+
         fn take_opaque(&mut self, warning: WarningCode) -> Option<Message> {
-            (!self.bytes.is_empty()).then(|| Message {
+            if self.bytes.is_empty() {
+                return None;
+            }
+            let sequence = self.start_sequence.unwrap_or_default();
+            let consumed = self.bytes.len();
+            let body = self.bytes.clone();
+            let mut message = Message {
                 kind: MessageKind::Opaque,
-                sequence: self.start_sequence.unwrap_or_default(),
+                sequence,
                 method: None,
                 target: None,
                 status: None,
                 reason: None,
                 headers: Vec::new(),
-                body: std::mem::take(&mut self.bytes),
+                body,
                 pipeline_depth: 0,
                 orphan_response: false,
                 warnings: vec![warning.as_str().into()],
-            })
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: false,
+            };
+            self.consume(consumed, &mut message);
+            Some(message)
         }
     }
 
@@ -1384,6 +1510,9 @@ pub mod http {
             .into_iter()
             .map(|message| {
                 let sequence = message.sequence;
+                let connection_generation = message.connection_generation.clone();
+                let provenance = message.provenance.clone();
+                let missing_payload_provenance = message.missing_payload_provenance;
                 let payload =
                     serde_json::to_vec(&message).map_err(|error| malformed(&error.to_string()))?;
                 Ok(chronicle_protocol::DecodedFrame {
@@ -1391,6 +1520,9 @@ pub mod http {
                     sequence,
                     payload,
                     attributes: Default::default(),
+                    connection_generation,
+                    provenance,
+                    missing_payload_provenance,
                 })
             })
             .collect()
@@ -1482,6 +1614,9 @@ pub mod http {
                 pipeline_depth: 0,
                 orphan_response: false,
                 warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: false,
             },
         )))
     }
@@ -1559,6 +1694,9 @@ pub mod http {
                 pipeline_depth: 0,
                 orphan_response: false,
                 warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: false,
             },
         )))
     }
@@ -1608,6 +1746,9 @@ pub mod http {
                 pipeline_depth: 0,
                 orphan_response: false,
                 warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: false,
             },
         )))
     }
@@ -1827,6 +1968,7 @@ pub mod http {
                     },
                 }
                 .into_protocol_data(),
+                provenance: OperationProvenance::default(),
                 redactions: Vec::new(),
                 warnings: Vec::new(),
             }
@@ -2309,6 +2451,220 @@ pub mod http {
         }
 
         #[test]
+        fn unsupported_and_bounded_http_edges_are_typed() {
+            let oversized = format!(
+                "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_RESPONSE_BYTES + 1
+            );
+            assert!(
+                parse_request(oversized.as_bytes(), 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("request exceeds byte limit")
+            );
+            assert!(
+                parse_request(
+                    b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                    1,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("transfer encoding")
+            );
+            assert!(
+                parse_response(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naX\r\n0\r\n\r\n",
+                    2,
+                    false,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("invalid chunk terminator")
+            );
+
+            let request = Message {
+                kind: MessageKind::Request,
+                sequence: 1,
+                method: Some("PURGE".into()),
+                target: Some("/cache".into()),
+                status: None,
+                reason: None,
+                headers: Vec::new(),
+                body: Vec::new(),
+                pipeline_depth: 1,
+                orphan_response: false,
+                warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: false,
+            };
+            let response = Message {
+                kind: MessageKind::Response,
+                sequence: 2,
+                method: None,
+                target: None,
+                status: Some(200),
+                reason: Some(b"OK".to_vec()),
+                headers: Vec::new(),
+                body: Vec::new(),
+                pipeline_depth: 1,
+                orphan_response: false,
+                warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: false,
+            };
+            let operation = Canonicalizer::new()
+                .canonicalize(
+                    &ProtocolStream {
+                        started_at: None,
+                        chunks: Vec::new(),
+                        truncated: false,
+                    },
+                    encode_messages(Direction::ClientToServer, vec![request])
+                        .unwrap()
+                        .into_iter()
+                        .chain(encode_messages(Direction::ServerToClient, vec![response]).unwrap())
+                        .collect(),
+                )
+                .unwrap()
+                .remove(0);
+            assert_eq!(operation.completeness, Completeness::Complete);
+            assert_eq!(operation.operation.effect, OperationEffect::Unknown);
+        }
+
+        #[test]
+        fn reconstructed_header_retains_all_contributing_wal_ranges() {
+            let generation = Some(SourceConnectionGeneration::Socket {
+                socket_cookie: 7,
+                first_seen_boot_id: "boot".into(),
+                first_seen_nanoseconds: 1,
+                network_namespace: Some(2),
+            });
+            let request_head = b"GET /split HTTP/1.1\r\nHost: test\r\n";
+            let request_tail = b"Content-Length: 0\r\n\r\n";
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            let inputs = [
+                (Direction::ClientToServer, 10, 0, request_head.as_slice()),
+                (Direction::ClientToServer, 11, 1, request_tail.as_slice()),
+                (Direction::ServerToClient, 12, 2, response.as_slice()),
+            ];
+            let mut parser = Decoder::new();
+            let mut output_frames = Vec::new();
+            for (direction, sequence, segment_ordinal, payload) in inputs {
+                output_frames.extend(
+                    chronicle_protocol::ProtocolDecoder::push(
+                        &mut parser,
+                        DecodedFrame {
+                            direction,
+                            sequence,
+                            payload: payload.to_vec(),
+                            attributes: Attributes::new(),
+                            connection_generation: generation.clone(),
+                            provenance: vec![WalByteRange {
+                                segment_ordinal,
+                                segment_first_sequence: sequence,
+                                frame_byte_offset: 64,
+                                wal_sequence: sequence,
+                                direction,
+                                payload_byte_offset: 0,
+                                payload_byte_length: payload.len() as u64,
+                                gap_before: false,
+                            }],
+                            missing_payload_provenance: false,
+                        },
+                    )
+                    .unwrap(),
+                );
+            }
+            let operations = Canonicalizer::new()
+                .canonicalize(
+                    &ProtocolStream {
+                        started_at: None,
+                        chunks: Vec::new(),
+                        truncated: false,
+                    },
+                    output_frames,
+                )
+                .unwrap();
+
+            assert_eq!(operations.len(), 1);
+            assert_eq!(operations[0].completeness, Completeness::Complete);
+            assert_eq!(
+                operations[0]
+                    .operation
+                    .provenance
+                    .wal_ranges
+                    .iter()
+                    .map(|range| range.wal_sequence)
+                    .collect::<Vec<_>>(),
+                [10, 11, 12]
+            );
+            assert_eq!(
+                operations[0].operation.provenance.connection_generation,
+                generation
+            );
+        }
+
+        #[test]
+        fn missing_reconstructed_payload_provenance_is_incomplete() {
+            let request = Message {
+                kind: MessageKind::Request,
+                sequence: 1,
+                method: Some("GET".into()),
+                target: Some("/".into()),
+                status: None,
+                reason: None,
+                headers: Vec::new(),
+                body: Vec::new(),
+                pipeline_depth: 1,
+                orphan_response: false,
+                warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: true,
+            };
+            let response = Message {
+                kind: MessageKind::Response,
+                sequence: 2,
+                method: None,
+                target: None,
+                status: Some(200),
+                reason: Some(b"OK".to_vec()),
+                headers: Vec::new(),
+                body: Vec::new(),
+                pipeline_depth: 1,
+                orphan_response: false,
+                warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: true,
+            };
+            let operations = Canonicalizer::new()
+                .canonicalize(
+                    &ProtocolStream {
+                        started_at: None,
+                        chunks: Vec::new(),
+                        truncated: false,
+                    },
+                    encode_messages(Direction::ClientToServer, vec![request])
+                        .unwrap()
+                        .into_iter()
+                        .chain(encode_messages(Direction::ServerToClient, vec![response]).unwrap())
+                        .collect(),
+                )
+                .unwrap();
+
+            assert_eq!(operations[0].completeness, Completeness::Incomplete);
+            assert!(
+                !HttpOperationData::from_protocol_data(&operations[0].operation.protocol_data)
+                    .unwrap()
+                    .replay
+                    .replayable
+            );
+        }
+
+        #[test]
         fn canonicalizer_maps_http_exchange_and_missing_response() {
             let canonicalizer = Canonicalizer::new();
             let request = Message {
@@ -2332,6 +2688,9 @@ pub mod http {
                 pipeline_depth: 1,
                 orphan_response: false,
                 warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: false,
             };
             let response = Message {
                 kind: MessageKind::Response,
@@ -2345,6 +2704,9 @@ pub mod http {
                 pipeline_depth: 1,
                 orphan_response: false,
                 warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: false,
             };
             let missing = Message {
                 sequence: 3,
@@ -2358,18 +2720,27 @@ pub mod http {
                     sequence: 1,
                     payload: serde_json::to_vec(&request).unwrap(),
                     attributes: Attributes::new(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 },
                 DecodedFrame {
                     direction: Direction::ServerToClient,
                     sequence: 2,
                     payload: serde_json::to_vec(&response).unwrap(),
                     attributes: Attributes::new(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 },
                 DecodedFrame {
                     direction: Direction::ClientToServer,
                     sequence: 3,
                     payload: serde_json::to_vec(&missing).unwrap(),
                     attributes: Attributes::new(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 },
             ];
             let operations = canonicalizer
@@ -2405,6 +2776,9 @@ pub mod http {
                 pipeline_depth: 0,
                 orphan_response: true,
                 warnings: Vec::new(),
+                connection_generation: None,
+                provenance: Vec::new(),
+                missing_payload_provenance: false,
             };
             let operations = Canonicalizer::new()
                 .canonicalize(
@@ -2414,6 +2788,9 @@ pub mod http {
                         sequence: 1,
                         payload: serde_json::to_vec(&response).unwrap(),
                         attributes: Attributes::new(),
+                        connection_generation: None,
+                        provenance: Vec::new(),
+                        missing_payload_provenance: false,
                     }],
                 )
                 .unwrap();
@@ -2451,6 +2828,9 @@ pub mod http {
                         sequence,
                         payload: payload.to_vec(),
                         attributes: Attributes::new(),
+                        connection_generation: None,
+                        provenance: Vec::new(),
+                        missing_payload_provenance: false,
                     })
                     .unwrap();
             }
@@ -2460,6 +2840,9 @@ pub mod http {
                     sequence: 3,
                     payload: b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
                     attributes: Attributes::new(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             assert_eq!(responses.len(), 2);
@@ -2479,6 +2862,9 @@ pub mod http {
                         sequence: 1,
                         payload: b"POST /bin HTTP/1.1\r\nContent-Length: 3\r\n".to_vec(),
                         attributes: Default::default(),
+                        connection_generation: None,
+                        provenance: Vec::new(),
+                        missing_payload_provenance: false,
                     })
                     .unwrap()
                     .is_empty()
@@ -2489,6 +2875,9 @@ pub mod http {
                     sequence: 2,
                     payload: b"\r\n\x00\xff\x80".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let request: Message = serde_json::from_slice(&request[0].payload).unwrap();
@@ -2501,6 +2890,9 @@ pub mod http {
                     sequence: 3,
                     payload: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let response: Message = serde_json::from_slice(&response[0].payload).unwrap();
@@ -2562,6 +2954,9 @@ pub mod http {
                     sequence: 1,
                     payload: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             assert!(
@@ -2572,6 +2967,9 @@ pub mod http {
                         payload: b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n\x00"
                             .to_vec(),
                         attributes: Default::default(),
+                        connection_generation: None,
+                        provenance: Vec::new(),
+                        missing_payload_provenance: false,
                     })
                     .unwrap()
                     .is_empty()
@@ -2582,6 +2980,9 @@ pub mod http {
                     sequence: 3,
                     payload: b"\xff\r\n0\r\nX-Trailer: ok\r\n\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let response: Message = serde_json::from_slice(&response[0].payload).unwrap();
@@ -2601,6 +3002,9 @@ pub mod http {
                     sequence: 1,
                     payload: b"POST /zero HTTP/1.1\r\nContent-Length: 0\r\n\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let request: Message = serde_json::from_slice(&request[0].payload).unwrap();
@@ -2614,6 +3018,9 @@ pub mod http {
                         sequence: 1,
                         payload: format!("{method} / HTTP/1.1\r\n\r\n").into_bytes(),
                         attributes: Default::default(),
+                        connection_generation: None,
+                        provenance: Vec::new(),
+                        missing_payload_provenance: false,
                     })
                     .unwrap();
                 let response = decoder
@@ -2623,6 +3030,9 @@ pub mod http {
                         payload: format!("HTTP/1.1 {status} OK\r\nContent-Length: 3\r\n\r\n")
                             .into_bytes(),
                         attributes: Default::default(),
+                        connection_generation: None,
+                        provenance: Vec::new(),
+                        missing_payload_provenance: false,
                     })
                     .unwrap();
                 let response: Message = serde_json::from_slice(&response[0].payload).unwrap();
@@ -2662,6 +3072,9 @@ pub mod http {
                     sequence: 1,
                     payload: payload.to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let message: Message = serde_json::from_slice(&frames[0].payload).unwrap();
@@ -2711,6 +3124,9 @@ pub mod http {
                         sequence: 1,
                         payload: payload.to_vec(),
                         attributes: Default::default(),
+                        connection_generation: None,
+                        provenance: Vec::new(),
+                        missing_payload_provenance: false,
                     })
                     .unwrap();
                 let message: Message = serde_json::from_slice(&frames[0].payload).unwrap();
@@ -2725,6 +3141,9 @@ pub mod http {
                     sequence: 1,
                     payload: b"GET / HTTP/1.1\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let frames = decoder.finish().unwrap();
@@ -2739,6 +3158,9 @@ pub mod http {
                     sequence: 1,
                     payload: over_limit.clone(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let message: Message = serde_json::from_slice(&frames[0].payload).unwrap();
@@ -2768,6 +3190,9 @@ pub mod http {
                     sequence: 1,
                     payload: b"GET /ok HTTP/1.1\r\n\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             assert_eq!(
@@ -2782,6 +3207,9 @@ pub mod http {
                     sequence: 2,
                     payload: b"GET / HTTP/1.0\r\n\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             assert_eq!(
@@ -2803,6 +3231,9 @@ pub mod http {
                     sequence: 1,
                     payload: b"HEAD / HTTP/1.1\r\n\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let response = decoder
@@ -2811,6 +3242,9 @@ pub mod http {
                     sequence: 2,
                     payload: b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let response: Message = serde_json::from_slice(&response[0].payload).unwrap();
@@ -2832,6 +3266,9 @@ pub mod http {
                         sequence,
                         payload: payload.to_vec(),
                         attributes: Default::default(),
+                        connection_generation: None,
+                        provenance: Vec::new(),
+                        missing_payload_provenance: false,
                     })
                     .unwrap();
             }
@@ -2842,6 +3279,9 @@ pub mod http {
                     sequence: 3,
                     payload: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let messages = responses
@@ -2858,6 +3298,9 @@ pub mod http {
                     sequence: 4,
                     payload: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 })
                 .unwrap();
             let orphan: Message = serde_json::from_slice(&orphan[0].payload).unwrap();
@@ -2938,15 +3381,16 @@ pub mod nats {
 
 pub mod fake {
     use chronicle_canonical::{
-        Attributes, CanonicalOperation, CanonicalWarning, OperationEffect, OperationKind,
-        PayloadRef, ProtocolData, RelativeTimeNanos,
+        Attributes, CanonicalOperation, CanonicalWarning, Completeness, OperationEffect,
+        OperationKind, OperationProvenance, PayloadRef, ProtocolData, RelativeTimeNanos,
     };
     use chronicle_common::{Direction, Endpoint, OperationId, ProtocolId};
     use chronicle_protocol::{
-        BoxFuture, CapabilityStatus, DecodedFrame, DecoderFactory, DetectionInput, DetectionResult,
-        ObservedResponse, ProtocolCanonicalizer, ProtocolCapabilities, ProtocolDecoder,
-        ProtocolDetector, ProtocolError, ProtocolRegistration, ProtocolStream, ReplayAdapter,
-        ReplayConnection, ReplayContext, VerificationResult, VerificationStatus, Verifier,
+        BoxFuture, CanonicalizedOperation, CapabilityStatus, DecodedFrame, DecoderFactory,
+        DetectionInput, DetectionResult, ObservedResponse, ProtocolCanonicalizer,
+        ProtocolCapabilities, ProtocolDecoder, ProtocolDetector, ProtocolError,
+        ProtocolRegistration, ProtocolStream, ReplayAdapter, ReplayConnection, ReplayContext,
+        VerificationResult, VerificationStatus, Verifier,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -3048,7 +3492,7 @@ pub mod fake {
             request: DecodedFrame,
             response: Option<DecodedFrame>,
             truncated: bool,
-        ) -> CanonicalOperation {
+        ) -> CanonicalizedOperation {
             let (started_at_offset, mut warnings) = Self::offset(stream, request.sequence);
             if truncated {
                 warnings.push(CanonicalWarning {
@@ -3059,29 +3503,60 @@ pub mod fake {
             let completed_at_offset = response
                 .as_ref()
                 .map(|frame| Self::offset(stream, frame.sequence).0);
-            CanonicalOperation {
-                id: OperationId::new(),
-                sequence: request.sequence,
-                started_at_offset,
-                completed_at_offset,
-                kind: OperationKind::Request,
-                effect: OperationEffect::Read,
-                request: PayloadRef::Inline {
-                    content_type: Some("application/x-chronicle-fake".into()),
-                    bytes: request.payload.clone(),
+            let mut wal_ranges = request.provenance.clone();
+            if let Some(frame) = &response {
+                wal_ranges.extend(frame.provenance.clone());
+            }
+            let connection_generation = request.connection_generation.clone().or_else(|| {
+                response
+                    .as_ref()
+                    .and_then(|frame| frame.connection_generation.clone())
+            });
+            let missing_payload_provenance = request.missing_payload_provenance
+                || response
+                    .as_ref()
+                    .is_some_and(|frame| frame.missing_payload_provenance);
+            let completeness = if truncated {
+                Completeness::Truncated
+            } else if response.is_none() {
+                Completeness::Unmatched
+            } else if missing_payload_provenance || wal_ranges.iter().any(|range| range.gap_before)
+            {
+                Completeness::Incomplete
+            } else {
+                Completeness::Complete
+            };
+            CanonicalizedOperation {
+                completeness,
+                operation: CanonicalOperation {
+                    id: OperationId::new(),
+                    sequence: request.sequence,
+                    started_at_offset,
+                    completed_at_offset,
+                    kind: OperationKind::Request,
+                    effect: OperationEffect::Read,
+                    request: PayloadRef::Inline {
+                        content_type: Some("application/x-chronicle-fake".into()),
+                        bytes: request.payload.clone(),
+                    },
+                    recorded_response: response.map(|frame| PayloadRef::Inline {
+                        content_type: Some("application/x-chronicle-fake".into()),
+                        bytes: frame.payload,
+                    }),
+                    attributes: Attributes::new(),
+                    protocol_data: ProtocolData {
+                        schema_version: 1,
+                        media_type: Some("application/x-chronicle-fake".into()),
+                        bytes: request.payload,
+                    },
+                    provenance: OperationProvenance {
+                        connection_generation,
+                        wal_ranges,
+                        missing_payload_provenance,
+                    },
+                    redactions: Vec::new(),
+                    warnings,
                 },
-                recorded_response: response.map(|frame| PayloadRef::Inline {
-                    content_type: Some("application/x-chronicle-fake".into()),
-                    bytes: frame.payload,
-                }),
-                attributes: Attributes::new(),
-                protocol_data: ProtocolData {
-                    schema_version: 1,
-                    media_type: Some("application/x-chronicle-fake".into()),
-                    bytes: request.payload,
-                },
-                redactions: Vec::new(),
-                warnings,
             }
         }
     }
@@ -3095,7 +3570,7 @@ pub mod fake {
             &self,
             stream: &ProtocolStream<'_>,
             frames: Vec<DecodedFrame>,
-        ) -> Result<Vec<CanonicalOperation>, ProtocolError> {
+        ) -> Result<Vec<CanonicalizedOperation>, ProtocolError> {
             let mut operations = Vec::new();
             let mut pending = None;
             for frame in frames {
@@ -3280,6 +3755,9 @@ mod tests {
                     sequence: 1,
                     payload: b"FAKE request".to_vec(),
                     attributes: Default::default(),
+                    connection_generation: None,
+                    provenance: Vec::new(),
+                    missing_payload_provenance: false,
                 }],
             )
             .unwrap();

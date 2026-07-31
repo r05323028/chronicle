@@ -5,20 +5,23 @@ pub use chronicle_protocol::ProtocolNeutralConnection;
 
 use chronicle_canonical::{
     Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalOperation,
-    CanonicalSession, Completeness, OperationEffect, OperationKind, PROTOCOL_DATA_SCHEMA_VERSION,
-    PayloadRef, ProtocolData, RelativeTimeNanos, ReplayMetadata, SourceMetadata, TimelineEntry,
+    CanonicalSession, Completeness, OperationEffect, OperationKind, OperationProvenance,
+    PROTOCOL_DATA_SCHEMA_VERSION, PayloadRef, ProtocolData, RelativeTimeNanos, ReplayMetadata,
+    SourceMetadata, TimelineEntry,
 };
 use chronicle_capture::{
     CaptureEvent, CaptureEventKind, LossWindowObserved, SocketRole, decode_event,
 };
 use chronicle_common::{ConnectionId, Endpoint, OperationId, ProtocolId, SessionId};
 use chronicle_protocol::{
-    DecodedFrame, ProtocolRegistry, ProtocolStream, StreamChunk, reconstructed_frames,
+    CanonicalizedOperation, DecodedFrame, ProtocolRegistry, ProtocolStream, StreamChunk,
+    reconstructed_frames,
 };
 use chronicle_session::{
     LossWindowClassification, ReconstructionAssembler, ReconstructionConnection,
     ReconstructionConnectionIdentity, ReconstructionEvidence, ReconstructionInput,
-    ReconstructionLimits, ReconstructionPushError, SessionError, SessionLimits,
+    ReconstructionLimits, ReconstructionPushError, ReconstructionWalProvenance, SessionError,
+    SessionLimits,
 };
 use chronicle_wal::{
     COMMIT_MARKER_VERSION, RecordKind, TerminalWalLoss, WalError, WalRecordEnvelope,
@@ -305,43 +308,51 @@ impl EtlPipeline {
                 truncated: incomplete,
             };
             let first_sequence = protocol_stream.chunks.first().map(|chunk| chunk.sequence);
-            let (protocol, operations) =
-                if let Some((registration, _)) = registry.detect(&protocol_stream, None) {
-                    match decode_and_canonicalize(registration, &protocol_stream) {
-                        Ok(operations) => (registration.id.clone(), operations),
-                        Err(error) => {
-                            record_issue(
-                                &mut issues,
-                                self.max_issues,
-                                EtlIssue {
-                                    sequence: first_sequence,
-                                    kind: EtlIssueKind::ProtocolDecode,
-                                    message: error,
-                                },
-                            )?;
-                            (
-                                registration.id.clone(),
-                                vec![opaque_operation_from_protocol_stream(&protocol_stream)],
-                            )
-                        }
+            let (protocol, decoded_operations) = if let Some((registration, _)) =
+                registry.detect(&protocol_stream, None)
+            {
+                match decode_and_canonicalize(registration, &protocol_stream, &frames) {
+                    Ok(operations) => (registration.id.clone(), operations),
+                    Err(error) => {
+                        record_issue(
+                            &mut issues,
+                            self.max_issues,
+                            EtlIssue {
+                                sequence: first_sequence,
+                                kind: EtlIssueKind::ProtocolDecode,
+                                message: error,
+                            },
+                        )?;
+                        (
+                            registration.id.clone(),
+                            vec![CanonicalizedOperation {
+                                operation: opaque_operation_from_protocol_stream(&protocol_stream),
+                                completeness: Completeness::Malformed,
+                            }],
+                        )
                     }
-                } else {
-                    record_issue(
-                        &mut issues,
-                        self.max_issues,
-                        EtlIssue {
-                            sequence: first_sequence,
-                            kind: EtlIssueKind::UnknownProtocol,
-                            message: "traffic preserved as opaque bytes".into(),
-                        },
-                    )?;
-                    (
-                        ProtocolId::unknown(),
-                        vec![opaque_operation_from_protocol_stream(&protocol_stream)],
-                    )
-                };
-            operation_count = bounded_operation_count(operation_count, operations.len())?;
-            for operation in &operations {
+                }
+            } else {
+                record_issue(
+                    &mut issues,
+                    self.max_issues,
+                    EtlIssue {
+                        sequence: first_sequence,
+                        kind: EtlIssueKind::UnknownProtocol,
+                        message: "traffic preserved as opaque bytes".into(),
+                    },
+                )?;
+                (
+                    ProtocolId::unknown(),
+                    vec![CanonicalizedOperation {
+                        operation: opaque_operation_from_protocol_stream(&protocol_stream),
+                        completeness: Completeness::Unsupported,
+                    }],
+                )
+            };
+            operation_count = bounded_operation_count(operation_count, decoded_operations.len())?;
+            for decoded in &decoded_operations {
+                let operation = &decoded.operation;
                 timeline.push((
                     operation.sequence,
                     TimelineEntry {
@@ -352,13 +363,17 @@ impl EtlPipeline {
                 ));
                 operation_completeness.insert(
                     operation.id,
-                    derive_operation_completeness(operation, incomplete),
+                    if incomplete {
+                        Completeness::Incomplete
+                    } else {
+                        decoded.completeness
+                    },
                 );
             }
             connection_completeness.insert(
                 connection_id,
                 if protocol_stream.chunks.is_empty() || incomplete {
-                    Completeness::Partial
+                    Completeness::Incomplete
                 } else {
                     Completeness::Complete
                 },
@@ -369,7 +384,10 @@ impl EtlPipeline {
                 client,
                 server,
                 attributes,
-                operations,
+                operations: decoded_operations
+                    .into_iter()
+                    .map(|decoded| decoded.operation)
+                    .collect(),
             });
         }
         timeline.sort_by_key(|(sequence, _)| *sequence);
@@ -402,22 +420,6 @@ fn bounded_operation_count(existing: usize, additional: usize) -> Result<usize, 
         });
     }
     Ok(count)
-}
-
-fn derive_operation_completeness(
-    operation: &CanonicalOperation,
-    stream_truncated: bool,
-) -> Completeness {
-    if stream_truncated
-        || operation.recorded_response.is_none()
-        || operation.warnings.iter().any(|warning| {
-            warning.code.contains("truncated") || warning.code.contains("incomplete")
-        })
-    {
-        Completeness::Partial
-    } else {
-        Completeness::Complete
-    }
 }
 
 fn sort_reconstructed_frames(connection: &ReconstructionConnection, frames: &mut [DecodedFrame]) {
@@ -566,6 +568,7 @@ fn opaque_operation_from_protocol_stream(stream: &ProtocolStream<'_>) -> Canonic
             media_type: Some("application/octet-stream".into()),
             bytes,
         },
+        provenance: OperationProvenance::default(),
         redactions: Vec::new(),
         warnings: Vec::new(),
     }
@@ -580,17 +583,35 @@ fn ingest_reconstructed_envelope(
     max_issues: usize,
 ) -> Result<(), EtlError> {
     match envelope.kind {
-        RecordKind::CaptureEvent => match decode_event(&envelope.payload) {
-            Ok(event) => match ReconstructionInput::from_capture_event(event) {
-                Ok(ReconstructionInput::Event(mut event)) => {
-                    event.wal_sequence = Some(envelope.sequence);
-                    assembler.push(ReconstructionInput::Event(event))?;
-                    Ok(())
-                }
-                Ok(input) => {
-                    assembler.push(input)?;
-                    Ok(())
-                }
+        RecordKind::CaptureEvent => {
+            match decode_event(&envelope.payload) {
+                Ok(event) => match ReconstructionInput::from_capture_event(event) {
+                    Ok(ReconstructionInput::Event(mut event)) => {
+                        event.wal_sequence = Some(envelope.sequence);
+                        event.wal_provenance = envelope.provenance.as_ref().map(|source| {
+                            ReconstructionWalProvenance {
+                                segment_ordinal: source.segment_ordinal,
+                                segment_first_sequence: source.segment_first_sequence,
+                                frame_byte_offset: source.byte_offset,
+                            }
+                        });
+                        assembler.push(ReconstructionInput::Event(event))?;
+                        Ok(())
+                    }
+                    Ok(input) => {
+                        assembler.push(input)?;
+                        Ok(())
+                    }
+                    Err(error) => record_issue(
+                        issues,
+                        max_issues,
+                        EtlIssue {
+                            sequence: Some(envelope.sequence),
+                            kind: EtlIssueKind::MalformedCaptureEvent,
+                            message: error.to_string(),
+                        },
+                    ),
+                },
                 Err(error) => record_issue(
                     issues,
                     max_issues,
@@ -600,17 +621,8 @@ fn ingest_reconstructed_envelope(
                         message: error.to_string(),
                     },
                 ),
-            },
-            Err(error) => record_issue(
-                issues,
-                max_issues,
-                EtlIssue {
-                    sequence: Some(envelope.sequence),
-                    kind: EtlIssueKind::MalformedCaptureEvent,
-                    message: error.to_string(),
-                },
-            ),
-        },
+            }
+        }
         RecordKind::LossWindow => match decode_event(&envelope.payload) {
             Ok(CaptureEvent {
                 kind: CaptureEventKind::LossWindowObserved(window),
@@ -706,7 +718,8 @@ fn record_issue(
 fn decode_and_canonicalize(
     registration: &chronicle_protocol::ProtocolRegistration,
     stream: &ProtocolStream<'_>,
-) -> Result<Vec<CanonicalOperation>, String> {
+    input_frames: &[DecodedFrame],
+) -> Result<Vec<CanonicalizedOperation>, String> {
     let factory = registration
         .decoder_factory
         .as_ref()
@@ -717,15 +730,10 @@ fn decode_and_canonicalize(
         .ok_or_else(|| "canonicalizer capability unavailable".to_string())?;
     let mut decoder = factory.create();
     let mut frames = Vec::new();
-    for chunk in &stream.chunks {
+    for frame in input_frames {
         frames.extend(
             decoder
-                .push(DecodedFrame {
-                    direction: chunk.direction,
-                    sequence: chunk.sequence,
-                    payload: chunk.payload.to_vec(),
-                    attributes: Attributes::new(),
-                })
+                .push(frame.clone())
                 .map_err(|error| error.to_string())?,
         );
     }
@@ -1258,14 +1266,14 @@ mod tests {
                 .values()
                 .copied()
                 .collect::<Vec<_>>(),
-            [Completeness::Partial]
+            [Completeness::Incomplete]
         );
         assert!(
             overlapping
                 .session
                 .operation_completeness
                 .values()
-                .all(|state| *state == Completeness::Partial)
+                .all(|state| *state == Completeness::Incomplete)
         );
     }
 
@@ -1390,7 +1398,7 @@ mod tests {
                 .session
                 .connection_completeness
                 .values()
-                .all(|state| *state == Completeness::Partial)
+                .all(|state| *state == Completeness::Incomplete)
         );
     }
 
