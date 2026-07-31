@@ -89,7 +89,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-Rootless CI runs workspace tests and isolated eBPF compilation. Real eBPF runtime coverage is opt-in and retained by `./scripts/p1-privileged-acceptance.sh`; skipped privileged runs are not passed off as runtime coverage.
+Rootless CI runs workspace tests and isolated eBPF compilation. Real eBPF runtime coverage is opt-in and retained by `./scripts/acceptance/p1-privileged.sh`; skipped privileged runs are not passed off as runtime coverage.
 
 No checked-in configuration should contain secrets. `postgres.connection_url_env` names an environment variable rather than storing credentials.
 

@@ -68,7 +68,7 @@ sudo -E env \
   CHRONICLE_ACCEPTANCE_MODE=fast \
   CARGO_PROFILE_DEV_DEBUG=0 \
   CARGO_PROFILE_TEST_DEBUG=0 \
-  ./scripts/p1-privileged-acceptance.sh
+  ./scripts/acceptance/p1-privileged.sh
 ```
 
 Full mode retains complete P1 evidence:
@@ -88,7 +88,7 @@ sudo -E env \
   CHRONICLE_ACCEPTANCE_MODE=full \
   CARGO_PROFILE_DEV_DEBUG=0 \
   CARGO_PROFILE_TEST_DEBUG=0 \
-  ./scripts/p1-privileged-acceptance.sh
+  ./scripts/acceptance/p1-privileged.sh
 ```
 
 `fast` mode is for development iteration and is not sufficient retained evidence for completing privileged P1 tasks. Reports record `acceptance_mode`; fast reports mark skipped full-only checks `not_checked`.

@@ -239,7 +239,7 @@ cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 cargo build --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release
-./scripts/p1-privileged-acceptance.sh
+./scripts/acceptance/p1-privileged.sh
 # Separate SDD artifact validation; not privileged runtime evidence.
 openspec validate add-production-http-recording-pipeline --strict
 ```
@@ -298,7 +298,7 @@ openspec validate add-production-http-recording-pipeline --strict
 - [x] F2.4 `[chronicle-storage, chronicle-application tests]` Consolidate mutable-v1 atomic publication, inspect integrity/safe output/partial replayability, WAL-absent behavior, and shared JSON failure tests; depends on Gate D.
 - [x] F2.5 `[chronicle-replay, chronicle-application, chronicle-cli tests]` Consolidate full/mixed/not replayable, target/effect denial, first/middle transport, verification stop, all-result accounting, original-target/redirect/timeout/JSON/exit tests; depends on Gate E.
 - [x] F2.6 `[chronicle-application tests]` Rootless fixture v1 -> WAL group commit/recovery -> reconstruction/loss windows -> HTTP -> deterministic session -> inspect -> authorized mixed replay -> verification; label as fixture, not eBPF; depends on F2.1-F2.5.
-- [x] F2.7 `[scripts/p1-privileged-acceptance.sh, tests/e2e]` Add runnable privileged command listed above. Harness creates dedicated/shared cgroups, local upstream/client/recorder/separate replay target and executes the retained runtime acceptance sequence; several Content-Length/chunked/sequential exchanges; no Internet/database. OpenSpec validation remains a separate SDD artifact check, not runtime evidence; depends on Gates A-E.
+- [x] F2.7 `[scripts/acceptance/p1-privileged.sh, scripts/tests/acceptance/test-p1-privileged-runner.sh, tests/e2e]` Add runnable privileged command listed above. Harness creates dedicated/shared cgroups, local upstream/client/recorder/separate replay target and executes the retained runtime acceptance sequence; several Content-Length/chunked/sequential exchanges; no Internet/database. OpenSpec validation remains a separate SDD artifact check, not runtime evidence; depends on Gates A-E.
 - [x] F2.8 `[privileged acceptance]` Verify 100 ms/final/delayed loss sampling; one in-WAL marker + one `fdatasync` and no per-group metadata-watermark cycle; crash after sync before acknowledgement observation; recovery-authoritative marker validation independent of delivery evidence; invalid marker references/digests fail closed; metadata lag reconciles from WAL without delivery claim; recover final authoritative marker/final tail/aborted; separate middle corruption fails closed; depends on F2.7.
 - [x] F2.9 `[privileged acceptance]` Fill WAL with queue remainder; assert physical cap, capacity-safe committed prefix, categorized discard, terminal loss record/summary, exact status on success/final-marker failure. ETL twice/second root; prove both loss types scoped and outside operations complete; depends on F2.8.
 - [x] F2.10 `[privileged acceptance]` Replay executable subset only to explicit local target, force middle transport failure, verify full result accounting and no original-destination contact; depends on F2.9.

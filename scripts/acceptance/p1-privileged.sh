@@ -2,7 +2,7 @@
 # Privileged Ubuntu 24.04 production acceptance. Retains artifacts; never uses fixtures.
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # shellcheck source=scripts/lib/common.sh
 source "$ROOT/scripts/lib/common.sh"
 # shellcheck source=scripts/lib/env.sh

@@ -94,8 +94,10 @@ cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml --target 
 Privileged profile (Linux only; retained artifacts, no skipped-runtime claim):
 
 ```bash
-./scripts/p1-privileged-acceptance.sh
+./scripts/acceptance/p1-privileged.sh
 ```
+
+`scripts/acceptance/` contains real privileged acceptance execution. `scripts/tests/acceptance/` contains rootless tests for acceptance tooling; run `./scripts/tests/acceptance/test-p1-privileged-runner.sh` to validate configuration and retained-report behavior.
 
 The profile uses local upstream/replay targets and dedicated/shared cgroups. It verifies capture, sampling, one-marker/one-sync WAL behavior, crash/recovery authority, hard-cap queue discard, ETL idempotency across roots, cgroup safety, signal/limit finalization, mixed replay, and original-destination isolation. Unsupported hosts must report skipped/not-checked rather than passing runtime coverage.
 

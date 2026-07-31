@@ -2,8 +2,8 @@
 # Rootless checks for acceptance configuration and retained report metadata.
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-SCRIPT="$ROOT/scripts/p1-privileged-acceptance.sh"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+SCRIPT="$ROOT/scripts/acceptance/p1-privileged.sh"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf -- "$TMP_DIR"' EXIT
 mkdir -p "$TMP_DIR/bin" "$TMP_DIR/home"
