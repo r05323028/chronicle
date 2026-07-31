@@ -1,15 +1,19 @@
 ## ADDED Requirements
 
 ### Requirement: Recording-scoped ETL input
-ETL SHALL accept one recording WAL directory, recover and validate metadata/segments, and process exactly recovered committed snapshot through last valid v1 `CommitMarker` (or unchanged declared P0 v1 boundary). It SHALL process `completed`, `failed`, and recovered `aborted` recordings when committed prefix is valid, preserving source status/reason; it SHALL reject active `starting`/`recording`, unsupported versions, corrupt committed prefix/marker reference, contradictory metadata, or WAL digest conflict. Complete frames after final valid marker SHALL remain written-not-durable uncertainty and SHALL NOT be promoted.
+ETL SHALL accept one recording WAL directory, recover and validate metadata/segments, and process exactly recovered committed snapshot through last valid v1 `CommitMarker` (or unchanged declared P0 v1 boundary). It SHALL process `completed`, `failed`, and recovered `aborted` recordings when committed prefix is valid, preserving source status/reason. A live `starting`/`recording` writer holding the advisory lock SHALL be rejected without reading partial live state; stale `starting`/`recording` metadata after lock release SHALL be reconciled to `aborted` with `process_crash_recovered` before processing. Unsupported versions, corrupt committed prefix/marker reference, contradictory metadata, or WAL digest conflict SHALL be rejected. Complete frames after final valid marker SHALL remain written-not-durable uncertainty and SHALL NOT be promoted.
 
 #### Scenario: Completed recording input
 - **WHEN** valid stopped recording is supplied
 - **THEN** ETL discovers all ordered segments and processes exactly through recovered commit-marker boundary
 
-#### Scenario: Active recording rejected
+#### Scenario: Live active recording rejected
 - **WHEN** record writer still holds recording lock
 - **THEN** ETL fails without reading partial live state or publishing session
+
+#### Scenario: Stale active recording recovered
+- **WHEN** `starting`/`recording` metadata remains after writer lock release and committed prefix is valid
+- **THEN** ETL atomically marks recording `aborted` with `process_crash_recovered`, persists recovery report, and publishes prefix with aborted provenance
 
 #### Scenario: Aborted recording input
 - **WHEN** recovery finalized stale active recording as aborted and commit-marker prefix is valid

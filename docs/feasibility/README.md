@@ -40,6 +40,59 @@ Not verified: other distributions, kernel minor versions, cloud-provider kernels
 - Eight MiB ring saturation increments cumulative per-CPU loss counters. Complete four-CPU snapshots use boot-monotonic 100 ms-or-later intervals plus mandatory final sample.
 - Selected parent cgroup covers descendant workload while direct TGID and descendant counts remain separate.
 
+## P1 privileged acceptance in Multipass
+
+Sync source into VM-local storage; do not compile from `/mnt/chronicle`. Recommended layout:
+
+```text
+/home/ubuntu/chronicle
+/home/ubuntu/chronicle-target
+/home/ubuntu/chronicle-ebpf-target
+/home/ubuntu/p1-artifacts
+```
+
+Fast mode keeps real privileged eBPF record → WAL → ETL → inspect → replay coverage, but skips full-only test matrices. It is for development iteration and is not sufficient retained evidence for completing privileged P1 tasks.
+
+```bash
+cd /home/ubuntu/chronicle
+
+sudo -E env \
+  HOME=/home/ubuntu \
+  USER=ubuntu \
+  PATH=/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  CARGO_HOME=/home/ubuntu/.cargo \
+  RUSTUP_HOME=/home/ubuntu/.rustup \
+  CARGO_TARGET_DIR=/home/ubuntu/chronicle-target \
+  CHRONICLE_EBPF_TARGET_DIR=/home/ubuntu/chronicle-ebpf-target \
+  CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT=/home/ubuntu/p1-artifacts/latest-fast \
+  CHRONICLE_ACCEPTANCE_MODE=fast \
+  CARGO_PROFILE_DEV_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 \
+  ./scripts/p1-privileged-acceptance.sh
+```
+
+Full mode retains complete P1 evidence:
+
+```bash
+cd /home/ubuntu/chronicle
+
+sudo -E env \
+  HOME=/home/ubuntu \
+  USER=ubuntu \
+  PATH=/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  CARGO_HOME=/home/ubuntu/.cargo \
+  RUSTUP_HOME=/home/ubuntu/.rustup \
+  CARGO_TARGET_DIR=/home/ubuntu/chronicle-target \
+  CHRONICLE_EBPF_TARGET_DIR=/home/ubuntu/chronicle-ebpf-target \
+  CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT=/home/ubuntu/p1-artifacts/full-$(date -u +%Y%m%dT%H%M%SZ) \
+  CHRONICLE_ACCEPTANCE_MODE=full \
+  CARGO_PROFILE_DEV_DEBUG=0 \
+  CARGO_PROFILE_TEST_DEBUG=0 \
+  ./scripts/p1-privileged-acceptance.sh
+```
+
+`fast` mode is for development iteration and is not sufficient retained evidence for completing privileged P1 tasks. Reports record `acceptance_mode`; fast reports mark skipped full-only checks `not_checked`.
+
 ## Unsupported or non-authoritative
 
 - `bpf_get_current_pid_tgid` is unavailable to sock-ops and is not meaningful for cgroup-skb; join process identity from connect evidence by socket cookie.

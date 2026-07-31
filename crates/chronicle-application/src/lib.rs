@@ -2543,6 +2543,7 @@ pub struct RecordingEtlResult {
     pub ignored_post_commit_records: u64,
     pub recording_id: RecordingId,
     pub status: RecordingStatus,
+    pub shutdown_reason: Option<ShutdownReason>,
     pub counters: RecordingCounters,
     pub commit_boundary: RecordingCommitBoundary,
     pub commit_marker_byte_offset: u64,
@@ -2559,24 +2560,36 @@ pub fn process_recording_wal(
 ) -> Result<RecordingEtlResult, ApplicationError> {
     let wal_directory = wal_directory.as_ref();
     let lock = RecordingLock::acquire(wal_directory)?;
-    let metadata = load_recording_metadata(wal_directory)?.ok_or_else(|| {
+    let mut metadata = load_recording_metadata(wal_directory)?.ok_or_else(|| {
         ApplicationError::RecordingMetadataValidation("recording metadata is missing".into())
     })?;
-    let source_status = match metadata.status {
-        RecordingStatus::Completed => SourceStatus::Completed,
-        RecordingStatus::Failed => SourceStatus::Failed,
-        RecordingStatus::Aborted => SourceStatus::Aborted,
-        RecordingStatus::Starting | RecordingStatus::Recording => {
-            return Err(ApplicationError::RecordingMetadataValidation(
-                "cannot process an active recording".into(),
-            ));
-        }
-    };
-    let scan = lock.scan(
+    let mut scan = lock.scan(
         wal_directory,
         metadata.recording_id,
         DEFAULT_MAX_RECORD_BYTES,
     )?;
+    if matches!(
+        metadata.status,
+        RecordingStatus::Starting | RecordingStatus::Recording
+    ) {
+        let reconciliation = reconcile_recording_metadata_with_scan(
+            &lock,
+            wal_directory,
+            metadata.recording_id,
+            None,
+            scan,
+        )?;
+        let recovery_report = build_recovery_report(&reconciliation, None, std::iter::empty())?;
+        persist_recovery_report(wal_directory, &recovery_report)?;
+        metadata = reconciliation.metadata;
+        scan = reconciliation.scan;
+    }
+    let source_status = match metadata.status {
+        RecordingStatus::Completed => SourceStatus::Completed,
+        RecordingStatus::Failed => SourceStatus::Failed,
+        RecordingStatus::Aborted => SourceStatus::Aborted,
+        RecordingStatus::Starting | RecordingStatus::Recording => unreachable!(),
+    };
     let Some(boundary) = metadata.last_valid_commit.as_ref() else {
         return Err(ApplicationError::RecordingMetadataValidation(
             "finalized recording is missing commit boundary".into(),
@@ -2707,6 +2720,7 @@ pub fn process_recording_wal(
         })?,
         recording_id: metadata.recording_id,
         status: metadata.status,
+        shutdown_reason: metadata.shutdown_reason,
         counters: metadata.counters,
         commit_boundary: boundary.clone(),
         commit_marker_byte_offset: marker_provenance.byte_offset,
@@ -2734,6 +2748,7 @@ pub struct RecordingEtlCheckpoint {
     pub output_root: String,
     pub output_identity: String,
     pub status: RecordingStatus,
+    pub shutdown_reason: Option<ShutdownReason>,
     pub counters: RecordingCounters,
 }
 
@@ -2742,6 +2757,7 @@ pub struct PublishedRecordingResult {
     pub session_id: chronicle_common::SessionId,
     pub already_published: bool,
     pub ignored_post_commit_records: u64,
+    pub checkpoint: RecordingEtlCheckpoint,
 }
 
 /// Processes one finalized recording and atomically publishes its deterministic session.
@@ -2799,6 +2815,7 @@ pub fn process_and_publish_recording_wal(
         output_root: fs::canonicalize(root)?.display().to_string(),
         output_identity: format!("sessions/{session_id}/manifest.json"),
         status: processed.status,
+        shutdown_reason: processed.shutdown_reason,
         counters: processed.counters,
     };
     write_private_atomic_json(wal_directory, "etl-checkpoint.json", &checkpoint, None)?;
@@ -2806,6 +2823,7 @@ pub fn process_and_publish_recording_wal(
         session_id,
         already_published,
         ignored_post_commit_records: processed.ignored_post_commit_records,
+        checkpoint,
     })
 }
 
@@ -4717,20 +4735,63 @@ mod tests {
     }
 
     #[test]
-    fn recording_scoped_etl_rejects_active_metadata_before_wal_access() {
-        let directory = ingest_directory("active-recording-etl");
-        write_recording_metadata(&directory, &recording_metadata(RecordingStatus::Starting))
-            .unwrap();
+    fn recording_scoped_etl_recovers_stale_active_metadata() {
+        use chronicle_capture::InMemoryCaptureSource;
+        use chronicle_common::SessionId;
+        use std::cell::Cell;
 
-        assert!(matches!(
-            process_recording_wal(
-                &directory,
-                &chronicle_protocol_builtins::registry().unwrap(),
-                chronicle_common::SessionId::new(),
-            ),
-            Err(ApplicationError::RecordingMetadataValidation(message))
-                if message == "cannot process an active recording"
-        ));
+        let directory = ingest_directory("active-recording-etl");
+        let mut metadata = recording_metadata(RecordingStatus::Starting);
+        metadata.recording_id = RecordingId(uuid::Uuid::from_u128(7));
+        let checks = Cell::new(0_u8);
+        record_production(
+            &directory,
+            &mut metadata,
+            capture_metadata(),
+            ProductionRecordingBounds {
+                duration_seconds: 60,
+                segment_bytes: MIN_SEGMENT_BYTES,
+                max_wal_bytes: MIN_SEGMENT_BYTES,
+            },
+            || {
+                Ok(InMemoryCaptureSource::new(test_capture_events(
+                    b"opaque".to_vec(),
+                )))
+            },
+            || 1,
+            || {
+                let count = checks.get();
+                checks.set(count + 1);
+                (count == 1).then_some(ShutdownReason::SourceCompleted)
+            },
+        )
+        .unwrap();
+
+        let mut stale = load_recording_metadata(&directory).unwrap().unwrap();
+        stale.status = RecordingStatus::Recording;
+        stale.shutdown_reason = None;
+        write_recording_metadata(&directory, &stale).unwrap();
+
+        let processed = process_recording_wal(
+            &directory,
+            &chronicle_protocol_builtins::registry().unwrap(),
+            SessionId::new(),
+        )
+        .unwrap();
+        assert_eq!(processed.status, RecordingStatus::Aborted);
+        assert_eq!(
+            processed.output.session.source_provenance.status,
+            SourceStatus::Aborted
+        );
+        let report = decode_recovery_report(
+            &std::fs::read(directory.join("etl/recovery-report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.status, RecordingStatus::Aborted);
+        assert_eq!(
+            report.shutdown_reason,
+            Some(ShutdownReason::ProcessCrashRecovered)
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 

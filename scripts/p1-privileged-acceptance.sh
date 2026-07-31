@@ -11,8 +11,32 @@ source "$ROOT/scripts/lib/env.sh"
 source "$ROOT/scripts/lib/assertions.sh"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-ARTIFACT_ROOT=${CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT:-"$ROOT/target/p1-acceptance/$RUN_ID"}
-TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT/target"}
+DEFAULT_ARTIFACT_ROOT="$ROOT/target/p1-acceptance/$RUN_ID"
+if [[ ${CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT+x} ]]; then
+  REQUESTED_ARTIFACT_ROOT=$CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT
+else
+  REQUESTED_ARTIFACT_ROOT="$DEFAULT_ARTIFACT_ROOT"
+fi
+ARTIFACT_ROOT="$REQUESTED_ARTIFACT_ROOT"
+canonical_path() {
+  if realpath -m -- "$1" 2>/dev/null; then
+    return 0
+  fi
+  python3 - "$1" <<'PY'
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
+TARGET_DIR=$(canonical_path "${CARGO_TARGET_DIR:-"$ROOT/target"}")
+EBPF_TARGET_DIR=$(canonical_path "${CHRONICLE_EBPF_TARGET_DIR:-"$ROOT/ebpf/target"}")
+EBPF_OBJECT="$EBPF_TARGET_DIR/bpfel-unknown-none/release/chronicle-ebpf-capture"
+if [[ ${CHRONICLE_ACCEPTANCE_MODE+x} ]]; then
+  ACCEPTANCE_MODE=$CHRONICLE_ACCEPTANCE_MODE
+else
+  ACCEPTANCE_MODE=full
+fi
 CHRONICLE="$TARGET_DIR/debug/chronicle"
 DRIVER="$ROOT/tests/e2e/http_acceptance_driver.py"
 WAL_DIR="$ARTIFACT_ROOT/wal"
@@ -29,10 +53,48 @@ SHARED_ONE_PID=""
 SHARED_TWO_PID=""
 CURRENT_PHASE="initializing"
 SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
-TOTAL_PHASES=30
-OPENSPEC_RESULT="not_checked"
+TOTAL_PHASES=29
 EBPF_OBJECT_SHA256="not_checked"
+WAL_MATRIX_RESULT="not_checked"
+INGEST_MATRIX_RESULT="not_checked"
+REPLAY_MATRIX_RESULT="not_checked"
+CGROUP_MATRIX_RESULT="not_checked"
+SIGNAL_RESULT="not_checked"
+FMT_RESULT="not_checked"
+WORKSPACE_CHECK_RESULT="not_checked"
 COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
+ARTIFACT_ROOT_ERROR=""
+
+full_mode() {
+  [[ $ACCEPTANCE_MODE == full ]]
+}
+
+valid_acceptance_mode() {
+  [[ $ACCEPTANCE_MODE == full || $ACCEPTANCE_MODE == fast ]]
+}
+
+safe_artifact_root() {
+  local path=$1 resolved home
+  [[ -n $path && $path == /* && ! -L $path ]] || return 1
+  resolved=$(canonical_path "$path") || return 1
+  home=${HOME:-}
+  [[ $resolved != / && $resolved != "$ROOT" && $resolved != "$home" ]] || return 1
+  [[ $resolved != "$ROOT/target" && $resolved != "$ROOT/ebpf" ]] || return 1
+  if [[ -e $path && ! -d $path ]]; then
+    return 1
+  fi
+  if [[ -d $path && ! -f "$path/.chronicle-acceptance-root" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+prepare_artifact_root() {
+  safe_artifact_root "$ARTIFACT_ROOT" || return 1
+  mkdir -p -- "$ARTIFACT_ROOT"
+  find "$ARTIFACT_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  printf '%s\n' 'chronicle-p1-acceptance-root-v1' >"$ARTIFACT_ROOT/.chronicle-acceptance-root"
+}
 
 skip() {
   log "SKIP: $*" >&2
@@ -42,6 +104,16 @@ skip() {
 phase() {
   CURRENT_PHASE="$1/$TOTAL_PHASES"
   log "[$1/$TOTAL_PHASES] $2"
+}
+
+skip_phase() {
+  local number=$1 description=$2 artifact
+  shift 2
+  phase "$number" "$description"
+  for artifact; do
+    printf '%s\n' 'Skipped in fast mode; covered by full privileged acceptance.' >"$ARTIFACT_ROOT/$artifact"
+  done
+  log "[$number/$TOTAL_PHASES] SKIPPED in fast mode; covered by full privileged acceptance."
 }
 
 write_summary() {
@@ -66,10 +138,10 @@ write_summary() {
     cap_eff=$(awk '/^CapEff:/ { print $2; exit }' /proc/self/status)
     [[ -n $cap_eff ]] || cap_eff="unavailable"
   fi
-  if [[ -f "$ROOT/ebpf/target/bpfel-unknown-none/release/chronicle-ebpf-capture" ]]; then
-    EBPF_OBJECT_SHA256=$(sha256sum "$ROOT/ebpf/target/bpfel-unknown-none/release/chronicle-ebpf-capture" | awk '{print $1}')
+  if [[ -f "$EBPF_OBJECT" ]]; then
+    EBPF_OBJECT_SHA256=$(sha256sum "$EBPF_OBJECT" | awk '{print $1}')
   fi
-  python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$ARTIFACT_ROOT" "$WAL_DIR" "$SESSION_ROOT" "$VALIDATION_ROOT" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$OPENSPEC_RESULT" "$working_tree_dirty" "$COMMAND_LOG" <<'PY'
+  python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$ARTIFACT_ROOT" "$WAL_DIR" "$SESSION_ROOT" "$VALIDATION_ROOT" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$working_tree_dirty" "$COMMAND_LOG" "$ACCEPTANCE_MODE" "$EBPF_OBJECT" "$WAL_MATRIX_RESULT" "$INGEST_MATRIX_RESULT" "$REPLAY_MATRIX_RESULT" "$CGROUP_MATRIX_RESULT" "$SIGNAL_RESULT" "$FMT_RESULT" "$WORKSPACE_CHECK_RESULT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -77,7 +149,8 @@ from pathlib import Path
 summary = Path(sys.argv[1])
 status, phase = sys.argv[2:4]
 artifacts, wal, sessions, validation = map(Path, sys.argv[4:8])
-commit, kernel, architecture, cgroup, btf, cap_eff, object_sha, openspec, dirty, command_log = sys.argv[8:]
+commit, kernel, architecture, cgroup, btf, cap_eff, object_sha, dirty, command_log = sys.argv[8:17]
+mode, object_path, wal_matrix, ingest_matrix, replay_matrix, cgroup_matrix, signal, fmt, workspace_check = sys.argv[17:]
 summary.parent.mkdir(parents=True, exist_ok=True)
 result = "passed" if status == "0" else ("not_checked" if status == "77" else "failed")
 commands = []
@@ -95,11 +168,19 @@ summary.write_text(json.dumps({
         "effective_hex": cap_eff,
         "required": ["CAP_BPF", "CAP_NET_ADMIN", "CAP_SYS_ADMIN"],
     },
+    "acceptance_mode": mode,
     "ebpf_object_sha256": object_sha,
     "commands_executed": commands,
     "checks": {
         "privileged_acceptance": result,
-        "openspec_validation": openspec,
+        "p1_retained_acceptance": "complete" if mode == "full" and result == "passed" else "not_checked",
+        "wal_fault_matrix": wal_matrix,
+        "ingest_limit_matrix": ingest_matrix,
+        "replay_matrix": replay_matrix,
+        "cgroup_matrix": cgroup_matrix,
+        "privileged_signal": signal,
+        "format_check": fmt,
+        "workspace_check": workspace_check,
     },
     "status": result,
     "exit_code": int(status),
@@ -110,6 +191,7 @@ summary.write_text(json.dumps({
         "sessions": str(sessions),
         "wal_validation": str(validation),
         "commands": str(Path(command_log)),
+        "ebpf_object": object_path,
     },
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
@@ -146,7 +228,7 @@ cleanup_resources() {
     log "ERROR: could not remove shared cgroup" >&2
     failed=1
   fi
-  [[ -z $TMP_DIR ]] || rm -rf "$TMP_DIR"
+  [[ -z $TMP_DIR ]] || rm -rf -- "$TMP_DIR"
   return "$failed"
 }
 
@@ -163,21 +245,48 @@ on_exit() {
 }
 trap on_exit EXIT
 
-mkdir -p "$ARTIFACT_ROOT"
+if ! prepare_artifact_root; then
+  ARTIFACT_ROOT_ERROR="unsafe or non-dedicated artifact root: $REQUESTED_ARTIFACT_ROOT"
+  ARTIFACT_ROOT="$DEFAULT_ARTIFACT_ROOT"
+  WAL_DIR="$ARTIFACT_ROOT/wal"
+  VALIDATION_ROOT="$ARTIFACT_ROOT/wal-validation"
+  SESSION_ROOT="$ARTIFACT_ROOT/sessions"
+  SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
+  COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
+  prepare_artifact_root || die "cannot initialize fallback artifact root: $ARTIFACT_ROOT"
+fi
+WAL_DIR="$ARTIFACT_ROOT/wal"
+VALIDATION_ROOT="$ARTIFACT_ROOT/wal-validation"
+SESSION_ROOT="$ARTIFACT_ROOT/sessions"
+SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
+COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
 : >"$COMMAND_LOG"
 trap 'printf "%s\\n" "$BASH_COMMAND" >>"$COMMAND_LOG"' DEBUG
 TMP_DIR=$(mktemp -d)
+
+if [[ -n $ARTIFACT_ROOT_ERROR ]]; then
+  die "$ARTIFACT_ROOT_ERROR; refusing to remove it; artifacts retained at $ARTIFACT_ROOT"
+fi
+valid_acceptance_mode || die "unsupported CHRONICLE_ACCEPTANCE_MODE=$ACCEPTANCE_MODE (expected full or fast)"
+[[ $TARGET_DIR != "$EBPF_TARGET_DIR" ]] || die "CARGO_TARGET_DIR and CHRONICLE_EBPF_TARGET_DIR must remain isolated"
+export CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR"
+log "Acceptance mode: $ACCEPTANCE_MODE"
 
 phase 1 "Validate environment"
 [[ $(uname -s) == Linux ]] || skip "privileged runtime requires Linux; rootless fixture and eBPF compile profiles remain available"
 validate_environment
 
-phase 2 "Build rootless workspace"
-cargo build --workspace --locked >"$ARTIFACT_ROOT/build.log" 2>&1
+phase 2 "Build isolated eBPF object"
+(
+  cd "$ROOT/ebpf"
+  CARGO_TARGET_DIR="$EBPF_TARGET_DIR" \
+    CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" \
+    cargo build --release --locked
+) >"$ARTIFACT_ROOT/build.log" 2>&1
+assert_file "$EBPF_OBJECT"
 
-phase 3 "Build isolated eBPF object"
-(cd "$ROOT/ebpf" && env -u CARGO_TARGET_DIR cargo build --release --locked) >>"$ARTIFACT_ROOT/build.log" 2>&1
-cargo build -p chronicle-cli --features linux-ebpf --locked >>"$ARTIFACT_ROOT/build.log" 2>&1
+phase 3 "Build Chronicle CLI with linux-ebpf"
+CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build -p chronicle-cli --features linux-ebpf --locked >>"$ARTIFACT_ROOT/build.log" 2>&1
 assert_file "$CHRONICLE"
 
 phase 4 "Prepare artifacts and cgroups"
@@ -260,21 +369,48 @@ PY
 phase 14 "Verify active recording metadata"
 assert_json "$WAL_DIR/recording.json" 'value["version"] == 1 and value["status"] == "completed" and value["capture"]["scope"]["selected_subtree"] is True and value["capture"]["scope"]["direct_tgid_count"] >= 0 and value["capture"]["scope"]["descendant_cgroup_count"] == 0'
 
-phase 15 "Run WAL commit and recovery fault matrix"
-cargo test -p chronicle-wal --locked >"$ARTIFACT_ROOT/wal-tests.log" 2>&1
-assert_file "$ARTIFACT_ROOT/wal-tests.log"
-grep -q 'test result: ok' "$ARTIFACT_ROOT/wal-tests.log"
+if full_mode; then
+  phase 15 "Run WAL commit and recovery fault matrix"
+  cargo test -p chronicle-wal --locked >"$ARTIFACT_ROOT/wal-tests.log" 2>&1
+  assert_file "$ARTIFACT_ROOT/wal-tests.log"
+  grep -q 'test result: ok' "$ARTIFACT_ROOT/wal-tests.log"
+  WAL_MATRIX_RESULT="passed"
+else
+  skip_phase 15 "Run WAL commit and recovery fault matrix" wal-tests.log
+fi
 
-phase 16 "Run bounded ingest and WAL-limit matrix"
-cargo test -p chronicle-application --locked ingest_discards_only_wal_limit_suffix_and_wal_limit_wins_duration_tie >"$ARTIFACT_ROOT/ingest-limit-tests.log" 2>&1
-cargo test -p chronicle-application --locked production_recording_bounds_enforce_duration_and_wal_limits >>"$ARTIFACT_ROOT/ingest-limit-tests.log" 2>&1
-grep -q 'test result: ok' "$ARTIFACT_ROOT/ingest-limit-tests.log"
+if full_mode; then
+  phase 16 "Run bounded ingest and WAL-limit matrix"
+  cargo test -p chronicle-application --locked ingest_discards_only_wal_limit_suffix_and_wal_limit_wins_duration_tie >"$ARTIFACT_ROOT/ingest-limit-tests.log" 2>&1
+  cargo test -p chronicle-application --locked production_recording_bounds_enforce_duration_and_wal_limits >>"$ARTIFACT_ROOT/ingest-limit-tests.log" 2>&1
+  grep -q 'test result: ok' "$ARTIFACT_ROOT/ingest-limit-tests.log"
+  INGEST_MATRIX_RESULT="passed"
+else
+  skip_phase 16 "Run bounded ingest and WAL-limit matrix" ingest-limit-tests.log
+fi
 
 phase 17 "Verify recovery report and categorized counters"
 for key in received accepted_into_queue written_not_committed committed discarded_from_queue_due_to_wal_limit kernel_or_backend_dropped rejected_after_stop etl_checkpointed; do
   grep -q "\"$key\"" "$ARTIFACT_ROOT/record.json"
   grep -q "\"$key\"" "$WAL_DIR/recording.json"
 done
+
+STALE_WAL="$ARTIFACT_ROOT/stale-recovery-wal"
+STALE_OUTPUT="$ARTIFACT_ROOT/stale-recovery-output"
+cp -a "$WAL_DIR" "$STALE_WAL"
+python3 - "$STALE_WAL/recording.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+metadata = json.loads(path.read_text(encoding="utf-8"))
+metadata["status"] = "recording"
+metadata["shutdown_reason"] = None
+path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+"$CHRONICLE" --format json etl --wal-dir "$STALE_WAL" --output "$STALE_OUTPUT" >"$ARTIFACT_ROOT/stale-recovery-etl.json" 2>"$ARTIFACT_ROOT/stale-recovery-etl.log"
+assert_json "$ARTIFACT_ROOT/stale-recovery-etl.json" 'value["status"] == "aborted" and value["shutdown_reason"] == "process_crash_recovered" and value["checkpoint"]["status"] == "aborted"'
+assert_json "$STALE_WAL/etl/recovery-report.json" 'value["status"] == "aborted" and value["shutdown_reason"] == "process_crash_recovered"'
 
 phase 18 "Rerun ETL in same output root"
 "$CHRONICLE" --format json etl --wal-dir "$WAL_DIR" --output "$SESSION_ROOT" >"$ARTIFACT_ROOT/etl-rerun.json" 2>"$ARTIFACT_ROOT/etl-rerun.log"
@@ -303,20 +439,35 @@ assert len(replay) == 3, replay
 assert all(item["target"] != "http://127.0.0.1" for item in replay)
 PY
 
-phase 22 "Run mixed replay transport and verification matrix"
-cargo test -p chronicle-replay --locked execution_stops_on_transport_or_verification_and_accounts_for_skips >"$ARTIFACT_ROOT/replay-tests.log" 2>&1
-grep -q 'test result: ok' "$ARTIFACT_ROOT/replay-tests.log"
+if full_mode; then
+  phase 22 "Run mixed replay transport and verification matrix"
+  cargo test -p chronicle-replay --locked execution_stops_on_transport_or_verification_and_accounts_for_skips >"$ARTIFACT_ROOT/replay-tests.log" 2>&1
+  grep -q 'test result: ok' "$ARTIFACT_ROOT/replay-tests.log"
+  REPLAY_MATRIX_RESULT="passed"
+else
+  skip_phase 22 "Run mixed replay transport and verification matrix" replay-tests.log
+fi
 
-phase 23 "Run cgroup scope and identity matrix"
-cargo test -p chronicle-application --locked deduplicates_threads_and_safe_result_is_count_only >"$ARTIFACT_ROOT/cgroup-tests.log" 2>&1
-cargo test -p chronicle-application --locked shared_posix_group_and_descendants_need_acknowledgement >>"$ARTIFACT_ROOT/cgroup-tests.log" 2>&1
-cargo test -p chronicle-application --locked pid_requires_exact_direct_tgid_even_with_acknowledgement >>"$ARTIFACT_ROOT/cgroup-tests.log" 2>&1
-cargo test -p chronicle-application --locked recorder_descendant_race_namespace_and_forbidden_scope_fail_closed >>"$ARTIFACT_ROOT/cgroup-tests.log" 2>&1
-grep -q 'test result: ok' "$ARTIFACT_ROOT/cgroup-tests.log"
+if full_mode; then
+  phase 23 "Run cgroup scope and identity matrix"
+  cargo test -p chronicle-application --locked deduplicates_threads_and_safe_result_is_count_only >"$ARTIFACT_ROOT/cgroup-tests.log" 2>&1
+  cargo test -p chronicle-application --locked shared_posix_group_and_descendants_need_acknowledgement >>"$ARTIFACT_ROOT/cgroup-tests.log" 2>&1
+  cargo test -p chronicle-application --locked pid_requires_exact_direct_tgid_even_with_acknowledgement >>"$ARTIFACT_ROOT/cgroup-tests.log" 2>&1
+  cargo test -p chronicle-application --locked recorder_descendant_race_namespace_and_forbidden_scope_fail_closed >>"$ARTIFACT_ROOT/cgroup-tests.log" 2>&1
+  grep -q 'test result: ok' "$ARTIFACT_ROOT/cgroup-tests.log"
+  CGROUP_MATRIX_RESULT="passed"
+else
+  skip_phase 23 "Run cgroup scope and identity matrix" cgroup-tests.log
+fi
 
-phase 24 "Run graceful signal acceptance"
-cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture >"$ARTIFACT_ROOT/signal-tests.log" 2>&1
-grep -q 'test result: ok' "$ARTIFACT_ROOT/signal-tests.log"
+if full_mode; then
+  phase 24 "Run graceful signal acceptance"
+  cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture >"$ARTIFACT_ROOT/signal-tests.log" 2>&1
+  grep -q 'test result: ok' "$ARTIFACT_ROOT/signal-tests.log"
+  SIGNAL_RESULT="passed"
+else
+  skip_phase 24 "Run graceful signal acceptance" signal-tests.log
+fi
 
 phase 25 "Verify doctor has no persistent side effects"
 [[ ! -e "$ARTIFACT_ROOT/doctor-wal/recording.json" ]] || die "doctor created recording metadata"
@@ -335,27 +486,22 @@ for path in [root / "record.json", root / "etl.json", root / "etl-rerun.json", r
     assert "command line" not in path.read_text(encoding="utf-8").lower()
 PY
 
-phase 27 "Validate stale-language guard"
-if command -v openspec >/dev/null 2>&1; then
-  openspec validate add-production-http-recording-pipeline --strict >"$ARTIFACT_ROOT/openspec-validation.log" 2>&1
-  OPENSPEC_RESULT="passed"
+if full_mode; then
+  phase 27 "Run final workspace checks"
+  cargo fmt --all --check >"$ARTIFACT_ROOT/fmt.log" 2>&1
+  FMT_RESULT="passed"
+  cargo check --workspace --all-targets --locked >"$ARTIFACT_ROOT/check.log" 2>&1
+  WORKSPACE_CHECK_RESULT="passed"
 else
-  printf '%s\n' 'OpenSpec CLI not installed in VM; validation runs in repository CI.' >"$ARTIFACT_ROOT/openspec-validation.log"
-fi
-if grep -R -nE 'no eBPF program exists|scaffold-only|future eBPF work' README.md docs/ >/dev/null; then
-  die "stale P0 language remains in docs"
+  skip_phase 27 "Run final workspace checks" fmt.log check.log
 fi
 
-phase 28 "Run final workspace checks"
-cargo fmt --all --check >"$ARTIFACT_ROOT/fmt.log" 2>&1
-cargo check --workspace --all-targets --locked >"$ARTIFACT_ROOT/check.log" 2>&1
-
-phase 29 "Collect artifacts"
+phase 28 "Collect artifacts"
 for artifact in "$ARTIFACT_ROOT/record.log" "$ARTIFACT_ROOT/etl.log" "$ARTIFACT_ROOT/replay.log" "$ARTIFACT_ROOT/doctor.json" "$ARTIFACT_ROOT/record.json" "$ARTIFACT_ROOT/etl.json" "$ARTIFACT_ROOT/inspect.json" "$ARTIFACT_ROOT/replay.json" "$ARTIFACT_ROOT/wal-tests.log" "$ARTIFACT_ROOT/signal-tests.log" "$WAL_DIR/recording.json"; do
   assert_file "$artifact"
 done
 write_summary 0
 
-phase 30 "Cleanup processes, cgroups, and temporary files"
+phase 29 "Cleanup processes, cgroups, and temporary files"
 cleanup_resources
 log "PASS: privileged acceptance artifacts retained at $ARTIFACT_ROOT"

@@ -413,6 +413,13 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
     assert!(stderr.is_empty());
     let first: serde_json::Value = serde_json::from_str(&stdout).expect("ETL JSON");
     assert_eq!(first["already_processed"], false);
+    assert!(first["recording_id"].is_string());
+    assert!(first["status"].is_string());
+    assert!(first["shutdown_reason"].is_string());
+    assert!(first["counters"]["committed"]["records"].is_u64());
+    assert_eq!(first["checkpoint"]["version"], 1);
+    assert!(first["checkpoint"]["wal_snapshot_sha256"].is_string());
+    assert!(first["checkpoint"]["output_identity"].is_string());
     let session_id = first["session_id"].as_str().expect("session ID").to_owned();
 
     std::fs::remove_file(std::path::Path::new(wal).join("etl-checkpoint.json"))

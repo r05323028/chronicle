@@ -1,7 +1,8 @@
 use chronicle_application::{
-    AppConfig, ApplicationError, REPLAY_REPORT_VERSION, inspect_session,
-    process_and_publish_recording_wal, record_fixture_file, render_inspect_human,
-    render_inspect_json, render_json, render_replay_human, replay_session_with_plan,
+    AppConfig, ApplicationError, REPLAY_REPORT_VERSION, RecordingCounters, RecordingEtlCheckpoint,
+    RecordingStatus, ShutdownReason, inspect_session, process_and_publish_recording_wal,
+    record_fixture_file, render_inspect_human, render_inspect_json, render_json,
+    render_replay_human, replay_session_with_plan,
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::{
@@ -126,12 +127,17 @@ struct RecordJson {
 }
 
 #[derive(Serialize)]
-struct EtlJson {
+struct EtlJson<'a> {
     version: u8,
     session_id: String,
+    recording_id: String,
+    status: RecordingStatus,
+    shutdown_reason: Option<ShutdownReason>,
     output: PathBuf,
     already_processed: bool,
     ignored_post_commit_records: u64,
+    counters: &'a RecordingCounters,
+    checkpoint: &'a RecordingEtlCheckpoint,
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
@@ -512,9 +518,14 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
                 Format::Json => render_json(&EtlJson {
                     version: 1,
                     session_id: result.session_id.to_string(),
+                    recording_id: result.checkpoint.recording_id.to_string(),
+                    status: result.checkpoint.status,
+                    shutdown_reason: result.checkpoint.shutdown_reason,
                     output,
                     already_processed: result.already_published,
                     ignored_post_commit_records: result.ignored_post_commit_records,
+                    counters: &result.checkpoint.counters,
+                    checkpoint: &result.checkpoint,
                 })?,
             };
             Ok((rendered, 0))

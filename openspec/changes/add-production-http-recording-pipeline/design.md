@@ -163,8 +163,8 @@ Layout:
   segments/
     00000000000000000001.chwal
     00000000000001048233.chwal
+  etl-checkpoint.json
   etl/
-    checkpoint.json
     recovery-report.json
 ```
 
