@@ -112,6 +112,16 @@ impl RecorderStartup {
         })
     }
 
+    pub fn begin_draining(&mut self) -> Result<(), RecorderStartupError> {
+        self.lifecycle.begin_draining()?;
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(), RecorderStartupError> {
+        self.lifecycle.stop()?;
+        Ok(())
+    }
+
     pub fn quota_authorities(&self) -> &[QuotaReservationAuthority] {
         &self.quotas
     }

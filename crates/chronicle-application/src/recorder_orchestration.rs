@@ -229,8 +229,33 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
         now_millis: u64,
         outcome_path: impl AsRef<std::path::Path>,
     ) -> Result<RecorderEpochBoundary, RecorderOrchestrationError> {
+        self.rollover_inner(now_millis, outcome_path, |ingest| {
+            ingest.rollover_to(next_writer, now_millis)
+        })
+    }
+
+    /// Roll over without acquiring a second lock on same WAL directory.
+    pub fn rollover(
+        &mut self,
+        now_millis: u64,
+        outcome_path: impl AsRef<std::path::Path>,
+    ) -> Result<RecorderEpochBoundary, RecorderOrchestrationError> {
+        self.rollover_inner(now_millis, outcome_path, |ingest| {
+            ingest.rollover(now_millis)
+        })
+    }
+
+    fn rollover_inner(
+        &mut self,
+        _now_millis: u64,
+        outcome_path: impl AsRef<std::path::Path>,
+        rollover: impl FnOnce(
+            &mut RecordingIngest,
+        )
+            -> Result<Option<crate::RecordingCommitBoundary>, chronicle_wal::WalError>,
+    ) -> Result<RecorderEpochBoundary, RecorderOrchestrationError> {
         let old_epoch_ordinal = self.epoch_ordinal;
-        let old_commit = self.ingest.rollover_to(next_writer, now_millis)?;
+        let old_commit = rollover(&mut self.ingest)?;
         if let Some(end_ordinal) = self.next_ingest_ordinal.checked_sub(1) {
             let start_ordinal = self
                 .last_outcome_ordinal

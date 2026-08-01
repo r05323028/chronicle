@@ -1745,7 +1745,7 @@ pub struct GroupAppendResult {
 
 pub struct GroupCommitWalWriter {
     writer: SegmentedEnvelopeWriter,
-    lock: RecordingLock,
+    lock: Option<RecordingLock>,
     recording_id: RecordingId,
     next_sequence: u64,
     pending: Vec<WalRecordEnvelope>,
@@ -1819,7 +1819,7 @@ impl GroupCommitWalWriter {
                 max_segment_bytes,
                 max_total_bytes,
             )?,
-            lock,
+            lock: Some(lock),
             recording_id,
             next_sequence: first_sequence,
             pending: Vec::new(),
@@ -1842,8 +1842,55 @@ impl GroupCommitWalWriter {
         &self.authority
     }
 
+    ///
+    /// # Panics
+    ///
+    /// Panics only if internal rollover has dropped ownership unexpectedly.
     pub fn recording_lock(&self) -> &RecordingLock {
-        &self.lock
+        self.lock
+            .as_ref()
+            .expect("group commit writer always owns recording lock")
+    }
+
+    /// Seal current epoch, release its lock, and acquire same-recording lock for next epoch.
+    pub fn rollover(&mut self, now_millis: u64, first_sequence: u64) -> Result<(), WalError> {
+        self.shutdown(now_millis)?;
+        let wal_directory = self
+            .writer
+            .directory
+            .parent()
+            .ok_or_else(|| WalError::Io(io::Error::other("WAL directory has no parent")))?
+            .to_path_buf();
+        let max_segment_bytes = self.writer.max_segment_bytes;
+        let max_total_bytes = self.writer.max_total_bytes;
+        let max_segment_age_millis = self.max_segment_age_millis;
+        self.lock.take();
+        let lock = RecordingLock::acquire(&wal_directory)?;
+        let segments_directory = wal_directory.join("segments");
+        let mut writer = SegmentedEnvelopeWriter::create_with_total_limit(
+            &segments_directory,
+            self.recording_id,
+            max_segment_bytes,
+            max_total_bytes,
+        )?;
+        writer.segment_ordinal = discover_segments(&segments_directory, self.recording_id)?
+            .into_iter()
+            .map(|segment| segment.header.segment_ordinal)
+            .max();
+        self.writer = writer;
+        self.lock = Some(lock);
+        self.next_sequence = first_sequence;
+        self.pending.clear();
+        self.pending_frame_bytes = 0;
+        self.last_sync_millis = now_millis;
+        self.max_segment_age_millis = max_segment_age_millis;
+        let previous_authority = self.authority.clone();
+        self.authority = CommitAuthority {
+            durable_record_count: previous_authority.durable_record_count,
+            durable_payload_bytes: previous_authority.durable_payload_bytes,
+            ..CommitAuthority::default()
+        };
+        Ok(())
     }
 
     pub fn set_max_segment_age_millis(
@@ -2175,7 +2222,7 @@ impl PreparedRecoveryReopen {
         )?;
         let group_writer = GroupCommitWalWriter {
             writer,
-            lock: self.lock,
+            lock: Some(self.lock),
             recording_id: self.recording_id,
             next_sequence: self.preview.next_sequence,
             pending: Vec::new(),
@@ -3579,6 +3626,35 @@ mod tests {
             2
         );
         drop(writer);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn in_place_rollover_releases_lock_and_continues_sequence() {
+        let directory = discovery_directory();
+        let recording_id = RecordingId::new();
+        let mut writer =
+            GroupCommitWalWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        writer
+            .append(RecordKind::CaptureEvent, 1, 0, b"first".to_vec(), 0)
+            .unwrap();
+        writer.poll(10).unwrap();
+        assert_eq!(writer.next_sequence(), 3);
+        writer.rollover(20, 3).unwrap();
+        writer
+            .append(RecordKind::CaptureEvent, 1, 0, b"second".to_vec(), 20)
+            .unwrap();
+        writer.poll(30).unwrap();
+        assert_eq!(writer.next_sequence(), 5);
+        drop(writer);
+        assert_eq!(
+            discover_segments(directory.join("segments"), recording_id)
+                .unwrap()
+                .len(),
+            2
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

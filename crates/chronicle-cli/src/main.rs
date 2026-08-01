@@ -8,7 +8,8 @@ use chronicle_application::{
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::{
     CgroupSelector, ProductionRecordingBounds, ProductionSignalStop, load_recording_metadata,
-    mark_recording_forced_termination, record_live_ebpf, recording_physical_wal_bytes,
+    mark_recording_forced_termination, record_continuous_ebpf, record_live_ebpf,
+    recording_physical_wal_bytes,
 };
 use chronicle_protocol::{ProtocolError, TransportErrorCategory};
 use chronicle_replay::{LoopbackReplayOptions, ReplayError, ReplayOutcome, TimingMode};
@@ -349,15 +350,11 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
                 let wal_dir = recorder_config.state_root.join("wal");
                 let stop = ProductionSignalStop::default();
                 spawn_signal_watcher(stop.clone(), wal_dir.clone());
-                let result = record_live_ebpf(
+                let result = record_continuous_ebpf(
                     CgroupSelector::Explicit(recorder_config.scope.cgroup_path.clone()),
                     recorder_config.scope.shared_scope_acknowledged,
+                    &recorder_config,
                     &wal_dir,
-                    ProductionRecordingBounds {
-                        duration_seconds: recorder_config.epoch.max_age_seconds,
-                        segment_bytes: recorder_config.segment.max_bytes,
-                        max_wal_bytes: recorder_config.epoch.max_bytes,
-                    },
                     stop,
                 )?;
                 let metadata = load_recording_metadata(&wal_dir)?.ok_or(

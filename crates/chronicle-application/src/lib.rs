@@ -1,6 +1,7 @@
 //! Application services and configuration. CLI remains an outer adapter.
 
 mod cgroup_selection;
+mod continuous_recorder;
 mod epoch_rollover;
 mod incremental_worker;
 mod recorder_config;
@@ -16,6 +17,7 @@ pub use cgroup_selection::{
     CgroupSelection, CgroupSelectionError, CgroupSelector, PidCgroupSelection,
     preflight_cgroup_selection, preflight_pid_cgroup_selection,
 };
+pub use continuous_recorder::{ContinuousRecorderError, ContinuousRecorderService};
 pub use epoch_rollover::{
     EpochAdmittedObservation, EpochOutcomeError, EpochOutcomeJournalV1, OutcomeRange,
     RolloverAssignment, RolloverFailureReason, write_epoch_outcome_atomic,
@@ -101,7 +103,7 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const RECORDING_METADATA_SCHEMA_VERSION: u16 = 1;
@@ -786,6 +788,121 @@ pub fn record_live_ebpf(
     )
 }
 
+/// Runs capture through the continuous startup/rollover/drain runtime.
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+pub fn record_continuous_ebpf(
+    selector: CgroupSelector,
+    allow_shared_cgroup: bool,
+    config: &NormalizedRecorderConfig,
+    wal_directory: impl AsRef<Path>,
+    stop: ProductionSignalStop,
+) -> Result<ProductionRecordingResult, ApplicationError> {
+    let wal_directory = wal_directory.as_ref();
+    if matches!(&selector, CgroupSelector::Pid(_)) && allow_shared_cgroup {
+        return Err(ApplicationError::ProductionPreflight(
+            "shared cgroup acknowledgement requires explicit cgroup",
+        ));
+    }
+    let pid_baseline = match &selector {
+        CgroupSelector::Pid(pid) => {
+            Some(preflight_pid_cgroup_selection(*pid).map_err(|_| {
+                ApplicationError::ProductionPreflight("PID cgroup selection invalid")
+            })?)
+        }
+        CgroupSelector::Explicit(_) => None,
+    };
+    let selection = match &pid_baseline {
+        Some(baseline) => baseline.selection().clone(),
+        None => preflight_cgroup_selection(selector, allow_shared_cgroup)
+            .map_err(|_| ApplicationError::ProductionPreflight("cgroup selection invalid"))?,
+    };
+    let bounds = ProductionRecordingBounds {
+        duration_seconds: config.epoch.max_age_seconds,
+        segment_bytes: config.segment.max_bytes,
+        max_wal_bytes: config.epoch.max_bytes,
+    };
+    preflight_wal_destination(wal_directory, bounds)?;
+    preflight_embedded_ebpf()?;
+    let capture_metadata = live_capture_metadata(&selection, bounds)?;
+    let recording_id = RecordingId::new();
+    let writer = GroupCommitWalWriter::create_with_total_limit_and_age(
+        wal_directory,
+        recording_id,
+        config.segment.max_bytes,
+        config.epoch.max_bytes,
+        1,
+        monotonic_millis(),
+        config.segment.max_age_seconds.saturating_mul(1_000),
+    )?;
+    let source = load_production_ebpf_source(&selection, pid_baseline.as_ref())?;
+    let recorder = RecorderOrchestrator::new(source, RecordingIngest::new(writer));
+    let mut service = ContinuousRecorderService::start(
+        config,
+        wal_directory,
+        recorder,
+        || Ok(()),
+        |quotas| {
+            for quota in quotas {
+                quota.reserve(ReservationKind::Wal, config.epoch.max_bytes)?;
+            }
+            Ok(())
+        },
+        || Ok(()),
+        || Ok(()),
+    )
+    .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    let mut metadata = load_recording_metadata(wal_directory)?.ok_or(
+        ApplicationError::RecordingMetadataValidation("continuous metadata missing".into()),
+    )?;
+    metadata.capture = Some(capture_metadata);
+    write_recording_metadata(wal_directory, &metadata)?;
+    let mut epoch_started = Instant::now();
+    let mut reason = ShutdownReason::SourceCompleted;
+    loop {
+        if let Some(requested) = stop.shutdown_reason() {
+            reason = requested;
+            break;
+        }
+        let now = monotonic_millis();
+        let _ = service
+            .poll(now)
+            .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+        let physical = recording_physical_wal_bytes(wal_directory)?;
+        let age_expired = epoch_started.elapsed().as_secs() >= config.epoch.max_age_seconds;
+        let size_expired = physical
+            >= config
+                .epoch
+                .max_bytes
+                .saturating_sub(config.segment.max_bytes);
+        if age_expired || size_expired {
+            service
+                .rollover(now, wal_directory.join("epoch-outcomes.json"))
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            epoch_started = Instant::now();
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let result = service
+        .shutdown(
+            reason,
+            monotonic_millis(),
+            Duration::from_secs(config.shutdown.timeout_seconds),
+        )
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    let last_valid_commit = service.recorder().ingest().commit_boundary();
+    drop(service);
+    Ok(ProductionRecordingResult {
+        recording_id,
+        status: result.status,
+        shutdown_reason: result.shutdown_reason,
+        last_valid_commit,
+        counters: result.counters,
+        terminal_wal_loss: result.terminal_wal_loss,
+        source_summary: CaptureSourceSummary::default(),
+    })
+}
+
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 fn live_capture_metadata(
     selection: &CgroupSelection,
@@ -1061,6 +1178,14 @@ impl RecordingIngest {
         &self.counters
     }
 
+    pub fn recording_id(&self) -> RecordingId {
+        self.writer.recording_id()
+    }
+
+    pub fn next_sequence(&self) -> u64 {
+        self.writer.next_sequence()
+    }
+
     pub fn commit_boundary(&self) -> Option<RecordingCommitBoundary> {
         let authority = self.writer.authority();
         Some(RecordingCommitBoundary {
@@ -1141,6 +1266,25 @@ impl RecordingIngest {
         self.writer.shutdown(now_millis)?;
         let boundary = self.commit_boundary();
         self.writer = next_writer;
+        self.reset_after_rollover();
+        Ok(boundary)
+    }
+
+    /// Seal current epoch and reopen same WAL ownership without constructing a second lock.
+    pub fn rollover(
+        &mut self,
+        now_millis: u64,
+    ) -> Result<Option<RecordingCommitBoundary>, WalError> {
+        self.drain(now_millis)?;
+        self.writer.shutdown(now_millis)?;
+        let boundary = self.commit_boundary();
+        let first_sequence = self.writer.next_sequence();
+        self.writer.rollover(now_millis, first_sequence)?;
+        self.reset_after_rollover();
+        Ok(boundary)
+    }
+
+    fn reset_after_rollover(&mut self) {
         self.queue.clear();
         self.written_records.clear();
         self.written_capture_timestamps.clear();
@@ -1148,7 +1292,6 @@ impl RecordingIngest {
         self.terminal_discarded_without_time = RecordByteCount::default();
         self.terminal_wal_loss = None;
         self.state = IngestState::Accepting;
-        Ok(boundary)
     }
 
     /// WAL-limit detection wins over duration when both occur in one shutdown cycle.
