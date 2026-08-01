@@ -1,0 +1,29 @@
+[Unit]
+Description=Chronicle continuous HTTP recorder
+After=local-fs.target
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=chronicle
+Group=chronicle
+StateDirectory=chronicle
+ExecStart=/usr/bin/env chronicle --format json recorder --config /etc/chronicle/recorder.toml
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/chronicle
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+TasksMax=512
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

@@ -192,6 +192,8 @@ pub const fn doctor_exit_code(status: DoctorStatus) -> i32 {
 pub struct DoctorOptions {
     pub wal_dir: Option<PathBuf>,
     pub output: Option<PathBuf>,
+    pub state_root: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 }
 
 /// Runs only local, non-attaching probes. Supplied paths are inspected but never created.
@@ -200,6 +202,16 @@ pub fn doctor_report(options: &DoctorOptions) -> DoctorReport {
     probes.extend([
         path_doctor_probe(options.wal_dir.as_deref(), "wal_dir", "WAL directory"),
         path_doctor_probe(options.output.as_deref(), "output", "output path"),
+        path_doctor_probe(
+            options.state_root.as_deref(),
+            "state_root",
+            "recorder state root",
+        ),
+        recorder_metadata_doctor_probe(options.state_root.as_deref()),
+        recorder_owner_doctor_probe(options.state_root.as_deref()),
+        recorder_config_doctor_probe(options.config.as_deref()),
+        wal_manifest_doctor_probe(options.wal_dir.as_deref()),
+        etl_checkpoint_doctor_probe(options.wal_dir.as_deref()),
         protocol_doctor_probe(),
         DoctorProbe {
             required: false,
@@ -210,6 +222,178 @@ pub fn doctor_report(options: &DoctorOptions) -> DoctorReport {
         },
     ]);
     DoctorReport::new(probes)
+}
+
+fn recorder_metadata_doctor_probe(path: Option<&Path>) -> DoctorProbe {
+    let Some(path) = path else {
+        return DoctorProbe {
+            required: false,
+            status: DoctorStatus::NotChecked,
+            code: "recorder.metadata".into(),
+            message: "recorder state root was not supplied".into(),
+            remediation: "supply --state-root to inspect recorder metadata".into(),
+        };
+    };
+    match load_recorder_metadata(path) {
+        Ok(_) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::Supported,
+            code: "recorder.metadata".into(),
+            message: "recorder metadata and checksum are valid".into(),
+            remediation: "none".into(),
+        },
+        Err(_) if !path.join(RECORDER_METADATA_FILE).exists() => DoctorProbe {
+            required: false,
+            status: DoctorStatus::NotChecked,
+            code: "recorder.metadata".into(),
+            message: "recorder metadata is not present".into(),
+            remediation: "start recorder before checking active metadata".into(),
+        },
+        Err(error) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::Unsupported,
+            code: "recorder.metadata".into(),
+            message: "recorder metadata is invalid".into(),
+            remediation: format!("recover or quarantine recorder metadata ({error})"),
+        },
+    }
+}
+
+fn recorder_owner_doctor_probe(path: Option<&Path>) -> DoctorProbe {
+    let Some(path) = path else {
+        return DoctorProbe {
+            required: false,
+            status: DoctorStatus::NotChecked,
+            code: "recorder.owner".into(),
+            message: "recorder state root was not supplied".into(),
+            remediation: "supply --state-root to inspect recorder ownership".into(),
+        };
+    };
+    match RecorderLease::state_is_owned(path) {
+        Ok(true) => DoctorProbe {
+            required: false,
+            status: DoctorStatus::SupportedWithWarnings,
+            code: "recorder.owner".into(),
+            message: "recorder state lease is currently held".into(),
+            remediation: "do not mutate recorder state outside the owner".into(),
+        },
+        Ok(false) => DoctorProbe {
+            required: false,
+            status: DoctorStatus::Supported,
+            code: "recorder.owner".into(),
+            message: "recorder state lease is available".into(),
+            remediation: "none".into(),
+        },
+        Err(error) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::Unsupported,
+            code: "recorder.owner".into(),
+            message: "recorder state lease could not be inspected".into(),
+            remediation: error.to_string(),
+        },
+    }
+}
+
+fn recorder_config_doctor_probe(path: Option<&Path>) -> DoctorProbe {
+    let Some(path) = path else {
+        return DoctorProbe {
+            required: false,
+            status: DoctorStatus::NotChecked,
+            code: "recorder.config".into(),
+            message: "recorder configuration was not supplied".into(),
+            remediation: "supply --config to validate recorder configuration".into(),
+        };
+    };
+    match RecorderConfigV1::from_file(path).and_then(|config| config.normalize()) {
+        Ok(config) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::Supported,
+            code: "recorder.config".into(),
+            message: format!(
+                "recorder configuration validated: {}",
+                config.stable_digest().unwrap_or_default()
+            ),
+            remediation: "none".into(),
+        },
+        Err(error) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::Unsupported,
+            code: "recorder.config".into(),
+            message: "recorder configuration is invalid".into(),
+            remediation: error.to_string(),
+        },
+    }
+}
+
+fn wal_manifest_doctor_probe(path: Option<&Path>) -> DoctorProbe {
+    let Some(path) = path else {
+        return DoctorProbe {
+            required: false,
+            status: DoctorStatus::NotChecked,
+            code: "wal.manifest".into(),
+            message: "WAL path was not supplied".into(),
+            remediation: "supply --wal-dir".into(),
+        };
+    };
+    match chronicle_wal::load_manifest(path) {
+        Ok(_) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::Supported,
+            code: "wal.manifest".into(),
+            message: "WAL manifest validates".into(),
+            remediation: "none".into(),
+        },
+        Err(_error) if !path.join(chronicle_wal::WAL_MANIFEST_FILE).exists() => DoctorProbe {
+            required: false,
+            status: DoctorStatus::NotChecked,
+            code: "wal.manifest".into(),
+            message: "WAL manifest is not present".into(),
+            remediation: "start or recover recorder".into(),
+        },
+        Err(error) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::Unsupported,
+            code: "wal.manifest".into(),
+            message: "WAL manifest is invalid".into(),
+            remediation: error.to_string(),
+        },
+    }
+}
+
+fn etl_checkpoint_doctor_probe(path: Option<&Path>) -> DoctorProbe {
+    let Some(path) = path else {
+        return DoctorProbe {
+            required: false,
+            status: DoctorStatus::NotChecked,
+            code: "etl.checkpoint".into(),
+            message: "WAL path was not supplied".into(),
+            remediation: "supply --wal-dir".into(),
+        };
+    };
+    let checkpoint = path.join("etl-checkpoint.json");
+    match chronicle_etl::read_checkpoint(&checkpoint) {
+        Ok(_) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::Supported,
+            code: "etl.checkpoint".into(),
+            message: "incremental ETL checkpoint validates".into(),
+            remediation: "none".into(),
+        },
+        Err(_) if !checkpoint.exists() => DoctorProbe {
+            required: false,
+            status: DoctorStatus::NotChecked,
+            code: "etl.checkpoint".into(),
+            message: "incremental ETL checkpoint is not present".into(),
+            remediation: "run recorder ETL before checking checkpoint".into(),
+        },
+        Err(error) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::Unsupported,
+            code: "etl.checkpoint".into(),
+            message: "incremental ETL checkpoint is invalid".into(),
+            remediation: error.to_string(),
+        },
+    }
 }
 
 fn protocol_doctor_probe() -> DoctorProbe {
@@ -5564,6 +5748,8 @@ mod tests {
         let report = doctor_report(&DoctorOptions {
             wal_dir: Some(wal_dir.clone()),
             output: Some(output.clone()),
+            state_root: None,
+            config: None,
         });
         assert!(matches!(
             storage_probe(&report, "wal_dir"),
@@ -5578,6 +5764,8 @@ mod tests {
         let missing_report = doctor_report(&DoctorOptions {
             wal_dir: Some(missing.clone()),
             output: None,
+            state_root: None,
+            config: None,
         });
         assert!(matches!(
             storage_probe(&missing_report, "wal_dir"),
@@ -5608,6 +5796,8 @@ mod tests {
         let report = doctor_report(&DoctorOptions {
             wal_dir: Some(file.clone()),
             output: Some(root.join("missing-parent").join("output")),
+            state_root: None,
+            config: None,
         });
         assert_eq!(storage_probe(&report, "wal_dir"), DoctorStatus::Unsupported);
         assert_eq!(storage_probe(&report, "output"), DoctorStatus::Unsupported);
@@ -5628,6 +5818,8 @@ mod tests {
         let report = doctor_report(&DoctorOptions {
             wal_dir: Some(read_only.clone()),
             output: None,
+            state_root: None,
+            config: None,
         });
         if !matches!(
             storage_probe(&report, "wal_dir"),

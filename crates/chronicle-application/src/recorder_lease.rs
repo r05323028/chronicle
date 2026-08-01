@@ -70,6 +70,10 @@ impl RecorderLease {
         STATE_LOCK_FILE
     }
 
+    pub fn state_is_owned(state_root: impl AsRef<Path>) -> Result<bool, RecorderLeaseError> {
+        lock_is_held(&state_root.as_ref().join(STATE_LOCK_FILE))
+    }
+
     pub fn domain_file(&self) -> &File {
         &self.domain_file
     }

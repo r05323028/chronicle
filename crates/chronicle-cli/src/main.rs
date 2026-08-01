@@ -1,6 +1,7 @@
 use chronicle_application::{
-    AppConfig, ApplicationError, REPLAY_REPORT_VERSION, RecordingCounters, RecordingEtlCheckpoint,
-    RecordingStatus, ShutdownReason, inspect_session, process_and_publish_recording_wal,
+    AppConfig, ApplicationError, REPLAY_REPORT_VERSION, RecorderConfigV1, RecorderLease,
+    RecorderStatusV1, RecordingCounters, RecordingEtlCheckpoint, RecordingStatus, ShutdownReason,
+    inspect_session, load_recorder_metadata, process_and_publish_recording_wal,
     record_fixture_file, render_inspect_human, render_inspect_json, render_json,
     render_replay_human, replay_session_with_plan,
 };
@@ -34,6 +35,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run continuous recorder in foreground until shutdown or configured limit.
+    Recorder,
+    /// Read recorder metadata without mutating recorder state.
+    RecorderStatus {
+        #[arg(long)]
+        state_root: PathBuf,
+    },
     Record {
         #[arg(long, value_enum)]
         source: Source,
@@ -98,6 +106,8 @@ enum Command {
         wal_dir: Option<PathBuf>,
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(long)]
+        state_root: Option<PathBuf>,
     },
 }
 
@@ -300,11 +310,103 @@ fn validate_record_arguments(cli: &Cli) -> Result<(), clap::Error> {
 
 #[allow(clippy::too_many_lines)]
 async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
-    let config = match cli.config {
-        Some(path) => AppConfig::from_file(path)?,
-        None => AppConfig::default(),
+    let recorder_config_path = cli.config.clone();
+    let config = if matches!(&cli.command, Command::Recorder) {
+        AppConfig::default()
+    } else {
+        match cli.config.clone() {
+            Some(path) => AppConfig::from_file(path)?,
+            None => AppConfig::default(),
+        }
     };
     match cli.command {
+        Command::RecorderStatus { state_root } => {
+            let metadata = load_recorder_metadata(&state_root)
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            let owner_live = RecorderLease::state_is_owned(&state_root)?;
+            let status = RecorderStatusV1::from_metadata(&metadata, owner_live)
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            let output = match cli.format {
+                Format::Human => status
+                    .render_human()
+                    .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?,
+                Format::Json => status
+                    .render_json()
+                    .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?,
+            };
+            Ok((output, 0))
+        }
+        Command::Recorder => {
+            let path = recorder_config_path.ok_or(ApplicationError::ProductionPreflight(
+                "recorder requires --config FILE",
+            ))?;
+            let recorder_config = RecorderConfigV1::from_file(path)
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?
+                .normalize()
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+            {
+                let wal_dir = recorder_config.state_root.join("wal");
+                let stop = ProductionSignalStop::default();
+                spawn_signal_watcher(stop.clone(), wal_dir.clone());
+                let result = record_live_ebpf(
+                    CgroupSelector::Explicit(recorder_config.scope.cgroup_path.clone()),
+                    recorder_config.scope.shared_scope_acknowledged,
+                    &wal_dir,
+                    ProductionRecordingBounds {
+                        duration_seconds: recorder_config.epoch.max_age_seconds,
+                        segment_bytes: recorder_config.segment.max_bytes,
+                        max_wal_bytes: recorder_config.epoch.max_bytes,
+                    },
+                    stop,
+                )?;
+                let metadata = load_recording_metadata(&wal_dir)?.ok_or(
+                    ApplicationError::RecordingMetadataValidation(
+                        "recording metadata missing after finalization".into(),
+                    ),
+                )?;
+                let capture = metadata.capture.as_ref().ok_or(
+                    ApplicationError::RecordingMetadataValidation(
+                        "capture metadata missing after finalization".into(),
+                    ),
+                )?;
+                let physical_wal_bytes = recording_physical_wal_bytes(&wal_dir)?;
+                let output = match cli.format {
+                    Format::Human => format!(
+                        "recording_id: {}\\nstatus: {:?}\\nshutdown_reason: {:?}\\nphysical_wal_bytes: {}",
+                        result.recording_id,
+                        result.status,
+                        result.shutdown_reason,
+                        physical_wal_bytes
+                    ),
+                    Format::Json => render_json(&ProductionRecordJson {
+                        version: 1,
+                        recording_id: result.recording_id.to_string(),
+                        status: result.status,
+                        shutdown_reason: result.shutdown_reason,
+                        last_valid_commit: result.last_valid_commit.as_ref(),
+                        physical_wal_bytes,
+                        selector: metadata.selector.as_ref(),
+                        direct_tgid_count: capture.scope.direct_tgid_count,
+                        descendant_cgroup_count: capture.scope.descendant_cgroup_count,
+                        selected_subtree: capture.scope.selected_subtree,
+                        shared_scope_acknowledged: capture.scope.shared_scope_acknowledged,
+                        configured_bounds: &capture.configured_bounds,
+                        effective_bounds: &capture.effective_bounds,
+                        counters: &result.counters,
+                    })?,
+                };
+                Ok((output, 0))
+            }
+            #[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+            {
+                let _ = recorder_config;
+                Err(ApplicationError::ProductionPreflight(
+                    "Linux eBPF capture unavailable",
+                ))
+            }
+        }
+
         Command::Record {
             source: Source::Fixture,
             input,
@@ -530,11 +632,17 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
             };
             Ok((rendered, 0))
         }
-        Command::Doctor { wal_dir, output } => {
+        Command::Doctor {
+            wal_dir,
+            output,
+            state_root,
+        } => {
             let report =
                 chronicle_application::doctor_report(&chronicle_application::DoctorOptions {
                     wal_dir,
                     output,
+                    state_root,
+                    config: recorder_config_path.clone(),
                 });
             let rendered = match cli.format {
                 Format::Human => report
@@ -634,6 +742,24 @@ mod tests {
         assert!(write_output(&mut flush_failure, "{}").is_err());
         assert_eq!(flush_failure.bytes, b"{}\n");
         assert_eq!(flush_failure.flushes, 1);
+    }
+
+    #[test]
+    fn cli_parses_recorder_status_command() {
+        let cli =
+            Cli::try_parse_from(["chronicle", "recorder-status", "--state-root", "state"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::RecorderStatus { state_root } if state_root.as_path() == std::path::Path::new("state")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_foreground_recorder_command() {
+        let cli =
+            Cli::try_parse_from(["chronicle", "recorder", "--config", "recorder.toml"]).unwrap();
+        assert!(matches!(cli.command, Command::Recorder));
+        assert_eq!(cli.config, Some(PathBuf::from("recorder.toml")));
     }
 
     #[test]
