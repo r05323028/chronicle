@@ -2,9 +2,11 @@
 #![allow(clippy::result_large_err)]
 
 use crate::{
-    NormalizedRecorderConfig, RecorderEpochBoundary, RecorderLifecycleError,
-    RecorderOrchestrationError, RecorderOrchestrator, RecorderPoll, RecorderStartup,
-    RecorderStartupError, RecordingMetadata, RecordingStatus, write_recording_metadata,
+    EpochMetadata, LagSummary, MetadataCode, NormalizedRecorderConfig, QuotaStatus,
+    RecorderCounters, RecorderEpochBoundary, RecorderHealth, RecorderLifecycleError,
+    RecorderMetadataV1, RecorderOrchestrationError, RecorderOrchestrator, RecorderPoll,
+    RecorderReadiness, RecorderStartup, RecorderStartupError, RecordingMetadata, RecordingStatus,
+    write_recorder_metadata, write_recording_metadata,
 };
 use chronicle_capture::{CaptureError, CaptureSource};
 use chronicle_wal::WalError;
@@ -34,6 +36,8 @@ pub struct ContinuousRecorderService<S> {
     recorder: RecorderOrchestrator<S>,
     wal_directory: std::path::PathBuf,
     metadata: RecordingMetadata,
+    active_metadata: RecorderMetadataV1,
+    state_root: std::path::PathBuf,
 }
 
 impl<S: CaptureSource> ContinuousRecorderService<S> {
@@ -63,9 +67,10 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             resume_etl,
         )?;
         let wal_directory = wal_directory.as_ref().to_path_buf();
+        let recording_id = recorder.ingest().recording_id();
         let metadata = RecordingMetadata {
             version: crate::RECORDING_METADATA_SCHEMA_VERSION,
-            recording_id: recorder.ingest().recording_id(),
+            recording_id,
             selector: Some(crate::RecordingSelectorIdentity {
                 canonical_cgroup_path: config.scope.cgroup_path.display().to_string(),
                 cgroup_id: config.scope.cgroup_id,
@@ -79,11 +84,61 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         };
         write_recording_metadata(&wal_directory, &metadata)
             .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        let active_metadata = RecorderMetadataV1 {
+            version: crate::RECORDER_METADATA_SCHEMA_VERSION,
+            recorder_id: recording_id.0,
+            attempt_id: uuid::Uuid::new_v4(),
+            config_digest: config
+                .stable_digest()
+                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?,
+            scope: config.scope.clone(),
+            boot_clock_identity: "continuous-recorder".into(),
+            lifecycle: crate::RecorderLifecycleState::Running,
+            capture_readiness: RecorderReadiness::Ready,
+            processing_readiness: RecorderReadiness::Unknown,
+            health: RecorderHealth::Degraded,
+            current_epoch: Some(EpochMetadata {
+                ordinal: 0,
+                recording_id: recording_id.0,
+            }),
+            previous_epoch: None,
+            active_segment: None,
+            commit: None,
+            incremental_checkpoint: None,
+            lag: LagSummary {
+                records: 0,
+                bytes: 0,
+                age_seconds: 0,
+            },
+            quota: startup
+                .quota_authorities()
+                .iter()
+                .map(|authority| QuotaStatus {
+                    domain: authority.quota().domain.clone(),
+                    quota_bytes: authority.quota().quota_bytes,
+                    free_bytes: authority.quota().free_bytes,
+                    reserved_bytes: 0,
+                })
+                .collect(),
+            counters: RecorderCounters::default(),
+            recovery: Some(crate::RecoverySummary {
+                code: MetadataCode::CleanStart,
+                repaired_tail: false,
+            }),
+            shutdown: None,
+            failure: None,
+            updated_at_unix_seconds: unix_seconds(),
+            checksum: String::new(),
+        };
+        write_recorder_metadata(&config.state_root, &active_metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
         Ok(Self {
             startup,
             recorder,
             wal_directory,
             metadata,
+            active_metadata,
+            state_root: config.state_root.clone(),
         })
     }
 
@@ -113,6 +168,16 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         result
             .persist_metadata(&self.wal_directory, &mut self.metadata)
             .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        self.active_metadata.lifecycle = crate::RecorderLifecycleState::Stopped;
+        self.active_metadata.capture_readiness = RecorderReadiness::NotReady;
+        self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+        self.active_metadata.health = RecorderHealth::Degraded;
+        self.active_metadata.counters.committed_records = result.counters.committed.records;
+        self.active_metadata.counters.committed_bytes = result.counters.committed.bytes;
+        self.active_metadata.updated_at_unix_seconds = unix_seconds();
+        self.active_metadata.shutdown = Some(MetadataCode::None);
+        write_recorder_metadata(&self.state_root, &self.active_metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
         self.startup.stop()?;
         Ok(result)
     }
@@ -124,6 +189,12 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     pub fn recorder(&self) -> &RecorderOrchestrator<S> {
         &self.recorder
     }
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -211,6 +282,12 @@ mod tests {
             || Ok(()),
         )
         .unwrap();
+        assert_eq!(
+            crate::load_recorder_metadata(config(&root).state_root)
+                .unwrap()
+                .lifecycle,
+            crate::RecorderLifecycleState::Running
+        );
         let mut accepted = 0;
         while accepted < 4 {
             if matches!(
@@ -233,6 +310,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.status, crate::RecordingStatus::Completed);
+        assert_eq!(
+            crate::load_recorder_metadata(config(&root).state_root)
+                .unwrap()
+                .lifecycle,
+            crate::RecorderLifecycleState::Stopped
+        );
         drop(service);
         let registry = registry().unwrap();
         let published = process_and_publish_recording_wal(&wal, &output, &registry).unwrap();
