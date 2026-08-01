@@ -6,8 +6,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 VM=${1:-chronicle-ubuntu}
 SHA=$(git -C "$ROOT" rev-parse HEAD)
 [[ -z $(git -C "$ROOT" status --porcelain --untracked-files=all) ]] || {
-  printf '%s\n' 'host working tree must be clean' >&2
-  exit 1
+	printf '%s\n' 'host working tree must be clean' >&2
+	exit 1
 }
 
 VM_ROOT=/home/ubuntu/chronicle-acceptance
@@ -38,7 +38,7 @@ mkdir -p "$DEST"
 multipass transfer --recursive "$VM:$VM_ARTIFACTS/." "$DEST/"
 printf '%s\n' "$SHA" >"$DEST/tested-commit.txt"
 (
-  cd "$DEST"
-  sha256sum -c artifact-manifest.sha256
+	cd "$DEST"
+	sha256sum -c artifact-manifest.sha256
 )
 printf '%s\n' "Retained evidence: $DEST"
