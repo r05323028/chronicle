@@ -190,20 +190,91 @@ mod tests {
         );
         let root = std::env::temp_dir().join(format!("chronicle-pub-{}", std::process::id()));
         let checkpoint_path = root.join("checkpoint.json");
-        let mut value = checkpoint();
-        value.outputs.push(DeltaBatchReference {
-            key: key.clone(),
-            digest: key.strip_prefix("delta/").unwrap().into(),
-            first_marker_sequence: 0,
-            last_marker_sequence: 0,
-            bytes: batch.encode().unwrap().len() as u64,
-        });
+        let value = checkpoint_with_output(&key, &batch);
         let first =
             publish_delta_then_checkpoint(&store, key.clone(), &batch, &value, &checkpoint_path);
         assert!(first.is_ok());
         assert!(
             publish_delta_then_checkpoint(&store, key, &batch, &value, &checkpoint_path).is_ok()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn checkpoint_with_output(
+        key: &str,
+        batch: &CanonicalDeltaBatchV1,
+    ) -> IncrementalEtlCheckpointV1 {
+        let artifact = RecordingArtifact::new(
+            key,
+            RecordingArtifactKind::CanonicalDeltaBatch,
+            batch.encode().unwrap(),
+        )
+        .unwrap();
+        let mut value = checkpoint();
+        value.outputs.push(DeltaBatchReference {
+            key: key.into(),
+            digest: artifact.checksum,
+            first_marker_sequence: 0,
+            last_marker_sequence: 0,
+            bytes: batch.encode().unwrap().len() as u64,
+        });
+        value
+    }
+
+    #[test]
+    fn reconcile_adopts_orphan_output_and_repairs_missing_checkpoint() {
+        let store = InMemoryRecordingStore::default();
+        let batch = CanonicalDeltaBatchV1::new(0, 0, Vec::new()).unwrap();
+        let key = "delta/orphan";
+        let artifact = RecordingArtifact::new(
+            key,
+            RecordingArtifactKind::CanonicalDeltaBatch,
+            batch.encode().unwrap(),
+        )
+        .unwrap();
+        store.put_if_absent(artifact).unwrap();
+        let root = std::env::temp_dir().join(format!("chronicle-reconcile-{}", std::process::id()));
+        let checkpoint_path = root.join("checkpoint.json");
+        let value = checkpoint_with_output(key, &batch);
+        assert_eq!(
+            reconcile_delta_checkpoint(&store, key, &value, &checkpoint_path).unwrap(),
+            ReconcileOutcome::RepairedCheckpoint
+        );
+        assert_eq!(
+            read_checkpoint(&checkpoint_path).unwrap().encode().unwrap(),
+            value.encode().unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconcile_rejects_corrupt_or_forked_checkpoint() {
+        let store = InMemoryRecordingStore::default();
+        let batch = CanonicalDeltaBatchV1::new(0, 0, Vec::new()).unwrap();
+        let key = "delta/fork";
+        let artifact = RecordingArtifact::new(
+            key,
+            RecordingArtifactKind::CanonicalDeltaBatch,
+            batch.encode().unwrap(),
+        )
+        .unwrap();
+        store.put_if_absent(artifact).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("chronicle-reconcile-fork-{}", std::process::id()));
+        let checkpoint_path = root.join("checkpoint.json");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&checkpoint_path, b"not-json").unwrap();
+        let value = checkpoint_with_output(key, &batch);
+        assert!(matches!(
+            reconcile_delta_checkpoint(&store, key, &value, &checkpoint_path),
+            Err(PublicationError::Checkpoint(CheckpointError::Parse))
+        ));
+        let fork = checkpoint();
+        std::fs::write(&checkpoint_path, fork.encode().unwrap()).unwrap();
+        assert!(matches!(
+            reconcile_delta_checkpoint(&store, key, &value, &checkpoint_path),
+            Err(PublicationError::OutputLineage)
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

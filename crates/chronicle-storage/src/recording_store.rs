@@ -681,18 +681,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filesystem_publication_is_private_and_idempotent() {
-        let root =
-            std::env::temp_dir().join(format!("chronicle-recording-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = FilesystemRecordingStore::new(&root);
+    fn recording_store_conformance(store: &dyn RecordingStore) {
         let artifact = RecordingArtifact::new(
-            "delta/0001",
+            "conformance/delta-0001",
             RecordingArtifactKind::CanonicalDeltaBatch,
             b"bytes".to_vec(),
         )
         .unwrap();
+        let digest = artifact.checksum.clone();
         assert_eq!(
             store.put_if_absent(artifact.clone()).unwrap(),
             PutIfAbsent::Created
@@ -701,8 +697,43 @@ mod tests {
             store.put_if_absent(artifact.clone()).unwrap(),
             PutIfAbsent::AlreadyExistsMatching
         );
-        assert_eq!(store.get("delta/0001").unwrap(), artifact);
-        assert_eq!(store.list("delta/", 10).unwrap().len(), 1);
+        assert_eq!(store.head(&artifact.key).unwrap().checksum, digest);
+        assert_eq!(store.get(&artifact.key).unwrap(), artifact);
+        assert_eq!(store.list("conformance/", 10).unwrap().len(), 1);
+        assert_eq!(
+            store.delete_if_digest(&artifact.key, "wrong").unwrap(),
+            DeleteIfDigest::DigestMismatch
+        );
+        assert_eq!(
+            store.tombstone_if_digest(&artifact.key, &digest).unwrap(),
+            DeleteIfDigest::Deleted
+        );
+        assert_eq!(store.get(&artifact.key), Err(RecordingStoreError::NotFound));
+        assert_eq!(
+            store.put_if_absent(
+                RecordingArtifact::new(
+                    artifact.key,
+                    RecordingArtifactKind::CanonicalDeltaBatch,
+                    b"new".to_vec(),
+                )
+                .unwrap()
+            ),
+            Err(RecordingStoreError::Conflict)
+        );
+    }
+
+    #[test]
+    fn in_memory_store_matches_recording_store_contract() {
+        recording_store_conformance(&InMemoryRecordingStore::default());
+    }
+
+    #[test]
+    fn filesystem_store_matches_recording_store_contract() {
+        let root =
+            std::env::temp_dir().join(format!("chronicle-recording-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = FilesystemRecordingStore::new(&root);
+        recording_store_conformance(&store);
         assert_eq!(store.recover_staging().unwrap(), 0);
         let _ = std::fs::remove_dir_all(root);
     }
