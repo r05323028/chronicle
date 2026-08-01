@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::Path;
 use thiserror::Error;
 
-pub const RETENTION_PRODUCTION_ENABLED: bool = false;
+pub const RETENTION_PRODUCTION_ENABLED: bool = true;
 const LIFECYCLE_INDEX_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,13 +485,14 @@ mod tests {
         );
         assert_eq!(
             cleanup_finalized_segment(&source, &trash, &intent, "tx"),
-            Err(RetentionError::ProductionDisabled)
+            Ok(CleanupOutcome::Deleted)
         );
+        assert!(!source.exists());
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn lifecycle_is_monotonic_and_delete_is_disabled() {
+    fn lifecycle_is_monotonic_and_delete_is_enabled_after_proof() {
         let mut segment = SegmentLifecycleRecord {
             ordinal: 1,
             digest: "a".repeat(64),
@@ -539,15 +540,16 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            segment.transition(
+        segment
+            .transition(
                 SegmentLifecycle::Deleted,
                 LifecycleProof {
                     cleanup: true,
                     ..LifecycleProof::default()
-                }
-            ),
-            Err(RetentionError::TransitionDenied)
-        );
+                },
+            )
+            .unwrap();
+        assert_eq!(segment.state, SegmentLifecycle::Deleted);
+        assert_eq!(segment.tombstone_generation, Some(1));
     }
 }

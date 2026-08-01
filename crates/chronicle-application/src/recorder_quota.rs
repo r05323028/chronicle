@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 use thiserror::Error;
 
-pub const QUOTA_ENFORCEMENT_ENABLED: bool = false;
+pub const QUOTA_ENFORCEMENT_ENABLED: bool = true;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DomainQuota {
@@ -130,5 +130,21 @@ mod tests {
         assert_eq!(authority.reserved_bytes().unwrap(), 25);
         authority.release(ReservationKind::Wal, 20).unwrap();
         assert_eq!(authority.reserved_bytes().unwrap(), 5);
+    }
+
+    #[test]
+    fn enforcement_preserves_minimum_free_headroom() {
+        let authority = QuotaReservationAuthority::new(DomainQuota {
+            domain: "domain".into(),
+            quota_bytes: 100,
+            minimum_free_bytes: 10,
+            free_bytes: 100,
+        })
+        .unwrap();
+        authority.reserve(ReservationKind::Wal, 90).unwrap();
+        assert_eq!(
+            authority.reserve(ReservationKind::Trash, 1),
+            Err(QuotaError::InsufficientHeadroom)
+        );
     }
 }
