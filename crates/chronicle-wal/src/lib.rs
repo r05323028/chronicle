@@ -1124,6 +1124,16 @@ pub struct CommittedSnapshot {
     pub committed_payload_bytes: u64,
 }
 
+/// Marker-capped WAL records for recorder-owned incremental ETL.
+///
+/// Snapshot read never acquires or mutates the writer lock. A mutable suffix
+/// returns retryable uncertainty instead of exposing records to ETL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedRecordSnapshot {
+    pub snapshot: CommittedSnapshot,
+    pub envelopes: Vec<WalRecordEnvelope>,
+}
+
 /// Reads a marker-capped snapshot without taking the writer lock or mutating WAL.
 /// Mutable suffixes are reported as retryable uncertainty.
 pub fn read_committed_snapshot(
@@ -1133,6 +1143,14 @@ pub fn read_committed_snapshot(
 ) -> Result<CommittedSnapshot, WalError> {
     let wal_directory = wal_directory.as_ref();
     let scan = scan_wal_unlocked(wal_directory, recording_id, max_record_bytes)?;
+    committed_snapshot_from_scan(wal_directory, recording_id, &scan)
+}
+
+fn committed_snapshot_from_scan(
+    wal_directory: &Path,
+    recording_id: RecordingId,
+    scan: &RecoveryScan,
+) -> Result<CommittedSnapshot, WalError> {
     if scan.partial_tail.is_some() || !scan.uncommitted.is_empty() {
         return Err(WalError::RetryableSnapshotUncertainty);
     }
@@ -1148,7 +1166,7 @@ pub fn read_committed_snapshot(
         })?;
     let marker_bytes = encode_envelope(marker)?;
     let marker_digest = Sha256::digest(marker_bytes).into();
-    let input_digest = verified_snapshot_sha256(wal_directory, &scan)?;
+    let input_digest = verified_snapshot_sha256(wal_directory, scan)?;
     let segment_count = usize::try_from(provenance.segment_ordinal)
         .ok()
         .and_then(|ordinal| ordinal.checked_add(1))
@@ -1167,6 +1185,24 @@ pub fn read_committed_snapshot(
         segment_count,
         committed_record_count: scan.authority.durable_record_count,
         committed_payload_bytes: scan.authority.durable_payload_bytes,
+    })
+}
+
+/// Reads committed envelopes together with their verified snapshot authority.
+pub fn read_committed_snapshot_with_records(
+    wal_directory: impl AsRef<Path>,
+    recording_id: RecordingId,
+    max_record_bytes: usize,
+) -> Result<CommittedRecordSnapshot, WalError> {
+    let wal_directory = wal_directory.as_ref();
+    let scan = scan_wal_unlocked(wal_directory, recording_id, max_record_bytes)?;
+    if scan.partial_tail.is_some() || !scan.uncommitted.is_empty() {
+        return Err(WalError::RetryableSnapshotUncertainty);
+    }
+    let snapshot = committed_snapshot_from_scan(wal_directory, recording_id, &scan)?;
+    Ok(CommittedRecordSnapshot {
+        snapshot,
+        envelopes: scan.committed,
     })
 }
 
@@ -3500,6 +3536,18 @@ mod tests {
             read_committed_snapshot(&directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(snapshot.marker_sequence, 2);
         assert_eq!(snapshot.committed_record_count, 1);
+        let records = read_committed_snapshot_with_records(
+            &directory,
+            recording_id,
+            DEFAULT_MAX_RECORD_BYTES,
+        )
+        .unwrap();
+        assert_eq!(records.snapshot, snapshot);
+        assert_eq!(records.envelopes.len(), 2);
+        assert_eq!(
+            records.envelopes.last().unwrap().sequence,
+            snapshot.marker_sequence
+        );
         writer
             .append(RecordKind::CaptureEvent, 1, 0, b"pending".to_vec(), 11)
             .unwrap();

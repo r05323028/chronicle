@@ -223,6 +223,18 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     pub fn recorder(&self) -> &RecorderOrchestrator<S> {
         &self.recorder
     }
+
+    /// Read only the durable WAL prefix for incremental ETL. Never repairs or
+    /// acquires the recorder-owned WAL lock.
+    pub fn committed_snapshot(
+        &self,
+    ) -> Result<chronicle_wal::CommittedRecordSnapshot, ContinuousRecorderError> {
+        Ok(chronicle_wal::read_committed_snapshot_with_records(
+            &self.wal_directory,
+            self.recorder.ingest().recording_id(),
+            chronicle_wal::DEFAULT_MAX_RECORD_BYTES,
+        )?)
+    }
 }
 
 fn unix_seconds() -> u64 {
@@ -349,6 +361,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.status, crate::RecordingStatus::Completed);
+        let snapshot = service.committed_snapshot().unwrap();
+        assert!(snapshot.snapshot.committed_record_count > 0);
+        assert_eq!(
+            snapshot.envelopes.last().unwrap().sequence,
+            snapshot.snapshot.marker_sequence
+        );
         let stopped = crate::load_recorder_metadata(config(&root).state_root).unwrap();
         assert_eq!(stopped.lifecycle, crate::RecorderLifecycleState::Stopped);
         assert_eq!(
