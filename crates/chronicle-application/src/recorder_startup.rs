@@ -1,8 +1,9 @@
 //! Ordered pre-ETL recorder startup.
 
 use crate::{
-    NormalizedRecorderConfig, RecorderHealth, RecorderLease, RecorderLeaseError, RecorderLifecycle,
-    RecorderLifecycleError, RecorderReadiness,
+    DomainQuota, NormalizedRecorderConfig, QuotaError, QuotaReservationAuthority, RecorderHealth,
+    RecorderLease, RecorderLeaseError, RecorderLifecycle, RecorderLifecycleError,
+    RecorderReadiness,
 };
 use thiserror::Error;
 
@@ -16,11 +17,18 @@ pub enum RecorderStartupError {
     Recovery,
     #[error("recorder capture attachment failed")]
     CaptureAttach,
+    #[error("recorder quota reservation failed")]
+    Quota(#[from] QuotaError),
+    #[error("recorder appendable epoch establishment failed")]
+    Appendable,
+    #[error("recorder incremental ETL resume failed")]
+    EtlResume,
 }
 
 pub struct RecorderStartup {
     lease: RecorderLease,
     lifecycle: RecorderLifecycle,
+    quotas: Vec<QuotaReservationAuthority>,
 }
 
 impl RecorderStartup {
@@ -43,7 +51,69 @@ impl RecorderStartup {
             return Err(RecorderStartupError::CaptureAttach);
         }
         lifecycle.running(RecorderReadiness::Unknown)?;
-        Ok(Self { lease, lifecycle })
+        Ok(Self {
+            lease,
+            lifecycle,
+            quotas: Vec::new(),
+        })
+    }
+
+    /// Completes startup after retention/quota activation. Recovery includes
+    /// state, WAL, manifest, checkpoint, and cleanup reconciliation; ETL is
+    /// resumed only after capture is attached and appendability is durable.
+    pub fn start_post_foundation(
+        config: &NormalizedRecorderConfig,
+        recover_foundation: impl FnOnce() -> Result<(), RecorderStartupError>,
+        reserve_quota: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
+        establish_appendable: impl FnOnce() -> Result<(), RecorderStartupError>,
+        attach_capture: impl FnOnce() -> Result<(), RecorderStartupError>,
+        resume_etl: impl FnOnce() -> Result<(), RecorderStartupError>,
+    ) -> Result<Self, RecorderStartupError> {
+        let lease = RecorderLease::acquire(config)?;
+        let mut lifecycle = RecorderLifecycle::new();
+        lifecycle.begin_recovery()?;
+        if let Err(error) = recover_foundation() {
+            lifecycle.fail();
+            return Err(error);
+        }
+        let quotas = config
+            .domains
+            .iter()
+            .map(|domain| {
+                QuotaReservationAuthority::new(DomainQuota {
+                    domain: domain.identity.canonical_root.clone(),
+                    quota_bytes: domain.quota_bytes,
+                    minimum_free_bytes: domain.minimum_free_bytes,
+                    free_bytes: domain.quota_bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Err(error) = reserve_quota(&quotas) {
+            lifecycle.fail();
+            return Err(error);
+        }
+        if let Err(error) = establish_appendable() {
+            lifecycle.fail();
+            return Err(error);
+        }
+        if let Err(error) = attach_capture() {
+            lifecycle.fail();
+            return Err(error);
+        }
+        if let Err(error) = resume_etl() {
+            lifecycle.fail();
+            return Err(error);
+        }
+        lifecycle.running(RecorderReadiness::Ready)?;
+        Ok(Self {
+            lease,
+            lifecycle,
+            quotas,
+        })
+    }
+
+    pub fn quota_authorities(&self) -> &[QuotaReservationAuthority] {
+        &self.quotas
     }
 
     pub fn lifecycle(&self) -> &RecorderLifecycle {
@@ -122,6 +192,111 @@ mod tests {
         }
         .normalize()
         .unwrap()
+    }
+
+    #[test]
+    fn post_foundation_startup_orders_recovery_quota_append_capture_etl() {
+        let root =
+            std::env::temp_dir().join(format!("chronicle-post-startup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let record = |name: &'static str, order: &Arc<Mutex<Vec<&'static str>>>| {
+            order.lock().unwrap().push(name);
+        };
+        let recovery_order = Arc::clone(&order);
+        let quota_order = Arc::clone(&order);
+        let append_order = Arc::clone(&order);
+        let attach_order = Arc::clone(&order);
+        let etl_order = Arc::clone(&order);
+        let startup = RecorderStartup::start_post_foundation(
+            &config(&root),
+            move || {
+                record("recover", &recovery_order);
+                Ok(())
+            },
+            move |quotas| {
+                assert_eq!(quotas.len(), 1);
+                record("quota", &quota_order);
+                Ok(())
+            },
+            move || {
+                record("appendable", &append_order);
+                Ok(())
+            },
+            move || {
+                record("attach", &attach_order);
+                Ok(())
+            },
+            move || {
+                record("etl", &etl_order);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["recover", "quota", "appendable", "attach", "etl"]
+        );
+        assert!(startup.capture_ready());
+        assert_eq!(startup.processing_ready(), RecorderReadiness::Ready);
+        assert_eq!(startup.health(), RecorderHealth::Healthy);
+        assert_eq!(startup.quota_authorities().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn post_foundation_failure_stops_before_later_steps() {
+        let expected = ["recover", "quota", "appendable", "attach", "etl"];
+        for failed in expected {
+            let root = std::env::temp_dir().join(format!(
+                "chronicle-post-failure-{failed}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let make_step = |name: &'static str, order: &Arc<Mutex<Vec<&'static str>>>| {
+                let order = Arc::clone(order);
+                move || {
+                    order.lock().unwrap().push(name);
+                    if failed == name {
+                        return Err(match name {
+                            "recover" => RecorderStartupError::Recovery,
+                            "appendable" => RecorderStartupError::Appendable,
+                            "attach" => RecorderStartupError::CaptureAttach,
+                            _ => RecorderStartupError::EtlResume,
+                        });
+                    }
+                    Ok(())
+                }
+            };
+            let recovery = make_step("recover", &order);
+            let quota = Arc::clone(&order);
+            let appendable = make_step("appendable", &order);
+            let attach = make_step("attach", &order);
+            let etl = make_step("etl", &order);
+            let result = RecorderStartup::start_post_foundation(
+                &config(&root),
+                recovery,
+                move |_| {
+                    quota.lock().unwrap().push("quota");
+                    if failed == "quota" {
+                        Err(RecorderStartupError::Quota(
+                            QuotaError::InsufficientHeadroom,
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                appendable,
+                attach,
+                etl,
+            );
+            assert!(result.is_err());
+            let steps = order.lock().unwrap().clone();
+            let end = expected.iter().position(|step| *step == failed).unwrap() + 1;
+            assert_eq!(steps.as_slice(), &expected[..end]);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
