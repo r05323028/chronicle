@@ -156,12 +156,22 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         Ok(self.recorder.poll(now_millis)?)
     }
 
+    fn sync_active_progress(&mut self) {
+        let counters = self.recorder.ingest().counters();
+        self.active_metadata.counters.captured_records = counters.accepted_into_queue.records;
+        self.active_metadata.counters.captured_bytes = counters.accepted_into_queue.bytes;
+        self.active_metadata.counters.committed_records = counters.committed.records;
+        self.active_metadata.counters.committed_bytes = counters.committed.bytes;
+        self.active_metadata.updated_at_unix_seconds = unix_seconds();
+    }
+
     pub fn rollover(
         &mut self,
         now_millis: u64,
         outcome_path: impl AsRef<Path>,
     ) -> Result<RecorderEpochBoundary, ContinuousRecorderError> {
         let boundary = self.recorder.rollover(now_millis, outcome_path)?;
+        self.sync_active_progress();
         let recording_id = self.recorder.ingest().recording_id().0;
         self.active_metadata.previous_epoch = Some(EpochMetadata {
             ordinal: boundary.old_epoch_ordinal,
@@ -191,6 +201,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         result
             .persist_metadata(&self.wal_directory, &mut self.metadata)
             .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        self.sync_active_progress();
         self.active_metadata.lifecycle = crate::RecorderLifecycleState::Stopped;
         self.active_metadata.capture_readiness = RecorderReadiness::NotReady;
         self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
@@ -328,6 +339,8 @@ mod tests {
         let active = crate::load_recorder_metadata(config(&root).state_root).unwrap();
         assert_eq!(active.current_epoch.unwrap().ordinal, 2);
         assert_eq!(active.previous_epoch.unwrap().ordinal, 1);
+        assert_eq!(active.counters.captured_records, 2);
+        assert_eq!(active.counters.committed_records, 0);
         let result = service
             .shutdown(
                 crate::ShutdownReason::SourceCompleted,
@@ -336,11 +349,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.status, crate::RecordingStatus::Completed);
+        let stopped = crate::load_recorder_metadata(config(&root).state_root).unwrap();
+        assert_eq!(stopped.lifecycle, crate::RecorderLifecycleState::Stopped);
         assert_eq!(
-            crate::load_recorder_metadata(config(&root).state_root)
-                .unwrap()
-                .lifecycle,
-            crate::RecorderLifecycleState::Stopped
+            stopped.counters.committed_records,
+            result.counters.committed.records
         );
         drop(service);
         let registry = registry().unwrap();
