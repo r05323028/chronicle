@@ -59,6 +59,7 @@ fn bpftool_ids(kind: &str) -> Result<BTreeSet<u32>, Box<dyn std::error::Error>> 
 
 #[test]
 #[ignore = "requires root, cgroup v2, BTF, and Ubuntu 24.04/Linux 6.8.0-136-generic/aarch64"]
+#[allow(clippy::too_many_lines)]
 fn ipv4_connect_and_active_establish_emit_capture_events() -> Result<(), Box<dyn std::error::Error>>
 {
     assert_eq!(std::env::consts::ARCH, "aarch64");

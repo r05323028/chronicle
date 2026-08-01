@@ -363,6 +363,7 @@ impl Drop for ServerGuard {
 
 #[test]
 #[ignore = "requires root, cgroup v2, BTF, and a prebuilt feasibility eBPF object"]
+#[allow(clippy::too_many_lines)]
 fn privileged_feasibility() -> Result<(), Box<dyn Error>> {
     require_supported_host()?;
     let object = feasibility_object();
@@ -579,7 +580,10 @@ fn dynamic_cap(mode: &str) -> Option<usize> {
 
 fn dynamic_pattern(length: usize) -> Vec<u8> {
     (0..length)
-        .map(|index| ((index * 73 + length * 29) % 251 + 1) as u8)
+        .map(|index| {
+            u8::try_from((index * 73 + length * 29) % 251 + 1)
+                .expect("dynamic pattern byte is bounded")
+        })
         .collect()
 }
 
@@ -595,11 +599,11 @@ fn run_dynamic_matrix<T: std::borrow::Borrow<aya::maps::MapData>>(
         ]
     };
     let script = format!(
-        r#"import socket
+        r"import socket
 listener = socket.socket(); listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 listener.bind(('127.0.0.1', 0)); listener.listen({})
 print(listener.getsockname()[1], flush=True)
-for expected in {}:
+for expected in {:?}:
     conn, _ = listener.accept()
     data = b''
     while len(data) < expected:
@@ -608,9 +612,9 @@ for expected in {}:
         data += chunk
     if len(data) != expected: raise RuntimeError((expected, len(data)))
     conn.close()
-"#,
+",
         lengths.len(),
-        format!("{:?}", lengths),
+        lengths,
     );
     let mut server = Command::new("python3")
         .args(["-u", "-c", &script])
@@ -657,8 +661,10 @@ fn validate_dynamic_matrix(
             .iter()
             .find(|record| record.payload == expected[..declared])
             .ok_or_else(|| io::Error::other(format!("matrix payload {length} missing")))?;
-        if record.header.observed_len != length as u32
-            || record.header.payload_len != declared as u32
+        let expected_len = u32::try_from(length).expect("matrix length is bounded");
+        let declared_len = u32::try_from(declared).expect("matrix length is bounded");
+        if record.header.observed_len != expected_len
+            || record.header.payload_len != declared_len
             || record.header.payload_offset != 0
             || record.payload.len() != declared
         {
@@ -1420,10 +1426,12 @@ fn require_supported_host() -> Result<(), Box<dyn Error>> {
 }
 
 fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
-    Ok(Sha256::digest(fs::read(path)?)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(fs::read(path)?) {
+        std::fmt::Write::write_fmt(&mut output, format_args!("{byte:02x}"))
+            .expect("writing to String cannot fail");
+    }
+    Ok(output)
 }
 
 fn feasibility_object() -> PathBuf {
