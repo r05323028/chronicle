@@ -22,9 +22,10 @@ pub use manifest::{
     write_manifest_atomic,
 };
 pub use retention::{
-    CleanupIntent, CleanupOutcome, LifecycleEpochEntry, LifecycleIndexV1, LifecycleProof,
-    RETENTION_PRODUCTION_ENABLED, RetentionError, SegmentLifecycleRecord,
-    cleanup_finalized_segment,
+    CleanupFault, CleanupIntent, CleanupOutcome, LifecycleEpochEntry, LifecycleIndexV1,
+    LifecycleProof, RETENTION_PRODUCTION_ENABLED, RetentionError, SegmentLifecycleRecord,
+    cleanup_finalized_segment, cleanup_finalized_segment_verified,
+    cleanup_finalized_segment_with_policy, recover_cleanup, recover_cleanup_with_policy,
 };
 
 pub const WAL_FORMAT_VERSION: u16 = 1;
