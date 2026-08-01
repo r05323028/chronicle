@@ -740,7 +740,7 @@ pub fn record_live_ebpf(
     allow_shared_cgroup: bool,
     wal_directory: impl AsRef<Path>,
     bounds: ProductionRecordingBounds,
-    stop: ProductionSignalStop,
+    stop: &ProductionSignalStop,
 ) -> Result<ProductionRecordingResult, ApplicationError> {
     preflight_wal_destination(wal_directory.as_ref(), bounds)?;
     preflight_embedded_ebpf()?;
@@ -790,12 +790,13 @@ pub fn record_live_ebpf(
 
 /// Runs capture through the continuous startup/rollover/drain runtime.
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[allow(clippy::too_many_lines)]
 pub fn record_continuous_ebpf(
     selector: CgroupSelector,
     allow_shared_cgroup: bool,
     config: &NormalizedRecorderConfig,
     wal_directory: impl AsRef<Path>,
-    stop: ProductionSignalStop,
+    stop: &ProductionSignalStop,
 ) -> Result<ProductionRecordingResult, ApplicationError> {
     let wal_directory = wal_directory.as_ref();
     if matches!(&selector, CgroupSelector::Pid(_)) && allow_shared_cgroup {
@@ -855,11 +856,9 @@ pub fn record_continuous_ebpf(
         .set_capture_metadata(capture_metadata)
         .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
     let mut epoch_started = Instant::now();
-    let mut reason = ShutdownReason::SourceCompleted;
-    loop {
+    let reason = loop {
         if let Some(requested) = stop.shutdown_reason() {
-            reason = requested;
-            break;
+            break requested;
         }
         let now = monotonic_millis();
         let _ = service
@@ -880,7 +879,7 @@ pub fn record_continuous_ebpf(
         } else {
             std::thread::sleep(Duration::from_millis(5));
         }
-    }
+    };
     let result = service
         .shutdown(
             reason,

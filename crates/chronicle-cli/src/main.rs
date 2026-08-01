@@ -355,7 +355,7 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
                     recorder_config.scope.shared_scope_acknowledged,
                     &recorder_config,
                     &wal_dir,
-                    stop,
+                    &stop,
                 )?;
                 let metadata = load_recording_metadata(&wal_dir)?.ok_or(
                     ApplicationError::RecordingMetadataValidation(
@@ -488,7 +488,7 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
                 let stop = ProductionSignalStop::default();
                 spawn_signal_watcher(stop.clone(), wal_dir.clone());
                 let result =
-                    record_live_ebpf(selector, allow_shared_cgroup, &wal_dir, bounds, stop)?;
+                    record_live_ebpf(selector, allow_shared_cgroup, &wal_dir, bounds, &stop)?;
                 let metadata = load_recording_metadata(&wal_dir)?.ok_or(
                     ApplicationError::RecordingMetadataValidation(
                         "recording metadata missing after finalization".into(),
