@@ -136,10 +136,11 @@ fn embedded_object_checks() -> (PreflightCheck, PreflightCheck) {
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
 fn required_file(path: &str, reason: &'static str) -> PreflightCheck {
-    std::path::Path::new(path)
-        .is_file()
-        .then_some(PreflightCheck::Available)
-        .unwrap_or(PreflightCheck::Unavailable(reason))
+    if std::path::Path::new(path).is_file() {
+        PreflightCheck::Available
+    } else {
+        PreflightCheck::Unavailable(reason)
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]

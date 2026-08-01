@@ -2,6 +2,8 @@ use crate::{adapter::CaptureAdapter, error::EbpfCaptureError};
 use chronicle_capture::{CaptureError, CaptureSource};
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
 use sha2::{Digest, Sha256};
+#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+use std::fmt::Write as _;
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use crate::abi::{RawKernelObservation, RawLossCounters, decode_raw_kernel_observation};
@@ -15,12 +17,11 @@ const EMBEDDED_OBJECT: &[u8] =
 /// SHA-256 identity for metadata; unavailable on unsupported object targets.
 #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
 pub fn embedded_object_sha256() -> Option<String> {
-    Some(
-        Sha256::digest(EMBEDDED_OBJECT)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    )
+    let mut output = String::with_capacity(EMBEDDED_OBJECT.len() * 2);
+    for byte in Sha256::digest(EMBEDDED_OBJECT) {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Some(output)
 }
 
 #[cfg(not(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little")))]
