@@ -161,7 +161,20 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         now_millis: u64,
         outcome_path: impl AsRef<Path>,
     ) -> Result<RecorderEpochBoundary, ContinuousRecorderError> {
-        Ok(self.recorder.rollover(now_millis, outcome_path)?)
+        let boundary = self.recorder.rollover(now_millis, outcome_path)?;
+        let recording_id = self.recorder.ingest().recording_id().0;
+        self.active_metadata.previous_epoch = Some(EpochMetadata {
+            ordinal: boundary.old_epoch_ordinal,
+            recording_id,
+        });
+        self.active_metadata.current_epoch = Some(EpochMetadata {
+            ordinal: boundary.new_epoch_ordinal,
+            recording_id,
+        });
+        self.active_metadata.updated_at_unix_seconds = unix_seconds();
+        write_recorder_metadata(&self.state_root, &self.active_metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        Ok(boundary)
     }
 
     pub fn shutdown(
@@ -312,6 +325,9 @@ mod tests {
                 }
             }
         }
+        let active = crate::load_recorder_metadata(config(&root).state_root).unwrap();
+        assert_eq!(active.current_epoch.unwrap().ordinal, 2);
+        assert_eq!(active.previous_epoch.unwrap().ordinal, 1);
         let result = service
             .shutdown(
                 crate::ShutdownReason::SourceCompleted,

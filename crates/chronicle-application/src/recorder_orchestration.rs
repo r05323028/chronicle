@@ -209,6 +209,10 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
         &self.ingest
     }
 
+    pub fn epoch_ordinal(&self) -> u64 {
+        self.epoch_ordinal
+    }
+
     pub fn ingest_mut(&mut self) -> &mut RecordingIngest {
         &mut self.ingest
     }
