@@ -13,6 +13,20 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+mod manifest;
+mod retention;
+pub use manifest::{
+    CheckpointReference, ManifestError, ManifestPolicy, ManifestRetention, MarkerSummary,
+    SegmentDeletion, SegmentLifecycle, WAL_MANIFEST_FILE, WAL_MANIFEST_SCHEMA_VERSION,
+    WalManifestSegment, WalManifestV1, capture_sealed_segment, load_manifest, rebuild_manifest,
+    write_manifest_atomic,
+};
+pub use retention::{
+    CleanupIntent, CleanupOutcome, LifecycleEpochEntry, LifecycleIndexV1, LifecycleProof,
+    RETENTION_PRODUCTION_ENABLED, RetentionError, SegmentLifecycleRecord,
+    cleanup_finalized_segment,
+};
+
 pub const WAL_FORMAT_VERSION: u16 = 1;
 pub const SEGMENT_HEADER_VERSION: u16 = 1;
 pub const SEGMENT_HEADER_LEN: usize = 64;
@@ -29,6 +43,7 @@ pub const COMMIT_MARKER_PAYLOAD_LEN: usize = 76;
 pub const COMMIT_MARKER_FRAME_LEN: usize = ENVELOPE_HEADER_LEN + COMMIT_MARKER_PAYLOAD_LEN;
 pub const GROUP_COMMIT_BYTES: u64 = 4 * 1024 * 1024;
 pub const GROUP_COMMIT_INTERVAL_MILLIS: u64 = 10;
+pub const DEFAULT_SEGMENT_AGE_MILLIS: u64 = 5 * 60 * 1_000;
 pub const DEFAULT_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 pub const MIN_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -211,6 +226,8 @@ pub enum ReadOutcome {
 pub enum WalError {
     #[error("WAL I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
     #[error("invalid WAL magic at byte offset {offset}")]
     InvalidMagic { offset: u64 },
     #[error("invalid WAL segment magic")]
@@ -294,6 +311,8 @@ pub enum WalError {
     NoActiveSegment,
     #[error("segment size must be between 16 MiB and 4 GiB")]
     InvalidSegmentSizeRange,
+    #[error("segment age must be greater than zero")]
+    InvalidSegmentAge,
     #[error("WAL envelope recording ID does not match writer")]
     WriterRecordingIdMismatch,
     #[error("WAL envelope already has segment provenance")]
@@ -307,6 +326,8 @@ pub enum WalError {
     },
     #[error("WAL segment publication is unsupported on this platform")]
     UnsupportedSegmentPublication,
+    #[error("live WAL snapshot is uncertain and should be retried")]
+    RetryableSnapshotUncertainty,
     #[error("WAL segment ordinal space is exhausted")]
     SegmentOrdinalExhausted,
     #[error("commit marker payload must be exactly 76 bytes; got {actual}")]
@@ -1088,6 +1109,66 @@ pub fn scan_wal(
 }
 
 /// Hashes exact verified WAL v1 segment bytes through final authoritative commit marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedSnapshot {
+    pub recording_id: RecordingId,
+    pub marker_sequence: u64,
+    pub durable_through_sequence: u64,
+    pub marker_segment_ordinal: u64,
+    pub marker_byte_offset: u64,
+    pub marker_digest: [u8; 32],
+    pub input_digest: [u8; 32],
+    pub segment_count: usize,
+    pub committed_record_count: u64,
+    pub committed_payload_bytes: u64,
+}
+
+/// Reads a marker-capped snapshot without taking the writer lock or mutating WAL.
+/// Mutable suffixes are reported as retryable uncertainty.
+pub fn read_committed_snapshot(
+    wal_directory: impl AsRef<Path>,
+    recording_id: RecordingId,
+    max_record_bytes: usize,
+) -> Result<CommittedSnapshot, WalError> {
+    let wal_directory = wal_directory.as_ref();
+    let scan = scan_wal_unlocked(wal_directory, recording_id, max_record_bytes)?;
+    if scan.partial_tail.is_some() || !scan.uncommitted.is_empty() {
+        return Err(WalError::RetryableSnapshotUncertainty);
+    }
+    let marker = scan
+        .final_marker
+        .as_ref()
+        .ok_or(WalError::NoAuthoritativeCommit)?;
+    let provenance = marker
+        .provenance
+        .as_ref()
+        .ok_or(WalError::MissingProvenance {
+            sequence: marker.sequence,
+        })?;
+    let marker_bytes = encode_envelope(marker)?;
+    let marker_digest = Sha256::digest(marker_bytes).into();
+    let input_digest = verified_snapshot_sha256(wal_directory, &scan)?;
+    let segment_count = usize::try_from(provenance.segment_ordinal)
+        .ok()
+        .and_then(|ordinal| ordinal.checked_add(1))
+        .ok_or(WalError::CommitArithmeticOverflow)?;
+    Ok(CommittedSnapshot {
+        recording_id,
+        marker_sequence: marker.sequence,
+        durable_through_sequence: scan
+            .authority
+            .durable_through_sequence
+            .ok_or(WalError::NoAuthoritativeCommit)?,
+        marker_segment_ordinal: provenance.segment_ordinal,
+        marker_byte_offset: provenance.byte_offset,
+        marker_digest,
+        input_digest,
+        segment_count,
+        committed_record_count: scan.authority.durable_record_count,
+        committed_payload_bytes: scan.authority.durable_payload_bytes,
+    })
+}
+
 pub fn verified_snapshot_sha256(
     wal_directory: impl AsRef<Path>,
     scan: &RecoveryScan,
@@ -1301,6 +1382,7 @@ pub struct SegmentedEnvelopeWriter {
     segment_ordinal: Option<u64>,
     segment_first_sequence: u64,
     segment_bytes: u64,
+    segment_started_millis: Option<u64>,
     last_sequence: Option<u64>,
     #[cfg(test)]
     fault: Option<SegmentPublishFault>,
@@ -1360,6 +1442,7 @@ impl SegmentedEnvelopeWriter {
                 segment_ordinal: None,
                 segment_first_sequence: 0,
                 segment_bytes: 0,
+                segment_started_millis: None,
                 last_sequence: None,
                 #[cfg(test)]
                 fault: None,
@@ -1377,6 +1460,7 @@ impl SegmentedEnvelopeWriter {
         max_segment_bytes: u64,
         max_total_bytes: u64,
         final_marker: &WalRecordEnvelope,
+        now_millis: u64,
     ) -> Result<Self, WalError> {
         if !(MIN_SEGMENT_BYTES..=MAX_SEGMENT_BYTES).contains(&max_segment_bytes) {
             return Err(WalError::InvalidSegmentSizeRange);
@@ -1423,6 +1507,7 @@ impl SegmentedEnvelopeWriter {
             segment_ordinal: Some(provenance.segment_ordinal),
             segment_first_sequence: provenance.segment_first_sequence,
             segment_bytes,
+            segment_started_millis: Some(now_millis),
             last_sequence: Some(final_marker.sequence),
             #[cfg(test)]
             fault: None,
@@ -1464,6 +1549,14 @@ impl SegmentedEnvelopeWriter {
             && self.segment_bytes.saturating_add(encoded_len) > self.max_segment_bytes
     }
 
+    fn age_expired(&self, now_millis: u64, max_age_millis: u64) -> bool {
+        self.file.is_some()
+            && self.segment_bytes > SEGMENT_HEADER_LEN_U64
+            && self
+                .segment_started_millis
+                .is_some_and(|started| now_millis.saturating_sub(started) >= max_age_millis)
+    }
+
     fn ensure_total_capacity(&self, additional_bytes: u64) -> Result<(), WalError> {
         let required = self.physical_bytes.checked_add(additional_bytes).ok_or(
             WalError::WalCapacityExceeded {
@@ -1482,6 +1575,11 @@ impl SegmentedEnvelopeWriter {
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     fn rotate(&mut self, first_sequence: u64) -> Result<(), WalError> {
+        self.rotate_at(first_sequence, 0)
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    fn rotate_at(&mut self, first_sequence: u64, now_millis: u64) -> Result<(), WalError> {
         self.ensure_total_capacity(SEGMENT_HEADER_LEN_U64)?;
         let segment_ordinal = match self.segment_ordinal {
             Some(ordinal) => ordinal
@@ -1530,6 +1628,7 @@ impl SegmentedEnvelopeWriter {
         self.segment_ordinal = Some(segment_ordinal);
         self.segment_first_sequence = first_sequence;
         self.segment_bytes = SEGMENT_HEADER_LEN_U64;
+        self.segment_started_millis = Some(now_millis);
         self.physical_bytes += SEGMENT_HEADER_LEN_U64;
         Ok(())
     }
@@ -1651,6 +1750,7 @@ pub struct GroupCommitWalWriter {
     pending: Vec<WalRecordEnvelope>,
     pending_frame_bytes: u64,
     last_sync_millis: u64,
+    max_segment_age_millis: u64,
     authority: CommitAuthority,
 }
 
@@ -1680,6 +1780,29 @@ impl GroupCommitWalWriter {
         first_sequence: u64,
         now_millis: u64,
     ) -> Result<Self, WalError> {
+        Self::create_with_total_limit_and_age(
+            directory,
+            recording_id,
+            max_segment_bytes,
+            max_total_bytes,
+            first_sequence,
+            now_millis,
+            DEFAULT_SEGMENT_AGE_MILLIS,
+        )
+    }
+
+    pub fn create_with_total_limit_and_age(
+        directory: impl AsRef<Path>,
+        recording_id: RecordingId,
+        max_segment_bytes: u64,
+        max_total_bytes: u64,
+        first_sequence: u64,
+        now_millis: u64,
+        max_segment_age_millis: u64,
+    ) -> Result<Self, WalError> {
+        if max_segment_age_millis == 0 {
+            return Err(WalError::InvalidSegmentAge);
+        }
         if !(MIN_SEGMENT_BYTES..=MAX_SEGMENT_BYTES).contains(&max_segment_bytes) {
             return Err(WalError::InvalidSegmentSizeRange);
         }
@@ -1701,6 +1824,7 @@ impl GroupCommitWalWriter {
             pending: Vec::new(),
             pending_frame_bytes: 0,
             last_sync_millis: now_millis,
+            max_segment_age_millis,
             authority: CommitAuthority::default(),
         })
     }
@@ -1709,12 +1833,51 @@ impl GroupCommitWalWriter {
         self.next_sequence
     }
 
+    pub fn recording_id(&self) -> RecordingId {
+        self.recording_id
+    }
+
     pub fn authority(&self) -> &CommitAuthority {
         &self.authority
     }
 
     pub fn recording_lock(&self) -> &RecordingLock {
         &self.lock
+    }
+
+    pub fn set_max_segment_age_millis(
+        &mut self,
+        max_segment_age_millis: u64,
+    ) -> Result<(), WalError> {
+        if max_segment_age_millis == 0 {
+            return Err(WalError::InvalidSegmentAge);
+        }
+        self.max_segment_age_millis = max_segment_age_millis;
+        Ok(())
+    }
+
+    pub fn max_segment_age_millis(&self) -> u64 {
+        self.max_segment_age_millis
+    }
+
+    pub fn persist_manifest(&self, manifest: &WalManifestV1) -> Result<PathBuf, WalError> {
+        if manifest.recording_id != self.recording_id {
+            return Err(ManifestError::Contradiction("recording_id").into());
+        }
+        if let Some(marker) = &manifest.authoritative_marker
+            && self
+                .authority
+                .marker_sequence
+                .is_none_or(|sequence| marker.sequence > sequence)
+        {
+            return Err(ManifestError::Contradiction("authoritative_marker").into());
+        }
+        let wal_directory = self
+            .writer
+            .directory
+            .parent()
+            .ok_or(ManifestError::Contradiction("wal_directory"))?;
+        Ok(write_manifest_atomic(wal_directory, manifest)?)
     }
 
     pub fn append(
@@ -1754,7 +1917,10 @@ impl GroupCommitWalWriter {
                 segment_bytes: self.writer.max_segment_bytes,
             });
         }
-        let rotate_before_data = self.writer.would_rotate(pair_len);
+        let rotate_before_data = self.writer.would_rotate(pair_len)
+            || self
+                .writer
+                .age_expired(now_millis, self.max_segment_age_millis);
         let sequence_advance = if rotate_before_data && !self.pending.is_empty() {
             3
         } else {
@@ -1791,7 +1957,7 @@ impl GroupCommitWalWriter {
         }
         if rotate_before_data {
             #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-            self.writer.rotate(self.next_sequence)?;
+            self.writer.rotate_at(self.next_sequence, now_millis)?;
             #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
             return Err(WalError::UnsupportedSegmentPublication);
         }
@@ -1828,6 +1994,24 @@ impl GroupCommitWalWriter {
     }
 
     pub fn poll(&mut self, now_millis: u64) -> Result<Option<DurableBatch>, WalError> {
+        let age_expired = self
+            .writer
+            .age_expired(now_millis, self.max_segment_age_millis);
+        if age_expired {
+            let durable = if self.pending.is_empty() {
+                None
+            } else {
+                self.commit(now_millis)?
+            };
+            #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+            {
+                self.writer.ensure_total_capacity(SEGMENT_HEADER_LEN_U64)?;
+                self.writer.rotate_at(self.next_sequence, now_millis)?;
+            }
+            #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+            return Err(WalError::UnsupportedSegmentPublication);
+            return Ok(durable);
+        }
         if self.pending.is_empty()
             || now_millis.saturating_sub(self.last_sync_millis) < GROUP_COMMIT_INTERVAL_MILLIS
         {
@@ -1986,6 +2170,7 @@ impl PreparedRecoveryReopen {
             self.max_segment_bytes,
             self.max_total_bytes,
             retained_marker,
+            self.now_millis,
         )?;
         let group_writer = GroupCommitWalWriter {
             writer,
@@ -1995,6 +2180,7 @@ impl PreparedRecoveryReopen {
             pending: Vec::new(),
             pending_frame_bytes: 0,
             last_sync_millis: self.now_millis,
+            max_segment_age_millis: DEFAULT_SEGMENT_AGE_MILLIS,
             authority: scan_after.authority.clone(),
         };
         let report = RecoveryReopenReport {
@@ -3251,6 +3437,36 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
+    fn live_snapshot_is_marker_capped_and_never_repairs_suffix() {
+        let directory = discovery_directory();
+        let recording_id = RecordingId::new();
+        let mut writer =
+            GroupCommitWalWriter::create(&directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        writer
+            .append(RecordKind::CaptureEvent, 1, 0, b"committed".to_vec(), 0)
+            .unwrap();
+        writer.shutdown(10).unwrap();
+        let path = directory.join("segments").join(segment_file_name(1));
+        let snapshot =
+            read_committed_snapshot(&directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+        assert_eq!(snapshot.marker_sequence, 2);
+        assert_eq!(snapshot.committed_record_count, 1);
+        writer
+            .append(RecordKind::CaptureEvent, 1, 0, b"pending".to_vec(), 11)
+            .unwrap();
+        let after_append = fs::read(&path).unwrap();
+        assert!(matches!(
+            read_committed_snapshot(&directory, recording_id, DEFAULT_MAX_RECORD_BYTES),
+            Err(WalError::RetryableSnapshotUncertainty)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), after_append);
+        drop(writer);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
     fn group_writer_enforces_physical_total_cap_and_marker_reservation() {
         for total in [MIN_SEGMENT_BYTES - 1, DEFAULT_MAX_WAL_BYTES + 1] {
             assert!(matches!(
@@ -3320,6 +3536,77 @@ mod tests {
             MIN_SEGMENT_BYTES - 100
         );
         assert!(!segments.join(segment_file_name(1)).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn segment_age_rotates_non_empty_segment_on_tick_without_empty_churn() {
+        let directory = discovery_directory();
+        let recording_id = RecordingId::new();
+        let mut writer = GroupCommitWalWriter::create_with_total_limit_and_age(
+            &directory,
+            recording_id,
+            MIN_SEGMENT_BYTES,
+            DEFAULT_MAX_WAL_BYTES,
+            1,
+            0,
+            100,
+        )
+        .unwrap();
+        writer
+            .append(RecordKind::CaptureEvent, 1, 0, b"data".to_vec(), 0)
+            .unwrap();
+        assert!(writer.poll(10).unwrap().is_some());
+        let syncs = writer.data_sync_count();
+        assert!(writer.poll(99).unwrap().is_none());
+        assert!(writer.poll(100).unwrap().is_none());
+        assert_eq!(writer.data_sync_count(), syncs);
+        assert_eq!(
+            discover_segments(directory.join("segments"), recording_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        writer
+            .append(RecordKind::CaptureEvent, 1, 0, b"next".to_vec(), 101)
+            .unwrap();
+        assert_eq!(
+            discover_segments(directory.join("segments"), recording_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(writer);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn empty_segment_does_not_rotate_due_to_age() {
+        let directory = discovery_directory();
+        let mut writer = GroupCommitWalWriter::create_with_total_limit_and_age(
+            &directory,
+            RecordingId::new(),
+            MIN_SEGMENT_BYTES,
+            DEFAULT_MAX_WAL_BYTES,
+            1,
+            0,
+            1,
+        )
+        .unwrap();
+        assert!(writer.poll(u64::MAX).unwrap().is_none());
+        assert!(
+            fs::read_dir(directory.join("segments"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(matches!(
+            writer.set_max_segment_age_millis(0),
+            Err(WalError::InvalidSegmentAge)
+        ));
+        drop(writer);
         fs::remove_dir_all(directory).unwrap();
     }
 

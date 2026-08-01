@@ -1,10 +1,58 @@
 //! Application services and configuration. CLI remains an outer adapter.
 
 mod cgroup_selection;
+mod epoch_rollover;
+mod incremental_worker;
+mod recorder_config;
+mod recorder_lease;
+mod recorder_lifecycle;
+mod recorder_metadata;
+mod recorder_orchestration;
+mod recorder_quota;
+mod recorder_startup;
+mod recorder_status;
 
 pub use cgroup_selection::{
     CgroupSelection, CgroupSelectionError, CgroupSelector, PidCgroupSelection,
     preflight_cgroup_selection, preflight_pid_cgroup_selection,
+};
+pub use epoch_rollover::{
+    EpochAdmittedObservation, EpochOutcomeError, EpochOutcomeJournalV1, OutcomeRange,
+    RolloverAssignment, RolloverFailureReason, write_epoch_outcome_atomic,
+};
+pub use incremental_worker::{
+    IncrementalWorker, IncrementalWorkerCounters, IncrementalWorkerError, IncrementalWorkerPolicy,
+    IncrementalWorkerState,
+};
+pub use recorder_config::{
+    EpochConfig, EtlConfig, FilesystemDomainConfig, FilesystemDomainIdentity, LogLevel,
+    LoggingConfig, NormalizedRecorderConfig, NormalizedScopeConfig, RECORDER_CONFIG_SCHEMA_VERSION,
+    RecorderConfigError, RecorderConfigV1, RecorderScopeConfig, ResolvedFilesystemDomain,
+    RetentionMode, SegmentConfig, ShutdownConfig, StoreBackend, StoreConfig,
+};
+pub use recorder_lease::{RecorderLease, RecorderLeaseError};
+pub use recorder_lifecycle::{
+    RecorderHealth, RecorderLifecycle, RecorderLifecycleError, RecorderLifecycleState,
+    RecorderReadiness, RecorderReadinessState,
+};
+pub use recorder_metadata::{
+    CommitWatermark, EpochMetadata, IncrementalCheckpointSummaryV1, LagSummary, MetadataCode,
+    QuotaStatus, RECORDER_METADATA_FILE, RECORDER_METADATA_SCHEMA_VERSION, RecorderCounters,
+    RecorderMetadataError, RecorderMetadataV1, RecoverySummary, load_recorder_metadata,
+    write_recorder_metadata,
+};
+pub use recorder_orchestration::{
+    AcceptedObservation, ContinuousRecorder, RecorderEpochBoundary, RecorderOrchestrationError,
+    RecorderOrchestrator, RecorderPoll,
+};
+pub use recorder_quota::{
+    DomainQuota, QUOTA_ENFORCEMENT_ENABLED, QuotaError, QuotaReservation,
+    QuotaReservationAuthority, ReservationKind,
+};
+pub use recorder_startup::{RecorderStartup, RecorderStartupError};
+pub use recorder_status::{
+    RECORDER_STATUS_SCHEMA_VERSION, RecorderStatusError, RecorderStatusV1, SegmentCounts,
+    StatusRemediation,
 };
 
 use chronicle_canonical::{
@@ -403,6 +451,43 @@ pub struct ProductionWalPreflight {
     pub low_space_warning: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordingStorePreflight {
+    pub state_root: PathBuf,
+    pub store_root: PathBuf,
+    pub same_filesystem: bool,
+    pub local_active_spool: bool,
+}
+
+/// Validates recorder-store placement without acquiring a store or WAL lock.
+pub fn preflight_recording_store(
+    config: &NormalizedRecorderConfig,
+) -> Result<RecordingStorePreflight, ApplicationError> {
+    let state_parent = config
+        .state_root
+        .parent()
+        .unwrap_or(config.state_root.as_path());
+    let store_parent = config
+        .store_root
+        .parent()
+        .unwrap_or(config.store_root.as_path());
+    let state_metadata = std::fs::metadata(state_parent)
+        .map_err(|_| ApplicationError::ProductionPreflight("state parent is unavailable"))?;
+    let store_metadata = std::fs::metadata(store_parent)
+        .map_err(|_| ApplicationError::ProductionPreflight("store parent is unavailable"))?;
+    if !state_metadata.is_dir() || !store_metadata.is_dir() {
+        return Err(ApplicationError::ProductionPreflight(
+            "recorder store parent is not a directory",
+        ));
+    }
+    Ok(RecordingStorePreflight {
+        state_root: config.state_root.clone(),
+        store_root: config.store_root.clone(),
+        same_filesystem: config.state_domain.device == config.store_domain.device,
+        local_active_spool: true,
+    })
+}
+
 /// Checks writable exclusive WAL destination and available capacity without creating recording metadata.
 pub fn preflight_wal_destination(
     wal_directory: &Path,
@@ -792,7 +877,7 @@ impl RecordingIngest {
         &self.counters
     }
 
-    fn commit_boundary(&self) -> Option<RecordingCommitBoundary> {
+    pub fn commit_boundary(&self) -> Option<RecordingCommitBoundary> {
         let authority = self.writer.authority();
         Some(RecordingCommitBoundary {
             marker_sequence: authority.marker_sequence?,
@@ -860,6 +945,26 @@ impl RecordingIngest {
             }
         }
         Ok(())
+    }
+
+    /// Seal current epoch and replace its writer without detaching capture ownership.
+    pub fn rollover_to(
+        &mut self,
+        next_writer: GroupCommitWalWriter,
+        now_millis: u64,
+    ) -> Result<Option<RecordingCommitBoundary>, WalError> {
+        self.drain(now_millis)?;
+        self.writer.shutdown(now_millis)?;
+        let boundary = self.commit_boundary();
+        self.writer = next_writer;
+        self.queue.clear();
+        self.written_records.clear();
+        self.written_capture_timestamps.clear();
+        self.terminal_discarded.clear();
+        self.terminal_discarded_without_time = RecordByteCount::default();
+        self.terminal_wal_loss = None;
+        self.state = IngestState::Accepting;
+        Ok(boundary)
     }
 
     /// WAL-limit detection wins over duration when both occur in one shutdown cycle.

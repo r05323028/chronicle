@@ -1,5 +1,23 @@
 //! Restartable WAL-to-canonical transformation boundary.
 
+mod checkpoint;
+mod delta;
+mod incremental;
+mod publication;
+pub use checkpoint::{
+    CheckpointError, CheckpointLifecycle, CheckpointOwner, CheckpointSummary, ConnectionState,
+    DecoderReconstructionState, DeltaBatchReference, HttpCorrelationState,
+    INCREMENTAL_CHECKPOINT_SCHEMA_VERSION, IncrementalEtlCheckpointV1, MarkerLineage,
+    RecoveryAuthoritativeSnapshot, SegmentLineage, SourceStatus, TcpDirectionState,
+    read_checkpoint, write_checkpoint_atomic,
+};
+pub use delta::{CANONICAL_DELTA_SCHEMA_VERSION, CanonicalDeltaBatchV1, DeltaBatchError};
+pub use incremental::{CommittedWalSnapshot, IncrementalProcessor, IncrementalResult};
+pub use publication::{
+    PublicationError, ReconcileOutcome, finalize_incremental_session,
+    publish_delta_then_checkpoint, reconcile_delta_checkpoint, verify_one_shot_equivalence,
+};
+
 /// ETL input boundary before protocol-specific decoding.
 pub use chronicle_protocol::ProtocolNeutralConnection;
 
@@ -190,6 +208,8 @@ pub enum EtlError {
     MissingSocketEvidence,
     #[error("reconstruction connection has conflicting socket endpoint evidence")]
     ConflictingSocketEvidence,
+    #[error("incremental snapshot marker regressed")]
+    SnapshotRegression,
 }
 
 pub struct EtlPipeline {

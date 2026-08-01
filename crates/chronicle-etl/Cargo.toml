@@ -13,7 +13,10 @@ chronicle-capture = { path = "../chronicle-capture" }
 chronicle-common = { path = "../chronicle-common" }
 chronicle-protocol = { path = "../chronicle-protocol" }
 chronicle-session = { path = "../chronicle-session" }
+chronicle-storage = { path = "../chronicle-storage" }
 chronicle-wal = { path = "../chronicle-wal" }
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true

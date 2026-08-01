@@ -22,6 +22,13 @@ use thiserror::Error;
 
 pub const MANIFEST_SCHEMA_VERSION: u8 = 1;
 
+pub mod recording_store;
+pub use recording_store::{
+    ArtifactLifecycle, DeleteIfDigest, FilesystemRecordingStore, InMemoryRecordingStore,
+    PutIfAbsent, RECORDING_STORE_SCHEMA_VERSION, RecordingArtifact, RecordingArtifactHead,
+    RecordingArtifactKind, RecordingStore, RecordingStoreError, RecordingTombstone,
+};
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
