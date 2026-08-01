@@ -1,8 +1,8 @@
 ## ADDED Requirements
 
-### Requirement: One foreground recorder owns one scope and state root
+### Requirement: One foreground recorder owns one filesystem domain
 
-Recorder service SHALL run in foreground and own exactly one configured cgroup subtree and one private state root. It SHALL acquire an OS-released exclusive lease before reading or mutating recorder state, and a second process targeting same state root SHALL fail without attaching capture, opening WAL for append, or changing metadata. Recorder SHALL NOT implement self-daemonization, PID-file liveness as authority, multi-node ownership, or a custom supervisor.
+Recorder service SHALL run in foreground and own exactly one configured cgroup subtree and one private state root. Preflight SHALL resolve configured WAL/store roots to a canonical filesystem-domain identity and deterministic configured domain-lock root. Recorder SHALL acquire an OS-released exclusive lock at `<domain-lock-root>/.chronicle-domain.lock` before the subordinate state-root lock, recovery, or mutation. All Chronicle mutating commands SHALL use the same domain-lock resolution and reject a live owner; read-only commands need neither lock. A filesystem domain SHALL have only one active Chronicle mutating owner; multiple recorder instances sharing the same WAL/store filesystem are unsupported. A second process targeting that domain SHALL fail without attaching capture, opening WAL for append, or changing metadata. Different cgroup scopes requiring independent recorder instances SHALL use isolated filesystem domains. Recorder SHALL NOT implement self-daemonization, PID-file liveness as authority, multi-node ownership, or a custom supervisor.
 
 #### Scenario: First owner starts
 
@@ -11,8 +11,13 @@ Recorder service SHALL run in foreground and own exactly one configured cgroup s
 
 #### Scenario: Concurrent owner rejected
 
-- **WHEN** second recorder targets state root with live owner
+- **WHEN** second recorder targets state root or another WAL/store path in the same filesystem domain with live owner
 - **THEN** second recorder exits with stable ownership error and performs no mutation or attachment
+
+#### Scenario: Standalone mutator rejected while recorder owns domain
+
+- **WHEN** a standalone mutating command targets a WAL/store filesystem domain owned by a live recorder
+- **THEN** command exits with stable ownership error; read-only commands may continue without acquiring mutation ownership
 
 #### Scenario: Process dies
 
@@ -21,19 +26,19 @@ Recorder service SHALL run in foreground and own exactly one configured cgroup s
 
 ### Requirement: Persistent recorder lifecycle state machine
 
-Recorder lifecycle SHALL use states `starting`, `recovering`, `running`, `draining`, `stopped`, and `failed`. Fresh start SHALL persist `starting` before recovery. Every start SHALL enter `recovering`; readiness SHALL remain false until state/manifest/checkpoint reconciliation, WAL append recovery, quota reservation, appendable epoch creation, capture preflight/attachment, and incremental ETL resume complete. Successful start SHALL transition to `running`. Graceful stop SHALL transition `running -> draining -> stopped`. Any unrecoverable startup/runtime/drain failure SHALL transition to `failed` where persistence remains possible while preserving prior recovery-authoritative WAL.
+Recorder lifecycle SHALL use states `starting`, `recovering`, `running`, `draining`, `stopped`, and `failed`. Fresh start SHALL persist `starting` before recovery. Every start SHALL enter `recovering`. Capture readiness SHALL remain false until filesystem-domain lease, state/manifest/WAL recovery, quota reservation, appendable epoch creation, and capture preflight/attachment complete. Processing readiness SHALL be reported separately and SHALL require checkpoint consistency, output-store availability, and incremental processing health. Successful capture startup SHALL transition to `running`; processing may remain not ready or degraded without forcing capture failure while safe WAL headroom remains. Graceful stop SHALL transition `running -> draining -> stopped`. Any unrecoverable startup/runtime/drain failure SHALL transition to `failed` where persistence remains possible while preserving prior recovery-authoritative WAL.
 
 Transitions SHALL be monotonic within one process attempt, idempotent under repeated stop notification, atomically persisted, and include bounded stable failure/shutdown codes without payload/header values.
 
 #### Scenario: Fresh successful start
 
 - **WHEN** valid configuration and empty state root start on supported host
-- **THEN** persisted states progress `starting -> recovering -> running` and readiness becomes true only at `running`
+- **THEN** persisted states progress `starting -> recovering -> running`, capture readiness becomes true only after attachment, and processing readiness is reported independently
 
 #### Scenario: Restart after clean stop
 
 - **WHEN** stopped recorder starts with valid prior state
-- **THEN** it enters `recovering`, verifies prior epoch/checkpoint state, opens new or resumable epoch, then becomes running
+- **THEN** it enters `recovering`, verifies prior epoch/checkpoint state, opens new or resumable epoch, then becomes running with capture readiness evaluated separately from processing readiness
 
 #### Scenario: Startup recovery fails
 
@@ -49,7 +54,7 @@ Transitions SHALL be monotonic within one process attempt, idempotent under repe
 
 Recorder SHALL keep one capture source attached while rolling successive recording epochs. Each epoch SHALL retain one unique recording ID and P1-compatible WAL identity, sequence, commit-marker, loss, metadata, and recovery semantics. Epoch SHALL roll before existing one-hour duration or 4 GiB per-recording hard bound, using configured lower limits when supplied. Rollover SHALL stop admission to old epoch, commit and sync its writable prefix, open and durably publish next epoch, then direct queued/new observations to exactly one epoch without planned source detach.
 
-Epoch rollover SHALL preserve a recorder-level monotonically increasing epoch ordinal and explicit predecessor identity. It SHALL NOT merge WAL sequence spaces or canonical sessions across recording IDs. Rollover failure SHALL stop capture and fail visibly; accepted entries that cannot reach either epoch SHALL be represented by exact metadata-only recorder-loss counts/bytes and capture-time interval/ambiguity with stable `epoch_rollover_failure` reason. Recorder SHALL NOT discard accepted queue entries silently or continue without durable WAL ownership.
+An **accepted observation** is an observation that has successfully entered the recorder-owned bounded ingest queue and received its ingest identity. At admission, every observation MUST receive a stable ingest ordinal, payload length, capture timestamp, and source metadata needed for loss reporting. During handoff, recorder SHALL persist bounded durable outcome ranges mapping every admitted ordinal exactly once to old-epoch assignment only after that observation is covered by the old epoch's authoritative marker, new-epoch assignment only after the successor commits it, or metadata-only `epoch_rollover_failure`. Rollover SHALL not report success until this outcome journal is durable. If outcome persistence fails, recorder SHALL stop and leave handoff unresolved for deterministic recovery; admitted ordinals without proven assignment SHALL be counted as rollover failure, never guessed or silently dropped. Epoch rollover SHALL preserve a recorder-level monotonically increasing epoch ordinal and explicit predecessor identity. It SHALL NOT merge WAL sequence spaces or canonical sessions across recording IDs. Rollover failure SHALL stop capture and fail visibly; accepted observations that cannot reach either epoch SHALL be represented by exact metadata-only recorder-loss counts/bytes and capture-time interval/ambiguity with stable `epoch_rollover_failure` reason. Recorder SHALL NOT discard accepted observations silently or continue without durable WAL ownership.
 
 #### Scenario: Age epoch rollover
 
@@ -68,14 +73,40 @@ Epoch rollover SHALL preserve a recorder-level monotonically increasing epoch or
 
 #### Scenario: Rollover cannot open next epoch
 
-- **WHEN** next epoch directory/header cannot be durably created while accepted entries remain queued
-- **THEN** recorder stops intake, finalizes prior authoritative prefix where possible, records exact metadata-only rollover-loss evidence for unpersisted accepted entries, enters failed state, and reports typed storage failure
+- **WHEN** next epoch directory/header cannot be durably created while accepted observations remain queued
+- **THEN** recorder stops intake, finalizes prior authoritative prefix where possible, records exact metadata-only rollover-loss evidence for unpersisted accepted observations, enters failed state, and reports typed storage failure
+
+#### Scenario: Rollover outcome persistence fails
+
+- **WHEN** outcome ranges cannot be atomically persisted during epoch handoff
+- **THEN** recorder does not report successful rollover, preserves prior authoritative WAL, and recovery counts every admitted-but-unproven ordinal exactly once as `epoch_rollover_failure`
+
+### Requirement: Split liveness, capture readiness, processing readiness, and overall health
+
+Recorder status SHALL expose four distinct concepts:
+
+- **Liveness:** recorder process is alive/executing.
+- **Capture readiness:** lease owns filesystem domain, WAL recovery is complete, an epoch is appendable, quota reservation is valid, and capture is attached.
+- **Processing readiness:** `IncrementalEtlCheckpoint v1` is consistent, output store is available, and incremental ETL can make progress.
+- **Overall health:** policy-derived `healthy`, `degraded`, or `failed` result.
+
+ETL lag, retry, or retention backlog MAY make processing/overall health degraded while capture remains ready and durable WAL headroom is safe. ETL lag MUST NOT force capture failure by default. WAL unappendability, capture detachment, corruption, unsafe quota, or checkpoint contradiction SHALL set the corresponding readiness false and expose stable remediation.
+
+#### Scenario: Capture ready while ETL lags
+
+- **WHEN** lease, recovered WAL, appendable epoch, quota, and capture attachment are healthy but incremental ETL is behind
+- **THEN** liveness and capture readiness are true, processing readiness is degraded/not ready, and overall health follows policy without claiming capture failure
+
+#### Scenario: Capture not ready during recovery
+
+- **WHEN** recorder process is alive but WAL recovery or appendable-epoch preparation is incomplete
+- **THEN** liveness is true, capture readiness is false, processing readiness is false or unknown, and overall health reports recovery state
 
 ### Requirement: Versioned active-recorder metadata
 
-Recorder SHALL atomically maintain private active metadata containing schema version, recorder identity, process-attempt identity, configuration digest, canonical cgroup path/stable ID/scope acknowledgement, lifecycle state, readiness, start/update times, boot/clock identity, current and previous epoch IDs/ordinals, active segment identity, final recovery-authoritative commit boundary, ETL checkpoint boundary and lag, retained physical bytes, quota/minimum-free-space state, categorized capture/WAL loss counters, last recovery result, and shutdown/failure code.
+Recorder SHALL atomically maintain private active metadata containing schema version, recorder identity, process-attempt identity, configuration digest, canonical cgroup path/stable ID/scope acknowledgement, lifecycle state, readiness, start/update times, boot/clock identity, current and previous epoch IDs/ordinals, active segment identity, final recovery-authoritative commit boundary, `IncrementalEtlCheckpoint v1` boundary and lag, retained physical bytes, quota/minimum-free-space state, categorized capture/WAL loss counters, last recovery result, and shutdown/failure code.
 
-Metadata SHALL be non-authoritative for committed WAL bytes and SHALL be reconciled from validated WAL, manifest, and checkpoint evidence after restart. Unknown versions, immutable identity/configuration contradictions, or metadata claims ahead of authoritative evidence SHALL fail closed. Metadata and default output SHALL omit command lines, environment values, captured payload, and arbitrary header values.
+Metadata SHALL be non-authoritative for committed WAL bytes and SHALL be reconciled from validated WAL, manifest, and checkpoint evidence after restart. Unknown versions, immutable identity/configuration contradictions, or metadata claims ahead of authoritative evidence SHALL fail closed. Metadata SHALL record capture readiness, processing readiness, and overall health separately. Metadata and default output SHALL omit command lines, environment values, captured payload, and arbitrary header values.
 
 #### Scenario: Metadata lags WAL
 

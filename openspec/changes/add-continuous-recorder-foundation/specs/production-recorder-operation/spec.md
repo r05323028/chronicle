@@ -18,7 +18,7 @@ Application sidecar SHALL be documented as evaluated but not supported P2 defaul
 
 ### Requirement: Production configuration is versioned and file-based
 
-Recorder SHALL load one private versioned configuration file identifying canonical cgroup selector, state root, epoch duration/size, segment size/age, synchronized quota/minimum-free reserve for each filesystem domain, retention mode/age/bytes, ETL bounds/retry/lag policy, filesystem store root, shutdown timeout, and safe logging level. Secrets SHALL not be accepted on command line. Unknown fields/version, contradictory bounds, unsafe paths, selector containing recorder, or missing required quota/retention choice SHALL fail before capture.
+Recorder SHALL load one private versioned configuration file identifying canonical cgroup selector, state root, canonical filesystem-domain identity and deterministic domain-lock root, epoch duration/size, segment size/age, synchronized quota/minimum-free reserve for each filesystem domain, retention mode/age/bytes, ETL bounds/retry/lag policy, filesystem store root, shutdown timeout, and safe logging level. P2 supports one active Chronicle mutating owner per filesystem domain; recorder lease ownership covers the domain, not only the process. Multiple recorder instances sharing a WAL/store filesystem are unsupported; independent cgroup scopes require isolated filesystem domains. Secrets SHALL not be accepted on command line. Unknown fields/version, contradictory bounds, unsafe paths, selector containing recorder, or missing required quota/retention choice SHALL fail before capture.
 
 Environment MAY supply non-secret deployment-specific path to configuration but SHALL not silently override persisted durability/retention values. P2 SHALL not support hot reload. Effective normalized configuration digest SHALL be recorded per process attempt/epoch and shown without sensitive values.
 
@@ -66,19 +66,19 @@ Recorder failure SHALL affect only configured scope/state root. It SHALL not kil
 
 ### Requirement: Readiness, health, and liveness semantics are operationally distinct
 
-Process liveness SHALL mean recorder process is executing. Readiness SHALL be true only in `running` after lease, recovery, WAL appendability, capture attachment, ETL checkpoint reconciliation, and required storage/quota checks succeed. Health SHALL be versioned status with `healthy`, `degraded`, or `failed`; degraded MAY include ETL lag/retry or retention backlog while durable capture remains safe. Failed SHALL include lost WAL appendability, unrecoverable corruption, unsafe quota, capture attachment loss, or checkpoint lineage contradiction.
+Process liveness SHALL mean recorder process is executing. Capture readiness SHALL be true only when filesystem-domain lease, WAL recovery, appendable epoch, quota reservation, and capture attachment succeed. Processing readiness SHALL be reported separately and SHALL require checkpoint consistency, output-store availability, and incremental processing health. Overall health SHALL be policy-derived `healthy`, `degraded`, or `failed`; ETL lag/retry or retention backlog MAY degrade processing/overall health while durable capture remains safe and capture readiness remains true. Failed capture SHALL include lost WAL appendability, unrecoverable corruption, unsafe quota, or capture attachment loss. Failed processing SHALL include checkpoint lineage contradiction or unavailable output store.
 
-Status SHALL expose recorder/attempt/epoch/segment IDs, lifecycle/readiness/health, configuration digest, final committed marker, ETL checkpoint and lag, retained/quota/free bytes, segment state counts, loss counters, last recovery/cleanup/publication, and stable failure/remediation code. P2 systemd unit SHALL use `Type=simple`; systemd active state proves liveness only. Readiness consumers SHALL poll local `recorder-status`/atomic state and SHALL NOT infer readiness from process start. No unauthenticated network metrics/HTTP server or `sd_notify` integration SHALL be added in P2.
+Status SHALL expose recorder/attempt/epoch/segment IDs, lifecycle/capture-readiness/processing-readiness/overall-health, configuration digest, final committed marker, `IncrementalEtlCheckpoint v1` boundary and lag, retained/quota/free bytes, segment state counts, loss counters, last recovery/cleanup/publication, and stable failure/remediation code. P2 systemd unit SHALL use `Type=simple`; systemd active state proves liveness only. Readiness consumers SHALL poll local `recorder-status`/atomic state and SHALL NOT infer readiness from process start. No unauthenticated network metrics/HTTP server or `sd_notify` integration SHALL be added in P2.
 
 #### Scenario: Recovery in progress
 
 - **WHEN** process is alive but startup reconciliation has not completed
-- **THEN** liveness is true, readiness false, and health/status says recovering
+- **THEN** liveness is true, capture readiness is false, processing readiness is false or unknown, and health/status says recovering
 
 #### Scenario: ETL lag warning
 
 - **WHEN** committed WAL advances beyond warning threshold but quota remains safe
-- **THEN** readiness policy reports configured degraded/warning state without claiming data loss
+- **THEN** processing readiness and overall health report configured degraded/warning state while capture readiness remains true and committed capture is not reported as failed
 
 ### Requirement: Restart and stop policy preserve evidence
 

@@ -126,7 +126,9 @@ Canonical outputs, checkpoints, manifests, and tombstones SHALL have separate re
 
 ### Requirement: Global quota and minimum-free-space protection
 
-Continuous recorder SHALL enforce configured physical quota domain per filesystem while retaining existing per-epoch 4 GiB hard maximum. One synchronized reservation authority SHALL account for every Chronicle writer sharing a filesystem: active/sealed WAL, manifests/checkpoints, RecordingStore objects, final Canonical Session staging/objects when co-located, temporary files, and cleanup trash peak. Each distinct filesystem root SHALL have independent configured quota and minimum-free-space reserve. Admission SHALL reserve complete next frame, final marker, required segment/epoch header, manifest/checkpoint update, concurrent ETL/session publication peak, and temp/trash bytes before write or rollover; separate roots SHALL not borrow one another's reserve.
+Continuous recorder SHALL enforce configured physical quota domain per filesystem while retaining existing per-epoch 4 GiB hard maximum. P2 supports one active Chronicle mutating owner per filesystem domain. Recorder lease ownership SHALL cover the domain, not only the recorder process; multiple recorder instances sharing the same WAL/store filesystem are unsupported. Standalone mutating commands SHALL reject execution when a live recorder owns the domain, while read-only commands may continue. Different cgroup scopes requiring independent recorder instances SHALL use isolated filesystem domains.
+
+Within one owner, one synchronized reservation authority SHALL account for active/sealed WAL, manifests/checkpoints, RecordingStore objects, final Canonical Session staging/objects when co-located, temporary files, and cleanup trash peak. This is not a cross-process quota ledger. Each distinct filesystem root SHALL have independent configured quota and minimum-free-space reserve. Admission SHALL reserve complete next frame, final marker, required segment/epoch header, manifest/checkpoint update, concurrent ETL/session publication peak, and temp/trash bytes before write or rollover; separate roots SHALL not borrow one another's reserve.
 
 At pressure threshold recorder SHALL first run only already-eligible cleanup. It SHALL never delete unprocessed/unverified/unexpired data to make space. If reservation still fails, it SHALL stop intake, persist typed quota-pressure loss/failure evidence, finalize current authoritative prefix where possible, enter failed/not-ready, and rely on supervisor/operator recovery. It SHALL not loop-roll empty epochs or continue capture without durable capacity.
 
@@ -149,6 +151,25 @@ At pressure threshold recorder SHALL first run only already-eligible cleanup. It
 
 - **WHEN** canonical/store root resides on different filesystem from active WAL
 - **THEN** each filesystem enforces independent quota/minimum-free reserve and failure in store domain cannot consume WAL reserve
+
+### Requirement: Lifecycle indexes remain bounded
+
+Recorder SHALL enforce hard byte and entry bounds for `epochs.json`, epoch lineage history, deletion tombstones, and retention metadata. It SHALL prevent unbounded epoch metadata growth by compacting finalized retention-complete epochs into deterministic summary records. Compaction SHALL preserve enough lineage to detect missing committed evidence, digest mismatch, lineage fork, and incomplete cleanup. It SHALL use private temp-write, file sync, atomic rename, and directory sync so a crash leaves either old or complete new index; recovery SHALL be able to finish or roll back deterministically. Status/readiness checks SHALL use bounded current summaries and SHALL NOT scan all historical epochs.
+
+#### Scenario: Multi-year history compaction
+
+- **WHEN** synthetic multi-year finalized epoch history exceeds configured byte or entry limit
+- **THEN** compaction reduces index size within hard bounds while preserving required contradiction-detection lineage
+
+#### Scenario: Crash during compaction
+
+- **WHEN** process crashes before or after compaction rename/sync
+- **THEN** recovery selects old or complete new index deterministically and never loses required tombstone/lineage proof
+
+#### Scenario: Lineage contradiction after compaction
+
+- **WHEN** compacted summary conflicts with committed evidence, digest, predecessor, or cleanup proof
+- **THEN** recovery reports stable contradiction and fails closed without scanning unrelated historical epochs
 
 ### Requirement: Continuous recovery reconciles manifest, files, and checkpoints
 

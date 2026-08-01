@@ -4,7 +4,7 @@
 
 CLI SHALL provide `recorder --config FILE` as foreground long-running service command. It SHALL parse only configuration path and global output/log options, delegate configuration/preflight/recovery/lifecycle/WAL/ETL/store work to application services, remain attached to foreground, and rely on service manager for daemonization/restart. It SHALL NOT accept captured secrets on command line, fork, create authoritative PID file, add custom control socket/server, or run protocol/recovery logic in CLI.
 
-Command SHALL emit one bounded startup result after readiness or terminal startup failure. Normal runtime progress SHALL use safe structured logs/atomic status state rather than unbounded stdout JSON stream. Graceful SIGINT/SIGTERM success SHALL exit 0; startup/runtime/recovery/storage/finalization failure SHALL exit 3; unsupported platform/preflight SHALL exit 4; Clap usage SHALL exit 2.
+Command SHALL emit one bounded startup result after capture readiness or terminal startup failure, including separate capture-readiness and processing-readiness fields. Normal runtime progress SHALL use safe structured logs/atomic status state rather than unbounded stdout JSON stream. Graceful SIGINT/SIGTERM success SHALL exit 0; startup/runtime/recovery/storage/finalization failure SHALL exit 3; unsupported platform/preflight SHALL exit 4; Clap usage SHALL exit 2.
 
 #### Scenario: Recorder reaches readiness
 
@@ -23,7 +23,7 @@ Command SHALL emit one bounded startup result after readiness or terminal startu
 
 ### Requirement: Non-mutating recorder status command
 
-CLI SHALL provide `recorder-status --state-root DIR` with global human/JSON format. It SHALL delegate to application diagnostics, acquire no writer ownership, perform no repair/cleanup/ETL/capture/replay, and render bounded versioned health/readiness/lifecycle/watermark/lag/quota/counter/recovery fields. If live owner cannot be proven or state is stale/contradictory, output SHALL say so without promoting metadata claims.
+CLI SHALL provide `recorder-status --state-root DIR` with global human/JSON format. It SHALL delegate to application diagnostics, acquire no writer ownership, perform no repair/cleanup/ETL/capture/replay, and render bounded versioned health, liveness, capture-readiness, processing-readiness, overall-health, lifecycle, watermark, lag, quota, counter, and recovery fields. If live owner cannot be proven or state is stale/contradictory, output SHALL say so without promoting metadata claims.
 
 #### Scenario: Healthy live recorder
 
@@ -42,7 +42,7 @@ CLI SHALL provide `recorder-status --state-root DIR` with global human/JSON form
 
 ### Requirement: P1 one-shot commands remain available
 
-Existing fixture/production `record`, standalone `etl`, `doctor`, `inspect`, and `replay` commands and their safety/exit contracts SHALL remain supported. `record` SHALL remain bounded and SHALL NOT silently become daemon mode. `etl` SHALL continue to process stopped P1/P2 epochs; incremental ETL lifecycle belongs to recorder application service. Replay defaults and authorization SHALL remain unchanged.
+Existing fixture/production `record`, standalone `etl`, `doctor`, `inspect`, and `replay` commands and their safety/exit contracts SHALL remain supported. `record` and standalone `etl` SHALL reject mutation against a WAL/store filesystem domain owned by a live recorder; read-only `doctor`, `inspect`, and `replay` may continue. `record` SHALL remain bounded and SHALL NOT silently become daemon mode. `etl` SHALL continue to process stopped P1/P2 epochs; incremental ETL lifecycle belongs to recorder application service. Replay defaults and authorization SHALL remain unchanged.
 
 #### Scenario: Existing production record
 

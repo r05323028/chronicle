@@ -16,7 +16,7 @@ P2 SHALL require active recorder state, active WAL segment, writer lease, recove
 
 ### Requirement: RecordingStore publishes immutable artifacts
 
-`RecordingStore` boundary SHALL begin after artifact bytes and identity are immutable. Supported P2 artifact kinds SHALL include sealed WAL segment copies, canonical incremental batches, recovery reports, and bounded provenance indexes. Final Canonical Session v1 and its multi-file manifest/payload publication SHALL remain solely owned by existing `FilesystemSessionStore`; `RecordingStore` SHALL NOT replace or wrap that authority in P2. Mutable recorder state, active segment, lock, checkpoint, final session staging, and in-progress bytes SHALL remain outside upload boundary.
+`RecordingStore` boundary SHALL begin after artifact bytes and identity are immutable. P2 MAY expose sealed WAL segment copies as future-compatible immutable artifacts, but they are optional and not required for retention correctness. Canonical incremental batches, recovery reports, and bounded provenance indexes remain supported immutable kinds. Final Canonical Session v1 and its multi-file manifest/payload publication SHALL remain solely owned by existing `FilesystemSessionStore`; `RecordingStore` SHALL NOT replace or wrap that authority in P2. Mutable recorder state, active segment, lock, checkpoint, final session staging, and in-progress bytes SHALL remain outside upload boundary.
 
 Store contract SHALL provide typed operations equivalent to put-if-absent with expected length/SHA-256/schema/provenance, get/read with integrity verification, metadata/head, explicitly bounded prefix/list for diagnostics only, and delete with exact identity/digest precondition. Store SHALL return stable created/already-exists-matching/conflict/not-found/unsupported/transient/permanent outcomes. Generic overwrite of immutable key SHALL not exist.
 
@@ -37,7 +37,7 @@ Store contract SHALL provide typed operations equivalent to put-if-absent with e
 
 ### Requirement: Explicit manifests own artifact reachability
 
-Recorder/ETL SHALL decide required artifact set from versioned manifests/checkpoints, not from store listing completeness or modification time. Every published artifact reference SHALL contain kind, deterministic key, size, SHA-256, schema version, source epoch/WAL range, creation transaction identity, and retention class. Manifest/checkpoint referencing artifact SHALL be persisted only after store confirms durable matching publication.
+Recorder/ETL SHALL decide required artifact set from versioned manifests/checkpoints, not from store listing completeness or modification time. Every published artifact reference SHALL contain kind, deterministic key, size, SHA-256, schema version, source epoch/WAL range, creation transaction identity, and retention class. Manifest/checkpoint referencing artifact SHALL be persisted only after store confirms durable matching publication. Retention decisions SHALL use local validated WAL, lifecycle manifest, checkpoint lineage, and final-session proof; duplicated sealed WAL copies and store listing SHALL never be required for retention correctness.
 
 Future eventually consistent listing SHALL not affect correctness. Orphan immutable artifacts from publish-before-checkpoint crash MAY exist; deterministic retry SHALL adopt exact matching artifact, while bounded garbage collection MAY remove unreferenced objects only after configured safety age and proof they are absent from every retained manifest/checkpoint.
 
@@ -90,9 +90,14 @@ Source WAL and derived canonical artifacts SHALL have independent retention clas
 
 ### Requirement: P2 upload boundary stops at sealed immutable artifacts
 
-P2 SHALL expose only locally sealed/digested immutable artifacts to `RecordingStore`. Local commit/acknowledgement and ETL input authority SHALL not wait on or derive from any upload concept. Active segment, lease, recovery repair, mutable checkpoint, and canonical session transaction SHALL remain local-owned boundaries.
+P2 SHALL expose only locally sealed/digested immutable artifacts to `RecordingStore`. Local commit/acknowledgement and ETL input authority SHALL not wait on or derive from any upload concept. Active segment, lease, recovery repair, mutable checkpoint, and canonical session transaction SHALL remain local-owned boundaries. Sealed WAL copies, if exposed, are optional future-compatible artifacts; P2 retention correctness SHALL not depend on copying them into `RecordingStore`.
 
 P2 SHALL implement filesystem backend only. It SHALL NOT add S3 client, bucket credentials, multipart upload, network retry engine, cloud configuration, remote durability claim, or normative remote-backend behavior.
+
+#### Scenario: Optional sealed WAL copy disabled
+
+- **WHEN** P2 retains sealed WAL only on its local durable spool
+- **THEN** retention eligibility still uses validated local WAL/manifest/checkpoint/final-session proof and does not require a `RecordingStore` copy
 
 #### Scenario: Remote backend requested
 

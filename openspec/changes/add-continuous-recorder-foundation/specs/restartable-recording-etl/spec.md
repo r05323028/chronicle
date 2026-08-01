@@ -26,13 +26,15 @@ Live ETL SHALL use read-only snapshot semantics and SHALL never repair, truncate
 - **WHEN** writer appends while ETL reads active segment
 - **THEN** ETL remains bounded by chosen marker and never repairs mutable suffix
 
-### Requirement: Durable incremental reconstruction checkpoint
+### Requirement: FinalSessionCheckpoint v1 and IncrementalEtlCheckpoint v1 are distinct
 
-Checkpoint SHALL persist enough bounded state to resume without rereading deleted input or changing semantic output. It SHALL include version; recorder/epoch/configuration/pipeline/canonical versions; prior checkpoint digest; exact input marker and WAL snapshot digest; sealed segment identities/digests; active connection generation map; directional TCP ranges/chunks/provenance; lifecycle/loss-window state; protocol detector/decoder state including pending request/response correlation; deterministic ID counters/derivation inputs; emitted immutable output identities/digests; source status; bounds/counters; and checkpoint checksum.
+`FinalSessionCheckpoint v1` SHALL remain the existing P1 stopped-recording checkpoint artifact and SHALL not be extended to represent live incremental state. It owns final-session ETL/publication lifecycle and existing P1 finalization behavior.
 
-Checkpoint SHALL use sole mutable v1 for P2 repository and reject unknown/non-v1 before allocation. State SHALL obey existing 1024 connections, 65,536 chunks/connection, 8 MiB/connection, five-minute event-time idle, 8 MiB operation body, 10,000 operations/epoch, 1024 issues, and 4096-record read-batch bounds. Checkpoint MAY contain pending captured bytes and SHALL use private permissions and payload-safe output.
+`IncrementalEtlCheckpoint v1` SHALL be a separate P2 artifact with a different discriminator, owner, and lifecycle. It SHALL persist enough bounded state to resume without rereading deleted input or changing semantic output. It SHALL include WAL marker lineage; segment digest lineage; decoder reconstruction state; TCP direction state; HTTP correlation state; loss-window state; emitted delta batch references; deterministic ID counters; recorder/epoch/configuration/pipeline/canonical versions; prior checkpoint digest; exact input marker and WAL snapshot digest; sealed segment identities/digests; active connection generation map; directional TCP ranges/chunks/provenance; lifecycle/loss-window state; protocol detector/decoder state including pending request/response correlation; deterministic ID derivation inputs; emitted immutable output identities/digests; source status; bounds/counters; and checkpoint checksum.
 
-Checkpoint SHALL be written atomically only after every output it references is durably published and verified. It SHALL never advance beyond recovery-authoritative input or rely on wall-clock/process scheduling for deterministic identity.
+`IncrementalEtlCheckpoint v1` SHALL reject unknown/non-v1 before allocation. No version SHALL have dual interpretation. State SHALL obey existing 1024 connections, 65,536 chunks/connection, 8 MiB/connection, five-minute event-time idle, 8 MiB operation body, 10,000 operations/epoch, 1024 issues, and 4096-record read-batch bounds. It MAY contain pending captured bytes and SHALL use private permissions and payload-safe output.
+
+`IncrementalEtlCheckpoint v1` SHALL be written atomically only after every output it references is durably published and verified. It SHALL never advance beyond recovery-authoritative input or rely on wall-clock/process scheduling for deterministic identity.
 
 #### Scenario: Mid-connection checkpoint
 
@@ -41,7 +43,7 @@ Checkpoint SHALL be written atomically only after every output it references is 
 
 #### Scenario: Unsupported checkpoint version
 
-- **WHEN** checkpoint declares unknown version
+- **WHEN** either checkpoint artifact declares unknown version or a `FinalSessionCheckpoint v1` is presented as incremental state
 - **THEN** ETL fails closed before output or retention eligibility
 
 #### Scenario: Checkpoint state exceeds bound

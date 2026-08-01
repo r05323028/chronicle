@@ -26,7 +26,7 @@ Critical P1 guarantees already exist and remain authoritative:
 - complete provenance and fail-closed corruption;
 - replay independent from capture/WAL and safe by default.
 
-P1 intentionally stops at one recording, rejects live ETL, keeps only advisory post-publication checkpoint, and uses concrete local filesystem paths. Always-on operation creates new coordination problems: process ownership, planned epoch rollover, live-reader/writer concurrency, durable incremental parser state, publication/checkpoint crash windows, safe retention, global quota, readiness, and deployment privilege.
+P1 intentionally stops at one recording, rejects live ETL, and uses `FinalSessionCheckpoint v1` as advisory post-publication final-session state with concrete local filesystem paths. Always-on operation creates new coordination problems: process ownership, planned epoch rollover, live-reader/writer concurrency, durable incremental parser state, publication/checkpoint crash windows, safe retention, global quota, readiness, and deployment privilege.
 
 P2 extends existing boundaries instead of replacing them. Protocol decoding, canonical meaning, eBPF ABI, replay policy, and P1 one-shot commands remain unchanged.
 
@@ -80,7 +80,7 @@ Recorder instance R
   bounded ingest/sequencer
         |
         +----> Epoch 17 / recording_id A / WAL seq 0..N
-        |            seal + final checkpoint
+        |            seal + FinalSessionCheckpoint v1
         |
         +----> Epoch 18 / recording_id B / WAL seq 0..M
         |            ...
@@ -88,7 +88,7 @@ Recorder instance R
 
 Each epoch keeps P1 recording ID, WAL v1 sequence space, commit-marker authority, 4 GiB hard maximum, and one-hour maximum age. Config may lower epoch duration/bytes but not exceed P1 maxima. Recorder-level epoch ordinal and predecessor ID provide continuous lineage without changing WAL bytes or merging canonical sessions.
 
-Rollover keeps one capture source and bounded queue alive. Old epoch stops admission; writable queued prefix is committed; next epoch directory/header is durably opened; remaining/new observations route exactly once to next epoch. Capture timestamps preserve observation order. If next epoch cannot open, recorder stops and fails; accepted queued entries that cannot reach either epoch become exact metadata-only `epoch_rollover_failure` loss counts/bytes with capture-time interval or explicit timestamp ambiguity. Recorder never detaches/re-attaches as planned rollover, silently discards accepted entries, or continues without WAL.
+Rollover keeps one capture source and bounded queue alive. Old epoch stops admission; writable queued prefix is committed; next epoch directory/header is durably opened; remaining/new observations route exactly once to next epoch. Capture timestamps preserve observation order. An **accepted observation** is one that has successfully entered the recorder-owned bounded ingest queue and received its ingest identity. At admission, it receives a stable ingest ordinal, payload length, capture timestamp, and source metadata required for loss reporting. During handoff, each admitted ordinal receives exactly one durable outcome range: old-epoch assignment only after its observation is covered by that epoch's authoritative marker, new-epoch assignment only after the successor commits it, or metadata-only `epoch_rollover_failure`. The bounded outcome ranges are persisted before rollover is reported successful; an outcome-journal persistence failure stops the recorder and leaves the handoff unresolved for deterministic recovery, which counts every admitted-but-unproven ordinal as rollover failure rather than guessing. If next epoch cannot open, recorder stops and fails; accepted observations that cannot reach either epoch become exact metadata-only `epoch_rollover_failure` loss counts/bytes with capture-time interval or explicit timestamp ambiguity. Recorder never detaches/re-attaches as planned rollover, silently discards accepted observations, or continues without WAL.
 
 Connection open across epoch boundary is represented independently in each epoch. Old epoch finalizes incomplete unless trusted close/complete message existed before boundary. This is conservative but avoids cross-recording decoder identity and unbounded state.
 
@@ -100,7 +100,7 @@ Connection open across epoch boundary is represented independently in each epoch
 
 ### 2. Use one OS lease and persistent lifecycle state
 
-One foreground recorder owns one state root and one cgroup scope. OS advisory lock is ownership authority; PID file is not. State machine:
+One foreground recorder owns one filesystem domain, one state root, and one cgroup scope. Preflight resolves configured WAL/store roots to a canonical filesystem-domain identity and deterministic configured domain-lock root. The recorder acquires `<domain-lock-root>/.chronicle-domain.lock` first; the state-root lock is subordinate. All Chronicle mutating commands resolve and attempt that same domain lock before mutation, while read-only commands acquire neither lock. Recorder lease ownership covers domain, not only process; multiple recorder instances sharing a WAL/store filesystem are unsupported. Standalone mutating commands reject a live-owned domain, while read-only commands may continue. OS advisory lock is ownership authority; PID file is not. State machine:
 
 ```text
                       unrecoverable error
@@ -124,17 +124,18 @@ process crash: lock released; persisted starting/recovering/running/draining
                -> next attempt starts at recovering
 ```
 
-Readiness becomes true only after:
+Capture readiness becomes true only after:
 
-1. lease acquired;
+1. filesystem-domain lease acquired;
 2. configuration/state identity validated;
 3. interrupted WAL/manifest/retention transactions reconciled;
-4. ETL output/checkpoint reconciled;
-5. quota headroom and filesystem reservations verified;
-6. active epoch is durably appendable;
-7. capture preflight and attachment succeed.
+4. quota headroom and filesystem reservations verified;
+5. active epoch is durably appendable;
+6. capture preflight and attachment succeed.
 
-Metadata is atomic private JSON and includes recorder ID, process-attempt ID, config digest, scope, state/readiness, boot/clock identity, epoch/segment, authoritative marker summary, ETL checkpoint/lag, quota, counters, last recovery, and failure/shutdown code. WAL markers remain authority for committed bytes; metadata is reconciled, never trusted ahead.
+Processing readiness is separate and requires `IncrementalEtlCheckpoint v1` reconciliation, output-store availability, and incremental ETL progress. ETL lag/retry may make processing/overall health degraded while capture remains ready if durable WAL headroom is safe. Overall health is policy-derived; ETL lag is not capture failure by default.
+
+Metadata is atomic private JSON and includes recorder ID, process-attempt ID, config digest, scope, lifecycle/capture-readiness/processing-readiness/overall-health, boot/clock identity, epoch/segment, authoritative marker summary, `IncrementalEtlCheckpoint v1` lineage/lag, quota, counters, last recovery, and failure/shutdown code. WAL markers remain authority for committed bytes; metadata is reconciled, never trusted ahead.
 
 **Alternatives considered:**
 
@@ -159,7 +160,7 @@ State layout:
         segments/
           <20-digit-first-sequence>.chwal
       etl/
-        checkpoint.json
+        incremental-etl-checkpoint.json
         recovery-report.json
         publications/
           <deterministic-batch-key>.json
@@ -197,7 +198,7 @@ sealed segment digest/range
 immutable canonical delta output durably published + verified
           |
           v
-ETL checkpoint durably references exact input/output
+`IncrementalEtlCheckpoint v1` durably references exact input/output
           |
           v
 final Canonical Session v1 + manifest verified for finalized epoch
@@ -221,6 +222,8 @@ Deletion transaction:
 
 Recovery completes or rolls back transaction from intent, checkpoint, digest, and file presence. Missing committed segment without tombstone is corruption, not assumed cleanup. Tombstone retains identity/range/digest/checkpoint/output/deletion reason without payload.
 
+Lifecycle indexes are bounded. `epochs.json`, per-epoch lineage history, deletion tombstones, and retention metadata have hard byte/entry limits. Finalized retention-complete epochs are compacted into deterministic summary records that retain enough lineage to detect missing committed evidence, digest mismatch, lineage fork, and incomplete cleanup. Compaction uses private temp-write, file sync, atomic rename, and directory sync; recovery either keeps old index or installs the complete new index. Readiness/status reads the bounded summary and never scans all historical epochs. If protected failed, unprocessed, uncertain, or `retain` history cannot be compacted within hard bounds, recorder MUST stop new admission/epoch creation and enter failed/not-ready with stable metadata-limit evidence; it MUST not delete protected lineage or exceed the bound.
+
 Configuration requires explicit `retain` or `delete_after` policy. `retain` never auto-deletes and eventually stops at quota. `delete_after` requires minimum age and may include retained-byte target, but never bypasses proof. Failed/quarantined/unprocessed/uncertain data remains protected.
 
 **Alternatives considered:**
@@ -231,7 +234,9 @@ Configuration requires explicit `retain` or `delete_after` policy. `retain` neve
 
 ### 5. Add global physical quota above existing per-epoch cap
 
-Per-epoch 4 GiB remains. Recorder config must supply quota and minimum free bytes for each filesystem domain. One synchronized reservation authority covers all Chronicle writers sharing a filesystem: active/sealed WAL, manifest/checkpoint, RecordingStore objects, co-located final-session staging/objects, temporary/trash peak, next epoch header, and final marker. Separate state/store filesystems keep independent reserves and cannot borrow headroom. This prevents ETL/session publication from consuming bytes already reserved for WAL finalization.
+Per-epoch 4 GiB remains. P2 supports exactly one active Chronicle mutating writer owner per filesystem domain. Recorder lease ownership covers the entire configured filesystem domain, not only the recorder process. A domain may have one live recorder owner; multiple recorder instances sharing the same WAL/store filesystem are unsupported. Standalone mutating commands MUST reject execution when a live recorder owns that domain; read-only commands may continue. Different cgroup scopes requiring independent recorder instances must use isolated filesystem domains.
+
+Within that single owner, one synchronized reservation authority covers active/sealed WAL, manifest/checkpoint, RecordingStore objects, co-located final-session staging/objects, temporary/trash peak, next epoch header, and final marker. Separate filesystem domains keep independent reserves and cannot borrow headroom. This prevents ETL/session publication from consuming bytes already reserved for WAL finalization without implying safe cross-process quota sharing.
 
 Pressure behavior:
 
@@ -275,10 +280,20 @@ Recorder-owned incremental ETL worker/API never repairs/truncates. If it observe
 - ETL scans/repairs active WAL: rejected; races writer and weakens ownership.
 - External durable watermark: rejected; duplicates WAL authority and group-sync cycle.
 
-### 7. Persist bounded reconstruction/decoder state
+### 7. Separate final-session and incremental ETL checkpoints
 
-P1 checkpoint is advisory after final session publication and does not contain intermediate state. P2 checkpoint v1 adds:
+`FinalSessionCheckpoint v1` is the existing P1 stopped-recording checkpoint artifact. It remains owned by final-session ETL/publication and is not extended to represent live incremental state. `IncrementalEtlCheckpoint v1` is a distinct P2 artifact with a distinct discriminator, owner, and lifecycle. Unknown versions fail closed; no version has dual interpretation.
 
+`IncrementalEtlCheckpoint v1` owns:
+
+- WAL marker lineage;
+- segment digest lineage;
+- decoder reconstruction state;
+- TCP direction state;
+- HTTP correlation state;
+- loss-window state;
+- emitted delta batch references;
+- deterministic ID counters;
 - predecessor checkpoint digest;
 - epoch/config/pipeline/canonical versions;
 - exact input marker/WAL/segment digests;
@@ -348,7 +363,7 @@ local durable spool                         RecordingStore
 -------------------                         --------------
 active WAL/lease/repair      X no upload
 mutable recorder/checkpoint  X no upload
-sealed segment -------------> put_if_absent(key,len,sha,provenance)
+sealed segment --optional--> put_if_absent(key,len,sha,provenance)
 canonical delta ------------> put_if_absent(...)
 final session --------------> existing atomic filesystem publication
 ```
@@ -361,7 +376,7 @@ Minimum store semantics:
 - delete with exact digest precondition;
 - typed created/matching/conflict/not-found/unsupported/transient/permanent/uncertain.
 
-P2 implements filesystem backend only, preserving private staging, sync, path confinement, and atomic no-replace. It stores sealed WAL copies, canonical delta batches, recovery reports, and provenance indexes—not final Canonical Session transactions. S3-compatible behavior remains future design context only; no SDK/config/client or normative remote-backend contract lands in P2.
+P2 implements filesystem backend only, preserving private staging, sync, path confinement, and atomic no-replace. It may store optional sealed WAL copies, canonical delta batches, recovery reports, and provenance indexes—not final Canonical Session transactions. Sealed WAL copies are future-compatible immutable artifacts, not mandatory P2 data flow; retention correctness uses local validated WAL/manifest/checkpoint/final-session proof and never requires duplicated WAL copies. S3-compatible behavior remains future design context only; no SDK/config/client or normative remote-backend contract lands in P2.
 
 **Alternatives considered:**
 
@@ -383,7 +398,7 @@ Comparison:
 | ownership | application team | platform + Chronicle operator |
 | P2 complexity | orchestration/manifests | systemd foreground service |
 
-Supported model: one systemd-managed foreground process per scope/state root, optionally template unit. Unit uses `Type=simple`: systemd active means liveness only, while automation polls local `recorder-status`/atomic state for readiness. Dedicated service user, private state directory, least verified capabilities, restart backoff/start limit, SIGTERM stop, systemd timeout longer than Chronicle drain timeout, resource controls, and no custom daemonization or `sd_notify` integration.
+Supported model: one systemd-managed foreground process per scope/state root and filesystem domain, optionally template unit. Different scopes needing independent recorder instances use isolated filesystem domains. Unit uses `Type=simple`: systemd active means liveness only, while automation polls local `recorder-status`/atomic state for capture and processing readiness. Dedicated service user, private state directory, least verified capabilities, restart backoff/start limit, SIGTERM stop, systemd timeout longer than Chronicle drain timeout, resource controls, and no custom daemonization or `sd_notify` integration.
 
 Configuration is one private versioned file. No hot reload. Incompatible scope/state/durability change requires new root or explicit acknowledged migration. Status uses atomic local file plus `recorder-status`; no network control plane.
 
@@ -393,15 +408,16 @@ Configuration is one private versioned file. No hot reload. Incompatible scope/s
 - One multi-scope node agent: deferred; adds scheduler/tenant isolation/control plane.
 - Kubernetes DaemonSet/operator: later milestone.
 
-### 11. Separate liveness, readiness, and health
+### 11. Split liveness, capture readiness, processing readiness, and health
 
-- **Liveness:** process executing.
-- **Readiness:** lifecycle `running` after recovery, WAL appendability, capture attachment, ETL reconciliation, and quota checks.
-- **Health:** `healthy`, `degraded`, or `failed`.
+- **Liveness:** recorder process is executing.
+- **Capture readiness:** recorder can safely capture: filesystem-domain lease ownership, recovered WAL, appendable epoch, quota reservation, and capture attachment are all valid.
+- **Processing readiness:** incremental ETL can make progress: `IncrementalEtlCheckpoint v1` lineage is consistent, output store is available, and incremental processing is healthy.
+- **Overall health:** policy-derived `healthy`, `degraded`, or `failed` status; ETL lag/retry may degrade processing/overall health without forcing capture failure while WAL headroom remains safe.
 
-ETL lag/store retry may be degraded while durable WAL has headroom. WAL unappendable, capture detached, corruption, unsafe quota, or checkpoint contradiction is failed/not ready.
+WAL unappendability, capture detachment, corruption, or unsafe quota makes capture not ready/failed. Checkpoint contradiction or output-store failure makes processing not ready; policy determines overall health. ETL lag MUST NOT be treated as capture failure by default.
 
-Safe status fields: recorder/attempt/epoch/segment IDs; lifecycle/readiness/health; config digest; commit/checkpoint watermarks; lag records/bytes/age; retained/quota/free bytes; segment counts; capture/WAL loss; last recovery/cleanup/publication; stable code/remediation. No payload/header values, command line, or environment values. P2 adds no metrics server.
+Safe status fields: recorder/attempt/epoch/segment IDs; lifecycle/capture-readiness/processing-readiness/overall-health; config digest; commit/`IncrementalEtlCheckpoint v1` watermarks; lag records/bytes/age; retained/quota/free bytes; segment counts; capture/WAL loss; last recovery/cleanup/publication; stable code/remediation. No payload/header values, command line, or environment values. P2 adds no metrics server.
 
 ### 12. Preserve P1 signal and failure semantics at service scope
 
@@ -413,7 +429,7 @@ stop intake
  -> drain capacity-qualified queue
  -> final marker + fdatasync
  -> seal epoch/manifest
- -> finish in-flight ETL output/checkpoint safe point
+ -> finish in-flight ETL output/`IncrementalEtlCheckpoint v1` safe point
  -> detach maps/links
  -> persist recorder state as stopped
  -> release lease
@@ -430,10 +446,10 @@ Failure/recovery matrix:
 | WAL write/marker/sync | stop, preserve prior marker authority |
 | manifest lag/missing | rebuild from validated WAL |
 | manifest contradiction | fail closed, preserve files |
-| ETL crash | capture continues while quota allows; resume checkpoint |
-| publish success/checkpoint failure | verify deterministic output, repair checkpoint |
-| checkpoint corruption/fork/ahead | fail ETL/retention; preserve WAL |
-| store transient failure | bounded retry/degraded; no checkpoint advance |
+| ETL crash | capture continues while quota allows; resume `IncrementalEtlCheckpoint v1` |
+| publish success/`IncrementalEtlCheckpoint v1` failure | verify deterministic output, repair incremental checkpoint |
+| `IncrementalEtlCheckpoint v1` corruption/fork/ahead | fail ETL/retention; preserve WAL |
+| store transient failure | bounded retry/degraded; no incremental checkpoint advance |
 | quota with eligible data | validated cleanup then continue |
 | quota without eligible data | stop/fail; no unsafe deletion |
 | cleanup crash | complete/roll back transaction |
@@ -462,6 +478,26 @@ OpenSpec strict validation proves artifact consistency only.
 Rootless automated evidence covers deterministic state machines, manifests, fault injection, ETL state/transaction equivalence, store conformance, quota/retention, CLI/config/status, and docs/static unit behavior.
 
 Privileged supported-Linux evidence covers only production-runtime claims: Ubuntu 24.04/kernel/cgroup v2/BTF/capabilities, real eBPF load/attach/capture, systemd placement, multi-epoch/segment operation, signals/crash/restart, WAL persistence, incremental ETL, disk pressure, cleanup, and process/cgroup/eBPF leak checks. Evidence is retained under exact commit/environment and labels untested combinations honestly.
+
+## Implementation Gates
+
+### Gate A: Recorder lifecycle foundation complete
+
+Evidence required for domain lease ownership, lifecycle state, WAL manifest, epoch rollover and durable observation outcomes, ordered shutdown, and status contracts. These foundation tasks may use an ETL safe-point hook but MUST NOT require incremental ETL correctness. Do not begin incremental ETL implementation until Gate A passes.
+
+### Gate B: Incremental ETL feasibility approved
+
+Evidence required for a bounded decoder state inventory, `IncrementalEtlCheckpoint v1` serialization, and pause/resume equivalence. Do not enable live ETL until Gate B is independently reviewed and approved.
+
+### Gate C: Incremental publication correctness proven
+
+Evidence required for deterministic delta output, publication-before-checkpoint transaction, crash recovery, and one-shot equivalence. Do not enable retention transitions based on incremental output until Gate C passes.
+
+### Gate D: Retention/quota enabled only after safety proof
+
+Evidence required for the cleanup proof chain, one-owner-per-filesystem-domain quota model, bounded lifecycle-index compaction including protected-history exhaustion behavior, and contradiction/crash tests. Do not enable retention deletion or quota enforcement as production behavior until Gate D passes.
+
+Implementation MUST NOT proceed to later gates without prior gate evidence. OpenSpec validation is artifact validation only and is not gate evidence.
 
 ## Data Flow Diagrams
 
