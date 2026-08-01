@@ -179,9 +179,35 @@ Recorder configuration SHALL be loaded from one versioned file and normalized in
 - **WHEN** configured cgroup scope differs from persisted active lineage
 - **THEN** recorder rejects reuse of state root and does not mix recordings
 
+### Requirement: Bounded lifecycle index compaction
+
+Recorder SHALL enforce configured maximum byte and entry limits for `epochs.json`, epoch lineage history, deletion tombstones, and retention metadata. Startup recovery, capture readiness, and status queries SHALL use bounded current entries and lineage summaries and MUST NOT scan unbounded historical epochs. An epoch MAY enter compaction only after it is finalized, retained according to policy, cleanup is complete, and all deletion tombstones are durably persisted.
+
+Compaction SHALL replace eligible history with a deterministic bounded lineage anchor preserving first retained epoch identity, last compacted epoch identity, predecessor relationship, digest-chain root/tip, cleanup summary, and enough range/count data to detect missing committed evidence, digest mismatch, lineage fork, incomplete cleanup, or conflicting/incomplete compaction. Each candidate SHALL carry monotonic compaction generation, unique transaction ID, source-index revision/digest, candidate digest, and anchor data; candidate digest SHALL cover anchor, active epochs, tombstone summary, and source metadata. Private temp-write, file sync, atomic rename, and directory sync SHALL make crash recovery validate old and candidate indexes independently. Candidate installation is allowed only when source revision/digest matches the old authoritative index and candidate digest/anchor recompute exactly; stale, incomplete, or conflicting candidates SHALL preserve old index and report stable contradiction. Protected history that cannot fit after legal compaction SHALL fail closed with bounded metadata-limit evidence; recorder SHALL stop new admission/epoch creation rather than delete protected lineage or exceed configured limits.
+
+#### Scenario: Multi-year lifecycle index compacts
+
+- **WHEN** finalized epochs are policy-retained, cleanup-complete, tombstones-persisted, and `epochs.json` reaches configured size or entry limits
+- **THEN** recorder installs a deterministic bounded anchor with first/last epoch identities, predecessor/digest-chain proof, cleanup summary, active epochs, and contradiction-detection data without scanning all history for readiness or status
+
+#### Scenario: Crash during lifecycle compaction
+
+- **WHEN** process crashes before or after compaction rename or directory sync
+- **THEN** recovery validates old and candidate indexes, selects the candidate only on exact source revision/digest and candidate digest match, otherwise preserves old index, and preserves lineage/tombstone proof
+
+#### Scenario: Conflicting lifecycle compaction candidate
+
+- **WHEN** candidate source revision/digest is stale or candidate/anchor digest conflicts with its source index
+- **THEN** recovery rejects candidate, records stable contradiction, and does not guess, install partial state, or scan unrelated historical epochs
+
+#### Scenario: Protected history exhausts metadata bound
+
+- **WHEN** failed, unprocessed, uncertain, or `retain` history cannot fit after legal compaction
+- **THEN** recorder stops new admission/epoch creation, reports stable metadata-limit failure, and does not delete protected lineage or exceed limits
+
 ### Requirement: Lifecycle acceptance is evidence-based
 
-Rootless automated tests SHALL prove state transitions, exclusive ownership, rollover, graceful timeout, crash-point recovery, metadata reconciliation, and no duplicate epoch assignment with deterministic fake capture/WAL/storage adapters. Privileged acceptance SHALL separately prove supported Ubuntu 24.04 real eBPF continuous operation, signal handling, process restart, cgroup/eBPF cleanup, and retained machine-readable evidence tied to exact commit/environment. OpenSpec validation SHALL NOT count as runtime acceptance.
+Rootless automated tests SHALL prove state transitions, exclusive ownership, rollover, graceful timeout, crash-point recovery, metadata reconciliation, bounded lifecycle compaction, and no duplicate epoch assignment with deterministic fake capture/WAL/storage adapters. Privileged acceptance SHALL separately prove supported Ubuntu 24.04 real eBPF continuous operation, signal handling, process restart, cgroup/eBPF cleanup, and retained machine-readable evidence tied to exact commit/environment. OpenSpec validation SHALL NOT count as runtime acceptance.
 
 #### Scenario: Continuous operation proof
 

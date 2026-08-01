@@ -181,7 +181,7 @@ P1 byte-size segment rotation remains. P2 adds five-minute default age rotation,
 **Alternatives considered:**
 
 - New WAL framing/segment seal record: rejected; existing final commit marker plus sealed-byte digest suffices and avoids format churn.
-- One global manifest only: rejected; per-epoch recovery/retention isolation is simpler. `epochs.json` remains small lineage index.
+- One global manifest only: rejected; per-epoch recovery/retention isolation is simpler. `epochs.json` remains a bounded lineage index with deterministic compaction anchors, not an unbounded epoch catalog.
 - Trust manifest watermark: rejected; would weaken P1 commit-marker proof.
 
 ### 4. Retain/delete only after proof chain; default active-prefix deletion deferred
@@ -222,7 +222,38 @@ Deletion transaction:
 
 Recovery completes or rolls back transaction from intent, checkpoint, digest, and file presence. Missing committed segment without tombstone is corruption, not assumed cleanup. Tombstone retains identity/range/digest/checkpoint/output/deletion reason without payload.
 
-Lifecycle indexes are bounded. `epochs.json`, per-epoch lineage history, deletion tombstones, and retention metadata have hard byte/entry limits. Finalized retention-complete epochs are compacted into deterministic summary records that retain enough lineage to detect missing committed evidence, digest mismatch, lineage fork, and incomplete cleanup. Compaction uses private temp-write, file sync, atomic rename, and directory sync; recovery either keeps old index or installs the complete new index. Readiness/status reads the bounded summary and never scans all historical epochs. If protected failed, unprocessed, uncertain, or `retain` history cannot be compacted within hard bounds, recorder MUST stop new admission/epoch creation and enter failed/not-ready with stable metadata-limit evidence; it MUST not delete protected lineage or exceed the bound.
+Lifecycle index compaction keeps long-running deployments bounded. `epochs.json`, per-epoch lineage history, deletion tombstones, and retention metadata each have configured maximum byte and entry limits. Startup recovery, capture readiness, and status queries MUST use the bounded current index and summaries; they MUST NOT scan unbounded historical epochs.
+
+An epoch is eligible for compaction only after it is finalized, retained according to policy, cleanup is complete, and all deletion tombstones are durably persisted. Eligible history is replaced by a deterministic bounded lineage anchor that preserves first retained epoch identity, last compacted epoch identity, predecessor relationship, digest-chain root/tip, cleanup summary, and enough range/count information for missing committed evidence, digest mismatch, lineage fork, incomplete cleanup, and conflicting-compaction detection.
+
+```text
+epochs.json before
+
+  epoch-1 ... epoch-100000
+  epoch-100001
+  epoch-100002
+
+compacted epochs.json
+
+  compaction:
+    generation
+    transaction_id
+    source_index_revision
+    source_index_digest
+    candidate_digest
+  compacted-lineage-anchor:
+    first_retained_epoch
+    last_compacted_epoch
+    predecessor_epoch
+    digest_chain_root
+    digest_chain_tip
+    cleanup_summary
+  active_epochs:
+    epoch-100001
+    epoch-100002
+```
+
+Each compaction candidate records monotonic `compaction_generation`, unique `transaction_id`, source-index revision/digest, candidate identity/digest, and anchor data. The candidate digest covers anchor, active epochs, tombstone summary, and source metadata. Compaction is deterministic and uses private temp-write, file sync, atomic rename, and directory sync. Recovery validates old index and candidate independently: candidate installation is allowed only when its source revision/digest matches the old authoritative index and its digest/anchor recompute exactly; stale, incomplete, or conflicting candidates are rejected, with the old index preserved and a stable contradiction recorded. If both old and candidate files are complete, this same source-match rule deterministically selects the candidate; otherwise recovery fails closed rather than guessing. If protected failed, unprocessed, uncertain, or `retain` history cannot fit within hard bounds after legal compaction, recorder MUST stop new admission/epoch creation and enter failed/not-ready with stable metadata-limit evidence; it MUST not delete protected lineage or exceed the bound.
 
 Configuration requires explicit `retain` or `delete_after` policy. `retain` never auto-deletes and eventually stops at quota. `delete_after` requires minimum age and may include retained-byte target, but never bypasses proof. Failed/quarantined/unprocessed/uncertain data remains protected.
 
@@ -354,9 +385,30 @@ Duplicate prevention uses exact WAL provenance/digests and deterministic keys, n
 - Checkpoint before publication: rejected; can omit output permanently.
 - Transactional database: rejected; no database requirement and filesystem ordering suffices.
 
-### 9. RecordingStore boundary starts at immutable artifacts
+### 9. RecordingStore owns immutable artifacts only
 
-Active WAL requires local filesystem append/`fdatasync`/lock/repair and stays local. `RecordingStore` receives only immutable sealed artifacts:
+RecordingStore ownership is deliberately narrow:
+
+- **RecordingStore owns:** immutable artifact storage semantics, artifact identity, integrity verification, artifact lifecycle metadata, and the filesystem backend implementation.
+- **RecordingStore does not own:** active WAL append authority, WAL commit-marker authority, WAL repair, incremental checkpoint authority, or final Canonical Session publication authority.
+
+Ownership flow is explicit:
+
+```text
+WAL
+ | commit authority
+ v
+Incremental ETL
+ | checkpoint authority
+ v
+RecordingStore
+ | immutable artifact persistence
+ v
+FilesystemSessionStore
+ | final Canonical Session publication
+```
+
+Active WAL requires local filesystem append/`fdatasync`/lock/repair and stays local. RecordingStore receives only immutable sealed artifacts:
 
 ```text
 local durable spool                         RecordingStore
@@ -365,8 +417,10 @@ active WAL/lease/repair      X no upload
 mutable recorder/checkpoint  X no upload
 sealed segment --optional--> put_if_absent(key,len,sha,provenance)
 canonical delta ------------> put_if_absent(...)
-final session --------------> existing atomic filesystem publication
+final session --------------> FilesystemSessionStore publication
 ```
+
+WAL remains sole authority for committed bytes and repair. Incremental ETL remains sole authority for checkpoint advancement and must publish/verify immutable outputs before advancing its checkpoint. FilesystemSessionStore remains sole owner of final Canonical Session manifest/payload publication. RecordingStore stores and verifies artifacts and their lifecycle metadata but cannot bypass any upstream authority.
 
 Minimum store semantics:
 

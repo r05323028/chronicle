@@ -35,6 +35,25 @@ Store contract SHALL provide typed operations equivalent to put-if-absent with e
 - **WHEN** same key exists with different length/digest/provenance
 - **THEN** store returns conflict and preserves existing object
 
+### Requirement: RecordingStore ownership boundaries
+
+RecordingStore SHALL own only immutable artifact storage semantics, artifact identity, integrity verification, artifact lifecycle metadata, and the filesystem backend implementation. It SHALL NOT own active WAL append authority, WAL commit-marker authority, WAL repair, incremental checkpoint authority, or final Canonical Session publication authority. WAL commit markers and recovery remain authoritative for committed bytes; incremental ETL remains authoritative for checkpoint advancement; existing `FilesystemSessionStore` remains authoritative for final Canonical Session manifest/payload publication.
+
+#### Scenario: RecordingStore cannot bypass WAL authority
+
+- **WHEN** caller submits an active or unsealed WAL mutation, commit-marker request, or repair request through RecordingStore
+- **THEN** operation is rejected as unsupported and WAL authority remains unchanged
+
+#### Scenario: Checkpoint ordering remains ETL-owned
+
+- **WHEN** incremental ETL publishes an immutable artifact through RecordingStore
+- **THEN** RecordingStore returns only artifact persistence/integrity outcome; ETL alone may advance `IncrementalEtlCheckpoint v1` after publication verification
+
+#### Scenario: Final session publication remains FilesystemSessionStore-owned
+
+- **WHEN** caller attempts to publish final Canonical Session manifest/payload through RecordingStore
+- **THEN** operation is rejected as unsupported and final publication remains an unchanged `FilesystemSessionStore` transaction
+
 ### Requirement: Explicit manifests own artifact reachability
 
 Recorder/ETL SHALL decide required artifact set from versioned manifests/checkpoints, not from store listing completeness or modification time. Every published artifact reference SHALL contain kind, deterministic key, size, SHA-256, schema version, source epoch/WAL range, creation transaction identity, and retention class. Manifest/checkpoint referencing artifact SHALL be persisted only after store confirms durable matching publication. Retention decisions SHALL use local validated WAL, lifecycle manifest, checkpoint lineage, and final-session proof; duplicated sealed WAL copies and store listing SHALL never be required for retention correctness.
@@ -120,7 +139,7 @@ Store operation SHALL classify permission, space/quota, integrity conflict, unsu
 
 ### Requirement: Backend conformance is executable
 
-P2 filesystem RecordingStore backend SHALL pass conformance suite for put-if-absent, matching retry, conflicting retry, integrity read, bounded list, preconditioned delete, path/key safety, crash staging, durability uncertainty, and lifecycle behavior. Conformance SHALL use rootless fault injection and SHALL not claim any remote backend support.
+P2 filesystem RecordingStore backend SHALL pass conformance suite for put-if-absent, matching retry, conflicting retry, integrity read, bounded list, preconditioned delete, path/key safety, crash staging, durability uncertainty, lifecycle behavior, and ownership-boundary rejection. Conformance SHALL prove RecordingStore cannot bypass WAL authority, advance incremental checkpoints, or publish final sessions. Conformance SHALL use rootless fault injection and SHALL not claim any remote backend support.
 
 #### Scenario: Filesystem conformance
 

@@ -154,7 +154,24 @@ At pressure threshold recorder SHALL first run only already-eligible cleanup. It
 
 ### Requirement: Lifecycle indexes remain bounded
 
-Recorder SHALL enforce hard byte and entry bounds for `epochs.json`, epoch lineage history, deletion tombstones, and retention metadata. It SHALL prevent unbounded epoch metadata growth by compacting finalized retention-complete epochs into deterministic summary records. Compaction SHALL preserve enough lineage to detect missing committed evidence, digest mismatch, lineage fork, and incomplete cleanup. It SHALL use private temp-write, file sync, atomic rename, and directory sync so a crash leaves either old or complete new index; recovery SHALL be able to finish or roll back deterministically. Status/readiness checks SHALL use bounded current summaries and SHALL NOT scan all historical epochs.
+Recorder SHALL enforce configured maximum byte and entry bounds for `epochs.json`, epoch lineage history, deletion tombstones, and retention metadata. Startup recovery, readiness checks, and status queries MUST NOT scan unbounded historical epochs. An epoch is eligible for compaction only after it is finalized, retained according to policy, cleanup is complete, and all deletion tombstones are persisted.
+
+Eligible history SHALL compact into a deterministic bounded lineage anchor preserving first retained epoch identity, last compacted epoch identity, predecessor relationship, digest-chain root/tip, cleanup summary, and range/count data sufficient to detect missing committed evidence, digest mismatch, lineage fork, incomplete cleanup, or conflicting/incomplete compaction. Each compaction candidate SHALL carry monotonic generation, unique transaction ID, source-index revision/digest, candidate digest, and anchor data; candidate digest SHALL cover anchor, active epochs, tombstone summary, and source metadata. The representation MAY retain active epochs separately:
+
+```text
+compacted-lineage-anchor:
+  first_retained_epoch
+  last_compacted_epoch
+  predecessor_epoch
+  digest_chain_root
+  digest_chain_tip
+  cleanup_summary
+active_epochs:
+  epoch-100001
+  epoch-100002
+```
+
+Compaction SHALL use private temp-write, file sync, atomic rename, and directory sync. Crash recovery SHALL validate old and candidate indexes independently, install a candidate only when its source revision/digest matches the old authoritative index and its candidate digest/anchor recompute exactly, and otherwise preserve old index with stable contradiction evidence. If protected history cannot fit after legal compaction, recorder SHALL stop new admission/epoch creation with bounded metadata-limit failure evidence; it SHALL not delete protected lineage or exceed configured bounds.
 
 #### Scenario: Multi-year history compaction
 
@@ -170,6 +187,11 @@ Recorder SHALL enforce hard byte and entry bounds for `epochs.json`, epoch linea
 
 - **WHEN** compacted summary conflicts with committed evidence, digest, predecessor, or cleanup proof
 - **THEN** recovery reports stable contradiction and fails closed without scanning unrelated historical epochs
+
+#### Scenario: Stale compaction candidate
+
+- **WHEN** candidate source revision/digest is stale or candidate digest conflicts with its source index
+- **THEN** recovery rejects candidate, preserves old authoritative index, and does not install partial or guessed lineage
 
 ### Requirement: Continuous recovery reconciles manifest, files, and checkpoints
 
