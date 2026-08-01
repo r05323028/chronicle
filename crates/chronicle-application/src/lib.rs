@@ -851,11 +851,9 @@ pub fn record_continuous_ebpf(
         || Ok(()),
     )
     .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-    let mut metadata = load_recording_metadata(wal_directory)?.ok_or(
-        ApplicationError::RecordingMetadataValidation("continuous metadata missing".into()),
-    )?;
-    metadata.capture = Some(capture_metadata);
-    write_recording_metadata(wal_directory, &metadata)?;
+    service
+        .set_capture_metadata(capture_metadata)
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
     let mut epoch_started = Instant::now();
     let mut reason = ShutdownReason::SourceCompleted;
     loop {

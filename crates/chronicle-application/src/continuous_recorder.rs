@@ -5,8 +5,8 @@ use crate::{
     EpochMetadata, LagSummary, MetadataCode, NormalizedRecorderConfig, QuotaStatus,
     RecorderCounters, RecorderEpochBoundary, RecorderHealth, RecorderLifecycleError,
     RecorderMetadataV1, RecorderOrchestrationError, RecorderOrchestrator, RecorderPoll,
-    RecorderReadiness, RecorderStartup, RecorderStartupError, RecordingMetadata, RecordingStatus,
-    write_recorder_metadata, write_recording_metadata,
+    RecorderReadiness, RecorderStartup, RecorderStartupError, RecordingCaptureMetadata,
+    RecordingMetadata, RecordingStatus, write_recorder_metadata, write_recording_metadata,
 };
 use chronicle_capture::{CaptureError, CaptureSource};
 use chronicle_wal::WalError;
@@ -140,6 +140,16 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             active_metadata,
             state_root: config.state_root.clone(),
         })
+    }
+
+    pub fn set_capture_metadata(
+        &mut self,
+        capture: RecordingCaptureMetadata,
+    ) -> Result<(), ContinuousRecorderError> {
+        self.metadata.capture = Some(capture);
+        write_recording_metadata(&self.wal_directory, &self.metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        Ok(())
     }
 
     pub fn poll(&mut self, now_millis: u64) -> Result<RecorderPoll, ContinuousRecorderError> {
