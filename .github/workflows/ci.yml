@@ -45,15 +45,12 @@ jobs:
           python3 scripts/tests/validation/test_layered_validation.py
           bash scripts/tests/acceptance/test-p2-readiness.sh
 
-      # Cargo directories above are caches, never evidence artifacts.
       - name: Upload failure-only validation evidence
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: validation-failure-${{ github.run_id }}
-          path: |
-            evidence/validation/
-            target/validation-work/
+          path: evidence/validation/
           if-no-files-found: ignore
           retention-days: 14
 

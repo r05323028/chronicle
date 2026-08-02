@@ -2,7 +2,7 @@
 
 ## Purpose
 
-See change add-continuous-recorder-foundation.
+Define local durable spool and immutable RecordingStore boundaries, lifecycle, integrity, and conformance obligations.
 
 ## Requirements
 
@@ -151,4 +151,3 @@ P2 filesystem RecordingStore backend SHALL pass conformance suite for put-if-abs
 
 - **WHEN** rootless conformance suite runs with injected write/sync/rename/delete failures
 - **THEN** final objects/checkpoints are absent or exact, retries converge, and no conflicting object is overwritten
-

@@ -50,6 +50,8 @@ for needle in \
 	grep -Fq -- "$needle" "$SCRIPT"
 done
 for needle in \
+	'ensure_vm_source' \
+	'multipass mount' \
 	'git clone --quiet --no-local' \
 	'checkout --quiet --detach' \
 	'multipass restart' \

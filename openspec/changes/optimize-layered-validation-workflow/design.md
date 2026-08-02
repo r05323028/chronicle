@@ -26,11 +26,11 @@ P1 and P2 already have authoritative privileged scripts and Multipass wrappers, 
 
 ### Declarative dependency map
 
-`validation/groups.toml` defines groups, path globs, commands, and gate ownership. A small Python standard-library helper embedded in `validate.sh` evaluates Git paths and emits selected/skipped reasons. Documentation-only paths select no privileged group. Unknown source paths conservatively select the portable group and both affected gates only when the map marks them gate-owned.
+`validation/groups.toml` defines groups, path globs, commands, and gate ownership. The standalone Python standard-library helper at `scripts/validation.py`, invoked by `validate.sh`, evaluates Git paths and emits selected/skipped reasons. Documentation-only paths select no privileged group. Unknown source paths conservatively select the portable group and both affected gates only when the map marks them gate-owned.
 
 ### Fingerprints
 
-A fingerprint is SHA-256 over canonical JSON containing gate name, sorted hashes of mapped source/acceptance/build-input paths, Cargo.lock, rustc version, target architecture, Ubuntu/kernel/BTF/cgroup capability values, and validation contract/config. It excludes unrelated repository paths and commit hash. Missing or changed inputs produce a different fingerprint; evidence manifests record original commit and covered checks.
+A fingerprint is SHA-256 over canonical JSON containing gate name, sorted hashes of mapped source/acceptance/build-input paths, Cargo.lock, rustc version, target architecture, Ubuntu/kernel/BTF/cgroup capability values collected inside the privileged VM, and validation contract/config. It excludes unrelated repository paths and commit hash. Missing or changed inputs produce a different fingerprint; evidence manifests record original commit and covered checks.
 
 ### Evidence retention
 
@@ -38,7 +38,7 @@ Each run writes `summary.json`, `environment.json`, `manifest.json`, and `checks
 
 ### Multipass and caches
 
-Wrappers reuse a named existing Ubuntu VM, mount source at `/mnt/chronicle`, and set `CARGO_TARGET_DIR=/home/ubuntu/chronicle-target`; Cargo home remains `/home/ubuntu/.cargo`. Bootstrap installs missing packages only, with a marker for completed setup. Source is not copied onto the host mount for build output. Existing wrapper behavior remains the source of privileged coverage.
+Wrappers reuse a named existing Ubuntu VM, verify or create the source mount at `/mnt/chronicle` before cloning, and set `CARGO_TARGET_DIR=/home/ubuntu/chronicle-target`; Cargo home remains `/home/ubuntu/.cargo`. Bootstrap installs missing packages only, with a marker for completed setup. Source is not copied onto the host mount for build output. Existing wrapper behavior remains the source of privileged coverage.
 
 ### Recorder readiness contract
 

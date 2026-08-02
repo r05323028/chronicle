@@ -30,6 +30,7 @@ class LayeredValidationTests(unittest.TestCase):
         (self.temp / "Cargo.lock").write_text("lock-v1\n")
         for path in (
             "docs/change.md",
+            "unmapped/change.md",
             "crates/chronicle-etl/src/lib.rs",
             "crates/chronicle-wal/src/lib.rs",
             "ebpf/src/main.rs",
@@ -44,8 +45,8 @@ class LayeredValidationTests(unittest.TestCase):
         shutil.rmtree(self.temp)
 
     def test_unknown_path_selects_all_groups_fail_closed(self):
-        result = validation.select(self.temp, ["docs/change.md"], self.cfg)
-        self.assertEqual(result["unknown_paths"], ["docs/change.md"])
+        result = validation.select(self.temp, ["unmapped/change.md"], self.cfg)
+        self.assertEqual(result["unknown_paths"], ["unmapped/change.md"])
         self.assertEqual(result["selected"], sorted(self.cfg["groups"]))
         self.assertTrue(all(item["selected"] for item in result["decisions"].values()))
 
@@ -75,6 +76,46 @@ class LayeredValidationTests(unittest.TestCase):
             first, validation.fingerprint(self.temp, "p1", self.cfg)["fingerprint"]
         )
 
+    def test_fingerprint_uses_supplied_environment(self):
+        vm_environment = {
+            "rustc": "rustc vm",
+            "architecture": "aarch64",
+            "kernel": "6.8.0",
+            "ubuntu": "24.04",
+            "os": "Linux",
+            "target": "host",
+            "btf": True,
+            "cgroup_v2": True,
+        }
+        first = validation.fingerprint(self.temp, "p1", self.cfg, vm_environment)[
+            "fingerprint"
+        ]
+        vm_environment["kernel"] = "6.8.1"
+        self.assertNotEqual(
+            first,
+            validation.fingerprint(self.temp, "p1", self.cfg, vm_environment)[
+                "fingerprint"
+            ],
+        )
+
+    def test_no_artifact_does_not_create_output(self):
+        source = self.temp / "source"
+        dest = self.temp / "evidence"
+        source.mkdir()
+        validation.compact(
+            argparse.Namespace(
+                source=source,
+                dest=dest,
+                gate="p1",
+                status="passed",
+                fingerprint="fp",
+                commit="sha",
+                checks="P1",
+                artifact_mode="no-artifact",
+            )
+        )
+        self.assertFalse(dest.exists())
+
     def test_success_artifact_is_compact(self):
         source = self.temp / "source"
         dest = self.temp / "evidence"
@@ -82,6 +123,8 @@ class LayeredValidationTests(unittest.TestCase):
         (source / "acceptance-report.json").write_text('{"status":"passed"}\n')
         (source / "target").mkdir()
         (source / "target" / "large.bin").write_bytes(b"x" * 1000)
+        environment_file = self.temp / "environment.json"
+        environment_file.write_text('{"kernel": "vm-kernel"}\n')
         args = argparse.Namespace(
             source=source,
             dest=dest,
@@ -90,6 +133,7 @@ class LayeredValidationTests(unittest.TestCase):
             fingerprint="fp",
             commit="sha",
             checks="P1",
+            environment=environment_file,
             artifact_mode="artifact-on-failure",
         )
         validation.compact(args)
@@ -99,6 +143,10 @@ class LayeredValidationTests(unittest.TestCase):
         )
         self.assertNotIn(
             "target", json.loads((dest / "manifest.json").read_text())["files"]
+        )
+        self.assertEqual(
+            json.loads((dest / "environment.json").read_text())["kernel"],
+            "vm-kernel",
         )
 
     def test_release_keeps_evidence_but_not_cache(self):
@@ -133,7 +181,9 @@ class LayeredValidationTests(unittest.TestCase):
         (evidence / "p1" / "manifest.json").write_text('{"status":"passed"}\n')
         (evidence / "p1" / "checksums.txt").write_text("bad  ../outside\n")
         self.assertEqual(
-            validation.reuse(argparse.Namespace(evidence_root=evidence, gate="p1", fingerprint="fp")),
+            validation.reuse(
+                argparse.Namespace(evidence_root=evidence, gate="p1", fingerprint="fp")
+            ),
             1,
         )
 

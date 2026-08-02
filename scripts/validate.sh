@@ -89,7 +89,11 @@ while (($#)); do
 done
 
 if [[ $MODE == release ]]; then
-	ARTIFACT_MODE=release
+	if [[ $NO_ARTIFACT == true ]]; then
+		ARTIFACT_MODE=no-artifact
+	else
+		ARTIFACT_MODE=release
+	fi
 fi
 mkdir -p "$WORKDIR"
 
@@ -109,6 +113,28 @@ cleanup() {
 	exit "$status"
 }
 trap cleanup EXIT
+
+ensure_vm_mount() {
+	local state
+	command -v multipass >/dev/null 2>&1 || {
+		printf '%s\n' 'multipass is required for privileged validation' >&2
+		return 1
+	}
+	state=$(multipass info "$VM" 2>/dev/null | awk '/State:/ {print $2; exit}')
+	if [[ $state != Running ]]; then
+		multipass start "$VM"
+	fi
+	if ! multipass exec "$VM" -- test -f /mnt/chronicle/scripts/validation.py; then
+		multipass mount "$ROOT" "$VM:/mnt/chronicle"
+	fi
+	multipass exec "$VM" -- test -f /mnt/chronicle/scripts/validation.py
+}
+
+vm_environment() {
+	ensure_vm_mount
+	multipass exec "$VM" -- bash -lc \
+		'cd /mnt/chronicle && python3 scripts/validation.py environment --root /mnt/chronicle'
+}
 
 run_step() {
 	local name=$1
@@ -150,15 +176,20 @@ run_shell() {
 }
 
 fingerprint_for() {
-	local gate=$1 out="$WORKDIR/$gate-fingerprint.json"
-	python3 "$HELPER" fingerprint --root "$ROOT" --gate "$gate" --config "$CONFIG" >"$out"
+	local gate=$1
+	local environment_file=$2
+	local out="$WORKDIR/$gate-fingerprint.json"
+	python3 "$HELPER" fingerprint --root "$ROOT" --gate "$gate" --config "$CONFIG" \
+		--environment "$environment_file" >"$out"
 	python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fingerprint"])' "$out"
 }
 
 run_gate() {
-	local gate=$1 fp source dest status
+	local gate=$1 fp source dest status environment_file
 	status=0
-	fp=$(fingerprint_for "$gate")
+	environment_file="$WORKDIR/$gate-environment.json"
+	vm_environment >"$environment_file"
+	fp=$(fingerprint_for "$gate" "$environment_file")
 	printf '\nGate %s fingerprint: %s\n' "$gate" "$fp"
 	if [[ $REUSE_EVIDENCE == true && $DRY_RUN != true && $DRY_RUN != 1 ]]; then
 		if reused=$(python3 "$HELPER" reuse --evidence-root "$EVIDENCE_ROOT" --gate "$gate" --fingerprint "$fp" 2>/dev/null); then
@@ -192,11 +223,11 @@ run_gate() {
 	if [[ $status -eq 0 ]]; then
 		python3 "$HELPER" compact --source "$source" --dest "$dest" --gate "$gate" --status passed \
 			--fingerprint "$fp" --commit "$(git -C "$ROOT" rev-parse HEAD)" \
-			--checks "$gate" --artifact-mode "$ARTIFACT_MODE"
+			--checks "$gate" --environment "$environment_file" --artifact-mode "$ARTIFACT_MODE"
 	else
 		python3 "$HELPER" compact --source "$source" --dest "$dest" --gate "$gate" --status failed \
 			--fingerprint "$fp" --commit "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)" \
-			--checks "$gate" --artifact-mode "$ARTIFACT_MODE" || true
+			--checks "$gate" --environment "$environment_file" --artifact-mode "$ARTIFACT_MODE" || true
 		return "$status"
 	fi
 }

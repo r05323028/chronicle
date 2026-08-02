@@ -320,7 +320,8 @@ phase equivalence 'compare one-shot ETL output with incremental checkpoint outpu
 "$CHRONICLE" --format json inspect "$SESSION_ID" --root "$STORE_ROOT" >"$ARTIFACT_ROOT/inspect.json"
 ONE_SHOT_STORE="$ARTIFACT_ROOT/one-shot-store"
 "$CHRONICLE" --format json etl --wal-dir "$STATE_ROOT/wal" --output "$ONE_SHOT_STORE" >"$ARTIFACT_ROOT/one-shot-etl.json" 2>"$ARTIFACT_ROOT/one-shot-etl.log"
-ONE_SHOT_SESSION=$(python3 - "$ARTIFACT_ROOT/one-shot-etl.json" <<'PY'
+ONE_SHOT_SESSION=$(
+	python3 - "$ARTIFACT_ROOT/one-shot-etl.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["session_id"])
 PY

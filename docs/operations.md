@@ -98,7 +98,7 @@ Validation entry point:
 
 Fast and targeted modes use local checks and default to failure-only artifacts. Successful gate artifacts contain only `summary.json`, `environment.json`, `manifest.json`, and `checksums.txt`; failure artifacts contain a bounded reproducer and failure-listed WAL/session data. Never upload `target/`, Cargo caches, VM filesystems, or complete successful WAL directories. Retention guidance: no upload or 1–3 days for fast/targeted successes, about 7 days for gate successes, about 14 days for gate failures, and long-term for release evidence.
 
-Privileged caches stay in reused Multipass VM paths `/home/ubuntu/chronicle-target`, `/home/ubuntu/chronicle-ebpf-target`, and `/home/ubuntu/.cargo`; source is mounted at `/mnt/chronicle`. `--reuse-evidence` matches gate fingerprints built from relevant source, acceptance/build inputs, Cargo.lock, toolchain, architecture, Ubuntu/kernel/BTF/cgroup capabilities, and validation configuration. It never uses the whole repository commit as the only key.
+Privileged caches stay in reused Multipass VM paths `/home/ubuntu/chronicle-target`, `/home/ubuntu/chronicle-ebpf-target`, and `/home/ubuntu/.cargo`; wrappers verify or create source mount `/mnt/chronicle` before cloning. `--reuse-evidence` matches gate fingerprints built from relevant source, acceptance/build inputs, Cargo.lock, and toolchain/environment data collected inside the VM. It never uses the whole repository commit as the only key.
 
 `scripts/acceptance/` contains authoritative privileged execution. `scripts/tests/acceptance/` contains rootless acceptance-runner checks; run them alongside `python3 scripts/tests/validation/test_layered_validation.py` and `bash scripts/tests/acceptance/test-p2-readiness.sh` for tooling coverage.
 

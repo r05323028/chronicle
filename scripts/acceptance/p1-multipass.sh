@@ -18,6 +18,19 @@ COMPACT=${CHRONICLE_ACCEPTANCE_COMPACT:-0}
 CARGO_TARGET_DIR_VM=${CARGO_TARGET_DIR:-/home/ubuntu/chronicle-target}
 EBPF_TARGET_DIR_VM=${CHRONICLE_EBPF_TARGET_DIR:-/home/ubuntu/chronicle-ebpf-target}
 
+ensure_vm_source() {
+	local state
+	state=$(multipass info "$VM" 2>/dev/null | awk '/State:/ {print $2; exit}')
+	if [[ $state != Running ]]; then
+		multipass start "$VM"
+	fi
+	if ! multipass exec "$VM" -- test -f /mnt/chronicle/scripts/acceptance/p1-privileged.sh; then
+		multipass mount "$ROOT" "$VM:/mnt/chronicle"
+	fi
+	multipass exec "$VM" -- test -f /mnt/chronicle/scripts/acceptance/p1-privileged.sh
+}
+
+ensure_vm_source
 REMOTE_STATUS=0
 multipass exec "$VM" -- bash -lc "
   set -euo pipefail

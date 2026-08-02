@@ -52,7 +52,7 @@ Use one entry point. Portable work stays local; targeted work selects only affec
 ./scripts/validate.sh release --reuse-evidence
 ```
 
-Multipass source remains mounted at `/mnt/chronicle`; build outputs and Cargo caches stay VM-local and survive runs:
+Wrappers verify or create the Multipass source mount at `/mnt/chronicle` before cloning; build outputs and Cargo caches stay VM-local and survive runs:
 
 ```text
 /mnt/chronicle
@@ -66,11 +66,11 @@ Wrappers reuse existing `chronicle-ubuntu`, bootstrap missing packages once, and
 
 Successful fast/targeted runs retain no artifact by default. Successful gates retain compact metadata; failures retain only a summary, failed log, reproducer, kernel log, and failure-listed WAL/session data. Release retains complete evidence. Use `--no-artifact` or `--keep-workdir` for local control.
 
-`validation/groups.toml` owns path-to-group selection. Targeted output always lists changed paths, selected groups, skipped groups, and reasons. Gate fingerprints include only owned source/build/acceptance inputs plus toolchain and environment; unrelated documentation does not invalidate P1/P2 evidence.
+`validation/groups.toml` owns path-to-group selection. Targeted output always lists changed paths, selected groups, skipped groups, and reasons. Gate fingerprints include only owned source/build/acceptance inputs plus toolchain and environment collected inside the VM; unrelated documentation does not invalidate P1/P2 evidence.
 
 Direct `p1-privileged.sh` and `p1-multipass.sh` calls remain compatibility paths. Use `gate p1` or `release` for retained exact-commit evidence; both require a clean source checkout and preserve the complete P1 report contract.
 
-Verification measurements (temporary clean snapshot `5b3f49c9…`):
+Historical verification measurements (temporary clean snapshot `5b3f49c9…`; not current retained acceptance evidence):
 
 - Prior P1 baseline: ~107 s.
 - Fresh P2 gate: 55.64 s; forced release: 97.25 s; unchanged P2 reuse: 0.58 s.

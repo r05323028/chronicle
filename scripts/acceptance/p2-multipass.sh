@@ -17,6 +17,20 @@ COMPACT=${CHRONICLE_ACCEPTANCE_COMPACT:-0}
 CARGO_TARGET_DIR_VM=${CARGO_TARGET_DIR:-/home/ubuntu/chronicle-target}
 EBPF_TARGET_DIR_VM=${CHRONICLE_EBPF_TARGET_DIR:-/home/ubuntu/chronicle-ebpf-target}
 
+ensure_vm_source() {
+	local state
+	state=$(multipass info "$VM" 2>/dev/null | awk '/State:/ {print $2; exit}')
+	if [[ $state != Running ]]; then
+		multipass start "$VM"
+	fi
+	if ! multipass exec "$VM" -- test -f /mnt/chronicle/scripts/acceptance/p2-privileged.sh; then
+		multipass mount "$ROOT" "$VM:/mnt/chronicle"
+	fi
+	multipass exec "$VM" -- test -f /mnt/chronicle/scripts/acceptance/p2-privileged.sh
+}
+
+ensure_vm_source
+
 remote_report_matches() {
 	local path=$1 phase=$2 status=$3 exit_code=$4 require_empty=$5
 	multipass exec "$VM" -- python3 - "$path" "$phase" "$status" "$exit_code" "$require_empty" <<'PY'
@@ -94,7 +108,7 @@ for _ in $(seq 1 60); do
 	fi
 	sleep 2
 done
-multipass mount "$ROOT" "$VM:/mnt/chronicle" 2>/dev/null || true
+ensure_vm_source
 
 SECOND_STATUS=0
 multipass exec "$VM" -- bash -lc "

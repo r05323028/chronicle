@@ -79,17 +79,17 @@ PY
 		cat "$CGROUP/cgroup.procs" 2>/dev/null || true
 	} >"$root/cgroup-information.txt"
 	if command -v bpftool >/dev/null 2>&1; then
-		bpftool prog show >"$root/bpftool-programs.txt" 2>&1 || true
-		bpftool link show >"$root/bpftool-links.txt" 2>&1 || true
+		bpftool prog show 2>&1 | head -n 200 >"$root/bpftool-programs.txt" || true
+		bpftool link show 2>&1 | head -n 200 >"$root/bpftool-links.txt" || true
 	else
 		printf '%s\n' 'bpftool unavailable' >"$root/bpftool-programs.txt"
 		printf '%s\n' 'bpftool unavailable' >"$root/bpftool-links.txt"
 	fi
 	systemctl status "$UNIT" --no-pager >"$root/recorder-service-status.txt" 2>&1 || true
-	journalctl --no-pager -u "$UNIT" >"$root/recorder-journal.log" 2>&1 || true
-	ps -eo pid,ppid,stat,etimes,cmd --forest >"$root/process-list.txt" 2>&1 || true
+	journalctl --no-pager -n 200 -u "$UNIT" >"$root/recorder-journal.log" 2>&1 || true
+	ps -eo pid,ppid,stat,etimes,cmd --forest 2>&1 | head -n 200 >"$root/process-list.txt" || true
 	df -P "$state_root" "$root" >"$root/disk-space.txt" 2>&1 || true
-	find "$state_root/wal" -maxdepth 3 -type f -printf '%p %s bytes\n' 2>/dev/null | sort >"$root/wal-directory-listing.txt" || true
+	find "$state_root/wal" -maxdepth 3 -type f -printf '%p %s bytes\n' 2>/dev/null | head -n 200 | sort >"$root/wal-directory-listing.txt" || true
 	python3 - "$state_root/wal/incremental-etl-checkpoint.json" "$root/checkpoint-metadata.json" <<'PY'
 import json
 import sys
@@ -114,10 +114,22 @@ wait_for_recorder_ready() {
 	local timeout=180 interval=1 allow_stale_owner=false
 	while (($#)); do
 		case $1 in
-			--timeout) timeout=${2:?missing timeout}; shift 2 ;;
-			--interval) interval=${2:?missing interval}; shift 2 ;;
-			--allow-stale-owner) allow_stale_owner=true; shift ;;
-			*) printf 'unknown readiness option: %s\n' "$1" >&2; return 2 ;;
+		--timeout)
+			timeout=${2:?missing timeout}
+			shift 2
+			;;
+		--interval)
+			interval=${2:?missing interval}
+			shift 2
+			;;
+		--allow-stale-owner)
+			allow_stale_owner=true
+			shift
+			;;
+		*)
+			printf 'unknown readiness option: %s\n' "$1" >&2
+			return 2
+			;;
 		esac
 	done
 	local deadline=$((SECONDS + timeout)) state last_state=none tmp="$RECORDER_STATUS.tmp"
@@ -136,16 +148,16 @@ wait_for_recorder_ready() {
 			last_state=$state
 		fi
 		case ${state%%|*} in
-			ready) return 0 ;;
-			failed)
-				if [[ $allow_stale_owner == true && ${state##*|} == true ]]; then
-					printf '[%s] stale owner while recorder restarts; continuing\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$ARTIFACT_ROOT/readiness-transitions.log"
-				else
-					printf 'recorder reported terminal failed state\n' >&2
-					collect_recorder_readiness_diagnostics
-					return 1
-				fi
-				;;
+		ready) return 0 ;;
+		failed)
+			if [[ $allow_stale_owner == true && ${state##*|} == true ]]; then
+				printf '[%s] stale owner while recorder restarts; continuing\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$ARTIFACT_ROOT/readiness-transitions.log"
+			else
+				printf 'recorder reported terminal failed state\n' >&2
+				collect_recorder_readiness_diagnostics
+				return 1
+			fi
+			;;
 		esac
 		sleep "$interval"
 	done

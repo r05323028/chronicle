@@ -2,7 +2,7 @@
 
 ## Purpose
 
-See change add-continuous-recorder-foundation.
+Define supported production recorder placement, readiness, operations, failure containment, and retained acceptance evidence.
 
 ## Requirements
 
@@ -121,4 +121,3 @@ Rootless tests SHALL validate configuration parsing, state/status schemas, syste
 
 - **WHEN** privileged deployment acceptance passes
 - **THEN** retained report proves recommended placement, continuous operation, restart, resource/failure behavior, and cleanup for exact environment without treating OpenSpec validation as runtime proof
-

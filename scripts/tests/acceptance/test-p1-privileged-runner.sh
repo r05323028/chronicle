@@ -133,6 +133,8 @@ grep -Fq 'TOTAL_PHASES=29' "$SCRIPT"
 grep -Fq 'phase 29 "Cleanup processes, cgroups, and temporary files"' "$SCRIPT"
 ! grep -Fq 'phase 30' "$SCRIPT"
 grep -Fq 'CHRONICLE_ACCEPTANCE_EXPECTED_SHA' "$SCRIPT"
+grep -Fq 'ensure_vm_source' "$ROOT/scripts/acceptance/p1-multipass.sh"
+grep -Fq 'multipass mount' "$ROOT/scripts/acceptance/p1-multipass.sh"
 grep -Fq 'tree_clean_for_entire_run' "$SCRIPT"
 grep -Fq 'privileged_scenarios' "$SCRIPT"
 printf '%s\n' 'p1 acceptance rootless checks passed'

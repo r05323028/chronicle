@@ -2,7 +2,7 @@
 
 ## Purpose
 
-See change add-continuous-recorder-foundation.
+Define continuous recorder lifecycle, recovery, readiness, bounded epochs, and evidence obligations for supported production operation.
 
 ## Requirements
 
@@ -229,4 +229,3 @@ Rootless automated tests SHALL prove state transitions, exclusive ownership, rol
 
 - **WHEN** privileged recorder stops or crashes and restarts
 - **THEN** acceptance verifies no leaked Chronicle process, cgroup, eBPF link/map, or temporary state artifact
-

@@ -134,6 +134,13 @@ def digest(path: Path) -> str:
 
 def environment(root: Path) -> dict[str, Any]:
     os_release: dict[str, str] = {}
+    capabilities: dict[str, str] = {}
+    status = Path("/proc/self/status")
+    if status.is_file():
+        for line in status.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith(("CapPrm:", "CapEff:", "CapBnd:")):
+                key, value = line.split(":", 1)
+                capabilities[key] = value.strip()
     release = Path("/etc/os-release")
     if release.is_file():
         for line in release.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -149,10 +156,28 @@ def environment(root: Path) -> dict[str, Any]:
         "target": os.environ.get("CARGO_BUILD_TARGET", "host"),
         "btf": Path("/sys/kernel/btf/vmlinux").is_file(),
         "cgroup_v2": Path("/sys/fs/cgroup/cgroup.controllers").is_file(),
+        "capabilities": capabilities,
     }
 
 
-def fingerprint(root: Path, gate: str, cfg: dict[str, Any]) -> dict[str, Any]:
+def load_environment(root: Path, path: Path | None = None) -> dict[str, Any]:
+    if path is None:
+        return environment(root)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid environment JSON: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("environment JSON must contain an object")
+    return value
+
+
+def fingerprint(
+    root: Path,
+    gate: str,
+    cfg: dict[str, Any],
+    environment_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     gate_cfg = cfg.get("gates", {}).get(gate)
     if not gate_cfg:
         raise ValueError(f"unknown gate: {gate}")
@@ -171,7 +196,7 @@ def fingerprint(root: Path, gate: str, cfg: dict[str, Any]) -> dict[str, Any]:
         "version": cfg.get("version", 1),
         "gate": gate,
         "inputs": inputs,
-        "environment": environment(root),
+        "environment": environment_override or environment(root),
         "validation_config_sha256": digest(root / "validation/groups.toml"),
         "checks": gate_cfg.get("checks", []),
     }
@@ -298,6 +323,7 @@ def compact(args: argparse.Namespace) -> None:
         copied = [
             str(path.relative_to(dest)) for path in dest.rglob("*") if path.is_file()
         ]
+    run_environment = load_environment(source, getattr(args, "environment", None))
     summary = {
         "version": 1,
         "gate": args.gate,
@@ -311,7 +337,7 @@ def compact(args: argparse.Namespace) -> None:
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     (dest / "environment.json").write_text(
-        json.dumps(environment(source), indent=2, sort_keys=True) + "\n",
+        json.dumps(run_environment, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     manifest = {
@@ -321,7 +347,7 @@ def compact(args: argparse.Namespace) -> None:
         "fingerprint": args.fingerprint,
         "original_commit": args.commit,
         "created_at": iso_now(),
-        "environment": environment(source),
+        "environment": run_environment,
         "covered_checks": [check for check in args.checks.split(",") if check],
         "executed": status == "passed",
         "reused": False,
@@ -399,10 +425,13 @@ def main() -> int:
     select_parser.add_argument("--changed-since")
     select_parser.add_argument("--paths", nargs="*")
     select_parser.add_argument("--config", type=Path)
+    environment_parser = sub.add_parser("environment")
+    environment_parser.add_argument("--root", type=Path, required=True)
     fp_parser = sub.add_parser("fingerprint")
     fp_parser.add_argument("--root", type=Path, required=True)
     fp_parser.add_argument("--gate", required=True)
     fp_parser.add_argument("--config", type=Path)
+    fp_parser.add_argument("--environment", type=Path)
     compact_parser = sub.add_parser("compact")
     compact_parser.add_argument("--source", required=True)
     compact_parser.add_argument("--dest", required=True)
@@ -411,6 +440,7 @@ def main() -> int:
     compact_parser.add_argument("--fingerprint", required=True)
     compact_parser.add_argument("--commit", required=True)
     compact_parser.add_argument("--checks", default="")
+    compact_parser.add_argument("--environment", type=Path)
     compact_parser.add_argument(
         "--artifact-mode",
         choices=("no-artifact", "artifact-on-failure", "release"),
@@ -421,7 +451,9 @@ def main() -> int:
     reuse_parser.add_argument("--gate", required=True)
     reuse_parser.add_argument("--fingerprint", required=True)
     args = parser.parse_args()
-    if args.command == "select":
+    if args.command == "environment":
+        print(json.dumps(environment(args.root), indent=2, sort_keys=True))
+    elif args.command == "select":
         cfg = config(args.root, args.config)
         paths = (
             args.paths
@@ -436,7 +468,12 @@ def main() -> int:
     elif args.command == "fingerprint":
         print(
             json.dumps(
-                fingerprint(args.root, args.gate, config(args.root, args.config)),
+                fingerprint(
+                    args.root,
+                    args.gate,
+                    config(args.root, args.config),
+                    load_environment(args.root, args.environment),
+                ),
                 indent=2,
                 sort_keys=True,
             )
