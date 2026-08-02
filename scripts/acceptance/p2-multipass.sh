@@ -160,6 +160,12 @@ multipass transfer --recursive "$VM:$VM_ARTIFACTS" "$DEST"
 # Root report summarizes complete two-phase acceptance; pre-reboot report remains nested.
 cp "$DEST/reboot-resume/acceptance-report.json" "$DEST/acceptance-report.json"
 printf '%s\n' "$SHA" >"$DEST/tested-commit.txt"
+(
+	cd "$DEST"
+	find . -type f ! -name artifact-manifest.sha256 -print0 \
+		| sort -z \
+		| xargs -0 sha256sum >artifact-manifest.sha256
+)
 if [[ $SECOND_STATUS -eq 0 ]]; then
 	python3 - "$DEST/reboot-resume/acceptance-report.json" <<'PY'
 import json, sys
