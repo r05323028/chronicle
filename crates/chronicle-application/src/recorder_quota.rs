@@ -170,8 +170,6 @@ mod tests {
             first.reserve(ReservationKind::RecordingStore, 1),
             Err(QuotaError::InsufficientHeadroom)
         );
-        assert!(second
-            .reserve(ReservationKind::RecordingStore, 90)
-            .is_ok());
+        assert!(second.reserve(ReservationKind::RecordingStore, 90).is_ok());
     }
 }

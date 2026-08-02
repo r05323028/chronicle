@@ -78,8 +78,12 @@ full_mode() {
 	[[ $ACCEPTANCE_MODE == full ]]
 }
 
+smoke_mode() {
+	[[ $ACCEPTANCE_MODE == smoke ]]
+}
+
 valid_acceptance_mode() {
-	[[ $ACCEPTANCE_MODE == full || $ACCEPTANCE_MODE == fast ]]
+	[[ $ACCEPTANCE_MODE == full || $ACCEPTANCE_MODE == fast || $ACCEPTANCE_MODE == smoke ]]
 }
 
 safe_artifact_root() {
@@ -303,7 +307,7 @@ TMP_DIR=$(mktemp -d)
 if [[ -n $ARTIFACT_ROOT_ERROR ]]; then
 	die "$ARTIFACT_ROOT_ERROR; refusing to remove it; artifacts retained at $ARTIFACT_ROOT"
 fi
-valid_acceptance_mode || die "unsupported CHRONICLE_ACCEPTANCE_MODE=$ACCEPTANCE_MODE (expected full or fast)"
+valid_acceptance_mode || die "unsupported CHRONICLE_ACCEPTANCE_MODE=$ACCEPTANCE_MODE (expected full, smoke, or fast)"
 [[ $TARGET_DIR != "$EBPF_TARGET_DIR" ]] || die "CARGO_TARGET_DIR and CHRONICLE_EBPF_TARGET_DIR must remain isolated"
 START_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || die "repository HEAD unavailable")
 END_SHA=$START_SHA

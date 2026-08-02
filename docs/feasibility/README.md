@@ -40,66 +40,43 @@ Not verified: other distributions, kernel minor versions, cloud-provider kernels
 - Eight MiB ring saturation increments cumulative per-CPU loss counters. Complete four-CPU snapshots use boot-monotonic 100 ms-or-later intervals plus mandatory final sample.
 - Selected parent cgroup covers descendant workload while direct TGID and descendant counts remain separate.
 
-## P1 privileged acceptance in Multipass
+## Layered validation and P1 privileged acceptance in Multipass
 
-Sync source into VM-local storage; do not compile from `/mnt/chronicle`. Recommended layout:
+Use one entry point. Portable work stays local; targeted work selects only affected groups; explicit gates and release preserve complete privileged coverage:
+
+```bash
+./scripts/validate.sh fast
+./scripts/validate.sh targeted --changed-since origin/main
+./scripts/validate.sh gate p1
+./scripts/validate.sh gate p2
+./scripts/validate.sh release --reuse-evidence
+```
+
+Multipass source remains mounted at `/mnt/chronicle`; build outputs and Cargo caches stay VM-local and survive runs:
 
 ```text
-/home/ubuntu/chronicle
+/mnt/chronicle
 /home/ubuntu/chronicle-target
 /home/ubuntu/chronicle-ebpf-target
+/home/ubuntu/.cargo
 /home/ubuntu/p1-artifacts
 ```
 
-Fast mode keeps real privileged eBPF record → WAL → ETL → inspect → replay coverage, but skips full-only test matrices. It is for development iteration and is not sufficient retained evidence for completing privileged P1 tasks.
+Wrappers reuse existing `chronicle-ubuntu`, bootstrap missing packages once, and never copy target or Cargo cache directories into evidence. eBPF changes select decoder/build checks plus a small privileged capture smoke; ETL/docs changes do not run full eBPF acceptance.
 
-```bash
-cd /home/ubuntu/chronicle
+Successful fast/targeted runs retain no artifact by default. Successful gates retain compact metadata; failures retain only a summary, failed log, reproducer, kernel log, and failure-listed WAL/session data. Release retains complete evidence. Use `--no-artifact` or `--keep-workdir` for local control.
 
-sudo -E env \
-  HOME=/home/ubuntu \
-  USER=ubuntu \
-  PATH=/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  CARGO_HOME=/home/ubuntu/.cargo \
-  RUSTUP_HOME=/home/ubuntu/.rustup \
-  CARGO_TARGET_DIR=/home/ubuntu/chronicle-target \
-  CHRONICLE_EBPF_TARGET_DIR=/home/ubuntu/chronicle-ebpf-target \
-  CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT=/home/ubuntu/p1-artifacts/latest-fast \
-  CHRONICLE_ACCEPTANCE_MODE=fast \
-  CARGO_PROFILE_DEV_DEBUG=0 \
-  CARGO_PROFILE_TEST_DEBUG=0 \
-  ./scripts/acceptance/p1-privileged.sh
-```
+`validation/groups.toml` owns path-to-group selection. Targeted output always lists changed paths, selected groups, skipped groups, and reasons. Gate fingerprints include only owned source/build/acceptance inputs plus toolchain and environment; unrelated documentation does not invalidate P1/P2 evidence.
 
-Full mode retains complete P1 evidence:
+Direct `p1-privileged.sh` and `p1-multipass.sh` calls remain compatibility paths. Use `gate p1` or `release` for retained exact-commit evidence; both require a clean source checkout and preserve the complete P1 report contract.
 
-```bash
-cd /home/ubuntu/chronicle
+Verification measurements (temporary clean snapshot `5b3f49c9…`):
 
-sudo -E env \
-  HOME=/home/ubuntu \
-  USER=ubuntu \
-  PATH=/home/ubuntu/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  CARGO_HOME=/home/ubuntu/.cargo \
-  RUSTUP_HOME=/home/ubuntu/.rustup \
-  CARGO_TARGET_DIR=/home/ubuntu/chronicle-target \
-  CHRONICLE_EBPF_TARGET_DIR=/home/ubuntu/chronicle-ebpf-target \
-  CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT=/home/ubuntu/p1-artifacts/full-$(date -u +%Y%m%dT%H%M%SZ) \
-  CHRONICLE_ACCEPTANCE_MODE=full \
-  CARGO_PROFILE_DEV_DEBUG=0 \
-  CARGO_PROFILE_TEST_DEBUG=0 \
-  ./scripts/acceptance/p1-privileged.sh
-```
-
-`fast` mode is for development iteration and is not sufficient retained evidence for completing privileged P1 tasks. Reports record `acceptance_mode`; fast reports mark skipped full-only checks `not_checked`.
-
-For exact-commit evidence from a host checkout, keep host tree clean and run the wrapper from repository root:
-
-```bash
-./scripts/acceptance/p1-multipass.sh chronicle-ubuntu
-```
-
-Wrapper clones detached `HEAD` into VM-local storage, requires `CHRONICLE_ACCEPTANCE_EXPECTED_SHA`, runs full acceptance, copies complete artifacts to `evidence/privileged/<sha>/ubuntu-24.04/`, and verifies artifact hashes. `target/` reports remain transient; only evidence copied outside ignored build output can complete privileged tasks.
+- Prior P1 baseline: ~107 s.
+- Fresh P2 gate: 55.64 s; forced release: 97.25 s; unchanged P2 reuse: 0.58 s.
+- Release evidence: P1 380 KiB, P2 6904 KiB.
+- P2 fingerprint: `f03c66f8…`; reboot report passed with `not_checked=[]`.
+- Evidence: `/tmp/chronicle-p2-final-evidence` (ephemeral).
 
 ## Unsupported or non-authoritative
 

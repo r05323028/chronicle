@@ -1,0 +1,106 @@
+version = 1
+
+# Path ownership drives targeted selection. Paths use git-style glob syntax.
+[groups.portable]
+description = "format, Clippy, workspace and changed-crate tests"
+paths = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "rust-toolchain.toml",
+  "crates/**",
+  "tests/**",
+  "examples/**",
+]
+commands = ["portable"]
+
+[groups.ebpf]
+description = "eBPF build, decoder tests, and minimal privileged smoke"
+paths = [
+  "ebpf/**",
+  "ebpf-feasibility/**",
+  "crates/chronicle-capture-ebpf/**",
+  "crates/chronicle-capture/src/**",
+]
+commands = ["ebpf"]
+gates = ["p1"]
+
+[groups.wal]
+description = "WAL recovery, checkpoint, retention, and quota tests"
+paths = [
+  "crates/chronicle-wal/**",
+  "crates/chronicle-application/src/recorder_quota.rs",
+  "crates/chronicle-application/src/retention.rs",
+  "crates/chronicle-application/src/checkpoint.rs",
+]
+commands = ["wal"]
+gates = ["p2"]
+
+[groups.etl]
+description = "ETL and checkpoint tests"
+paths = [
+  "crates/chronicle-etl/**",
+  "crates/chronicle-application/src/incremental_worker.rs",
+  "crates/chronicle-application/src/checkpoint.rs",
+  "crates/chronicle-application/src/continuous_recorder.rs",
+  "crates/chronicle-application/src/recorder_status.rs",
+  "crates/chronicle-application/src/lib.rs",
+]
+commands = ["etl"]
+gates = ["p2"]
+
+[groups.replay]
+description = "replay and verification tests"
+paths = [
+  "crates/chronicle-replay/**",
+  "crates/chronicle-cli/src/replay.rs",
+  "docs/replay-safety.md",
+]
+commands = ["replay"]
+gates = ["p1"]
+
+[groups.cli_docs]
+description = "CLI, documentation, and OpenSpec checks"
+paths = [
+  "crates/chronicle-cli/**",
+  "docs/**",
+  "README.md",
+  "CONTRIBUTING.md",
+  "openspec/**",
+]
+commands = ["cli_docs"]
+
+[groups.acceptance]
+description = "privileged acceptance scripts and evidence contract"
+paths = ["scripts/acceptance/**", "scripts/tests/acceptance/**"]
+commands = ["acceptance"]
+gates = ["p1", "p2"]
+
+[groups.build_tooling]
+description = "validation and CI tooling"
+paths = ["scripts/**", ".github/**", "deny.toml"]
+commands = ["build_tooling"]
+gates = ["p1", "p2"]
+
+[gates.p1]
+source_groups = ["ebpf", "replay", "acceptance", "build_tooling"]
+acceptance_paths = [
+  "scripts/acceptance/p1-multipass.sh",
+  "scripts/acceptance/p1-privileged.sh",
+]
+build_inputs = ["ebpf/**", "ebpf-feasibility/**"]
+checks = ["P1 complete privileged acceptance"]
+
+[gates.p2]
+source_groups = ["wal", "etl", "acceptance", "build_tooling"]
+acceptance_paths = [
+  "scripts/acceptance/p2-multipass.sh",
+  "scripts/acceptance/p2-privileged.sh",
+]
+build_inputs = ["ebpf/**", "ebpf-feasibility/**"]
+checks = [
+  "P2 complete privileged acceptance",
+  "reboot recovery",
+  "quota",
+  "corruption",
+  "resource cleanup",
+]

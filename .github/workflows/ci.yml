@@ -8,7 +8,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -20,10 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Cache Cargo dependencies and build output
-        uses: actions/cache@v4
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a
         with:
           path: |
             ~/.cargo/registry
@@ -36,33 +37,43 @@ jobs:
       - name: Check toolchain
         run: rustup show active-toolchain
 
-      - name: Check formatting
-        run: cargo fmt --all --check
+      - name: Run fast layered validation
+        run: ./scripts/validate.sh fast
 
-      - name: Check rootless workspace
+      - name: Validate layered tooling
         run: |
-          cargo check --workspace --all-targets --locked
-          echo "This rootless check does not prove privileged runtime hook behavior."
+          python3 scripts/tests/validation/test_layered_validation.py
+          bash scripts/tests/acceptance/test-p2-readiness.sh
 
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-      - name: Run tests
-        run: cargo test --workspace --all-features --locked
+      # Cargo directories above are caches, never evidence artifacts.
+      - name: Upload failure-only validation evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: validation-failure-${{ github.run_id }}
+          path: |
+            evidence/validation/
+            target/validation-work/
+          if-no-files-found: ignore
+          retention-days: 14
 
   ebpf-compile:
     name: eBPF compile (unprivileged)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Install eBPF build toolchain
         run: |
-          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup toolchain install nightly --profile minimal \
+            --component rust-src
           cargo +nightly install bpf-linker --locked
 
       - name: Compile eBPF capture
         run: |
-          cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release --locked
-          echo "Compile success is unprivileged only; privileged runtime hook behavior is not checked."
+          cargo +nightly build -Z build-std=core \
+            --manifest-path ebpf/Cargo.toml \
+            --target bpfel-unknown-none --release --locked
+          echo "Compile success is unprivileged only;"
+          echo "privileged runtime hook behavior is not checked."

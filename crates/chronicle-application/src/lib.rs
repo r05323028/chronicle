@@ -53,8 +53,8 @@ pub use recorder_quota::{
 };
 pub use recorder_startup::{RecorderStartup, RecorderStartupError};
 pub use recorder_status::{
-    RECORDER_STATUS_SCHEMA_VERSION, RecorderStatusError, RecorderStatusV1, SegmentCounts,
-    StatusRemediation,
+    RECORDER_STATUS_SCHEMA_VERSION, RecorderStatusError, RecorderStatusState, RecorderStatusV1,
+    SegmentCounts, StatusRemediation,
 };
 
 use chronicle_canonical::{

@@ -20,6 +20,17 @@ Rules:
 - After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
 <!-- GRAPHIFY_END -->
 
+## Linux-only validation on macOS
+
+If the host OS is macOS and the task requires Linux-specific validation:
+
+1. Check for Multipass with `command -v multipass`.
+2. Reuse a suitable Ubuntu VM from `multipass list` when available.
+3. Otherwise, create an Ubuntu 24.04 VM and mount the repository.
+4. Run Linux-only checks inside the VM.
+5. Do not mark Linux-only tasks complete based only on macOS results.
+6. If Multipass is unavailable, report the blocker and continue with portable checks only.
+
 ## Specification, Testing, and Acceptance Responsibilities
 
 ### OpenSpec / SDD workflow

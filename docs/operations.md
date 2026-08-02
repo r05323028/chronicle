@@ -84,20 +84,27 @@ chronicle --format json doctor --wal-dir /var/lib/chronicle/wal --output /var/li
 
 Doctor is diagnostic only. It performs independent non-destructive probes, removes temporary artifacts, and never starts capture, repairs WAL, publishes sessions, or sends replay traffic. Aggregate status is `unsupported` for required unsupported probes, `not_checked` for required undecidable probes, `supported_with_warnings` for warnings/optional gaps, otherwise `supported`. Omitted paths are optional `not_checked`; no default path is guessed.
 
-Rootless profile:
+Validation entry point:
 
 ```bash
-cargo test --workspace --all-features --locked
-cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release
+./scripts/validate.sh fast
+./scripts/validate.sh targeted --changed-since origin/main
+./scripts/validate.sh gate p1
+./scripts/validate.sh gate p2
+./scripts/validate.sh release --reuse-evidence
 ```
 
-Privileged profile (Linux only; retained artifacts, no skipped-runtime claim):
+`validation/groups.toml` maps paths to focused groups. Targeted output lists every selected/skipped group and reason. Documentation-only changes select no privileged gate; ETL changes select ETL/checkpoint checks; WAL/recovery changes select focused WAL/P2 checks; eBPF changes select build/decoder checks and a minimal privileged smoke. Explicit gates and release retain all existing P1/P2 checks.
 
-```bash
-./scripts/acceptance/p1-privileged.sh
-```
+Fast and targeted modes use local checks and default to failure-only artifacts. Successful gate artifacts contain only `summary.json`, `environment.json`, `manifest.json`, and `checksums.txt`; failure artifacts contain a bounded reproducer and failure-listed WAL/session data. Never upload `target/`, Cargo caches, VM filesystems, or complete successful WAL directories. Retention guidance: no upload or 1–3 days for fast/targeted successes, about 7 days for gate successes, about 14 days for gate failures, and long-term for release evidence.
 
-`scripts/acceptance/` contains real privileged acceptance execution. `scripts/tests/acceptance/` contains rootless tests for acceptance tooling; run `./scripts/tests/acceptance/test-p1-privileged-runner.sh` to validate configuration and retained-report behavior.
+Privileged caches stay in reused Multipass VM paths `/home/ubuntu/chronicle-target`, `/home/ubuntu/chronicle-ebpf-target`, and `/home/ubuntu/.cargo`; source is mounted at `/mnt/chronicle`. `--reuse-evidence` matches gate fingerprints built from relevant source, acceptance/build inputs, Cargo.lock, toolchain, architecture, Ubuntu/kernel/BTF/cgroup capabilities, and validation configuration. It never uses the whole repository commit as the only key.
+
+`scripts/acceptance/` contains authoritative privileged execution. `scripts/tests/acceptance/` contains rootless acceptance-runner checks; run them alongside `python3 scripts/tests/validation/test_layered_validation.py` and `bash scripts/tests/acceptance/test-p2-readiness.sh` for tooling coverage.
+
+P2 readiness contract: `recorder-status` now reports machine-readable `state` values (`starting`, `recovering`, `loading_ebpf`, `ready`, `degraded`, `failed`) alongside liveness, lifecycle, capture readiness, processing readiness, and health. Workload admission waits for `state=ready`; systemd `active` alone is insufficient. Polling prints state transitions, tolerates temporary status-command failures, stops immediately on terminal failure, and uses configurable timeout/interval values (`CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_READINESS_INTERVAL_SECONDS`).
+
+Previous blocker root cause: P2 treated `processing_readiness=not_ready` as capture-not-ready and waited forever even though capture was safe to admit workload; status-command errors were also suppressed and startup/recovery, stale-owner, and terminal failure collapsed into one generic timeout. Recovery can spend longer than the old 60-second loop validating a large incremental checkpoint. Failure diagnostics now retain status/service/journal, kernel/BTF/cgroup/eBPF, WAL listing, checkpoint metadata, process, and disk evidence without Cargo caches or VM data. Multipass stops stale P2 units and fixes artifact ownership before transfer.
 
 The profile uses local upstream/replay targets and dedicated/shared cgroups. It verifies capture, sampling, one-marker/one-sync WAL behavior, crash/recovery authority, hard-cap queue discard, ETL idempotency across roots, cgroup safety, signal/limit finalization, mixed replay, and original-destination isolation. Unsupported hosts must report skipped/not-checked rather than passing runtime coverage.
 

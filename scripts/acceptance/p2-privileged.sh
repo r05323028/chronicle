@@ -26,6 +26,9 @@ RECORDER_STATUS="$ARTIFACT_ROOT/recorder-status.json"
 CHECKS_JSON="$ARTIFACT_ROOT/checks.json"
 UPSTREAM_PID=""
 CURRENT_PHASE="initializing"
+READINESS_TIMEOUT=${CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS:-180}
+READINESS_INTERVAL=${CHRONICLE_ACCEPTANCE_READINESS_INTERVAL_SECONDS:-1}
+source "$ROOT/scripts/acceptance/recorder-readiness.sh"
 
 mkdir -p "$ARTIFACT_ROOT"
 printf '%s\n' 'chronicle-p2-acceptance-root-v1' >"$ARTIFACT_ROOT/.chronicle-acceptance-root"
@@ -59,6 +62,7 @@ checks = {
     "three_epochs": "not_checked",
     "size_and_age_rotation": "not_checked",
     "incremental_worker": "not_checked",
+    "incremental_restart_equivalence": "not_checked",
     "standalone_etl_live_rejection": "not_checked",
     "signal_shutdown": "not_checked",
     "crash_restart_recovery": "not_checked",
@@ -200,25 +204,22 @@ systemd-run --quiet --unit="$UNIT" --working-directory="$ROOT" \
 	--property=Restart=on-failure --property=RestartSec=1s \
 	--property=NoNewPrivileges=no \
 	"$CHRONICLE" --format json recorder --config "$CONFIG"
-sleep 1
+for _ in $(seq 1 30); do
+	if systemctl is-active --quiet "$UNIT"; then
+		break
+	fi
+	sleep 1
+done
 if ! systemctl is-active --quiet "$UNIT"; then
-	journalctl --no-pager -u "$UNIT" >"$ARTIFACT_ROOT/recorder-start.log" || true
+	collect_recorder_readiness_diagnostics
 	exit 1
 fi
 [[ "$(systemctl show "$UNIT" -p Type --value)" == simple ]]
 set_check systemd_type_simple passed
 
 phase readiness 'poll recorder status before workload admission'
-for _ in $(seq 1 120); do
-	if "$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS" 2>/dev/null; then
-		grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$RECORDER_STATUS" && break
-	fi
-	sleep 0.5
-done
-grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$RECORDER_STATUS" || {
-	printf '%s\n' 'recorder did not reach capture readiness' >&2
-	exit 1
-}
+# Contract requires capture_readiness=ready and state=ready before admission.
+wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
 if [[ "$REBOOT_RESUME" == 1 ]]; then
 	set_check host_reboot_recovery passed
 	set_check pre_reboot_persistence passed
@@ -251,14 +252,8 @@ if [[ "$CRASH_MODE" == 1 ]]; then
 	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/pre-crash-workload.json"
 	sleep 1
 	systemctl kill --kill-who=main -s SIGKILL "$UNIT"
-	for _ in $(seq 1 120); do
-		if systemctl is-active --quiet "$UNIT" &&
-			"$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$ARTIFACT_ROOT/recorder-restart-status.json" 2>/dev/null &&
-			grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$ARTIFACT_ROOT/recorder-restart-status.json"; then
-			break
-		fi
-		sleep 0.5
-	done
+	RECORDER_STATUS="$ARTIFACT_ROOT/recorder-restart-status.json" \
+		wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL" --allow-stale-owner
 	systemctl is-active --quiet "$UNIT"
 	set_check crash_restart_recovery passed
 fi
@@ -320,6 +315,33 @@ print(value["session_id"])
 PY
 )
 test -d "$STORE_ROOT/sessions/$SESSION_ID"
+
+phase equivalence 'compare one-shot ETL output with incremental checkpoint output'
+ONE_SHOT_STORE="$ARTIFACT_ROOT/one-shot-store"
+"$CHRONICLE" --format json etl --wal-dir "$STATE_ROOT/wal" --output "$ONE_SHOT_STORE" >"$ARTIFACT_ROOT/one-shot-etl.json" 2>"$ARTIFACT_ROOT/one-shot-etl.log"
+ONE_SHOT_SESSION=$(python3 - "$ARTIFACT_ROOT/one-shot-etl.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["session_id"])
+PY
+)
+"$CHRONICLE" --format json inspect "$ONE_SHOT_SESSION" --root "$ONE_SHOT_STORE" >"$ARTIFACT_ROOT/one-shot-inspect.json"
+python3 - "$ARTIFACT_ROOT/inspect.json" "$ARTIFACT_ROOT/one-shot-inspect.json" "$ARTIFACT_ROOT/equivalence.json" <<'PY'
+import json
+import sys
+
+def comparable(path):
+    value = json.load(open(path, encoding="utf-8"))
+    value.pop("root", None)
+    value.pop("output", None)
+    return value
+
+incremental, one_shot, report = map(comparable, sys.argv[1:3])
+assert incremental == one_shot, (incremental, one_shot)
+json.dump({"version": 1, "equivalent": True, "comparison": "inspect", "session_id": incremental["session_id"]}, open(sys.argv[3], "w", encoding="utf-8"), indent=2)
+with open(sys.argv[3], "a", encoding="utf-8") as handle:
+    handle.write("\n")
+PY
+set_check incremental_restart_equivalence passed
 
 phase corruption 'corrupt sealed WAL copy and prove evidence is preserved'
 CORRUPT_WAL="$ARTIFACT_ROOT/corrupt-wal"

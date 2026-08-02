@@ -9,10 +9,22 @@ use thiserror::Error;
 
 pub const RECORDER_STATUS_SCHEMA_VERSION: u16 = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderStatusState {
+    Starting,
+    Recovering,
+    LoadingEbpf,
+    Ready,
+    Degraded,
+    Failed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecorderStatusV1 {
     pub version: u16,
+    pub state: RecorderStatusState,
     pub liveness: bool,
     pub capture_readiness: RecorderReadiness,
     pub processing_readiness: RecorderReadiness,
@@ -58,8 +70,35 @@ impl RecorderStatusV1 {
         } else {
             metadata.health
         };
+        let state = if stale_owner
+            || metadata.lifecycle == RecorderLifecycleState::Failed
+            || health == RecorderHealth::Failed
+        {
+            RecorderStatusState::Failed
+        } else if metadata.capture_readiness == RecorderReadiness::Ready
+            && metadata.lifecycle == RecorderLifecycleState::Running
+        {
+            // Capture admission remains safe while incremental ETL is catching up.
+            RecorderStatusState::Ready
+        } else {
+            match metadata.lifecycle {
+                RecorderLifecycleState::Starting => RecorderStatusState::Starting,
+                RecorderLifecycleState::Recovering => RecorderStatusState::Recovering,
+                RecorderLifecycleState::Running
+                    if metadata.capture_readiness != RecorderReadiness::Ready =>
+                {
+                    RecorderStatusState::LoadingEbpf
+                }
+                RecorderLifecycleState::Running => RecorderStatusState::Degraded,
+                RecorderLifecycleState::Draining | RecorderLifecycleState::Stopped => {
+                    RecorderStatusState::Degraded
+                }
+                RecorderLifecycleState::Failed => RecorderStatusState::Failed,
+            }
+        };
         Ok(Self {
             version: RECORDER_STATUS_SCHEMA_VERSION,
+            state,
             liveness: owner_live,
             capture_readiness: if stale_owner {
                 RecorderReadiness::NotReady
@@ -102,7 +141,8 @@ impl RecorderStatusV1 {
     pub fn render_human(&self) -> Result<String, RecorderStatusError> {
         self.validate()?;
         Ok(format!(
-            "liveness={} capture_readiness={:?} processing_readiness={:?} health={:?} lifecycle={:?} lag_records={} lag_bytes={} stale_owner={}",
+            "state={:?} liveness={} capture_readiness={:?} processing_readiness={:?} health={:?} lifecycle={:?} lag_records={} lag_bytes={} stale_owner={}",
+            self.state,
             self.liveness,
             self.capture_readiness,
             self.processing_readiness,
@@ -210,6 +250,7 @@ mod tests {
     fn stale_owner_is_not_reported_healthy() {
         let status = RecorderStatusV1::from_metadata(&metadata(), false).unwrap();
         assert!(status.stale_owner);
+        assert_eq!(status.state, RecorderStatusState::Failed);
         assert_eq!(status.health, RecorderHealth::Failed);
         assert!(
             status
@@ -220,9 +261,21 @@ mod tests {
     }
 
     #[test]
+    fn capture_ready_is_admission_ready_while_etl_is_degraded() {
+        let mut value = metadata();
+        value.processing_readiness = RecorderReadiness::NotReady;
+        value.health = RecorderHealth::Degraded;
+        let status = RecorderStatusV1::from_metadata(&value, true).unwrap();
+        assert_eq!(status.state, RecorderStatusState::Ready);
+        assert_eq!(status.processing_readiness, RecorderReadiness::NotReady);
+    }
+
+    #[test]
     fn human_output_is_bounded_and_payload_free() {
         let status = RecorderStatusV1::from_metadata(&metadata(), true).unwrap();
         let text = status.render_human().unwrap();
+        assert_eq!(status.state, RecorderStatusState::Ready);
+        assert!(text.contains("state=Ready"));
         assert!(text.contains("capture_readiness=Ready"));
         assert!(!text.contains("/scope"));
     }

@@ -30,3 +30,7 @@ Thumbs.db
 
 # Local privileged acceptance evidence (keep outside Git)
 evidence/
+
+# Python
+__pycache__
+.ruff_cache
