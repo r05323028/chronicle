@@ -54,7 +54,7 @@ multipass exec "$VM" -- bash -lc "
     CHRONICLE_ACCEPTANCE_EXPECTED_SHA='$SHA' \\
     CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT='$VM_ARTIFACTS/reboot-resume' \\
     CHRONICLE_ACCEPTANCE_STATE_ROOT='$VM_ARTIFACTS/state' \\
-    CHRONICLE_ACCEPTANCE_STORE_ROOT='$VM_ARTIFACTS/reboot-store' \\
+    CHRONICLE_ACCEPTANCE_STORE_ROOT='$VM_ARTIFACTS/store' \\
     CHRONICLE_ACCEPTANCE_DOMAIN_ROOT='$VM_ARTIFACTS' \\
     ./scripts/acceptance/p2-privileged.sh
   sudo chown -R ubuntu:ubuntu '$VM_ARTIFACTS'
