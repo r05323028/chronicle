@@ -132,8 +132,28 @@ ensure_vm_mount() {
 
 vm_environment() {
 	ensure_vm_mount
-	multipass exec "$VM" -- bash -lc \
-		'cd /mnt/chronicle && python3 scripts/validation.py environment --root /mnt/chronicle'
+	local value
+	value=$(multipass exec "$VM" -- bash -lc \
+		'cd /mnt/chronicle && sudo -E env HOME=/home/ubuntu PATH="$PATH" python3 scripts/validation.py environment --root /mnt/chronicle')
+	printf '%s' "$value" | python3 -c '
+import json
+import sys
+value = json.load(sys.stdin)
+capabilities = value.get("capabilities", {})
+if not any(int(raw, 16) for raw in capabilities.values() if raw):
+    raise SystemExit("privileged VM environment has no effective capabilities")
+print(json.dumps(value, indent=2, sort_keys=True))
+'
+}
+
+checks_for() {
+	python3 - "$CONFIG" "$1" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+config = tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(",".join(config["gates"][sys.argv[2]].get("checks", [])))
+PY
 }
 
 run_step() {
@@ -185,14 +205,15 @@ fingerprint_for() {
 }
 
 run_gate() {
-	local gate=$1 fp source dest status environment_file
+	local gate=$1 fp source dest status environment_file checks
 	status=0
 	environment_file="$WORKDIR/$gate-environment.json"
+	checks=$(checks_for "$gate")
 	vm_environment >"$environment_file"
 	fp=$(fingerprint_for "$gate" "$environment_file")
 	printf '\nGate %s fingerprint: %s\n' "$gate" "$fp"
 	if [[ $REUSE_EVIDENCE == true && $DRY_RUN != true && $DRY_RUN != 1 ]]; then
-		if reused=$(python3 "$HELPER" reuse --evidence-root "$EVIDENCE_ROOT" --gate "$gate" --fingerprint "$fp" 2>/dev/null); then
+		if reused=$(python3 "$HELPER" reuse --evidence-root "$EVIDENCE_ROOT" --gate "$gate" --fingerprint "$fp" --checks "$checks" 2>/dev/null); then
 			printf 'REUSED evidence: %s\n' "$reused"
 			printf '%s reused\n' "$gate" >>"$WORKDIR/reused.txt"
 			return 0
@@ -223,11 +244,11 @@ run_gate() {
 	if [[ $status -eq 0 ]]; then
 		python3 "$HELPER" compact --source "$source" --dest "$dest" --gate "$gate" --status passed \
 			--fingerprint "$fp" --commit "$(git -C "$ROOT" rev-parse HEAD)" \
-			--checks "$gate" --environment "$environment_file" --artifact-mode "$ARTIFACT_MODE"
+			--checks "$checks" --environment "$environment_file" --artifact-mode "$ARTIFACT_MODE"
 	else
 		python3 "$HELPER" compact --source "$source" --dest "$dest" --gate "$gate" --status failed \
 			--fingerprint "$fp" --commit "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)" \
-			--checks "$gate" --environment "$environment_file" --artifact-mode "$ARTIFACT_MODE" || true
+			--checks "$checks" --environment "$environment_file" --artifact-mode "$ARTIFACT_MODE" || true
 		return "$status"
 	fi
 }

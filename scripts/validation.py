@@ -379,6 +379,12 @@ def reuse(args: argparse.Namespace) -> int:
             or manifest.get("fingerprint") != args.fingerprint
         ):
             return 1
+        required_checks = {
+            check for check in getattr(args, "checks", "").split(",") if check
+        }
+        covered_checks = set(manifest.get("covered_checks", []))
+        if not required_checks.issubset(covered_checks):
+            return 1
         checksums = manifest_path.parent / "checksums.txt"
         if not checksums.is_file():
             return 1
@@ -450,6 +456,7 @@ def main() -> int:
     reuse_parser.add_argument("--evidence-root", required=True)
     reuse_parser.add_argument("--gate", required=True)
     reuse_parser.add_argument("--fingerprint", required=True)
+    reuse_parser.add_argument("--checks", default="")
     args = parser.parse_args()
     if args.command == "environment":
         print(json.dumps(environment(args.root), indent=2, sort_keys=True))

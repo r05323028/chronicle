@@ -215,6 +215,17 @@ class LayeredValidationTests(unittest.TestCase):
             ),
             1,
         )
+        self.assertEqual(
+            validation.reuse(
+                argparse.Namespace(
+                    evidence_root=evidence,
+                    gate="p1",
+                    fingerprint="fp",
+                    checks="P2",
+                )
+            ),
+            1,
+        )
 
     def test_failure_artifact_contains_reproducer_inputs_only(self):
         source = self.temp / "source"
