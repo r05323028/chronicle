@@ -336,7 +336,7 @@ def comparable(path):
     value.pop("output", None)
     return value
 
-incremental, one_shot, report = map(comparable, sys.argv[1:3])
+incremental, one_shot = map(comparable, sys.argv[1:3])
 assert incremental == one_shot, (incremental, one_shot)
 json.dump({"version": 1, "equivalent": True, "comparison": "inspect", "session_id": incremental["session_id"]}, open(sys.argv[3], "w", encoding="utf-8"), indent=2)
 with open(sys.argv[3], "a", encoding="utf-8") as handle:
