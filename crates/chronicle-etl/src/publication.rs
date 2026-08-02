@@ -2,8 +2,8 @@
 #![allow(clippy::format_collect)]
 
 use crate::{
-    CanonicalDeltaBatchV1, CheckpointError, IncrementalEtlCheckpointV1, read_checkpoint,
-    write_checkpoint_atomic,
+    read_checkpoint, write_checkpoint_atomic, CanonicalDeltaBatchV1, CheckpointError,
+    IncrementalEtlCheckpointV1,
 };
 use chronicle_storage::{
     FilesystemSessionStore, PublishSession, PutIfAbsent, RecordingArtifact, RecordingArtifactKind,

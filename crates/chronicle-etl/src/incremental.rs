@@ -48,9 +48,16 @@ impl IncrementalProcessor {
         let first_marker_sequence = self
             .last_marker_sequence
             .map_or(0, |sequence| sequence.saturating_add(1));
-        let output = self
-            .pipeline
-            .process_envelopes(snapshot.envelopes, registry, session_id)?;
+        let start = self.last_marker_sequence.map_or(0, |previous| {
+            snapshot
+                .envelopes
+                .iter()
+                .position(|envelope| envelope.sequence > previous)
+                .unwrap_or(snapshot.envelopes.len())
+        });
+        let output =
+            self.pipeline
+                .process_envelopes(&snapshot.envelopes[start..], registry, session_id)?;
         self.last_marker_sequence = Some(snapshot.marker_sequence);
         Ok(IncrementalResult {
             output,
@@ -61,6 +68,14 @@ impl IncrementalProcessor {
 
     pub fn last_marker_sequence(&self) -> Option<u64> {
         self.last_marker_sequence
+    }
+
+    pub fn restore_marker_sequence(&mut self, marker_sequence: u64) {
+        self.last_marker_sequence = Some(marker_sequence);
+    }
+
+    pub fn clear_marker_sequence(&mut self) {
+        self.last_marker_sequence = None;
     }
 }
 

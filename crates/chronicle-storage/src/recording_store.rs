@@ -303,13 +303,55 @@ impl RecordingStore for InMemoryRecordingStore {
 
 pub struct FilesystemRecordingStore {
     root: PathBuf,
+    #[cfg(test)]
+    fault: Mutex<Option<FilesystemStoreFault>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilesystemStoreFault {
+    BeforeTempOpen,
+    AfterTempWrite,
+    BeforePublish,
+    BeforePublishDirectorySync,
+    BeforeDelete,
+    BeforeDeleteDirectorySync,
+    BeforeTombstoneOpen,
+    AfterTombstoneSync,
+    BeforeTombstoneDirectorySync,
 }
 
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl FilesystemRecordingStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            #[cfg(test)]
+            fault: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_fault(&self, fault: FilesystemStoreFault) {
+        let Ok(mut injected) = self.fault.lock() else {
+            panic!("filesystem fault mutex poisoned");
+        };
+        *injected = Some(fault);
+    }
+
+    #[cfg(test)]
+    fn fail_if_injected(&self, fault: FilesystemStoreFault) -> Result<(), RecordingStoreError> {
+        let Ok(mut injected) = self.fault.lock() else {
+            return Err(RecordingStoreError::LockPoisoned);
+        };
+        if *injected == Some(fault) {
+            *injected = None;
+            return Err(RecordingStoreError::Backend(format!(
+                "injected ENOSPC at {fault:?}"
+            )));
+        }
+        Ok(())
     }
 
     pub fn recover_staging(&self) -> Result<usize, RecordingStoreError> {
@@ -407,12 +449,20 @@ impl RecordingStore for FilesystemRecordingStore {
             options.write(true).create_new(true);
             #[cfg(unix)]
             std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            #[cfg(test)]
+            self.fail_if_injected(FilesystemStoreFault::BeforeTempOpen)?;
             let mut file = options.open(&temporary).map_err(io_error)?;
             file.write_all(&bytes).map_err(io_error)?;
+            #[cfg(test)]
+            self.fail_if_injected(FilesystemStoreFault::AfterTempWrite)?;
             file.sync_all().map_err(io_error)?;
         }
+        #[cfg(test)]
+        self.fail_if_injected(FilesystemStoreFault::BeforePublish)?;
         let result = match fs::hard_link(&temporary, &destination) {
             Ok(()) => {
+                #[cfg(test)]
+                self.fail_if_injected(FilesystemStoreFault::BeforePublishDirectorySync)?;
                 let result = sync_directory(parent).map(|()| PutIfAbsent::Created);
                 let _ = fs::remove_file(&temporary);
                 result
@@ -498,8 +548,12 @@ impl RecordingStore for FilesystemRecordingStore {
         if existing.checksum != expected_digest {
             return Ok(DeleteIfDigest::DigestMismatch);
         }
+        #[cfg(test)]
+        self.fail_if_injected(FilesystemStoreFault::BeforeDelete)?;
         fs::remove_file(path).map_err(io_error)?;
         if let Some(parent) = self.path_for(key)?.parent() {
+            #[cfg(test)]
+            self.fail_if_injected(FilesystemStoreFault::BeforeDeleteDirectorySync)?;
             sync_directory(parent)?;
         }
         Ok(DeleteIfDigest::Deleted)
@@ -528,12 +582,18 @@ impl RecordingStore for FilesystemRecordingStore {
         .map_err(|_| RecordingStoreError::Backend("tombstone serialization failed".into()))?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(test)]
+        self.fail_if_injected(FilesystemStoreFault::BeforeTombstoneOpen)?;
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(&tombstone).map_err(io_error)?;
         file.write_all(&bytes).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
+        #[cfg(test)]
+        self.fail_if_injected(FilesystemStoreFault::AfterTombstoneSync)?;
         fs::remove_file(path).map_err(io_error)?;
+        #[cfg(test)]
+        self.fail_if_injected(FilesystemStoreFault::BeforeTombstoneDirectorySync)?;
         sync_directory(tombstone.parent().ok_or(RecordingStoreError::UnsafeKey)?)?;
         Ok(DeleteIfDigest::Deleted)
     }
@@ -736,6 +796,105 @@ mod tests {
         recording_store_conformance(&store);
         assert_eq!(store.recover_staging().unwrap(), 0);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn filesystem_faults_cover_disk_full_persistence_boundaries() {
+        let put_faults = [
+            FilesystemStoreFault::BeforeTempOpen,
+            FilesystemStoreFault::AfterTempWrite,
+            FilesystemStoreFault::BeforePublish,
+            FilesystemStoreFault::BeforePublishDirectorySync,
+        ];
+        for (index, fault) in put_faults.into_iter().enumerate() {
+            let root = std::env::temp_dir().join(format!(
+                "chronicle-recording-store-enospc-put-{}-{index}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let store = FilesystemRecordingStore::new(&root);
+            let artifact = RecordingArtifact::new(
+                "faults/put",
+                RecordingArtifactKind::CanonicalDeltaBatch,
+                b"bytes".to_vec(),
+            )
+            .unwrap();
+            store.inject_fault(fault);
+            let result = store.put_if_absent(artifact.clone());
+            assert!(result.is_err(), "fault {fault:?} returned {result:?}");
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error,
+                RecordingStoreError::Backend(message) if message.contains("ENOSPC")
+            ));
+            store.recover_staging().unwrap();
+            assert!(matches!(
+                store.put_if_absent(artifact),
+                Ok(PutIfAbsent::Created | PutIfAbsent::AlreadyExistsMatching)
+            ));
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        let delete_faults = [
+            FilesystemStoreFault::BeforeDelete,
+            FilesystemStoreFault::BeforeDeleteDirectorySync,
+        ];
+        for (index, fault) in delete_faults.into_iter().enumerate() {
+            let root = std::env::temp_dir().join(format!(
+                "chronicle-recording-store-enospc-delete-{}-{index}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let store = FilesystemRecordingStore::new(&root);
+            let artifact = RecordingArtifact::new(
+                "faults/delete",
+                RecordingArtifactKind::CanonicalDeltaBatch,
+                b"bytes".to_vec(),
+            )
+            .unwrap();
+            let digest = artifact.checksum.clone();
+            store.put_if_absent(artifact).unwrap();
+            store.inject_fault(fault);
+            let error = store
+                .delete_if_digest("faults/delete", &digest)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RecordingStoreError::Backend(message) if message.contains("ENOSPC")
+            ));
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        let tombstone_faults = [
+            FilesystemStoreFault::BeforeTombstoneOpen,
+            FilesystemStoreFault::AfterTombstoneSync,
+            FilesystemStoreFault::BeforeTombstoneDirectorySync,
+        ];
+        for (index, fault) in tombstone_faults.into_iter().enumerate() {
+            let root = std::env::temp_dir().join(format!(
+                "chronicle-recording-store-enospc-tombstone-{}-{index}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let store = FilesystemRecordingStore::new(&root);
+            let artifact = RecordingArtifact::new(
+                "faults/tombstone",
+                RecordingArtifactKind::CanonicalDeltaBatch,
+                b"bytes".to_vec(),
+            )
+            .unwrap();
+            let digest = artifact.checksum.clone();
+            store.put_if_absent(artifact).unwrap();
+            store.inject_fault(fault);
+            let error = store
+                .tombstone_if_digest("faults/tombstone", &digest)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RecordingStoreError::Backend(message) if message.contains("ENOSPC")
+            ));
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
