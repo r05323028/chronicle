@@ -19,7 +19,7 @@ const MAX_SEGMENTS: usize = 256;
 const MAX_CONNECTIONS: usize = 4_096;
 const MAX_OUTPUTS: usize = 4_096;
 const MAX_OPERATION_KEYS: usize = 10_000;
-const MAX_STATE_BYTES: usize = 64 * 1024;
+const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
