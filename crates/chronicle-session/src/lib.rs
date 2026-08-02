@@ -8,7 +8,8 @@ use chronicle_capture::{
 };
 use chronicle_common::{ConnectionKey, Direction, Timestamp, TransportProtocol};
 use chronicle_wal::TerminalWalLoss;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug)]
@@ -68,19 +69,22 @@ pub enum SessionError {
     ConflictingSocketEvidence,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ReconstructionConnectionIdentity {
     Fixture(ConnectionKey),
     Socket(SocketIdentity),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconstructionTimestamp {
     pub monotonic: MonotonicTimestamp,
     pub fixture_derived: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReconstructionDirection {
     ClientToServer,
     ServerToClient,
@@ -88,7 +92,8 @@ pub enum ReconstructionDirection {
     Egress,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconstructionPayload {
     pub direction: ReconstructionDirection,
     pub tcp_position: Option<FragmentSequenceEvidence>,
@@ -96,7 +101,8 @@ pub struct ReconstructionPayload {
     pub truncation: TruncationMetadata,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RawLifecycleEvidence {
     MissingOpen,
     ConnectObserved,
@@ -106,20 +112,23 @@ pub enum RawLifecycleEvidence {
     StateChanged { raw_state: u32 },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
 pub enum ReconstructionEvidence {
     Lifecycle(RawLifecycleEvidence),
     Payload(ReconstructionPayload),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconstructionWalProvenance {
     pub segment_ordinal: u64,
     pub segment_first_sequence: u64,
     pub frame_byte_offset: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconstructionEvent {
     pub connection: ReconstructionConnectionIdentity,
     /// Persistence sequence is ordering evidence only; absent for live/unpersisted input.
@@ -142,7 +151,8 @@ pub enum ReconstructionInput {
 }
 
 /// Groups reconstruction evidence by fixture key or kernel socket generation identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconstructionConnection {
     pub identity: ReconstructionConnectionIdentity,
     pub events: Vec<ReconstructionEvent>,
@@ -151,14 +161,16 @@ pub struct ReconstructionConnection {
     pub finalization: Option<ReconstructionFinalization>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReconstructionFinalization {
     ByteLimit,
     ChunkLimit,
     Idle,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DerivedTermination {
     CleanClose,
     /// Reserved until directional close evidence is available from Gate A.
@@ -167,7 +179,8 @@ pub enum DerivedTermination {
     UnknownTermination,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LossWindowClassification {
     Outside,
     Overlaps,
@@ -176,7 +189,8 @@ pub enum LossWindowClassification {
     ClockMismatch,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionLossWindow {
     pub window: LossWindowObserved,
     pub classification: LossWindowClassification,
@@ -561,6 +575,7 @@ pub enum ReconstructionPushError {
     ActiveConnectionLimit { limit: usize },
 }
 
+#[derive(Clone)]
 pub struct ReconstructionAssembler {
     limits: ReconstructionLimits,
     connections: BTreeMap<ReconstructionConnectionIdentity, Vec<ReconstructionEvent>>,
@@ -571,6 +586,55 @@ pub struct ReconstructionAssembler {
     )>,
     loss_windows: Vec<LossWindowObserved>,
     terminal_wal_losses: Vec<TerminalWalLoss>,
+}
+
+pub const RECONSTRUCTION_SNAPSHOT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconstructionAssemblerSnapshot {
+    pub version: u32,
+    pub max_active_connections: usize,
+    pub max_bytes_per_connection: usize,
+    pub max_chunks_per_connection: usize,
+    pub idle_nanoseconds: u64,
+    pub active: Vec<ReconstructionPendingConnection>,
+    pub finalized: Vec<ReconstructionFinalizedConnection>,
+    pub loss_windows: Vec<LossWindowObserved>,
+    pub terminal_wal_losses: Vec<TerminalWalLoss>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconstructionPendingConnection {
+    pub identity: ReconstructionConnectionIdentity,
+    pub events: Vec<ReconstructionEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconstructionFinalizedConnection {
+    pub identity: ReconstructionConnectionIdentity,
+    pub events: Vec<ReconstructionEvent>,
+    pub finalization: ReconstructionFinalization,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReconstructionSnapshotError {
+    #[error("reconstruction snapshot could not be serialized")]
+    Serialization,
+    #[error("reconstruction snapshot could not be parsed")]
+    Parse,
+    #[error("reconstruction snapshot version {0} is unsupported")]
+    UnsupportedVersion(u32),
+    #[error("reconstruction snapshot limits do not match decoder configuration")]
+    LimitMismatch,
+    #[error("reconstruction snapshot exceeds decoder bounds")]
+    Bounds,
+    #[error("reconstruction snapshot contains duplicate connection state")]
+    DuplicateConnection,
+    #[error("reconstruction snapshot contains inconsistent connection state")]
+    InconsistentConnection,
 }
 
 impl Default for ReconstructionAssembler {
@@ -686,6 +750,101 @@ impl ReconstructionAssembler {
         }
     }
 
+    pub fn pending_connection_count(&self) -> usize {
+        self.connections.len() + self.finalized.len()
+    }
+
+    /// Serialize every mutable reconstruction input needed to resume at same WAL cursor.
+    pub fn snapshot(&self) -> Result<Vec<u8>, ReconstructionSnapshotError> {
+        let snapshot = ReconstructionAssemblerSnapshot {
+            version: RECONSTRUCTION_SNAPSHOT_VERSION,
+            max_active_connections: self.limits.max_active_connections,
+            max_bytes_per_connection: self.limits.max_bytes_per_connection,
+            max_chunks_per_connection: self.limits.max_chunks_per_connection,
+            idle_nanoseconds: self.limits.idle_nanoseconds,
+            active: self
+                .connections
+                .iter()
+                .map(|(identity, events)| ReconstructionPendingConnection {
+                    identity: identity.clone(),
+                    events: events.clone(),
+                })
+                .collect(),
+            finalized: self
+                .finalized
+                .iter()
+                .map(
+                    |(identity, events, finalization)| ReconstructionFinalizedConnection {
+                        identity: identity.clone(),
+                        events: events.clone(),
+                        finalization: *finalization,
+                    },
+                )
+                .collect(),
+            loss_windows: self.loss_windows.clone(),
+            terminal_wal_losses: self.terminal_wal_losses.clone(),
+        };
+        serde_json::to_vec(&snapshot).map_err(|_| ReconstructionSnapshotError::Serialization)
+    }
+
+    /// Restore only snapshots produced with same bounded decoder configuration.
+    pub fn restore(
+        limits: ReconstructionLimits,
+        bytes: &[u8],
+    ) -> Result<Self, ReconstructionSnapshotError> {
+        let snapshot: ReconstructionAssemblerSnapshot =
+            serde_json::from_slice(bytes).map_err(|_| ReconstructionSnapshotError::Parse)?;
+        if snapshot.version != RECONSTRUCTION_SNAPSHOT_VERSION {
+            return Err(ReconstructionSnapshotError::UnsupportedVersion(
+                snapshot.version,
+            ));
+        }
+        if snapshot.max_active_connections != limits.max_active_connections
+            || snapshot.max_bytes_per_connection != limits.max_bytes_per_connection
+            || snapshot.max_chunks_per_connection != limits.max_chunks_per_connection
+            || snapshot.idle_nanoseconds != limits.idle_nanoseconds
+        {
+            return Err(ReconstructionSnapshotError::LimitMismatch);
+        }
+        if snapshot.active.len() > limits.max_active_connections {
+            return Err(ReconstructionSnapshotError::Bounds);
+        }
+        let mut connections = BTreeMap::new();
+        for pending in &snapshot.active {
+            validate_connection_state(&pending.identity, &pending.events, &limits)?;
+            if connections
+                .insert(pending.identity.clone(), pending.events.clone())
+                .is_some()
+            {
+                return Err(ReconstructionSnapshotError::DuplicateConnection);
+            }
+        }
+        if snapshot.finalized.len() > limits.max_active_connections {
+            return Err(ReconstructionSnapshotError::Bounds);
+        }
+        let mut seen = BTreeSet::new();
+        seen.extend(connections.keys().cloned());
+        let mut finalized = Vec::with_capacity(snapshot.finalized.len());
+        for connection in &snapshot.finalized {
+            validate_connection_state(&connection.identity, &connection.events, &limits)?;
+            if !seen.insert(connection.identity.clone()) {
+                return Err(ReconstructionSnapshotError::DuplicateConnection);
+            }
+            finalized.push((
+                connection.identity.clone(),
+                connection.events.clone(),
+                connection.finalization,
+            ));
+        }
+        Ok(Self {
+            limits,
+            connections,
+            finalized,
+            loss_windows: snapshot.loss_windows,
+            terminal_wal_losses: snapshot.terminal_wal_losses,
+        })
+    }
+
     pub fn finish(self) -> ReconstructionAssembly {
         let Self {
             connections,
@@ -714,6 +873,33 @@ impl ReconstructionAssembler {
             terminal_wal_losses,
         }
     }
+}
+
+fn validate_connection_state(
+    identity: &ReconstructionConnectionIdentity,
+    events: &[ReconstructionEvent],
+    limits: &ReconstructionLimits,
+) -> Result<(), ReconstructionSnapshotError> {
+    if events.iter().any(|event| &event.connection != identity) {
+        return Err(ReconstructionSnapshotError::InconsistentConnection);
+    }
+    let payloads = events
+        .iter()
+        .filter_map(|event| match &event.evidence {
+            ReconstructionEvidence::Payload(payload) => Some(payload),
+            ReconstructionEvidence::Lifecycle(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if payloads.len() > limits.max_chunks_per_connection
+        || payloads
+            .iter()
+            .map(|payload| payload.bytes.len())
+            .sum::<usize>()
+            > limits.max_bytes_per_connection
+    {
+        return Err(ReconstructionSnapshotError::Bounds);
+    }
+    Ok(())
 }
 
 fn materialize_connection(
@@ -1882,6 +2068,50 @@ mod tests {
             connection.termination,
             DerivedTermination::UnknownTermination
         );
+    }
+
+    #[test]
+    fn reconstruction_snapshot_restores_pending_fragments_exactly() {
+        let first = tcp_payload(1, 10, ReconstructionDirection::Ingress);
+        let second = tcp_payload(2, 11, ReconstructionDirection::Ingress);
+        let mut uninterrupted = ReconstructionAssembler::default();
+        uninterrupted.push(first.clone()).unwrap();
+        uninterrupted.push(second.clone()).unwrap();
+        let expected = uninterrupted.finish();
+
+        let mut before_restart = ReconstructionAssembler::default();
+        before_restart.push(first).unwrap();
+        let snapshot = before_restart.snapshot().unwrap();
+        assert!(!snapshot.is_empty());
+        let mut resumed =
+            ReconstructionAssembler::restore(ReconstructionLimits::default(), &snapshot).unwrap();
+        resumed.push(second).unwrap();
+        assert_eq!(resumed.finish(), expected);
+    }
+
+    #[test]
+    fn reconstruction_snapshot_rejects_unknown_version_and_limit_mismatch() {
+        let assembler = ReconstructionAssembler::default();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&assembler.snapshot().unwrap()).unwrap();
+        value["version"] = serde_json::json!(99);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(matches!(
+            ReconstructionAssembler::restore(ReconstructionLimits::default(), &bytes),
+            Err(ReconstructionSnapshotError::UnsupportedVersion(99))
+        ));
+
+        let bytes = assembler.snapshot().unwrap();
+        assert!(matches!(
+            ReconstructionAssembler::restore(
+                ReconstructionLimits {
+                    max_bytes_per_connection: 1,
+                    ..ReconstructionLimits::default()
+                },
+                &bytes,
+            ),
+            Err(ReconstructionSnapshotError::LimitMismatch)
+        ));
     }
 
     #[test]

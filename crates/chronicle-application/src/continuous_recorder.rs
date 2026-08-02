@@ -2,14 +2,29 @@
 #![allow(clippy::result_large_err)]
 
 use crate::{
-    EpochMetadata, LagSummary, MetadataCode, NormalizedRecorderConfig, QuotaStatus,
-    RecorderCounters, RecorderEpochBoundary, RecorderHealth, RecorderLifecycleError,
-    RecorderMetadataV1, RecorderOrchestrationError, RecorderOrchestrator, RecorderPoll,
-    RecorderReadiness, RecorderStartup, RecorderStartupError, RecordingCaptureMetadata,
-    RecordingMetadata, RecordingStatus, write_recorder_metadata, write_recording_metadata,
+    EpochMetadata, IncrementalWorker, IncrementalWorkerError, IncrementalWorkerPolicy, LagSummary,
+    MetadataCode, NormalizedRecorderConfig, QuotaStatus, RecorderCounters, RecorderEpochBoundary,
+    RecorderHealth, RecorderLifecycleError, RecorderMetadataV1, RecorderOrchestrationError,
+    RecorderOrchestrator, RecorderPoll, RecorderReadiness, RecorderStartup, RecorderStartupError,
+    RecordingCaptureMetadata, RecordingMetadata, RecordingStatus, write_recorder_metadata,
+    write_recording_metadata,
 };
 use chronicle_capture::{CaptureError, CaptureSource};
+use chronicle_common::SessionId;
+use chronicle_etl::{
+    CanonicalDeltaBatchV1, CheckpointLifecycle, CheckpointOwner, CommittedWalSnapshot,
+    DeltaBatchReference, ETL_PIPELINE_VERSION, INCREMENTAL_CHECKPOINT_SCHEMA_VERSION,
+    IncrementalEtlCheckpointV1, IncrementalProcessor, IncrementalResult, MarkerLineage,
+    SourceStatus, publish_delta_then_checkpoint, read_checkpoint,
+};
+use chronicle_protocol::ProtocolRegistry;
+use chronicle_protocol_builtins::registry;
+use chronicle_storage::{
+    FilesystemRecordingStore, RecordingArtifact, RecordingArtifactKind, RecordingStore,
+};
 use chronicle_wal::WalError;
+use sha2::{Digest, Sha256};
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -28,6 +43,8 @@ pub enum ContinuousRecorderError {
     Wal(#[from] WalError),
     #[error("recorder metadata persistence failed: {0}")]
     Metadata(String),
+    #[error("incremental ETL failed: {0}")]
+    Incremental(String),
 }
 
 /// Foreground runtime. Owns startup lease and capture source for entire epoch sequence.
@@ -38,10 +55,17 @@ pub struct ContinuousRecorderService<S> {
     metadata: RecordingMetadata,
     active_metadata: RecorderMetadataV1,
     state_root: std::path::PathBuf,
+    store_root: std::path::PathBuf,
+    incremental_worker: IncrementalWorker,
+    incremental_processor: IncrementalProcessor,
+    incremental_registry: ProtocolRegistry,
+    incremental_session_id: SessionId,
+    incremental_checkpoint: Option<IncrementalEtlCheckpointV1>,
+    next_incremental_millis: u64,
 }
 
 impl<S: CaptureSource> ContinuousRecorderService<S> {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn start(
         config: &NormalizedRecorderConfig,
         wal_directory: impl AsRef<Path>,
@@ -54,6 +78,15 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         resume_etl: impl FnOnce() -> Result<(), RecorderStartupError>,
     ) -> Result<Self, ContinuousRecorderError> {
         let mut recorder = recorder;
+        let mut incremental_worker = IncrementalWorker::new(IncrementalWorkerPolicy {
+            max_lag_records: config.etl.max_lag_records,
+            retry_attempts: config.etl.retry_attempts,
+            backoff_millis: 10,
+        })
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        incremental_worker.start();
+        let incremental_registry =
+            registry().map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
         let startup = RecorderStartup::start_post_foundation(
             config,
             recover_foundation,
@@ -67,6 +100,33 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             resume_etl,
         )?;
         let wal_directory = wal_directory.as_ref().to_path_buf();
+        let checkpoint_path = wal_directory.join("incremental-etl-checkpoint.json");
+        let incremental_checkpoint = match fs::metadata(&checkpoint_path) {
+            Ok(_) => {
+                let checkpoint = read_checkpoint(&checkpoint_path)
+                    .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+                let store = FilesystemRecordingStore::new(config.store_root.clone());
+                for output in &checkpoint.outputs {
+                    let head = store
+                        .head(&output.key)
+                        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+                    if head.key != output.key
+                        || head.kind != RecordingArtifactKind::CanonicalDeltaBatch
+                        || head.checksum != output.digest
+                        || head.bytes != output.bytes
+                    {
+                        return Err(ContinuousRecorderError::Incremental(
+                            "checkpoint output artifact verification failed".into(),
+                        ));
+                    }
+                }
+                Some(checkpoint)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(ContinuousRecorderError::Incremental(error.to_string()));
+            }
+        };
         let recording_id = recorder.ingest().recording_id();
         let metadata = RecordingMetadata {
             version: crate::RECORDING_METADATA_SCHEMA_VERSION,
@@ -104,7 +164,13 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             previous_epoch: None,
             active_segment: None,
             commit: None,
-            incremental_checkpoint: None,
+            incremental_checkpoint: incremental_checkpoint.as_ref().map(|checkpoint| {
+                crate::IncrementalCheckpointSummaryV1 {
+                    marker_sequence: checkpoint.marker.sequence,
+                    checkpoint_digest: checkpoint.checksum.clone(),
+                    output_count: checkpoint.outputs.len() as u64,
+                }
+            }),
             lag: LagSummary {
                 records: 0,
                 bytes: 0,
@@ -132,6 +198,25 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         };
         write_recorder_metadata(&config.state_root, &active_metadata)
             .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        let incremental_session_id = SessionId(recording_id.0);
+        let mut incremental_processor =
+            IncrementalProcessor::new(chronicle_session::SessionLimits::default());
+        if let Some(checkpoint) = &incremental_checkpoint {
+            incremental_processor
+                .restore_decoder_state(
+                    &checkpoint.decoder,
+                    incremental_session_id,
+                    recording_id.0,
+                    checkpoint.epoch_ordinal,
+                    checkpoint.marker.sequence,
+                    &checkpoint.marker.marker_digest,
+                )
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+            incremental_processor.restore_segment_lineage(checkpoint.segment_lineage.clone());
+            incremental_processor
+                .restore_publication_keys(checkpoint.published_operation_keys.clone())
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        }
         Ok(Self {
             startup,
             recorder,
@@ -139,6 +224,13 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             metadata,
             active_metadata,
             state_root: config.state_root.clone(),
+            store_root: config.store_root.clone(),
+            incremental_worker,
+            incremental_processor,
+            incremental_registry,
+            incremental_session_id,
+            incremental_checkpoint,
+            next_incremental_millis: 0,
         })
     }
 
@@ -153,7 +245,262 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     }
 
     pub fn poll(&mut self, now_millis: u64) -> Result<RecorderPoll, ContinuousRecorderError> {
-        Ok(self.recorder.poll(now_millis)?)
+        let poll = self.recorder.poll(now_millis)?;
+        self.poll_incremental(now_millis)?;
+        Ok(poll)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn poll_incremental(&mut self, now_millis: u64) -> Result<(), ContinuousRecorderError> {
+        if now_millis < self.next_incremental_millis {
+            return Ok(());
+        }
+        self.next_incremental_millis = now_millis.saturating_add(250);
+        let wal_directory = self.wal_directory.clone();
+        let recording_id = self.recorder.ingest().recording_id();
+        let checkpoint = self.incremental_checkpoint.clone();
+        let processor = &mut self.incremental_processor;
+        let protocol_registry = &self.incremental_registry;
+        let session_id = self.incremental_session_id;
+        let previous_processor_state = processor.state_snapshot();
+        let mut incremental_result: Option<IncrementalResult> = None;
+        let mut marker = None;
+        let worker_result = self.incremental_worker.process_once(|| {
+            let snapshot = chronicle_wal::read_committed_snapshot_with_records(
+                &wal_directory,
+                recording_id,
+                chronicle_wal::DEFAULT_MAX_RECORD_BYTES,
+            )
+            .map_err(|_| IncrementalWorkerError::BatchFailed)?;
+            if let Some(checkpoint) = &checkpoint
+                && checkpoint.marker.sequence < snapshot.snapshot.marker_sequence
+            {
+                let marker_digest = snapshot
+                    .envelopes
+                    .iter()
+                    .find(|envelope| envelope.sequence == checkpoint.marker.sequence)
+                    .and_then(|envelope| chronicle_wal::encode_envelope(envelope).ok())
+                    .map(|bytes| {
+                        let digest: [u8; 32] = Sha256::digest(bytes).into();
+                        digest_hex(&digest)
+                    });
+                if marker_digest.as_deref() != Some(checkpoint.marker.marker_digest.as_str()) {
+                    return Err(IncrementalWorkerError::BatchFailed);
+                }
+            }
+            if let Some(checkpoint) = &checkpoint
+                && (checkpoint.recording_id != recording_id.0
+                    || checkpoint.marker.sequence > snapshot.snapshot.marker_sequence
+                    || (checkpoint.marker.sequence == snapshot.snapshot.marker_sequence
+                        && checkpoint.marker.marker_digest
+                            != digest_hex(&snapshot.snapshot.marker_digest)))
+            {
+                return Err(IncrementalWorkerError::BatchFailed);
+            }
+            if let Some(checkpoint) = &checkpoint {
+                let active_digest = chronicle_wal::verified_segment_prefix_sha256(
+                    &wal_directory,
+                    recording_id,
+                    &snapshot.envelopes,
+                    checkpoint.marker.segment_ordinal,
+                    checkpoint.marker.sequence,
+                )
+                .map_err(|_| IncrementalWorkerError::BatchFailed)?;
+                if digest_hex(&active_digest) != checkpoint.marker.active_segment_digest {
+                    return Err(IncrementalWorkerError::BatchFailed);
+                }
+            }
+            if processor.last_marker_sequence() == Some(snapshot.snapshot.marker_sequence) {
+                if !processor.marker_digest_matches(&snapshot.snapshot.marker_digest)
+                    || snapshot
+                        .envelopes
+                        .iter()
+                        .any(|envelope| envelope.sequence > snapshot.snapshot.marker_sequence)
+                {
+                    return Err(IncrementalWorkerError::BatchFailed);
+                }
+                return Ok(0);
+            }
+            let result = processor
+                .process_snapshot(
+                    CommittedWalSnapshot {
+                        marker_sequence: snapshot.snapshot.marker_sequence,
+                        marker_digest: snapshot.snapshot.marker_digest,
+                        envelopes: &snapshot.envelopes,
+                        segment_lineage: &snapshot.snapshot.segment_lineage,
+                    },
+                    protocol_registry,
+                    session_id,
+                )
+                .map_err(|_| IncrementalWorkerError::BatchFailed)?;
+            let active_segment_digest = chronicle_wal::verified_segment_prefix_sha256(
+                &wal_directory,
+                recording_id,
+                &snapshot.envelopes,
+                snapshot.snapshot.marker_segment_ordinal,
+                snapshot.snapshot.marker_sequence,
+            )
+            .map_err(|_| IncrementalWorkerError::BatchFailed)?;
+            marker = Some((
+                snapshot.snapshot.marker_sequence,
+                snapshot.snapshot.marker_segment_ordinal,
+                snapshot.snapshot.marker_digest,
+                active_segment_digest,
+            ));
+            incremental_result = Some(result);
+            Ok(0)
+        });
+        match worker_result {
+            Ok(()) => {
+                let mut published = true;
+                if let (
+                    Some(result),
+                    Some((marker_sequence, segment_ordinal, marker_digest, active_segment_digest)),
+                ) = (incremental_result, marker)
+                    && let Err(error) = self.publish_incremental_result(
+                        &result,
+                        marker_sequence,
+                        segment_ordinal,
+                        marker_digest,
+                        active_segment_digest,
+                    )
+                {
+                    self.incremental_processor
+                        .restore_state(previous_processor_state);
+                    published = false;
+                    let _ = error;
+                }
+                if published {
+                    self.active_metadata.processing_readiness = RecorderReadiness::Ready;
+                    self.active_metadata.health = RecorderHealth::Healthy;
+                    self.active_metadata.failure = None;
+                } else {
+                    self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+                    self.active_metadata.health = RecorderHealth::Degraded;
+                    self.active_metadata.failure = Some(MetadataCode::StorageFailure);
+                }
+                self.active_metadata.lag.records = 0;
+                self.active_metadata.lag.age_seconds = 0;
+                self.active_metadata.lag.bytes = 0;
+            }
+            Err(_error) => {
+                self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+                self.active_metadata.health = RecorderHealth::Degraded;
+                self.active_metadata.failure = Some(MetadataCode::StorageFailure);
+            }
+        }
+        write_recorder_metadata(&self.state_root, &self.active_metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        Ok(())
+    }
+
+    fn publish_incremental_result(
+        &mut self,
+        result: &IncrementalResult,
+        marker_sequence: u64,
+        segment_ordinal: u64,
+        marker_digest: [u8; 32],
+        active_segment_digest: [u8; 32],
+    ) -> Result<(), ContinuousRecorderError> {
+        let operations = result
+            .output
+            .session
+            .connections
+            .iter()
+            .flat_map(|connection| connection.operations.iter().cloned())
+            .collect();
+        let batch = CanonicalDeltaBatchV1::new(
+            result.first_marker_sequence,
+            result.last_marker_sequence,
+            operations,
+        )
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let recording_id = self.recorder.ingest().recording_id();
+        let key = format!(
+            "deltas/{}/{}.json",
+            recording_id.0, result.last_marker_sequence
+        );
+        let bytes = batch
+            .encode()
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let artifact = RecordingArtifact::new(
+            key.clone(),
+            RecordingArtifactKind::CanonicalDeltaBatch,
+            bytes.clone(),
+        )
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let mut outputs = self
+            .incremental_checkpoint
+            .as_ref()
+            .map_or_else(Vec::new, |checkpoint| checkpoint.outputs.clone());
+        outputs.push(DeltaBatchReference {
+            key: key.clone(),
+            digest: artifact.checksum,
+            first_marker_sequence: result.first_marker_sequence,
+            last_marker_sequence: result.last_marker_sequence,
+            bytes: bytes.len() as u64,
+        });
+        let marker_digest_hex = digest_hex(&marker_digest);
+        let epoch_ordinal = self
+            .active_metadata
+            .current_epoch
+            .as_ref()
+            .map_or(0, |epoch| epoch.ordinal);
+        let decoder = self
+            .incremental_processor
+            .decoder_state(
+                self.incremental_session_id,
+                recording_id.0,
+                epoch_ordinal,
+                marker_sequence,
+                marker_digest_hex.clone(),
+            )
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let checkpoint = IncrementalEtlCheckpointV1 {
+            version: INCREMENTAL_CHECKPOINT_SCHEMA_VERSION,
+            owner: CheckpointOwner::Recorder,
+            lifecycle: CheckpointLifecycle::Active,
+            recording_id: recording_id.0,
+            epoch_ordinal,
+            config_digest: self.active_metadata.config_digest.clone(),
+            pipeline_version: ETL_PIPELINE_VERSION.into(),
+            canonical_schema_version: chronicle_canonical::CANONICAL_SCHEMA_VERSION,
+            marker: MarkerLineage {
+                sequence: marker_sequence,
+                segment_ordinal,
+                marker_digest: marker_digest_hex,
+                active_segment_digest: digest_hex(&active_segment_digest),
+            },
+            segment_lineage: result.segment_lineage.clone(),
+            predecessor_digest: self
+                .incremental_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.checksum.clone()),
+            decoder,
+            outputs,
+            published_operation_keys: self.incremental_processor.published_operation_keys(),
+            source_status: SourceStatus::Live,
+            checksum: String::new(),
+        };
+        let store = FilesystemRecordingStore::new(self.store_root.clone());
+        publish_delta_then_checkpoint(
+            &store,
+            key,
+            &batch,
+            &checkpoint,
+            self.wal_directory.join("incremental-etl-checkpoint.json"),
+        )
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let checkpoint =
+            read_checkpoint(self.wal_directory.join("incremental-etl-checkpoint.json"))
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        self.active_metadata.incremental_checkpoint = Some(crate::IncrementalCheckpointSummaryV1 {
+            marker_sequence: checkpoint.marker.sequence,
+            checkpoint_digest: checkpoint.checksum.clone(),
+            output_count: checkpoint.outputs.len() as u64,
+        });
+        self.incremental_checkpoint = Some(checkpoint);
+        Ok(())
     }
 
     fn sync_active_progress(&mut self) {
@@ -235,6 +582,15 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             chronicle_wal::DEFAULT_MAX_RECORD_BYTES,
         )?)
     }
+}
+
+fn digest_hex(value: &[u8; 32]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in value {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 fn unix_seconds() -> u64 {

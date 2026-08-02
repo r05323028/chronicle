@@ -78,6 +78,8 @@ use chronicle_replay::{
 };
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+use chronicle_wal::prepare_group_commit_reopen;
 use chronicle_wal::{
     COMMIT_MARKER_FRAME_LEN, DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_WAL_BYTES,
     DEFAULT_SEGMENT_BYTES, GroupCommitWalWriter, MAX_SEGMENT_BYTES, MIN_SEGMENT_BYTES, RecordKind,
@@ -822,19 +824,47 @@ pub fn record_continuous_ebpf(
         segment_bytes: config.segment.max_bytes,
         max_wal_bytes: config.epoch.max_bytes,
     };
-    preflight_wal_destination(wal_directory, bounds)?;
+    let existing_recording_id = if wal_directory.exists() {
+        let metadata = load_recording_metadata(wal_directory)?.ok_or(
+            ApplicationError::RecordingMetadataValidation(
+                "recording metadata missing during WAL recovery".into(),
+            ),
+        )?;
+        if matches!(
+            metadata.status,
+            RecordingStatus::Starting | RecordingStatus::Recording
+        ) {
+            let _ = fs::remove_file(wal_directory.join("etl-checkpoint.json"));
+        }
+        Some(metadata.recording_id)
+    } else {
+        preflight_wal_destination(wal_directory, bounds)?;
+        None
+    };
     preflight_embedded_ebpf()?;
     let capture_metadata = live_capture_metadata(&selection, bounds)?;
-    let recording_id = RecordingId::new();
-    let writer = GroupCommitWalWriter::create_with_total_limit_and_age(
-        wal_directory,
-        recording_id,
-        config.segment.max_bytes,
-        config.epoch.max_bytes,
-        1,
-        monotonic_millis(),
-        config.segment.max_age_seconds.saturating_mul(1_000),
-    )?;
+    let recording_id = existing_recording_id.unwrap_or_else(RecordingId::new);
+    let writer = if wal_directory.exists() {
+        prepare_group_commit_reopen(
+            wal_directory,
+            recording_id,
+            config.segment.max_bytes,
+            config.epoch.max_bytes,
+            monotonic_millis(),
+        )?
+        .apply()?
+        .0
+    } else {
+        GroupCommitWalWriter::create_with_total_limit_and_age(
+            wal_directory,
+            recording_id,
+            config.segment.max_bytes,
+            config.epoch.max_bytes,
+            1,
+            monotonic_millis(),
+            config.segment.max_age_seconds.saturating_mul(1_000),
+        )?
+    };
     let source = load_production_ebpf_source(&selection, pid_baseline.as_ref())?;
     let recorder = RecorderOrchestrator::new(source, RecordingIngest::new(writer));
     let mut service = ContinuousRecorderService::start(
@@ -889,6 +919,11 @@ pub fn record_continuous_ebpf(
         .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
     let last_valid_commit = service.recorder().ingest().commit_boundary();
     drop(service);
+    process_and_publish_recording_wal(
+        wal_directory,
+        &config.store_root,
+        &chronicle_protocol_builtins::registry()?,
+    )?;
     Ok(ProductionRecordingResult {
         recording_id,
         status: result.status,
@@ -1110,6 +1145,7 @@ pub struct RecordingIngest {
     terminal_discarded: BTreeMap<ClockIdentity, TerminalDiscardAccumulator>,
     terminal_discarded_without_time: RecordByteCount,
     terminal_wal_loss: Option<TerminalWalLossSummary>,
+    last_valid_commit: Option<RecordingCommitBoundary>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1133,6 +1169,7 @@ impl RecordingIngest {
             terminal_discarded: BTreeMap::new(),
             terminal_discarded_without_time: RecordByteCount::default(),
             terminal_wal_loss: None,
+            last_valid_commit: None,
         }
     }
 
@@ -1185,13 +1222,22 @@ impl RecordingIngest {
 
     pub fn commit_boundary(&self) -> Option<RecordingCommitBoundary> {
         let authority = self.writer.authority();
-        Some(RecordingCommitBoundary {
-            marker_sequence: authority.marker_sequence?,
-            durable_through_sequence: authority.durable_through_sequence?,
-            durable_record_count: authority.durable_record_count,
-            durable_payload_bytes: authority.durable_payload_bytes,
-            segment_ordinal: authority.segment_ordinal?,
-        })
+        match (
+            authority.marker_sequence,
+            authority.durable_through_sequence,
+            authority.segment_ordinal,
+        ) {
+            (Some(marker_sequence), Some(durable_through_sequence), Some(segment_ordinal)) => {
+                Some(RecordingCommitBoundary {
+                    marker_sequence,
+                    durable_through_sequence,
+                    durable_record_count: authority.durable_record_count,
+                    durable_payload_bytes: authority.durable_payload_bytes,
+                    segment_ordinal,
+                })
+            }
+            _ => self.last_valid_commit.clone(),
+        }
     }
 
     pub fn stop_reason(&self) -> Option<ShutdownReason> {
@@ -1262,6 +1308,7 @@ impl RecordingIngest {
         self.drain(now_millis)?;
         self.writer.shutdown(now_millis)?;
         let boundary = self.commit_boundary();
+        self.last_valid_commit.clone_from(&boundary);
         self.writer = next_writer;
         self.reset_after_rollover();
         Ok(boundary)
@@ -1275,6 +1322,7 @@ impl RecordingIngest {
         self.drain(now_millis)?;
         self.writer.shutdown(now_millis)?;
         let boundary = self.commit_boundary();
+        self.last_valid_commit.clone_from(&boundary);
         let first_sequence = self.writer.next_sequence();
         self.writer.rollover(now_millis, first_sequence)?;
         self.reset_after_rollover();
@@ -4211,6 +4259,20 @@ mod tests {
             payload,
             capture_timestamp: None,
         }
+    }
+
+    #[test]
+    fn ingest_empty_queue_after_rollover_keeps_last_durable_commit() {
+        let directory = ingest_directory("rollover-empty");
+        let mut ingest = ingest(&directory);
+        assert_eq!(ingest.admit(queued(vec![1])), Ok(IngestAdmission::Accepted));
+        ingest.drain(1).unwrap();
+        let boundary = ingest.rollover(2).unwrap().unwrap();
+        assert_eq!(ingest.commit_boundary(), Some(boundary.clone()));
+        ingest.finish(ShutdownReason::SourceCompleted, 3).unwrap();
+        assert_eq!(ingest.commit_boundary(), Some(boundary));
+        drop(ingest);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

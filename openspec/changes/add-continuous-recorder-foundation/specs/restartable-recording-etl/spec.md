@@ -163,3 +163,19 @@ Rootless automated tests SHALL include snapshot concurrency, serialized-state ro
 
 - **WHEN** real workload produces committed records during multi-segment recording and ETL is terminated/restarted
 - **THEN** checkpoint resumes from validated lineage, final output is deterministic, and no committed operation is duplicated or omitted
+
+### Requirement: Decoder snapshot and cursor restoration fail closed
+
+The decoder reconstruction snapshot SHALL be a versioned, non-empty bounded representation of active/finalized connection evidence, continuation fragments, loss evidence, and decoder limits. Its metadata SHALL bind decoder kind and implementation version, snapshot schema version, session identity, recording/epoch identity, marker cursor/digest, and serialized length. Restore SHALL reject malformed bytes, unsupported versions or kinds, bound/configuration mismatch, duplicate or inconsistent connection state, session/recording mismatch, cursor mismatch, and segment-lineage fork. A fresh decoder SHALL never replace failed restore.
+
+An incremental retry SHALL require contiguous WAL envelope sequence after its checkpoint cursor and exact matching digest/range for every previously checkpointed segment. Delta publication SHALL retain stable operation fingerprints in checkpoint state and publish only unseen operations; rollback SHALL restore reconstruction, evidence, issue, lineage, fingerprint, and cursor state together.
+
+#### Scenario: Pending continuation restart
+
+- **WHEN** checkpoint is taken with pending fragmented connection bytes and ETL restarts
+- **THEN** restore reconstructs same state and uninterrupted/restarted publication is byte-equivalent without duplicate operations
+
+#### Scenario: WAL fork or gap
+
+- **WHEN** resumed snapshot omits a sequence or changes any checkpointed segment digest/range
+- **THEN** ETL fails closed before publication and preserves prior checkpoint/output

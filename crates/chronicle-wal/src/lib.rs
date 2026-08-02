@@ -4,6 +4,7 @@ use chronicle_capture::{ClockIdentity, MonotonicTimestamp};
 use chronicle_common::RecordingId;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, FlockOperation, RenameFlags, flock, renameat_with};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -130,25 +131,29 @@ pub struct WalRecordEnvelope {
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalWalLossInterval {
     pub start: MonotonicTimestamp,
     pub end: MonotonicTimestamp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum TerminalWalLossReason {
     WalHardLimit = 1,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum TerminalWalLossAmbiguity {
     UnknownDownstreamEffects = 1,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalWalLoss {
     pub interval: TerminalWalLossInterval,
     pub discarded_records: u64,
@@ -1120,6 +1125,7 @@ pub struct CommittedSnapshot {
     pub marker_digest: [u8; 32],
     pub input_digest: [u8; 32],
     pub segment_count: usize,
+    pub segment_lineage: Vec<CommittedSegment>,
     pub committed_record_count: u64,
     pub committed_payload_bytes: u64,
 }
@@ -1128,6 +1134,14 @@ pub struct CommittedSnapshot {
 ///
 /// Snapshot read never acquires or mutates the writer lock. A mutable suffix
 /// returns retryable uncertainty instead of exposing records to ETL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedSegment {
+    pub ordinal: u64,
+    pub digest: [u8; 32],
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommittedRecordSnapshot {
     pub snapshot: CommittedSnapshot,
@@ -1183,6 +1197,7 @@ fn committed_snapshot_from_scan(
         marker_digest,
         input_digest,
         segment_count,
+        segment_lineage: committed_segment_lineage(wal_directory, scan, provenance)?,
         committed_record_count: scan.authority.durable_record_count,
         committed_payload_bytes: scan.authority.durable_payload_bytes,
     })
@@ -1204,6 +1219,39 @@ pub fn read_committed_snapshot_with_records(
         snapshot,
         envelopes: scan.committed,
     })
+}
+
+pub fn verified_segment_prefix_sha256(
+    wal_directory: impl AsRef<Path>,
+    recording_id: RecordingId,
+    envelopes: &[WalRecordEnvelope],
+    segment_ordinal: u64,
+    through_sequence: u64,
+) -> Result<[u8; 32], WalError> {
+    let target = envelopes
+        .iter()
+        .find(|envelope| envelope.sequence == through_sequence)
+        .ok_or(WalError::CommitSegmentMismatch)?;
+    let provenance = target
+        .provenance
+        .as_ref()
+        .filter(|provenance| provenance.segment_ordinal == segment_ordinal)
+        .ok_or(WalError::CommitSegmentMismatch)?;
+    let end = provenance
+        .byte_offset
+        .checked_add(u64::try_from(encode_envelope(target)?.len()).unwrap_or(u64::MAX))
+        .ok_or(WalError::CommitArithmeticOverflow)?;
+    let segments = discover_segments(wal_directory.as_ref().join("segments"), recording_id)?;
+    let segment = segments
+        .into_iter()
+        .find(|segment| segment.header.segment_ordinal == segment_ordinal)
+        .ok_or(WalError::CommitSegmentMismatch)?;
+    let bytes = fs::read(segment.path)?;
+    let end = usize::try_from(end).map_err(|_| WalError::CommitArithmeticOverflow)?;
+    if bytes.len() < end {
+        return Err(WalError::CommitSegmentMismatch);
+    }
+    Ok(Sha256::digest(&bytes[..end]).into())
 }
 
 pub fn verified_snapshot_sha256(
@@ -1248,6 +1296,58 @@ pub fn verified_snapshot_sha256(
         return Err(WalError::CommitSegmentMismatch);
     }
     Ok(digest.finalize().into())
+}
+
+fn committed_segment_lineage(
+    wal_directory: &Path,
+    scan: &RecoveryScan,
+    marker_provenance: &WalRecordProvenance,
+) -> Result<Vec<CommittedSegment>, WalError> {
+    let segments = discover_segments(
+        wal_directory.join("segments"),
+        marker_provenance_recording_id(scan)?,
+    )?;
+    let mut lineage = Vec::new();
+    for segment in segments {
+        if segment.header.segment_ordinal > marker_provenance.segment_ordinal {
+            break;
+        }
+        // Final marker segment remains appendable; its digest changes with normal
+        // growth and is represented by marker/cursor continuity instead.
+        if segment.header.segment_ordinal == marker_provenance.segment_ordinal {
+            continue;
+        }
+        let bytes = fs::read(&segment.path)?;
+        let records: Vec<_> = scan
+            .committed
+            .iter()
+            .filter(|record| {
+                record.provenance.as_ref().is_some_and(|provenance| {
+                    provenance.segment_ordinal == segment.header.segment_ordinal
+                })
+            })
+            .collect();
+        let (Some(first), Some(last)) = (
+            records.first().map(|record| record.sequence),
+            records.last().map(|record| record.sequence),
+        ) else {
+            continue;
+        };
+        lineage.push(CommittedSegment {
+            ordinal: segment.header.segment_ordinal,
+            digest: Sha256::digest(bytes).into(),
+            first_sequence: first,
+            last_sequence: last,
+        });
+    }
+    Ok(lineage)
+}
+
+fn marker_provenance_recording_id(scan: &RecoveryScan) -> Result<RecordingId, WalError> {
+    scan.final_marker
+        .as_ref()
+        .map(|marker| marker.recording_id)
+        .ok_or(WalError::NoAuthoritativeCommit)
 }
 
 fn scan_wal_unlocked(

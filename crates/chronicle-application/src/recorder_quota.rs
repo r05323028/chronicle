@@ -147,4 +147,31 @@ mod tests {
             Err(QuotaError::InsufficientHeadroom)
         );
     }
+
+    #[test]
+    fn separate_domains_do_not_borrow_headroom() {
+        let first = QuotaReservationAuthority::new(DomainQuota {
+            domain: "first".into(),
+            quota_bytes: 100,
+            minimum_free_bytes: 10,
+            free_bytes: 100,
+        })
+        .unwrap();
+        let second = QuotaReservationAuthority::new(DomainQuota {
+            domain: "second".into(),
+            quota_bytes: 100,
+            minimum_free_bytes: 10,
+            free_bytes: 100,
+        })
+        .unwrap();
+
+        first.reserve(ReservationKind::Wal, 90).unwrap();
+        assert_eq!(
+            first.reserve(ReservationKind::RecordingStore, 1),
+            Err(QuotaError::InsufficientHeadroom)
+        );
+        assert!(second
+            .reserve(ReservationKind::RecordingStore, 90)
+            .is_ok());
+    }
 }

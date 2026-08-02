@@ -118,6 +118,9 @@ pub fn publish_delta_then_checkpoint<S: RecordingStore>(
         batch.encode()?,
     )?;
     let checksum = artifact.checksum.clone();
+    let artifact_version = artifact.version;
+    let artifact_kind = artifact.kind;
+    let artifact_bytes = artifact.bytes.len() as u64;
     if !checkpoint
         .outputs
         .iter()
@@ -127,7 +130,11 @@ pub fn publish_delta_then_checkpoint<S: RecordingStore>(
     }
     let outcome = store.put_if_absent(artifact)?;
     let head = store.head(&key)?;
-    if head.checksum != checksum {
+    if head.version != artifact_version
+        || head.kind != artifact_kind
+        || head.bytes != artifact_bytes
+        || head.checksum != checksum
+    {
         return Err(PublicationError::Verification);
     }
     write_checkpoint_atomic(checkpoint_path, checkpoint)?;
@@ -146,11 +153,15 @@ mod tests {
     use uuid::Uuid;
 
     fn checkpoint() -> IncrementalEtlCheckpointV1 {
+        let recording_id = Uuid::new_v4();
+        let state = chronicle_session::ReconstructionAssembler::default()
+            .snapshot()
+            .unwrap();
         IncrementalEtlCheckpointV1 {
             version: 1,
             owner: CheckpointOwner::Recorder,
             lifecycle: CheckpointLifecycle::Active,
-            recording_id: Uuid::new_v4(),
+            recording_id,
             epoch_ordinal: 0,
             config_digest: "a".repeat(64),
             pipeline_version: "p".into(),
@@ -159,6 +170,7 @@ mod tests {
                 sequence: 0,
                 segment_ordinal: 0,
                 marker_digest: "b".repeat(64),
+                active_segment_digest: "e".repeat(64),
             },
             segment_lineage: vec![SegmentLineage {
                 ordinal: 0,
@@ -168,10 +180,20 @@ mod tests {
             }],
             predecessor_digest: None,
             decoder: DecoderReconstructionState {
-                connections: Vec::new(),
-                serialized_bytes: 0,
+                kind: crate::DECODER_KIND.into(),
+                implementation_version: crate::DECODER_IMPLEMENTATION_VERSION,
+                snapshot_version: crate::DECODER_SNAPSHOT_VERSION,
+                session_id: Uuid::new_v4(),
+                recording_id,
+                epoch_ordinal: 0,
+                marker_sequence: 0,
+                marker_digest: "b".repeat(64),
+                state: state.clone(),
+                pending_connection_count: 0,
+                serialized_bytes: state.len(),
             },
             outputs: Vec::new(),
+            published_operation_keys: Vec::new(),
             source_status: SourceStatus::Live,
             checksum: String::new(),
         }

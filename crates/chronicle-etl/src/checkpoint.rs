@@ -1,6 +1,7 @@
 //! Bounded incremental ETL checkpoint. Distinct from final-session checkpoint.
 #![allow(clippy::format_collect)]
 
+use chronicle_session::{ReconstructionAssembler, ReconstructionLimits};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -11,9 +12,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const INCREMENTAL_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
+pub const DECODER_SNAPSHOT_VERSION: u32 = 1;
+pub const DECODER_IMPLEMENTATION_VERSION: u32 = 1;
+pub const DECODER_KIND: &str = "chronicle-reconstruction";
 const MAX_SEGMENTS: usize = 256;
 const MAX_CONNECTIONS: usize = 4_096;
 const MAX_OUTPUTS: usize = 4_096;
+const MAX_OPERATION_KEYS: usize = 10_000;
 const MAX_STATE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +40,7 @@ pub struct MarkerLineage {
     pub sequence: u64,
     pub segment_ordinal: u64,
     pub marker_digest: String,
+    pub active_segment_digest: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,35 +55,18 @@ pub struct SegmentLineage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecoderReconstructionState {
-    pub connections: Vec<ConnectionState>,
+    pub kind: String,
+    pub implementation_version: u32,
+    pub snapshot_version: u32,
+    pub session_id: Uuid,
+    pub recording_id: Uuid,
+    pub epoch_ordinal: u64,
+    pub marker_sequence: u64,
+    pub marker_digest: String,
+    /// Authoritative versioned snapshot of all mutable reconstruction state.
+    pub state: Vec<u8>,
+    pub pending_connection_count: usize,
     pub serialized_bytes: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConnectionState {
-    pub connection_id: Uuid,
-    pub generation: u64,
-    pub tcp: TcpDirectionState,
-    pub http: HttpCorrelationState,
-    pub lifecycle: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TcpDirectionState {
-    pub client_to_server_offset: u64,
-    pub server_to_client_offset: u64,
-    pub client_to_server_buffer_bytes: u64,
-    pub server_to_client_buffer_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpCorrelationState {
-    pub request_queue_depth: u32,
-    pub active_request_id: Option<Uuid>,
-    pub body_bytes_pending: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +104,7 @@ pub struct IncrementalEtlCheckpointV1 {
     pub predecessor_digest: Option<String>,
     pub decoder: DecoderReconstructionState,
     pub outputs: Vec<DeltaBatchReference>,
+    pub published_operation_keys: Vec<String>,
     pub source_status: SourceStatus,
     pub checksum: String,
 }
@@ -196,13 +186,34 @@ impl IncrementalEtlCheckpointV1 {
             || !is_digest(&self.config_digest)
             || self.pipeline_version.len() > 32
             || self.segment_lineage.len() > MAX_SEGMENTS
-            || self.decoder.connections.len() > MAX_CONNECTIONS
+            || self.decoder.pending_connection_count > MAX_CONNECTIONS
             || self.outputs.len() > MAX_OUTPUTS
+            || self.published_operation_keys.len() > MAX_OPERATION_KEYS
             || self.decoder.serialized_bytes > MAX_STATE_BYTES
         {
             return Err(CheckpointError::Invalid);
         }
         validate_marker(&self.marker)?;
+        if self.decoder.kind != DECODER_KIND
+            || self.decoder.implementation_version != DECODER_IMPLEMENTATION_VERSION
+            || self.decoder.snapshot_version != DECODER_SNAPSHOT_VERSION
+            || self.decoder.session_id.is_nil()
+            || self.decoder.recording_id != self.recording_id
+            || self.decoder.epoch_ordinal != self.epoch_ordinal
+            || self.decoder.marker_sequence != self.marker.sequence
+            || self.decoder.marker_digest != self.marker.marker_digest
+            || self.decoder.state.is_empty()
+            || self.decoder.serialized_bytes != self.decoder.state.len()
+            || self.decoder.pending_connection_count > MAX_CONNECTIONS
+        {
+            return Err(CheckpointError::DecoderStateMismatch);
+        }
+        let restored =
+            ReconstructionAssembler::restore(ReconstructionLimits::default(), &self.decoder.state)
+                .map_err(|_| CheckpointError::DecoderStateInvalid)?;
+        if restored.pending_connection_count() != self.decoder.pending_connection_count {
+            return Err(CheckpointError::DecoderStateMismatch);
+        }
         for pair in self.segment_lineage.windows(2) {
             if pair[0].ordinal >= pair[1].ordinal || pair[0].last_sequence >= pair[1].first_sequence
             {
@@ -219,6 +230,11 @@ impl IncrementalEtlCheckpointV1 {
         if let Some(digest) = &self.predecessor_digest {
             validate_digest(digest)?;
         }
+        for key in &self.published_operation_keys {
+            if !is_digest(key) {
+                return Err(CheckpointError::Invalid);
+            }
+        }
         for output in &self.outputs {
             if output.key.is_empty()
                 || output.key.len() > 512
@@ -232,14 +248,6 @@ impl IncrementalEtlCheckpointV1 {
                 || output.first_marker_sequence > output.last_marker_sequence
             {
                 return Err(CheckpointError::AheadOfMarker);
-            }
-        }
-        for connection in &self.decoder.connections {
-            if connection.lifecycle.len() > 32
-                || connection.tcp.client_to_server_buffer_bytes > MAX_STATE_BYTES as u64
-                || connection.tcp.server_to_client_buffer_bytes > MAX_STATE_BYTES as u64
-            {
-                return Err(CheckpointError::Invalid);
             }
         }
         Ok(())
@@ -273,7 +281,7 @@ impl IncrementalEtlCheckpointV1 {
         CheckpointSummary {
             marker_sequence: self.marker.sequence,
             segment_count: self.segment_lineage.len(),
-            connection_count: self.decoder.connections.len(),
+            connection_count: self.decoder.pending_connection_count,
             output_count: self.outputs.len(),
             source_status: self.source_status,
         }
@@ -307,6 +315,10 @@ pub enum CheckpointError {
     ChecksumMismatch,
     #[error("incremental checkpoint could not be parsed")]
     Parse,
+    #[error("incremental checkpoint decoder state metadata does not match checkpoint cursor")]
+    DecoderStateMismatch,
+    #[error("incremental checkpoint decoder state is malformed or unsupported")]
+    DecoderStateInvalid,
     #[error("incremental checkpoint serialization failed")]
     Serialization,
     #[error("incremental checkpoint I/O failed")]
@@ -314,7 +326,8 @@ pub enum CheckpointError {
 }
 
 fn validate_marker(marker: &MarkerLineage) -> Result<(), CheckpointError> {
-    validate_digest(&marker.marker_digest)
+    validate_digest(&marker.marker_digest)?;
+    validate_digest(&marker.active_segment_digest)
 }
 
 fn validate_digest(value: &str) -> Result<(), CheckpointError> {
@@ -341,11 +354,14 @@ mod tests {
     use super::*;
 
     fn checkpoint() -> IncrementalEtlCheckpointV1 {
+        let recording_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let state = ReconstructionAssembler::default().snapshot().unwrap();
         IncrementalEtlCheckpointV1 {
             version: 1,
             owner: CheckpointOwner::Recorder,
             lifecycle: CheckpointLifecycle::Active,
-            recording_id: Uuid::new_v4(),
+            recording_id,
             epoch_ordinal: 1,
             config_digest: "a".repeat(64),
             pipeline_version: "p2".into(),
@@ -354,6 +370,7 @@ mod tests {
                 sequence: 4,
                 segment_ordinal: 0,
                 marker_digest: "b".repeat(64),
+                active_segment_digest: "e".repeat(64),
             },
             segment_lineage: vec![SegmentLineage {
                 ordinal: 0,
@@ -363,23 +380,17 @@ mod tests {
             }],
             predecessor_digest: None,
             decoder: DecoderReconstructionState {
-                connections: vec![ConnectionState {
-                    connection_id: Uuid::new_v4(),
-                    generation: 2,
-                    tcp: TcpDirectionState {
-                        client_to_server_offset: 10,
-                        server_to_client_offset: 20,
-                        client_to_server_buffer_bytes: 3,
-                        server_to_client_buffer_bytes: 4,
-                    },
-                    http: HttpCorrelationState {
-                        request_queue_depth: 1,
-                        active_request_id: Some(Uuid::new_v4()),
-                        body_bytes_pending: 5,
-                    },
-                    lifecycle: "open".into(),
-                }],
-                serialized_bytes: 128,
+                kind: DECODER_KIND.into(),
+                implementation_version: DECODER_IMPLEMENTATION_VERSION,
+                snapshot_version: DECODER_SNAPSHOT_VERSION,
+                session_id,
+                recording_id,
+                epoch_ordinal: 1,
+                marker_sequence: 4,
+                marker_digest: "b".repeat(64),
+                serialized_bytes: state.len(),
+                state,
+                pending_connection_count: 0,
             },
             outputs: vec![DeltaBatchReference {
                 key: "delta/1".into(),
@@ -388,6 +399,7 @@ mod tests {
                 last_marker_sequence: 4,
                 bytes: 8,
             }],
+            published_operation_keys: Vec::new(),
             source_status: SourceStatus::Live,
             checksum: String::new(),
         }
@@ -433,6 +445,17 @@ mod tests {
             value.validate_against(&wrong),
             Err(CheckpointError::WrongEpoch)
         );
+    }
+
+    #[test]
+    fn checkpoint_rejects_corrupt_or_unsupported_decoder_state() {
+        let mut value = checkpoint();
+        value.decoder.state[0] = b'!';
+        assert_eq!(value.encode(), Err(CheckpointError::DecoderStateInvalid));
+
+        let mut value = checkpoint();
+        value.decoder.snapshot_version = DECODER_SNAPSHOT_VERSION + 1;
+        assert_eq!(value.encode(), Err(CheckpointError::DecoderStateMismatch));
     }
 
     #[test]

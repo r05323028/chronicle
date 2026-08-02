@@ -624,6 +624,12 @@ acquire lease
 - **Incremental batch artifact adds format** -> keep internal v1 wrapper around existing canonical values; final public replay artifact remains Canonical Session v1.
 - **Working tree contains concurrent P1 edits** -> implementation must rebase/reinspect current contracts and not overwrite unrelated changes.
 
+## Decoder checkpoint implementation contract
+
+`IncrementalEtlCheckpoint v1` binds each checkpoint to one recorder session, recording ID, epoch, normalized configuration, exact marker, and ordered sealed-segment lineage. Decoder state is a versioned `chronicle-reconstruction` snapshot containing active and finalized connection evidence, loss windows, terminal WAL-loss evidence, limits, and bounded payload bytes. The snapshot is non-empty even when no connection is pending; empty/default state is invalid. Snapshot restore checks kind, implementation version, schema version, session/recording/epoch/cursor bindings, configured bounds, duplicate identities, state consistency, and serialized length. Any mismatch, corruption, unsupported version, or lineage fork fails closed; no fresh-decoder fallback exists.
+
+Incremental processing requires the next committed envelope sequence after a checkpoint cursor and verifies prior segment digests/ranges before accepting newer WAL. Immutable delta publication tracks stable operation fingerprints (canonical operation ID removed before hashing) in the checkpoint, so a restarted or retried worker does not republish prior operations. Publication failure restores the complete in-memory processor state, including reconstruction evidence, issues, segment lineage, operation fingerprints, and marker. Output publication remains before checkpoint persistence; final session publication still uses the existing one-shot canonical session authority.
+
 ## Migration Plan
 
 1. Add new P2 artifacts/contracts beside P1; retain all one-shot commands/readers.

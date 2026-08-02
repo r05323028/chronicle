@@ -5,11 +5,11 @@ mod delta;
 mod incremental;
 mod publication;
 pub use checkpoint::{
-    CheckpointError, CheckpointLifecycle, CheckpointOwner, CheckpointSummary, ConnectionState,
-    DecoderReconstructionState, DeltaBatchReference, HttpCorrelationState,
-    INCREMENTAL_CHECKPOINT_SCHEMA_VERSION, IncrementalEtlCheckpointV1, MarkerLineage,
-    RecoveryAuthoritativeSnapshot, SegmentLineage, SourceStatus, TcpDirectionState,
-    read_checkpoint, write_checkpoint_atomic,
+    CheckpointError, CheckpointLifecycle, CheckpointOwner, CheckpointSummary,
+    DECODER_IMPLEMENTATION_VERSION, DECODER_KIND, DECODER_SNAPSHOT_VERSION,
+    DecoderReconstructionState, DeltaBatchReference, INCREMENTAL_CHECKPOINT_SCHEMA_VERSION,
+    IncrementalEtlCheckpointV1, MarkerLineage, RecoveryAuthoritativeSnapshot, SegmentLineage,
+    SourceStatus, read_checkpoint, write_checkpoint_atomic,
 };
 pub use delta::{CANONICAL_DELTA_SCHEMA_VERSION, CanonicalDeltaBatchV1, DeltaBatchError};
 pub use incremental::{CommittedWalSnapshot, IncrementalProcessor, IncrementalResult};
@@ -210,6 +210,14 @@ pub enum EtlError {
     ConflictingSocketEvidence,
     #[error("incremental snapshot marker regressed")]
     SnapshotRegression,
+    #[error("incremental snapshot has a gap after prior checkpoint")]
+    SnapshotGap,
+    #[error("incremental snapshot segment lineage does not extend prior checkpoint")]
+    SnapshotLineageMismatch,
+    #[error(transparent)]
+    ReconstructionSnapshot(#[from] chronicle_session::ReconstructionSnapshotError),
+    #[error("decoder checkpoint does not match current session or WAL cursor")]
+    DecoderCheckpointMismatch,
 }
 
 pub struct EtlPipeline {

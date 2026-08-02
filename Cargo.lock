@@ -287,6 +287,8 @@ dependencies = [
  "chronicle-capture",
  "chronicle-common",
  "chronicle-wal",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
