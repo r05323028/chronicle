@@ -317,6 +317,7 @@ PY
 test -d "$STORE_ROOT/sessions/$SESSION_ID"
 
 phase equivalence 'compare one-shot ETL output with incremental checkpoint output'
+"$CHRONICLE" --format json inspect "$SESSION_ID" --root "$STORE_ROOT" >"$ARTIFACT_ROOT/inspect.json"
 ONE_SHOT_STORE="$ARTIFACT_ROOT/one-shot-store"
 "$CHRONICLE" --format json etl --wal-dir "$STATE_ROOT/wal" --output "$ONE_SHOT_STORE" >"$ARTIFACT_ROOT/one-shot-etl.json" 2>"$ARTIFACT_ROOT/one-shot-etl.log"
 ONE_SHOT_SESSION=$(python3 - "$ARTIFACT_ROOT/one-shot-etl.json" <<'PY'
