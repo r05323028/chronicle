@@ -368,7 +368,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                     self.incremental_processor
                         .restore_state(previous_processor_state);
                     published = false;
-                    let _ = error;
+                    eprintln!("incremental publication failed: {error}");
                 }
                 if published {
                     self.active_metadata.processing_readiness = RecorderReadiness::Ready;
@@ -383,7 +383,8 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                 self.active_metadata.lag.age_seconds = 0;
                 self.active_metadata.lag.bytes = 0;
             }
-            Err(_error) => {
+            Err(error) => {
+                eprintln!("incremental worker failed: {error}");
                 self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
                 self.active_metadata.health = RecorderHealth::Degraded;
                 self.active_metadata.failure = Some(MetadataCode::StorageFailure);
