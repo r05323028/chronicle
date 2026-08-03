@@ -414,6 +414,13 @@ assert_dir "$SESSION_ROOT/sessions/$SESSION_ID"
 phase 12 "Validate canonical session and inspect"
 "$CHRONICLE" --format json inspect "$SESSION_ID" --root "$SESSION_ROOT" >"$ARTIFACT_ROOT/inspect.json" 2>"$ARTIFACT_ROOT/inspect.log"
 assert_json "$ARTIFACT_ROOT/inspect.json" 'value["version"] == 1 and len(value["connections"]) >= 1 and sum(len(connection["operations"]) for connection in value["connections"]) >= 3 and all("client" in connection and "server" in connection for connection in value["connections"]) and all(operation["method"] and operation["target"] and operation["response_status"] for connection in value["connections"] for operation in connection["operations"])'
+CANONICAL_OPERATION_COUNT=$(
+	python3 - "$ARTIFACT_ROOT/inspect.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+print(sum(len(connection["operations"]) for connection in value["connections"]))
+PY
+)
 
 phase 13 "Replay against dedicated local target"
 python3 "$DRIVER" serve --port-file "$TMP_DIR/replay.port" --requests "$ARTIFACT_ROOT/replay-requests.jsonl" >"$ARTIFACT_ROOT/replay-target.log" 2>&1 &
@@ -421,7 +428,7 @@ REPLAY_PID=$!
 wait_for_file "$TMP_DIR/replay.port" 5 || die "replay target did not become ready; see $ARTIFACT_ROOT/replay-target.log"
 REPLAY_ORIGIN="http://127.0.0.1:$(<"$TMP_DIR/replay.port")"
 "$CHRONICLE" --format json replay "$SESSION_ID" --root "$SESSION_ROOT" --target "$REPLAY_ORIGIN" --allow-host 127.0.0.1 --allow-read --allow-write --execute >"$ARTIFACT_ROOT/replay.json" 2>"$ARTIFACT_ROOT/replay.log"
-assert_json "$ARTIFACT_ROOT/replay.json" 'value["version"] == 1 and value["result"]["outcome"] in ("completed", "completed_with_skips") and len(value["result"]["operations"]) >= 3 and all(item["verification"] == "passed" for item in value["result"]["operations"] if item["state"] == "completed")'
+assert_json "$ARTIFACT_ROOT/replay.json" 'value["version"] == 1 and value["result"]["outcome"] in ("completed", "completed_with_skips") and len(value["result"]["operations"]) == int("'"$CANONICAL_OPERATION_COUNT"'") and all(item["verification"] == "passed" for item in value["result"]["operations"] if item["state"] == "completed")'
 python3 - "$ARTIFACT_ROOT/replay-requests.jsonl" <<'PY'
 import json
 import sys
@@ -429,6 +436,26 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as source:
     requests = [json.loads(line) for line in source]
 assert len(requests) >= 2, requests
+PY
+python3 - "$ARTIFACT_ROOT/inspect.json" "$ARTIFACT_ROOT/replay.json" <<'PY'
+import json, sys
+canonical = json.load(open(sys.argv[1], encoding="utf-8"))
+replay = json.load(open(sys.argv[2], encoding="utf-8"))
+canonical_operations = [
+    operation
+    for connection in canonical["connections"]
+    for operation in connection["operations"]
+]
+results = replay["result"]["operations"]
+assert len(results) == len(canonical_operations), (canonical_operations, replay)
+assert [item["operation_id"] for item in results] == [
+    operation["id"] for operation in canonical_operations
+], (canonical_operations, results)
+assert all(
+    item["verification"] == "passed"
+    for item in results
+    if item["state"] == "completed"
+)
 PY
 
 phase 14 "Verify active recording metadata"

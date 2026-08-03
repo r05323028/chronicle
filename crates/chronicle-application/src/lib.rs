@@ -2,6 +2,7 @@
 
 mod cgroup_selection;
 mod continuous_recorder;
+mod epoch_catalog;
 mod epoch_rollover;
 mod incremental_worker;
 mod recorder_config;
@@ -18,6 +19,9 @@ pub use cgroup_selection::{
     preflight_cgroup_selection, preflight_pid_cgroup_selection,
 };
 pub use continuous_recorder::{ContinuousRecorderError, ContinuousRecorderService};
+pub use epoch_catalog::{
+    EPOCH_CATALOG_FILE, EpochCatalogEntry, EpochCatalogError, EpochCatalogState, EpochCatalogV1,
+};
 pub use epoch_rollover::{
     EpochAdmittedObservation, EpochOutcomeError, EpochOutcomeJournalV1, OutcomeRange,
     RolloverAssignment, RolloverFailureReason, write_epoch_outcome_atomic,
@@ -48,8 +52,8 @@ pub use recorder_orchestration::{
     RecorderOrchestrator, RecorderPoll,
 };
 pub use recorder_quota::{
-    DomainQuota, QUOTA_ENFORCEMENT_ENABLED, QuotaError, QuotaReservation,
-    QuotaReservationAuthority, ReservationKind,
+    CapacityProvider, DomainQuota, QUOTA_ENFORCEMENT_ENABLED, QuotaError, QuotaReservation,
+    QuotaReservationAuthority, ReservationKind, StatvfsCapacityProvider,
 };
 pub use recorder_startup::{RecorderStartup, RecorderStartupError};
 pub use recorder_status::{
@@ -78,8 +82,6 @@ use chronicle_replay::{
 };
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-use chronicle_wal::prepare_group_commit_reopen;
 use chronicle_wal::{
     COMMIT_MARKER_FRAME_LEN, DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_WAL_BYTES,
     DEFAULT_SEGMENT_BYTES, GroupCommitWalWriter, MAX_SEGMENT_BYTES, MIN_SEGMENT_BYTES, RecordKind,
@@ -89,6 +91,8 @@ use chronicle_wal::{
     WalError, WalRecordEnvelope, encode_envelope, encode_terminal_wal_loss,
     prepare_group_commit_reopen_from_scan, verified_snapshot_sha256,
 };
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+use chronicle_wal::{prepare_group_commit_reopen, recover_cleanup};
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
@@ -793,6 +797,46 @@ pub fn record_live_ebpf(
 /// Runs capture through the continuous startup/rollover/drain runtime.
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 #[allow(clippy::too_many_lines)]
+fn recover_cleanup_for_root(root: &Path) -> Result<(), RecorderStartupError> {
+    let mut directories = vec![root.to_path_buf()];
+    let epochs = root.join("epochs");
+    if epochs.exists() {
+        let entries = fs::read_dir(&epochs).map_err(|_| RecorderStartupError::Recovery)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| RecorderStartupError::Recovery)?;
+            if entry
+                .file_type()
+                .map_err(|_| RecorderStartupError::Recovery)?
+                .is_dir()
+            {
+                directories.push(entry.path());
+            }
+        }
+    }
+    for directory in directories {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(RecorderStartupError::Recovery),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|_| RecorderStartupError::Recovery)?;
+            let file_name = entry.file_name();
+            if entry
+                .file_type()
+                .map_err(|_| RecorderStartupError::Recovery)?
+                .is_file()
+                && file_name.to_string_lossy().starts_with("cleanup-intent")
+            {
+                recover_cleanup(entry.path()).map_err(|_| RecorderStartupError::Recovery)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[allow(clippy::too_many_lines)]
 pub fn record_continuous_ebpf(
     selector: CgroupSelector,
     allow_shared_cgroup: bool,
@@ -800,7 +844,24 @@ pub fn record_continuous_ebpf(
     wal_directory: impl AsRef<Path>,
     stop: &ProductionSignalStop,
 ) -> Result<ProductionRecordingResult, ApplicationError> {
-    let wal_directory = wal_directory.as_ref();
+    let root_wal_directory = wal_directory.as_ref().to_path_buf();
+    let mut wal_directory = root_wal_directory.clone();
+    let mut epoch_catalog = match fs::metadata(root_wal_directory.join(EPOCH_CATALOG_FILE)) {
+        Ok(_) => Some(
+            EpochCatalogV1::load(&root_wal_directory)
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(ApplicationError::Io(error)),
+    };
+    let starting_epoch_ordinal = if let Some(catalog) = &epoch_catalog {
+        wal_directory = catalog
+            .resolve_active_path(&root_wal_directory)
+            .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+        catalog.active().map_or(0, |entry| entry.ordinal)
+    } else {
+        0
+    };
     if matches!(&selector, CgroupSelector::Pid(_)) && allow_shared_cgroup {
         return Err(ApplicationError::ProductionPreflight(
             "shared cgroup acknowledgement requires explicit cgroup",
@@ -825,7 +886,7 @@ pub fn record_continuous_ebpf(
         max_wal_bytes: config.epoch.max_bytes,
     };
     let existing_recording_id = if wal_directory.exists() {
-        let metadata = load_recording_metadata(wal_directory)?.ok_or(
+        let metadata = load_recording_metadata(&wal_directory)?.ok_or(
             ApplicationError::RecordingMetadataValidation(
                 "recording metadata missing during WAL recovery".into(),
             ),
@@ -838,7 +899,12 @@ pub fn record_continuous_ebpf(
         }
         Some(metadata.recording_id)
     } else {
-        preflight_wal_destination(wal_directory, bounds)?;
+        if epoch_catalog.is_some() {
+            return Err(ApplicationError::RecordingMetadataValidation(
+                "active epoch path missing from WAL recovery".into(),
+            ));
+        }
+        preflight_wal_destination(&wal_directory, bounds)?;
         None
     };
     preflight_embedded_ebpf()?;
@@ -846,7 +912,7 @@ pub fn record_continuous_ebpf(
     let recording_id = existing_recording_id.unwrap_or_else(RecordingId::new);
     let writer = if wal_directory.exists() {
         prepare_group_commit_reopen(
-            wal_directory,
+            &wal_directory,
             recording_id,
             config.segment.max_bytes,
             config.epoch.max_bytes,
@@ -856,7 +922,7 @@ pub fn record_continuous_ebpf(
         .0
     } else {
         GroupCommitWalWriter::create_with_total_limit_and_age(
-            wal_directory,
+            &wal_directory,
             recording_id,
             config.segment.max_bytes,
             config.epoch.max_bytes,
@@ -866,15 +932,35 @@ pub fn record_continuous_ebpf(
         )?
     };
     let source = load_production_ebpf_source(&selection, pid_baseline.as_ref())?;
-    let recorder = RecorderOrchestrator::new(source, RecordingIngest::new(writer));
+    let predecessor = epoch_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.active())
+        .and_then(|entry| entry.predecessor);
+    let recorder = RecorderOrchestrator::new_with_epoch_and_predecessor(
+        source,
+        RecordingIngest::new(writer),
+        starting_epoch_ordinal,
+        predecessor,
+    );
+    let current_wal_bytes = recording_physical_wal_bytes(&wal_directory)?;
     let mut service = ContinuousRecorderService::start(
         config,
-        wal_directory,
+        &wal_directory,
         recorder,
-        || Ok(()),
+        || recover_cleanup_for_root(&root_wal_directory),
         |quotas| {
             for quota in quotas {
-                quota.reserve(ReservationKind::Wal, config.epoch.max_bytes)?;
+                quota.refresh_from_filesystem()?;
+                let domain = Path::new(&quota.quota().domain);
+                if wal_directory.starts_with(domain) {
+                    quota.reserve(
+                        ReservationKind::Wal,
+                        config.epoch.max_bytes.saturating_sub(current_wal_bytes),
+                    )?;
+                }
+                if config.store_root.starts_with(domain) {
+                    quota.reserve(ReservationKind::Staging, config.store.max_staging_bytes)?;
+                }
             }
             Ok(())
         },
@@ -894,7 +980,7 @@ pub fn record_continuous_ebpf(
         let _ = service
             .poll(now)
             .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-        let physical = recording_physical_wal_bytes(wal_directory)?;
+        let physical = recording_physical_wal_bytes(&wal_directory)?;
         let age_expired = epoch_started.elapsed().as_secs() >= config.epoch.max_age_seconds;
         let size_expired = physical
             >= config
@@ -902,9 +988,81 @@ pub fn record_continuous_ebpf(
                 .max_bytes
                 .saturating_sub(config.segment.max_bytes);
         if age_expired || size_expired {
-            service
-                .rollover(now, wal_directory.join("epoch-outcomes.json"))
+            let next_recording_id = RecordingId::new();
+            let next_wal_directory = root_wal_directory.join("epochs").join(format!(
+                "{}-{}",
+                service.recorder().epoch_ordinal().saturating_add(1),
+                next_recording_id.0
+            ));
+            fs::create_dir_all(&next_wal_directory).map_err(ApplicationError::Io)?;
+            let next_writer = GroupCommitWalWriter::create_with_total_limit_and_age(
+                &next_wal_directory,
+                next_recording_id,
+                config.segment.max_bytes,
+                config.epoch.max_bytes,
+                1,
+                monotonic_millis(),
+                config.segment.max_age_seconds.saturating_mul(1_000),
+            )?;
+            let old_wal_directory = wal_directory.clone();
+            let old_path = old_wal_directory
+                .strip_prefix(&root_wal_directory)
+                .map_err(|_| ApplicationError::InvalidConfig("epoch path escaped root".into()))?;
+            let new_path = next_wal_directory
+                .strip_prefix(&root_wal_directory)
+                .map_err(|_| ApplicationError::InvalidConfig("epoch path escaped root".into()))?;
+            if epoch_catalog.is_none() {
+                let old_path = if old_path.as_os_str().is_empty() {
+                    ".".to_owned()
+                } else {
+                    old_path.to_string_lossy().into_owned()
+                };
+                epoch_catalog = Some(
+                    EpochCatalogV1::new(EpochCatalogEntry {
+                        ordinal: service.recorder().epoch_ordinal(),
+                        recording_id: service.recorder().ingest().recording_id(),
+                        predecessor: None,
+                        path: old_path,
+                        state: EpochCatalogState::Active,
+                    })
+                    .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?,
+                );
+            }
+            let catalog = epoch_catalog.as_mut().ok_or_else(|| {
+                ApplicationError::InvalidConfig("epoch catalog initialization failed".into())
+            })?;
+            catalog
+                .append(EpochCatalogEntry {
+                    ordinal: service.recorder().epoch_ordinal().saturating_add(1),
+                    recording_id: next_recording_id,
+                    predecessor: Some(service.recorder().ingest().recording_id()),
+                    path: new_path.to_string_lossy().into_owned(),
+                    state: EpochCatalogState::Prepared,
+                })
                 .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            catalog
+                .write_atomic(&root_wal_directory)
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            let boundary = service
+                .rollover_to(
+                    &next_wal_directory,
+                    next_writer,
+                    now,
+                    old_wal_directory.join("epoch-outcomes.json"),
+                )
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            if boundary.new_recording_id != next_recording_id {
+                return Err(ApplicationError::RecordingMetadataValidation(
+                    "successor recording identity changed during handoff".into(),
+                ));
+            }
+            catalog
+                .activate_latest()
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            catalog
+                .write_atomic(&root_wal_directory)
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            wal_directory = next_wal_directory;
             epoch_started = Instant::now();
         } else {
             std::thread::sleep(Duration::from_millis(5));
@@ -918,12 +1076,50 @@ pub fn record_continuous_ebpf(
         )
         .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
     let last_valid_commit = service.recorder().ingest().commit_boundary();
+    let recording_id = service.recorder().ingest().recording_id();
     drop(service);
-    process_and_publish_recording_wal(
-        wal_directory,
-        &config.store_root,
-        &chronicle_protocol_builtins::registry()?,
-    )?;
+    let registry = chronicle_protocol_builtins::registry()?;
+    let epoch_directories = if let Some(catalog) = &epoch_catalog {
+        let mut directories = Vec::with_capacity(catalog.epochs.len());
+        for entry in &catalog.epochs {
+            let directory = root_wal_directory.join(&entry.path);
+            let metadata = load_recording_metadata(&directory)?.ok_or(
+                ApplicationError::RecordingMetadataValidation(
+                    "catalog epoch metadata missing during ETL".into(),
+                ),
+            )?;
+            if metadata.recording_id != entry.recording_id {
+                return Err(ApplicationError::RecordingMetadataValidation(
+                    "catalog epoch identity mismatch during ETL".into(),
+                ));
+            }
+            directories.push(directory);
+        }
+        let epochs_directory = root_wal_directory.join("epochs");
+        if epochs_directory.exists() {
+            for epoch in fs::read_dir(&epochs_directory)
+                .map_err(ApplicationError::Io)?
+                .collect::<Result<Vec<_>, _>>()?
+            {
+                if epoch.file_type().map_err(ApplicationError::Io)?.is_dir()
+                    && !catalog
+                        .epochs
+                        .iter()
+                        .any(|entry| root_wal_directory.join(&entry.path) == epoch.path())
+                {
+                    return Err(ApplicationError::RecordingMetadataValidation(
+                        "orphan epoch directory is not in catalog".into(),
+                    ));
+                }
+            }
+        }
+        directories
+    } else {
+        vec![root_wal_directory.clone()]
+    };
+    for directory in epoch_directories {
+        process_and_publish_recording_wal(directory, &config.store_root, &registry)?;
+    }
     Ok(ProductionRecordingResult {
         recording_id,
         status: result.status,

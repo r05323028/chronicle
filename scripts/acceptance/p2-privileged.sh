@@ -60,16 +60,28 @@ status, phase, commit, expected, mode, checks_path = sys.argv[2:8]
 checks = {
     "systemd_type_simple": "not_checked",
     "three_epochs": "not_checked",
-    "size_and_age_rotation": "not_checked",
+    "segment_age_rotation": "not_checked",
+    "segment_size_rotation": "not_checked",
+    "epoch_size_rollover": "not_checked",
     "incremental_worker": "not_checked",
-    "incremental_restart_equivalence": "not_checked",
+    "one_shot_equivalence": "not_checked",
     "standalone_etl_live_rejection": "not_checked",
     "signal_shutdown": "not_checked",
-    "crash_restart_recovery": "not_checked",
+    "process_restart_readiness": "not_checked",
+    "checkpoint_output_committed_checkpoint_missing": "not_checked",
+    "checkpoint_committed_status_missing": "not_checked",
     "host_reboot_recovery": "not_checked",
     "pre_reboot_persistence": "not_checked",
-    "quota_min_free": "not_checked",
+    "quota_exhaustion_admission": "not_checked",
+    "quota_restart_accounting": "not_checked",
+    "quota_recovery_after_space": "not_checked",
+    "minimum_free_enforcement": "not_checked",
+    "minimum_free_recovery": "not_checked",
+    "corruption_fail_closed": "not_checked",
     "corruption_quarantine": "not_checked",
+    "cleanup_interrupted_recovery": "not_checked",
+    "cleanup_protected_lineage": "not_checked",
+    "cleanup_restart_consistency": "not_checked",
     "inspect_replay": "not_checked",
     "resource_cleanup": "not_checked",
 }
@@ -109,6 +121,10 @@ on_exit() {
 	local rc=$?
 	cleanup
 	write_report "$rc"
+	if [[ -d "$ARTIFACT_ROOT" ]]; then
+		find "$ARTIFACT_ROOT" -type f ! -name artifact-manifest.sha256 -print0 |
+			sort -z | xargs -0 sha256sum >"$ARTIFACT_ROOT/artifact-manifest.sha256"
+	fi
 	exit "$rc"
 }
 trap on_exit EXIT
@@ -161,7 +177,7 @@ shared_scope_acknowledged = true
 
 [epoch]
 max_age_seconds = 1
-max_bytes = 67108864
+max_bytes = 50331648
 
 [segment]
 max_age_seconds = 1
@@ -246,6 +262,51 @@ set -e
 [[ $live_etl_status -ne 0 ]]
 set_check standalone_etl_live_rejection passed
 
+phase size_rotation 'force deterministic segment and epoch byte rollover'
+SIZE_SEGMENTS_BEFORE=$(find "$STATE_ROOT/wal/segments" -maxdepth 1 -name '*.chwal' | wc -l)
+SIZE_BYTES_BEFORE=$(du -sb "$STATE_ROOT/wal/segments" | awk '{print $1}')
+EPOCH_BEFORE=$(
+	python3 - "$RECORDER_STATUS" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+print(value["current_epoch"]["ordinal"])
+PY
+)
+for _ in $(seq 1 12); do
+	printf '%s\n' "$$" >"$CGROUP/cgroup.procs"
+	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" --body-bytes 2097152 >"$ARTIFACT_ROOT/size-workload-$_.json"
+done
+sleep 1
+SIZE_SEGMENTS_AFTER=$(find "$STATE_ROOT/wal/segments" -maxdepth 1 -name '*.chwal' | wc -l)
+SIZE_BYTES_AFTER=$(du -sb "$STATE_ROOT/wal/segments" | awk '{print $1}')
+"$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
+EPOCH_AFTER=$(
+	python3 - "$RECORDER_STATUS" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+print(value["current_epoch"]["ordinal"])
+PY
+)
+[[ $SIZE_SEGMENTS_AFTER -gt $SIZE_SEGMENTS_BEFORE ]]
+[[ $((SIZE_BYTES_AFTER - SIZE_BYTES_BEFORE)) -ge 41943040 ]]
+[[ $EPOCH_AFTER -gt $EPOCH_BEFORE ]]
+python3 - "$ARTIFACT_ROOT/rotation-proof.json" <<PY
+import json
+json.dump({
+    "version": 1,
+    "segment_count_before": $SIZE_SEGMENTS_BEFORE,
+    "segment_count_after": $SIZE_SEGMENTS_AFTER,
+    "segment_bytes_before": $SIZE_BYTES_BEFORE,
+    "segment_bytes_after": $SIZE_BYTES_AFTER,
+    "epoch_ordinal_before": $EPOCH_BEFORE,
+    "epoch_ordinal_after": $EPOCH_AFTER,
+    "fixed_post_body_bytes": 2097152,
+    "workload_iterations": 12,
+}, open("$ARTIFACT_ROOT/rotation-proof.json", "w", encoding="utf-8"), indent=2)
+PY
+set_check segment_size_rotation passed
+set_check epoch_size_rollover passed
+
 if [[ "$CRASH_MODE" == 1 ]]; then
 	phase crash_restart 'kill recorder process and verify systemd recovery'
 	printf '%s\n' "$$" >"$CGROUP/cgroup.procs"
@@ -255,8 +316,26 @@ if [[ "$CRASH_MODE" == 1 ]]; then
 	RECORDER_STATUS="$ARTIFACT_ROOT/recorder-restart-status.json" \
 		wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL" --allow-stale-owner
 	systemctl is-active --quiet "$UNIT"
-	set_check crash_restart_recovery passed
+	set_check process_restart_readiness passed
 fi
+
+phase segment_age_rotation 'force age rotation with delayed low-traffic append'
+AGE_SEGMENTS_BEFORE=$(find "$STATE_ROOT/wal/segments" -maxdepth 1 -name '*.chwal' | wc -l)
+sleep 2
+printf '%s\n' "$$" >"$CGROUP/cgroup.procs"
+python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/age-workload.json"
+AGE_SEGMENTS_AFTER=$(find "$STATE_ROOT/wal/segments" -maxdepth 1 -name '*.chwal' | wc -l)
+[[ $AGE_SEGMENTS_AFTER -gt $AGE_SEGMENTS_BEFORE ]]
+python3 - "$ARTIFACT_ROOT/age-rotation-proof.json" <<PY
+import json
+json.dump({
+    "version": 1,
+    "segment_count_before": $AGE_SEGMENTS_BEFORE,
+    "segment_count_after": $AGE_SEGMENTS_AFTER,
+    "idle_seconds": 2,
+}, open("$ARTIFACT_ROOT/age-rotation-proof.json", "w", encoding="utf-8"), indent=2)
+PY
+set_check segment_age_rotation passed
 
 phase epochs 'generate traffic across at least three short epochs'
 for _ in 1 2 3 4 5 6; do
@@ -300,8 +379,8 @@ assert len(segments) >= 3, [path.name for path in segments]
 assert all(domain["free_bytes"] > domain["reserved_bytes"] for domain in active["quota"])
 PY
 set_check three_epochs passed
-set_check size_and_age_rotation passed
-set_check quota_min_free passed
+# Metadata headroom is diagnostic only; quota/min-free behavior remains unchecked
+# until production admission and recovery paths exercise dynamic capacity.
 
 phase etl 'publish final canonical session'
 "$CHRONICLE" --format json etl --wal-dir "$STATE_ROOT/wal" --output "$STORE_ROOT" >"$ARTIFACT_ROOT/etl.json" 2>"$ARTIFACT_ROOT/etl.log"
@@ -343,9 +422,9 @@ json.dump({"version": 1, "equivalent": True, "comparison": "inspect", "session_i
 with open(sys.argv[3], "a", encoding="utf-8") as handle:
     handle.write("\n")
 PY
-set_check incremental_restart_equivalence passed
+set_check one_shot_equivalence passed
 
-phase corruption 'corrupt sealed WAL copy and prove evidence is preserved'
+phase corruption 'corrupt committed WAL copy and prove fail-closed preservation'
 CORRUPT_WAL="$ARTIFACT_ROOT/corrupt-wal"
 CORRUPT_STORE="$ARTIFACT_ROOT/corrupt-store"
 cp -a "$STATE_ROOT/wal" "$CORRUPT_WAL"
@@ -362,14 +441,18 @@ offset = min(len(data) - 1, max(64, len(data) // 2))
 data[offset] ^= 0x01
 path.write_bytes(data)
 PY
+CORRUPT_WAL_DIGEST=$(sha256sum "$CORRUPT_WAL"/segments/*.chwal | sha256sum | awk '{print $1}')
 set +e
 "$CHRONICLE" --format json etl --wal-dir "$CORRUPT_WAL" --output "$CORRUPT_STORE" >"$ARTIFACT_ROOT/corruption.json" 2>"$ARTIFACT_ROOT/corruption.log"
 corruption_status=$?
+"$CHRONICLE" --format json etl --wal-dir "$CORRUPT_WAL" --output "$CORRUPT_STORE-retry" >"$ARTIFACT_ROOT/corruption-retry.json" 2>"$ARTIFACT_ROOT/corruption-retry.log"
+corruption_retry_status=$?
 set -e
-[[ $corruption_status -ne 0 ]]
+[[ $corruption_status -ne 0 && $corruption_retry_status -ne 0 ]]
 [[ "$(sha256sum "$STATE_ROOT"/wal/segments/*.chwal | sha256sum | awk '{print $1}')" == "$SOURCE_WAL_DIGEST" ]]
+[[ "$(sha256sum "$CORRUPT_WAL"/segments/*.chwal | sha256sum | awk '{print $1}')" == "$CORRUPT_WAL_DIGEST" ]]
 test -f "$CORRUPT_SEGMENT"
-set_check corruption_quarantine passed
+set_check corruption_fail_closed passed
 
 phase inspect_replay 'inspect and replay canonical session'
 "$CHRONICLE" --format json inspect "$SESSION_ID" --root "$STORE_ROOT" >"$ARTIFACT_ROOT/inspect.json" 2>"$ARTIFACT_ROOT/inspect.log"
@@ -416,6 +499,11 @@ if [[ -d "$CGROUP" ]] || systemctl is-active --quiet "$UNIT"; then
 	exit 1
 fi
 set_check resource_cleanup passed
-find "$ARTIFACT_ROOT" -type f ! -name artifact-manifest.sha256 -print0 |
-	sort -z | xargs -0 sha256sum >"$ARTIFACT_ROOT/artifact-manifest.sha256"
-exit 0
+if python3 - "$CHECKS_JSON" <<'PY'; then
+import json, sys
+checks = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if all(value != "not_checked" for value in checks.values()) else 77)
+PY
+	exit 0
+fi
+exit 77

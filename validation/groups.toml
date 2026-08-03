@@ -39,6 +39,8 @@ gates = ["p2"]
 description = "ETL and checkpoint tests"
 paths = [
   "crates/chronicle-etl/**",
+  # Recorder admission/lifecycle/quota/checkpoint wiring is P2-owned.
+  "crates/chronicle-application/src/**",
   "crates/chronicle-application/src/incremental_worker.rs",
   "crates/chronicle-application/src/checkpoint.rs",
   "crates/chronicle-application/src/continuous_recorder.rs",
@@ -71,7 +73,11 @@ commands = ["cli_docs"]
 
 [groups.acceptance]
 description = "privileged acceptance scripts and evidence contract"
-paths = ["scripts/acceptance/**", "scripts/tests/acceptance/**"]
+paths = [
+  "scripts/acceptance/**",
+  "scripts/tests/acceptance/**",
+  "tests/e2e/http_acceptance_driver.py",
+]
 commands = ["acceptance"]
 gates = ["p1", "p2"]
 

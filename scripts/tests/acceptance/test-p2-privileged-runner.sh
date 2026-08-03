@@ -50,6 +50,17 @@ for needle in \
 	grep -Fq -- "$needle" "$SCRIPT"
 done
 for needle in \
+	'segment_size_rotation' \
+	'epoch_size_rollover' \
+	'checkpoint_output_committed_checkpoint_missing' \
+	'checkpoint_committed_status_missing' \
+	'corruption_fail_closed' \
+	'quota_exhaustion_admission' \
+	'minimum_free_enforcement' \
+	'cleanup_interrupted_recovery'; do
+	grep -Fq -- "$needle" "$SCRIPT"
+done
+for needle in \
 	'ensure_vm_source' \
 	'multipass mount' \
 	'git clone --quiet --no-local' \
@@ -60,4 +71,6 @@ for needle in \
 done
 ! grep -Fq 'openspec validate' "$SCRIPT"
 ! grep -Fq 'openspec validate' "$MULTIPASS"
+! grep -Fq 'size_and_age_rotation' "$SCRIPT"
+! grep -Fq 'quota_min_free' "$SCRIPT"
 printf '%s\n' 'p2 privileged runner rootless checks passed'

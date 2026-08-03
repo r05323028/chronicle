@@ -33,6 +33,14 @@ pub enum PublicationError {
     OutputLineage,
     #[error("final session publication failed: {0}")]
     FinalSession(String),
+    #[error("checkpoint publication fault injected")]
+    InjectedFault,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointFault {
+    BeforeCheckpoint,
+    AfterCheckpoint,
 }
 
 pub fn reconcile_delta_checkpoint<S: RecordingStore>(
@@ -109,6 +117,17 @@ pub fn publish_delta_then_checkpoint<S: RecordingStore>(
     checkpoint: &IncrementalEtlCheckpointV1,
     checkpoint_path: impl AsRef<Path>,
 ) -> Result<PutIfAbsent, PublicationError> {
+    publish_delta_then_checkpoint_with_fault(store, key, batch, checkpoint, checkpoint_path, None)
+}
+
+fn publish_delta_then_checkpoint_with_fault<S: RecordingStore>(
+    store: &S,
+    key: impl Into<String>,
+    batch: &CanonicalDeltaBatchV1,
+    checkpoint: &IncrementalEtlCheckpointV1,
+    checkpoint_path: impl AsRef<Path>,
+    fault: Option<CheckpointFault>,
+) -> Result<PutIfAbsent, PublicationError> {
     batch.validate()?;
     checkpoint.validate()?;
     let key = key.into();
@@ -137,7 +156,13 @@ pub fn publish_delta_then_checkpoint<S: RecordingStore>(
     {
         return Err(PublicationError::Verification);
     }
+    if fault == Some(CheckpointFault::BeforeCheckpoint) {
+        return Err(PublicationError::InjectedFault);
+    }
     write_checkpoint_atomic(checkpoint_path, checkpoint)?;
+    if fault == Some(CheckpointFault::AfterCheckpoint) {
+        return Err(PublicationError::InjectedFault);
+    }
     Ok(outcome)
 }
 
@@ -197,6 +222,46 @@ mod tests {
             source_status: SourceStatus::Live,
             checksum: String::new(),
         }
+    }
+
+    #[test]
+    fn checkpoint_fault_windows_recover_without_duplicate_output() {
+        let store = InMemoryRecordingStore::default();
+        let batch = CanonicalDeltaBatchV1::new(0, 0, Vec::new()).unwrap();
+        let key = "delta/fault-window";
+        let checkpoint = checkpoint_with_output(key, &batch);
+        let root =
+            std::env::temp_dir().join(format!("chronicle-pub-fault-{}", uuid::Uuid::new_v4()));
+        let checkpoint_path = root.join("checkpoint.json");
+        assert!(matches!(
+            publish_delta_then_checkpoint_with_fault(
+                &store,
+                key,
+                &batch,
+                &checkpoint,
+                &checkpoint_path,
+                Some(CheckpointFault::BeforeCheckpoint),
+            ),
+            Err(PublicationError::InjectedFault)
+        ));
+        assert!(!checkpoint_path.exists());
+        publish_delta_then_checkpoint(&store, key, &batch, &checkpoint, &checkpoint_path).unwrap();
+        assert!(matches!(
+            publish_delta_then_checkpoint_with_fault(
+                &store,
+                key,
+                &batch,
+                &checkpoint,
+                &checkpoint_path,
+                Some(CheckpointFault::AfterCheckpoint),
+            ),
+            Err(PublicationError::InjectedFault)
+        ));
+        let persisted = read_checkpoint(&checkpoint_path).unwrap();
+        assert_eq!(persisted.outputs, checkpoint.outputs);
+        assert_eq!(persisted.recording_id, checkpoint.recording_id);
+        publish_delta_then_checkpoint(&store, key, &batch, &checkpoint, &checkpoint_path).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

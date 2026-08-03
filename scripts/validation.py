@@ -311,19 +311,16 @@ def compact(args: argparse.Namespace) -> None:
     copied: list[str] = []
     if status != "passed":
         copied = copy_failure_data(source, dest)
+    # Successful evidence stays compact locally. Full release artifacts belong in
+    # an external evidence store, never in the repository workspace.
     elif args.artifact_mode == "release":
-        for path in source.iterdir():
-            if path.name in {"target", ".cargo", "artifact-manifest.sha256"}:
-                continue
-            target = dest / path.name
-            if path.is_dir():
-                shutil.copytree(path, target, dirs_exist_ok=True)
-            elif path.is_file():
-                shutil.copy2(path, target)
-        copied = [
-            str(path.relative_to(dest)) for path in dest.rglob("*") if path.is_file()
-        ]
+        copied = []
     run_environment = load_environment(source, getattr(args, "environment", None))
+    artifact_policy = (
+        "compact-success-external-full"
+        if args.artifact_mode == "release"
+        else "failure-first"
+    )
     summary = {
         "version": 1,
         "gate": args.gate,
@@ -331,7 +328,7 @@ def compact(args: argparse.Namespace) -> None:
         "fingerprint": args.fingerprint,
         "original_commit": args.commit,
         "checks": [check for check in args.checks.split(",") if check],
-        "artifact_policy": "failure-first",
+        "artifact_policy": artifact_policy,
     }
     (dest / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -352,7 +349,7 @@ def compact(args: argparse.Namespace) -> None:
         "executed": status == "passed",
         "reused": False,
         "files": ["summary.json", "environment.json", "manifest.json", *copied],
-        "artifact_policy": "failure-first",
+        "artifact_policy": artifact_policy,
     }
     (dest / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -376,7 +373,13 @@ def reuse(args: argparse.Namespace) -> int:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (
             manifest.get("status") != "passed"
+            or not isinstance(manifest.get("executed"), bool)
+            or not manifest.get("executed")
             or manifest.get("fingerprint") != args.fingerprint
+            or (
+                getattr(args, "commit", None)
+                and manifest.get("original_commit") != args.commit
+            )
         ):
             return 1
         required_checks = {
@@ -457,6 +460,7 @@ def main() -> int:
     reuse_parser.add_argument("--gate", required=True)
     reuse_parser.add_argument("--fingerprint", required=True)
     reuse_parser.add_argument("--checks", default="")
+    reuse_parser.add_argument("--commit")
     args = parser.parse_args()
     if args.command == "environment":
         print(json.dumps(environment(args.root), indent=2, sort_keys=True))

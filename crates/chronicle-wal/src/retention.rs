@@ -1,4 +1,4 @@
-//! Proof-gated WAL segment lifecycle. Production deletion remains disabled.
+//! Proof-gated WAL segment lifecycle. Callers must supply retention proof.
 #![allow(clippy::format_collect, clippy::struct_excessive_bools)]
 
 use crate::SegmentLifecycle;
@@ -489,6 +489,37 @@ mod tests {
         );
         assert!(!source.exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corruption_quarantine_is_terminal_and_not_deletable() {
+        let mut segment = SegmentLifecycleRecord {
+            ordinal: 1,
+            digest: "a".repeat(64),
+            state: SegmentLifecycle::Sealed,
+            tombstone_generation: None,
+        };
+        assert!(
+            segment
+                .transition(
+                    SegmentLifecycle::Quarantined,
+                    LifecycleProof {
+                        corruption: true,
+                        ..LifecycleProof::default()
+                    },
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            segment.transition(
+                SegmentLifecycle::Deleted,
+                LifecycleProof {
+                    cleanup: true,
+                    ..LifecycleProof::default()
+                },
+            ),
+            Err(RetentionError::TransitionDenied)
+        );
     }
 
     #[test]

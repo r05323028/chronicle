@@ -149,7 +149,7 @@ class LayeredValidationTests(unittest.TestCase):
             "vm-kernel",
         )
 
-    def test_release_keeps_evidence_but_not_cache(self):
+    def test_release_success_keeps_only_compact_metadata(self):
         source = self.temp / "source"
         dest = self.temp / "release"
         source.mkdir()
@@ -170,8 +170,12 @@ class LayeredValidationTests(unittest.TestCase):
                 artifact_mode="release",
             )
         )
-        self.assertTrue((dest / "wal" / "segment.chwal").is_file())
+        self.assertFalse((dest / "wal").exists())
         self.assertFalse((dest / "target").exists())
+        self.assertEqual(
+            {path.name for path in dest.iterdir()},
+            {"summary.json", "environment.json", "manifest.json", "checksums.txt"},
+        )
 
     def test_checksum_paths_cannot_escape_evidence_root(self):
         evidence = self.temp / "evidence"
@@ -186,6 +190,15 @@ class LayeredValidationTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_recorder_source_selects_p2_validation(self):
+        result = validation.select(
+            self.temp,
+            ["crates/chronicle-application/src/recorder_orchestration.rs"],
+            self.cfg,
+        )
+        self.assertIn("etl", result["selected"])
+        self.assertIn("p2", self.cfg["groups"]["etl"]["gates"])
 
     def test_matching_evidence_reuses_and_mismatch_does_not(self):
         source = self.temp / "source"
@@ -203,7 +216,7 @@ class LayeredValidationTests(unittest.TestCase):
         )
         validation.compact(args)
         reuse_args = argparse.Namespace(
-            evidence_root=evidence, gate="p1", fingerprint="fp"
+            evidence_root=evidence, gate="p1", fingerprint="fp", commit="sha"
         )
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(validation.reuse(reuse_args), 0)
@@ -222,6 +235,18 @@ class LayeredValidationTests(unittest.TestCase):
                     gate="p1",
                     fingerprint="fp",
                     checks="P2",
+                    commit="sha",
+                )
+            ),
+            1,
+        )
+        self.assertEqual(
+            validation.reuse(
+                argparse.Namespace(
+                    evidence_root=evidence,
+                    gate="p1",
+                    fingerprint="fp",
+                    commit="new-sha",
                 )
             ),
             1,

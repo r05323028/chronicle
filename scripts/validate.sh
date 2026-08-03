@@ -213,7 +213,7 @@ run_gate() {
 	fp=$(fingerprint_for "$gate" "$environment_file")
 	printf '\nGate %s fingerprint: %s\n' "$gate" "$fp"
 	if [[ $REUSE_EVIDENCE == true && $DRY_RUN != true && $DRY_RUN != 1 ]]; then
-		if reused=$(python3 "$HELPER" reuse --evidence-root "$EVIDENCE_ROOT" --gate "$gate" --fingerprint "$fp" --checks "$checks" 2>/dev/null); then
+		if reused=$(python3 "$HELPER" reuse --evidence-root "$EVIDENCE_ROOT" --gate "$gate" --fingerprint "$fp" --checks "$checks" --commit "$(git -C "$ROOT" rev-parse HEAD)" 2>/dev/null); then
 			printf 'REUSED evidence: %s\n' "$reused"
 			printf '%s reused\n' "$gate" >>"$WORKDIR/reused.txt"
 			return 0
@@ -227,9 +227,7 @@ run_gate() {
 		printf 'WOULD RUN complete %s gate via existing Multipass acceptance.\n' "$gate"
 		return 0
 	fi
-	local compact
-	compact=1
-	[[ $ARTIFACT_MODE == release ]] && compact=0
+	local compact=1
 	if [[ $gate == p1 ]]; then
 		CHRONICLE_ACCEPTANCE_DEST="$source" CHRONICLE_ACCEPTANCE_COMPACT="$compact" \
 			CHRONICLE_ACCEPTANCE_MODE=full CARGO_TARGET_DIR=/home/ubuntu/chronicle-target \
@@ -348,9 +346,13 @@ fast) run_fast ;;
 targeted) run_targeted ;;
 gate) run_gate "$GATE" ;;
 release)
+	# Release must prove portable quality before privileged gates.
+	run_shell release-fmt 'cargo fmt --all --check'
+	run_shell release-clippy "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
+	run_shell release-tests "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo test --workspace --all-features --locked"
+	run_shell release-openspec 'openspec validate --all --strict --no-interactive'
 	run_gate p1
 	run_gate p2
-	run_shell release-openspec 'openspec validate --all --strict --no-interactive'
 	;;
 help | -h | --help) usage ;;
 *)

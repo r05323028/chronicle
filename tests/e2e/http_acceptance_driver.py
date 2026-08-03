@@ -22,7 +22,9 @@ def append_json(path: Path, value: dict[str, object]) -> None:
         output.flush()
 
 
-def read_request(connection: socket.socket, buffered: bytes) -> tuple[str, str, bytes, bytes] | None:
+def read_request(
+    connection: socket.socket, buffered: bytes
+) -> tuple[str, str, bytes, bytes] | None:
     while b"\r\n\r\n" not in buffered:
         chunk = connection.recv(4096)
         if not chunk:
@@ -49,10 +51,21 @@ def read_request(connection: socket.socket, buffered: bytes) -> tuple[str, str, 
 
 
 def response(method: str, target: str, body: bytes) -> bytes:
-    status, payload = RESPONSES.get((method, target), ("201 Created", body) if (method, target) == ("POST", "/echo") else ("404 Not Found", b"not found"))
+    status, payload = RESPONSES.get(
+        (method, target),
+        ("201 Created", body)
+        if (method, target) == ("POST", "/echo")
+        else ("404 Not Found", b"not found"),
+    )
     if target == "/chunked":
-        return f"HTTP/1.1 {status}\r\ntransfer-encoding: chunked\r\n\r\n".encode() + b"1\r\nb\r\n0\r\n\r\n"
-    return f"HTTP/1.1 {status}\r\ncontent-length: {len(payload)}\r\n\r\n".encode() + payload
+        return (
+            f"HTTP/1.1 {status}\r\ntransfer-encoding: chunked\r\n\r\n".encode()
+            + b"1\r\nb\r\n0\r\n\r\n"
+        )
+    return (
+        f"HTTP/1.1 {status}\r\ncontent-length: {len(payload)}\r\n\r\n".encode()
+        + payload
+    )
 
 
 class Handler(socketserver.BaseRequestHandler):
@@ -65,7 +78,10 @@ class Handler(socketserver.BaseRequestHandler):
             if request is None:
                 return
             method, target, body, buffered = request
-            append_json(self.requests, {"method": method, "target": target, "body_bytes": len(body)})
+            append_json(
+                self.requests,
+                {"method": method, "target": target, "body_bytes": len(body)},
+            )
             self.request.sendall(response(method, target, body))
 
 
@@ -83,7 +99,9 @@ def serve(args: argparse.Namespace) -> None:
         server.serve_forever(poll_interval=0.1)
 
 
-def receive(connection: socket.socket, buffered: bytes, size: int) -> tuple[bytes, bytes]:
+def receive(
+    connection: socket.socket, buffered: bytes, size: int
+) -> tuple[bytes, bytes]:
     while len(buffered) < size:
         chunk = connection.recv(4096)
         if not chunk:
@@ -92,7 +110,9 @@ def receive(connection: socket.socket, buffered: bytes, size: int) -> tuple[byte
     return buffered[:size], buffered[size:]
 
 
-def response_from(connection: socket.socket, buffered: bytes) -> tuple[tuple[int, bytes], bytes]:
+def response_from(
+    connection: socket.socket, buffered: bytes
+) -> tuple[tuple[int, bytes], bytes]:
     while b"\r\n\r\n" not in buffered:
         chunk = connection.recv(4096)
         if not chunk:
@@ -103,7 +123,9 @@ def response_from(connection: socket.socket, buffered: bytes) -> tuple[tuple[int
     status = int(lines[0].split(" ", 2)[1])
     headers = dict(line.split(":", 1) for line in lines[1:])
     if "transfer-encoding" not in headers:
-        body, buffered = receive(connection, buffered, int(headers.get("content-length", "0")))
+        body, buffered = receive(
+            connection, buffered, int(headers.get("content-length", "0"))
+        )
         return (status, body), buffered
     body = b""
     while True:
@@ -118,7 +140,13 @@ def response_from(connection: socket.socket, buffered: bytes) -> tuple[tuple[int
         body += chunk[:-2]
 
 
-def request(connection: socket.socket, buffered: bytes, method: str, target: str, body: bytes = b"") -> tuple[tuple[int, bytes], bytes]:
+def request(
+    connection: socket.socket,
+    buffered: bytes,
+    method: str,
+    target: str,
+    body: bytes = b"",
+) -> tuple[tuple[int, bytes], bytes]:
     head = f"{method} {target} HTTP/1.1\r\nhost: x\r\n".encode()
     if body:
         head += f"content-length: {len(body)}\r\n".encode()
@@ -136,13 +164,18 @@ def workload(args: argparse.Namespace) -> None:
     second_result, buffered = request(first, buffered, "GET", "/chunked")
     first.close()
     second = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
-    third_result, _ = request(second, b"", "POST", "/echo", b"c")
+    body = b"c" * args.body_bytes
+    third_result, _ = request(second, b"", "POST", "/echo", body)
     second.close()
     results = [first_result, second_result, third_result]
-    expected = [(200, b"content-length"), (200, b"b"), (201, b"c")]
+    expected = [(200, b"content-length"), (200, b"b"), (201, body)]
     if results != expected:
         raise AssertionError(f"unexpected workload replies: {results!r}")
-    print(json.dumps({"connections": 2, "requests": len(results), "status": "ok"}, sort_keys=True))
+    print(
+        json.dumps(
+            {"connections": 2, "requests": len(results), "status": "ok"}, sort_keys=True
+        )
+    )
 
 
 def main() -> None:
@@ -155,6 +188,7 @@ def main() -> None:
     server.set_defaults(run=serve)
     workload_parser = commands.add_parser("workload")
     workload_parser.add_argument("--origin", required=True)
+    workload_parser.add_argument("--body-bytes", type=int, default=1)
     workload_parser.set_defaults(run=workload)
     args = parser.parse_args()
     args.run(args)

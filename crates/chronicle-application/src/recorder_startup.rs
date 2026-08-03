@@ -1,10 +1,10 @@
 //! Ordered pre-ETL recorder startup.
 
 use crate::{
-    DomainQuota, NormalizedRecorderConfig, QuotaError, QuotaReservationAuthority, RecorderHealth,
-    RecorderLease, RecorderLeaseError, RecorderLifecycle, RecorderLifecycleError,
-    RecorderReadiness,
+    NormalizedRecorderConfig, QuotaError, QuotaReservationAuthority, RecorderHealth, RecorderLease,
+    RecorderLeaseError, RecorderLifecycle, RecorderLifecycleError, RecorderReadiness,
 };
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -80,14 +80,28 @@ impl RecorderStartup {
             .domains
             .iter()
             .map(|domain| {
-                QuotaReservationAuthority::new(DomainQuota {
-                    domain: domain.identity.canonical_root.clone(),
-                    quota_bytes: domain.quota_bytes,
-                    minimum_free_bytes: domain.minimum_free_bytes,
-                    free_bytes: domain.quota_bytes,
-                })
+                let domain_root = Path::new(&domain.identity.canonical_root);
+                let managed_roots = [config.state_root.as_path(), config.store_root.as_path()]
+                    .into_iter()
+                    .filter(|root| root.starts_with(domain_root))
+                    .collect::<Vec<_>>();
+                QuotaReservationAuthority::from_filesystem_with_roots(
+                    &domain.identity.canonical_root,
+                    &managed_roots,
+                    domain.quota_bytes,
+                    domain.minimum_free_bytes,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if quotas
+            .iter()
+            .any(|quota| quota.available_bytes() < quota.quota().minimum_free_bytes)
+        {
+            lifecycle.fail();
+            return Err(RecorderStartupError::Quota(
+                QuotaError::InsufficientHeadroom,
+            ));
+        }
         if let Err(error) = reserve_quota(&quotas) {
             lifecycle.fail();
             return Err(error);

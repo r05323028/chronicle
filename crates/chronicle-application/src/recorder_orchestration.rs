@@ -13,6 +13,7 @@ use chronicle_capture::{
     CAPTURE_EVENT_SCHEMA_VERSION, CaptureError, CaptureEvent, CaptureEventKind, CaptureSource,
     MonotonicTimestamp, encode_event,
 };
+use chronicle_common::RecordingId;
 use chronicle_wal::{GroupCommitWalWriter, RecordKind};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -44,6 +45,8 @@ pub enum RecorderOrchestrationError {
 pub struct RecorderEpochBoundary {
     pub old_epoch_ordinal: u64,
     pub new_epoch_ordinal: u64,
+    pub old_recording_id: RecordingId,
+    pub new_recording_id: RecordingId,
     pub old_commit: Option<crate::RecordingCommitBoundary>,
 }
 
@@ -68,13 +71,29 @@ pub struct RecorderOrchestrator<S> {
 
 impl<S: CaptureSource> RecorderOrchestrator<S> {
     pub fn new(source: S, ingest: RecordingIngest) -> Self {
+        Self::new_with_epoch(source, ingest, 0)
+    }
+
+    pub fn new_with_epoch(source: S, ingest: RecordingIngest, epoch_ordinal: u64) -> Self {
+        Self::new_with_epoch_and_predecessor(source, ingest, epoch_ordinal, None)
+    }
+
+    pub fn new_with_epoch_and_predecessor(
+        source: S,
+        ingest: RecordingIngest,
+        epoch_ordinal: u64,
+        predecessor: Option<RecordingId>,
+    ) -> Self {
         Self {
             source,
             ingest,
             next_ingest_ordinal: 0,
-            outcome_journal: EpochOutcomeJournalV1::new(0, None),
+            outcome_journal: EpochOutcomeJournalV1::new(
+                epoch_ordinal,
+                predecessor.map(|recording_id| recording_id.0),
+            ),
             last_outcome_ordinal: None,
-            epoch_ordinal: 0,
+            epoch_ordinal,
             started: false,
         }
     }
@@ -233,7 +252,8 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
         now_millis: u64,
         outcome_path: impl AsRef<std::path::Path>,
     ) -> Result<RecorderEpochBoundary, RecorderOrchestrationError> {
-        self.rollover_inner(now_millis, outcome_path, |ingest| {
+        let new_recording_id = next_writer.recording_id();
+        self.rollover_inner(now_millis, outcome_path, Some(new_recording_id), |ingest| {
             ingest.rollover_to(next_writer, now_millis)
         })
     }
@@ -244,7 +264,7 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
         now_millis: u64,
         outcome_path: impl AsRef<std::path::Path>,
     ) -> Result<RecorderEpochBoundary, RecorderOrchestrationError> {
-        self.rollover_inner(now_millis, outcome_path, |ingest| {
+        self.rollover_inner(now_millis, outcome_path, None, |ingest| {
             ingest.rollover(now_millis)
         })
     }
@@ -253,13 +273,16 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
         &mut self,
         _now_millis: u64,
         outcome_path: impl AsRef<std::path::Path>,
+        next_recording_id: Option<RecordingId>,
         rollover: impl FnOnce(
             &mut RecordingIngest,
         )
             -> Result<Option<crate::RecordingCommitBoundary>, chronicle_wal::WalError>,
     ) -> Result<RecorderEpochBoundary, RecorderOrchestrationError> {
         let old_epoch_ordinal = self.epoch_ordinal;
+        let old_recording_id = self.ingest.recording_id();
         let old_commit = rollover(&mut self.ingest)?;
+        let new_recording_id = next_recording_id.unwrap_or_else(|| self.ingest.recording_id());
         if let Some(end_ordinal) = self.next_ingest_ordinal.checked_sub(1) {
             let start_ordinal = self
                 .last_outcome_ordinal
@@ -281,9 +304,15 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
             .map_err(RecorderOrchestrationError::Outcome)?;
         crate::write_epoch_outcome_atomic(outcome_path, &self.outcome_journal)?;
         self.epoch_ordinal = self.epoch_ordinal.saturating_add(1);
+        self.outcome_journal =
+            EpochOutcomeJournalV1::new(self.epoch_ordinal, Some(old_recording_id.0));
+        self.last_outcome_ordinal = None;
+        self.next_ingest_ordinal = 0;
         Ok(RecorderEpochBoundary {
             old_epoch_ordinal,
             new_epoch_ordinal: self.epoch_ordinal,
+            old_recording_id,
+            new_recording_id,
             old_commit,
         })
     }
@@ -322,6 +351,42 @@ mod tests {
     use chronicle_common::RecordingId;
     use chronicle_wal::GroupCommitWalWriter;
     use std::fs;
+
+    #[test]
+    fn rollover_to_preserves_explicit_epoch_identity_boundary() {
+        let root =
+            std::env::temp_dir().join(format!("chronicle-rollover-to-{}", uuid::Uuid::new_v4()));
+        let old_directory = root.join("old");
+        let new_directory = root.join("new");
+        let old_id = RecordingId::new();
+        let new_id = RecordingId::new();
+        let source = InMemoryCaptureSource::new(Vec::<CaptureEvent>::new());
+        let writer = GroupCommitWalWriter::create(
+            &old_directory,
+            old_id,
+            chronicle_wal::MIN_SEGMENT_BYTES,
+            1,
+            0,
+        )
+        .unwrap();
+        let next_writer = GroupCommitWalWriter::create(
+            &new_directory,
+            new_id,
+            chronicle_wal::MIN_SEGMENT_BYTES,
+            1,
+            0,
+        )
+        .unwrap();
+        let mut recorder = RecorderOrchestrator::new(source, RecordingIngest::new(writer));
+        let boundary = recorder
+            .rollover_to(next_writer, 0, root.join("outcome.json"))
+            .unwrap();
+        assert_eq!(boundary.old_recording_id, old_id);
+        assert_eq!(boundary.new_recording_id, new_id);
+        assert_ne!(boundary.old_recording_id, boundary.new_recording_id);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn start_is_idempotent_and_admission_assigns_stable_ordinals() {
