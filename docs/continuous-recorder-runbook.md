@@ -45,7 +45,7 @@ Quarantine contradictory manifest, checkpoint, or digest artifacts. Preserve WAL
 
 ## Evidence export
 
-Retain machine-readable status, recovery reports, manifests, checkpoints, tombstones, command logs, SHA-256 manifests, kernel/architecture/capability data, and exact commit SHA under `evidence/`. Redact payloads and credentials.
+Retain machine-readable status, recovery reports, manifests, checkpoints, tombstones, command logs, SHA-256 manifests, kernel/architecture/capability data, and exact commit SHA under runtime-only `target/validation-evidence/`. Redact payloads and credentials.
 
 ## Upgrade and rollback
 

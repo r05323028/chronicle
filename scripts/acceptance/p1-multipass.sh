@@ -12,7 +12,7 @@ SHA=$(git -C "$ROOT" rev-parse HEAD)
 
 VM_ROOT=/home/ubuntu/chronicle-acceptance
 VM_ARTIFACTS=/home/ubuntu/p1-artifacts/$SHA/$(date -u +%Y%m%dT%H%M%SZ)-$$
-DEST=${CHRONICLE_ACCEPTANCE_DEST:-"$ROOT/evidence/privileged/$SHA/ubuntu-24.04"}
+DEST=${CHRONICLE_ACCEPTANCE_DEST:-"$ROOT/target/validation-evidence/privileged/$SHA/ubuntu-24.04"}
 ACCEPTANCE_MODE=${CHRONICLE_ACCEPTANCE_MODE:-full}
 COMPACT=${CHRONICLE_ACCEPTANCE_COMPACT:-0}
 CARGO_TARGET_DIR_VM=${CARGO_TARGET_DIR:-/home/ubuntu/chronicle-target}

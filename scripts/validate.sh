@@ -15,7 +15,7 @@ NO_ARTIFACT=false
 DRY_RUN=${CHRONICLE_VALIDATE_DRY_RUN:-false}
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
 WORKDIR="$ROOT/target/validation-work/$RUN_ID"
-EVIDENCE_ROOT=${CHRONICLE_VALIDATION_EVIDENCE_ROOT:-"$ROOT/evidence/validation"}
+EVIDENCE_ROOT=${CHRONICLE_VALIDATION_EVIDENCE_ROOT:-"$ROOT/target/validation-evidence"}
 ARTIFACT_MODE=artifact-on-failure
 
 usage() {
