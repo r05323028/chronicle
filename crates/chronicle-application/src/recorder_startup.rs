@@ -61,13 +61,10 @@ impl RecorderStartup {
     /// Completes startup after retention/quota activation. Recovery includes
     /// state, WAL, manifest, checkpoint, and cleanup reconciliation; ETL is
     /// resumed only after capture is attached and appendability is durable.
-    pub fn start_post_foundation(
+    pub(crate) fn prepare_foundation(
         config: &NormalizedRecorderConfig,
         recover_foundation: impl FnOnce() -> Result<(), RecorderStartupError>,
         reserve_quota: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
-        establish_appendable: impl FnOnce() -> Result<(), RecorderStartupError>,
-        attach_capture: impl FnOnce() -> Result<(), RecorderStartupError>,
-        resume_etl: impl FnOnce() -> Result<(), RecorderStartupError>,
     ) -> Result<Self, RecorderStartupError> {
         let lease = RecorderLease::acquire(config)?;
         let mut lifecycle = RecorderLifecycle::new();
@@ -106,24 +103,48 @@ impl RecorderStartup {
             lifecycle.fail();
             return Err(error);
         }
-        if let Err(error) = establish_appendable() {
-            lifecycle.fail();
-            return Err(error);
-        }
-        if let Err(error) = attach_capture() {
-            lifecycle.fail();
-            return Err(error);
-        }
-        if let Err(error) = resume_etl() {
-            lifecycle.fail();
-            return Err(error);
-        }
-        lifecycle.running(RecorderReadiness::Ready)?;
         Ok(Self {
             lease,
             lifecycle,
             quotas,
         })
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        establish_appendable: impl FnOnce() -> Result<(), RecorderStartupError>,
+        attach_capture: impl FnOnce() -> Result<(), RecorderStartupError>,
+        resume_etl: impl FnOnce() -> Result<(), RecorderStartupError>,
+    ) -> Result<Self, RecorderStartupError> {
+        if let Err(error) = establish_appendable() {
+            self.lifecycle.fail();
+            return Err(error);
+        }
+        if let Err(error) = attach_capture() {
+            self.lifecycle.fail();
+            return Err(error);
+        }
+        if let Err(error) = resume_etl() {
+            self.lifecycle.fail();
+            return Err(error);
+        }
+        self.lifecycle.running(RecorderReadiness::Ready)?;
+        Ok(self)
+    }
+
+    pub fn start_post_foundation(
+        config: &NormalizedRecorderConfig,
+        recover_foundation: impl FnOnce() -> Result<(), RecorderStartupError>,
+        reserve_quota: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
+        establish_appendable: impl FnOnce() -> Result<(), RecorderStartupError>,
+        attach_capture: impl FnOnce() -> Result<(), RecorderStartupError>,
+        resume_etl: impl FnOnce() -> Result<(), RecorderStartupError>,
+    ) -> Result<Self, RecorderStartupError> {
+        Self::prepare_foundation(config, recover_foundation, reserve_quota)?.finish(
+            establish_appendable,
+            attach_capture,
+            resume_etl,
+        )
     }
 
     pub fn begin_draining(&mut self) -> Result<(), RecorderStartupError> {

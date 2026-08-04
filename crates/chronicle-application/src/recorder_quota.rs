@@ -181,6 +181,47 @@ impl QuotaReservationAuthority {
         Ok(())
     }
 
+    /// Convert reserved future capacity into durable managed usage.
+    pub fn consume(&self, kind: ReservationKind, bytes: u64) -> Result<(), QuotaError> {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| QuotaError::LockPoisoned)?;
+        let Some(reservation) = reservations
+            .iter_mut()
+            .find(|reservation| reservation.kind == kind)
+        else {
+            return Ok(());
+        };
+        let consumed = reservation.bytes.min(bytes);
+        reservation.bytes -= consumed;
+        if reservation.bytes == 0 {
+            reservations.retain(|item| item.bytes != 0);
+        }
+        Ok(())
+    }
+
+    /// Release oldest reservation for kind after its durable owner is
+    /// finalized. Partial release preserves successor reservations.
+    pub fn release_prefix(&self, kind: ReservationKind, bytes: u64) -> Result<(), QuotaError> {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| QuotaError::LockPoisoned)?;
+        let Some(index) = reservations
+            .iter()
+            .position(|reservation| reservation.kind == kind)
+        else {
+            return Ok(());
+        };
+        let released = reservations[index].bytes.min(bytes);
+        reservations[index].bytes -= released;
+        if reservations[index].bytes == 0 {
+            reservations.remove(index);
+        }
+        Ok(())
+    }
+
     pub fn release(&self, kind: ReservationKind, bytes: u64) -> Result<(), QuotaError> {
         let mut reservations = self
             .reservations
@@ -272,8 +313,9 @@ mod tests {
         .unwrap();
         authority.reserve(ReservationKind::Wal, 20).unwrap();
         authority.reserve(ReservationKind::Checkpoint, 5).unwrap();
-        assert_eq!(authority.reserved_bytes().unwrap(), 25);
-        authority.release(ReservationKind::Wal, 20).unwrap();
+        authority.consume(ReservationKind::Wal, 10).unwrap();
+        assert_eq!(authority.reserved_bytes().unwrap(), 15);
+        authority.release(ReservationKind::Wal, 10).unwrap();
         assert_eq!(authority.reserved_bytes().unwrap(), 5);
     }
 
@@ -332,6 +374,31 @@ mod tests {
         capacity.0.store(200, Ordering::Release);
         authority.refresh_from_filesystem().unwrap();
         authority.reserve(ReservationKind::Staging, 11).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn minimum_free_blocks_before_quota_is_exhausted_and_recovers() {
+        let root =
+            std::env::temp_dir().join(format!("chronicle-min-free-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let capacity = std::sync::Arc::new(FixedCapacity(AtomicU64::new(50)));
+        let authority = QuotaReservationAuthority::from_filesystem_with_provider(
+            &root,
+            &[root.as_path()],
+            100,
+            40,
+            capacity.clone(),
+        )
+        .unwrap();
+        assert_eq!(authority.quota().quota_bytes, 100);
+        assert_eq!(
+            authority.reserve(ReservationKind::Wal, 11),
+            Err(QuotaError::InsufficientHeadroom)
+        );
+        capacity.0.store(80, Ordering::Release);
+        authority.refresh_from_filesystem().unwrap();
+        authority.reserve(ReservationKind::Wal, 11).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

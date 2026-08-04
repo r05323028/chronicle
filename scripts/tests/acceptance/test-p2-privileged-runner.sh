@@ -55,6 +55,7 @@ for needle in \
 	'checkpoint_output_committed_checkpoint_missing' \
 	'checkpoint_committed_status_missing' \
 	'corruption_fail_closed' \
+	'corruption_evidence_preservation' \
 	'quota_exhaustion_admission' \
 	'minimum_free_enforcement' \
 	'cleanup_interrupted_recovery'; do

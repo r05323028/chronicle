@@ -193,7 +193,7 @@ pub fn cleanup_finalized_segment_with_policy(
         return Err(RetentionError::Interrupted);
     }
     fs::create_dir_all(trash_root).map_err(|_| RetentionError::Io)?;
-    let target = trash_root.join(source.file_name().ok_or(RetentionError::UnsafePath)?);
+    let target = cleanup_target(trash_root, source, &intent.transaction_id)?;
     fs::rename(source, &target).map_err(|_| RetentionError::Io)?;
     if fault == Some(CleanupFault::AfterRename) {
         return Err(RetentionError::Interrupted);
@@ -225,14 +225,31 @@ pub fn recover_cleanup_with_policy(
     let bytes = fs::read(intent_path).map_err(|_| RetentionError::MissingIntent)?;
     let intent: CleanupIntent =
         serde_json::from_slice(&bytes).map_err(|_| RetentionError::InvalidIntent)?;
-    if intent.version != 1 {
+    if intent.version != 1
+        || !valid_transaction_id(&intent.transaction_id)
+        || !valid_digest(&intent.digest)
+    {
         return Err(RetentionError::InvalidIntent);
     }
     let source = Path::new(&intent.source);
     let trash_root = Path::new(&intent.trash_root);
+    if !source.is_absolute()
+        || !trash_root.is_absolute()
+        || source
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || trash_root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(RetentionError::UnsafePath);
+    }
     fs::create_dir_all(trash_root).map_err(|_| RetentionError::Io)?;
-    let file_name = source.file_name().ok_or(RetentionError::UnsafePath)?;
-    let target = trash_root.join(file_name);
+    let target = cleanup_target(trash_root, source, &intent.transaction_id)?;
+    if source.exists() && target.exists() {
+        // Both authorities exist: choosing one would silently lose evidence.
+        return Err(RetentionError::InvalidIntent);
+    }
     if source.exists() && !target.exists() {
         if digest_bytes(&fs::read(source).map_err(|_| RetentionError::Io)?) != intent.digest {
             return Err(RetentionError::DigestMismatch);
@@ -243,15 +260,58 @@ pub fn recover_cleanup_with_policy(
     if !target.exists() {
         let tombstone = target.with_extension("deleted");
         return if tombstone.exists() {
-            Ok(CleanupOutcome::Recovered)
+            let tombstone_bytes = fs::read(&tombstone).map_err(|_| RetentionError::Io)?;
+            let recorded: CleanupIntent = serde_json::from_slice(&tombstone_bytes)
+                .map_err(|_| RetentionError::InvalidIntent)?;
+            if recorded.transaction_id == intent.transaction_id && recorded.digest == intent.digest
+            {
+                Ok(CleanupOutcome::Recovered)
+            } else {
+                Err(RetentionError::InvalidIntent)
+            }
         } else {
             Err(RetentionError::MissingArtifact)
         };
+    }
+    if fs::symlink_metadata(&target)
+        .map_err(|_| RetentionError::Io)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(RetentionError::UnsafePath);
+    }
+    if digest_bytes(&fs::read(&target).map_err(|_| RetentionError::Io)?) != intent.digest {
+        return Err(RetentionError::DigestMismatch);
     }
     write_tombstone(&target, &intent)?;
     fs::remove_file(&target).map_err(|_| RetentionError::Io)?;
     sync_directory(trash_root)?;
     Ok(CleanupOutcome::Recovered)
+}
+
+fn cleanup_target(
+    trash_root: &Path,
+    source: &Path,
+    transaction_id: &str,
+) -> Result<std::path::PathBuf, RetentionError> {
+    let file_name = source.file_name().ok_or(RetentionError::UnsafePath)?;
+    Ok(trash_root.join(format!(
+        "{}.{}",
+        file_name.to_string_lossy(),
+        transaction_id
+    )))
+}
+
+fn valid_transaction_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn write_tombstone(target: &Path, intent: &CleanupIntent) -> Result<(), RetentionError> {
@@ -448,8 +508,8 @@ mod tests {
                 Ok(CleanupOutcome::Recovered)
             );
             assert!(!source.exists());
-            assert!(!trash.join("segment.chwal").exists());
-            assert!(trash.join("segment.deleted").exists());
+            assert!(!trash.join("segment.chwal.tx").exists());
+            assert!(trash.join("segment.chwal.deleted").exists());
             let _ = fs::remove_dir_all(&root);
         }
     }
@@ -492,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn corruption_quarantine_is_terminal_and_not_deletable() {
+    fn corruption_evidence_preservation_is_terminal_and_not_deletable() {
         let mut segment = SegmentLifecycleRecord {
             ordinal: 1,
             digest: "a".repeat(64),

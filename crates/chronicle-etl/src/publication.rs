@@ -38,7 +38,7 @@ pub enum PublicationError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CheckpointFault {
+pub enum CheckpointFault {
     BeforeCheckpoint,
     AfterCheckpoint,
 }
@@ -120,7 +120,7 @@ pub fn publish_delta_then_checkpoint<S: RecordingStore>(
     publish_delta_then_checkpoint_with_fault(store, key, batch, checkpoint, checkpoint_path, None)
 }
 
-fn publish_delta_then_checkpoint_with_fault<S: RecordingStore>(
+pub fn publish_delta_then_checkpoint_with_fault<S: RecordingStore>(
     store: &S,
     key: impl Into<String>,
     batch: &CanonicalDeltaBatchV1,

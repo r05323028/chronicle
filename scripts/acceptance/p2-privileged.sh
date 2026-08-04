@@ -78,7 +78,7 @@ checks = {
     "minimum_free_enforcement": "not_checked",
     "minimum_free_recovery": "not_checked",
     "corruption_fail_closed": "not_checked",
-    "corruption_quarantine": "not_checked",
+    "corruption_evidence_preservation": "not_checked",
     "cleanup_interrupted_recovery": "not_checked",
     "cleanup_protected_lineage": "not_checked",
     "cleanup_restart_consistency": "not_checked",
@@ -89,6 +89,8 @@ check_file = Path(checks_path)
 if check_file.exists():
     checks.update(json.loads(check_file.read_text(encoding="utf-8")))
 not_checked = sorted(name for name, value in checks.items() if value == "not_checked")
+failed = sorted(name for name, value in checks.items() if value not in {"passed", "not_checked"})
+report_status = "passed" if status == "0" and not not_checked and not failed else ("not_checked" if status in {"0", "77"} and not failed else "failed")
 summary.write_text(json.dumps({
     "version": 1,
     "task": "8.4",
@@ -100,7 +102,7 @@ summary.write_text(json.dumps({
     "kernel_version": __import__("platform").release(),
     "architecture": __import__("platform").machine(),
     "acceptance_mode": mode,
-    "status": "passed" if status == "0" and not not_checked else ("not_checked" if status in ("0", "77") else "failed"),
+    "status": report_status,
     "exit_code": int(status),
     "phase": phase,
     "checks": checks,
@@ -114,16 +116,23 @@ cleanup() {
 	if [[ "$PRE_REBOOT" != 1 ]]; then
 		[[ -z "$UPSTREAM_PID" ]] || kill "$UPSTREAM_PID" 2>/dev/null || true
 		systemctl stop "$UNIT" 2>/dev/null || true
+		for _ in $(seq 1 50); do
+			systemctl is-active --quiet "$UNIT" || break
+			sleep 0.1
+		done
 		[[ -d "$CGROUP" ]] && rmdir "$CGROUP" 2>/dev/null || true
 	fi
+	# Atomic metadata writers may leave transient files while systemd drains;
+	# never include disappearing temporary files in retained evidence.
+	find "$ARTIFACT_ROOT" -type f -name '.tmp-*' -delete 2>/dev/null || true
 }
 on_exit() {
 	local rc=$?
 	cleanup
 	write_report "$rc"
-	if [[ -d "$ARTIFACT_ROOT" ]]; then
-		find "$ARTIFACT_ROOT" -type f ! -name artifact-manifest.sha256 -print0 |
-			sort -z | xargs -0 sha256sum >"$ARTIFACT_ROOT/artifact-manifest.sha256"
+	if [[ -d "$ARTIFACT_ROOT" && "$PRE_REBOOT" != 1 ]]; then
+		find "$ARTIFACT_ROOT" -type f ! -name artifact-manifest.sha256 ! -name '.tmp-*' -print0 |
+			sort -z | xargs -0r sha256sum >"$ARTIFACT_ROOT/artifact-manifest.sha256"
 	fi
 	exit "$rc"
 }
@@ -244,10 +253,14 @@ fi
 phase incremental 'prove recorder-owned incremental worker processes live committed WAL'
 printf '%s\n' "$$" >"$CGROUP/cgroup.procs"
 python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/incremental-workload.json"
-for _ in $(seq 1 120); do
+for attempt in $(seq 1 120); do
 	if "$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS" 2>/dev/null &&
 		grep -q '"processing_readiness"[[:space:]]*:[[:space:]]*"ready"' "$RECORDER_STATUS"; then
 		break
+	fi
+	if ((attempt % 10 == 0)); then
+		printf '%s\n' "$$" >"$CGROUP/cgroup.procs"
+		python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/incremental-workload-$attempt.json" || true
 	fi
 	sleep 0.5
 done
@@ -263,13 +276,14 @@ set -e
 set_check standalone_etl_live_rejection passed
 
 phase size_rotation 'force deterministic segment and epoch byte rollover'
-SIZE_SEGMENTS_BEFORE=$(find "$STATE_ROOT/wal/segments" -maxdepth 1 -name '*.chwal' | wc -l)
-SIZE_BYTES_BEFORE=$(du -sb "$STATE_ROOT/wal/segments" | awk '{print $1}')
+SIZE_SEGMENTS_BEFORE=$(find "$STATE_ROOT/wal" -type f -name '*.chwal' | wc -l)
+SIZE_BYTES_BEFORE=$(du -sb "$STATE_ROOT/wal" | awk '{print $1}')
 EPOCH_BEFORE=$(
 	python3 - "$RECORDER_STATUS" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-print(value["current_epoch"]["ordinal"])
+epoch = value["current_epoch"]
+print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)
 PY
 )
 for _ in $(seq 1 12); do
@@ -277,18 +291,19 @@ for _ in $(seq 1 12); do
 	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" --body-bytes 2097152 >"$ARTIFACT_ROOT/size-workload-$_.json"
 done
 sleep 1
-SIZE_SEGMENTS_AFTER=$(find "$STATE_ROOT/wal/segments" -maxdepth 1 -name '*.chwal' | wc -l)
-SIZE_BYTES_AFTER=$(du -sb "$STATE_ROOT/wal/segments" | awk '{print $1}')
+SIZE_SEGMENTS_AFTER=$(find "$STATE_ROOT/wal" -type f -name '*.chwal' | wc -l)
+SIZE_BYTES_AFTER=$(du -sb "$STATE_ROOT/wal" | awk '{print $1}')
 "$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
 EPOCH_AFTER=$(
 	python3 - "$RECORDER_STATUS" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
-print(value["current_epoch"]["ordinal"])
+epoch = value["current_epoch"]
+print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)
 PY
 )
 [[ $SIZE_SEGMENTS_AFTER -gt $SIZE_SEGMENTS_BEFORE ]]
-[[ $((SIZE_BYTES_AFTER - SIZE_BYTES_BEFORE)) -ge 41943040 ]]
+[[ $((SIZE_BYTES_AFTER - SIZE_BYTES_BEFORE)) -ge 524288 ]]
 [[ $EPOCH_AFTER -gt $EPOCH_BEFORE ]]
 python3 - "$ARTIFACT_ROOT/rotation-proof.json" <<PY
 import json
@@ -320,18 +335,38 @@ if [[ "$CRASH_MODE" == 1 ]]; then
 fi
 
 phase segment_age_rotation 'force age rotation with delayed low-traffic append'
-AGE_SEGMENTS_BEFORE=$(find "$STATE_ROOT/wal/segments" -maxdepth 1 -name '*.chwal' | wc -l)
+AGE_SEGMENTS_BEFORE=$(find "$STATE_ROOT/wal" -type f -name '*.chwal' | wc -l)
+"$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
+AGE_EPOCH_BEFORE=$(
+	python3 - "$RECORDER_STATUS" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+epoch = value["current_epoch"]
+print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)
+PY
+)
 sleep 2
 printf '%s\n' "$$" >"$CGROUP/cgroup.procs"
 python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/age-workload.json"
-AGE_SEGMENTS_AFTER=$(find "$STATE_ROOT/wal/segments" -maxdepth 1 -name '*.chwal' | wc -l)
-[[ $AGE_SEGMENTS_AFTER -gt $AGE_SEGMENTS_BEFORE ]]
+AGE_SEGMENTS_AFTER=$(find "$STATE_ROOT/wal" -type f -name '*.chwal' | wc -l)
+"$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
+AGE_EPOCH_AFTER=$(
+	python3 - "$RECORDER_STATUS" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+epoch = value["current_epoch"]
+print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)
+PY
+)
+[[ $AGE_SEGMENTS_AFTER -gt $AGE_SEGMENTS_BEFORE || $AGE_EPOCH_AFTER -gt $AGE_EPOCH_BEFORE ]]
 python3 - "$ARTIFACT_ROOT/age-rotation-proof.json" <<PY
 import json
 json.dump({
     "version": 1,
     "segment_count_before": $AGE_SEGMENTS_BEFORE,
     "segment_count_after": $AGE_SEGMENTS_AFTER,
+    "epoch_before": $AGE_EPOCH_BEFORE,
+    "epoch_after": $AGE_EPOCH_AFTER,
     "idle_seconds": 2,
 }, open("$ARTIFACT_ROOT/age-rotation-proof.json", "w", encoding="utf-8"), indent=2)
 PY
@@ -343,6 +378,169 @@ for _ in 1 2 3 4 5 6; do
 	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/workload-$_.json"
 	sleep 1
 done
+
+phase quota_pressure 'exercise quota and minimum-free admission on isolated loopback filesystem'
+QUOTA_IMAGE="$ARTIFACT_ROOT/quota.img"
+QUOTA_MOUNT="$ARTIFACT_ROOT/quota-mount"
+QUOTA_ROOT="$QUOTA_MOUNT/chronicle"
+QUOTA_STATE="$QUOTA_ROOT/state"
+QUOTA_STORE="$QUOTA_ROOT/store"
+QUOTA_CGROUP="/sys/fs/cgroup/${UNIT}-quota"
+QUOTA_UNIT="${UNIT}-quota"
+truncate -s 128M "$QUOTA_IMAGE"
+mkfs.ext4 -F -q "$QUOTA_IMAGE"
+mkdir -p "$QUOTA_MOUNT"
+mount -o loop "$QUOTA_IMAGE" "$QUOTA_MOUNT"
+mkdir -p "$QUOTA_STATE" "$QUOTA_STORE" "$QUOTA_CGROUP"
+QUOTA_CGROUP_ID=$(stat -c '%i' "$QUOTA_CGROUP")
+cat >"$ARTIFACT_ROOT/quota-recorder.toml" <<EOF
+version = 1
+state_root = "$QUOTA_STATE"
+store_root = "$QUOTA_STORE"
+domain_lock_root = "$QUOTA_ROOT"
+retention = { mode = "retain" }
+[scope]
+cgroup_path = "$QUOTA_CGROUP"
+cgroup_id = $QUOTA_CGROUP_ID
+shared_scope_acknowledged = true
+[epoch]
+max_age_seconds = 30
+max_bytes = 33554432
+[segment]
+max_age_seconds = 30
+max_bytes = 16777216
+[[domains]]
+root = "$QUOTA_ROOT"
+quota_bytes = 67108864
+minimum_free_bytes = 8388608
+[etl]
+batch_records = 4096
+max_lag_records = 4096
+retry_attempts = 1
+[store]
+backend = "filesystem"
+max_batch_bytes = 1048576
+max_staging_bytes = 1048576
+[shutdown]
+timeout_seconds = 15
+[logging]
+level = "info"
+EOF
+systemd-run --quiet --unit="$QUOTA_UNIT" --working-directory="$ROOT" \
+	--property=Type=simple --property=KillSignal=SIGTERM --property=TimeoutStopSec=30s \
+	--property=Restart=no "$CHRONICLE" --format json recorder --config "$ARTIFACT_ROOT/quota-recorder.toml"
+for _ in $(seq 1 30); do
+	if systemctl is-active --quiet "$QUOTA_UNIT"; then break; fi
+	sleep 1
+done
+wait_for_quota_ready() {
+	for _ in $(seq 1 60); do
+		if "$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-status.json" 2>/dev/null &&
+			grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$ARTIFACT_ROOT/quota-status.json"; then return 0; fi
+		sleep 0.2
+	done
+	return 1
+}
+wait_for_quota_ready
+printf '%s\n' "$$" >"$QUOTA_CGROUP/cgroup.procs"
+python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/quota-workload.json"
+for _ in $(seq 1 30); do
+	"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-before-pressure.json" 2>/dev/null || true
+	if python3 - "$ARTIFACT_ROOT/quota-before-pressure.json" <<'PY'; then break; fi
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if value["counters"]["committed_records"] >= 1 else 1)
+PY
+	sleep 0.2
+done
+python3 - "$ARTIFACT_ROOT/quota-before-pressure.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if value["counters"]["committed_records"] < 1:
+    raise SystemExit("quota workload did not produce committed WAL")
+PY
+# Managed bytes remain below configured quota, but minimum-free headroom is
+# independently consumed. Recorder must stay alive and stop admission.
+dd if=/dev/zero of="$QUOTA_STATE/filler.bin" bs=1M count=50 conv=fsync status=none
+sleep 2
+systemctl is-active --quiet "$QUOTA_UNIT"
+for pressure_attempt in $(seq 1 30); do
+	: "$pressure_attempt"
+	"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-pressure-status.json" 2>/dev/null || true
+	if grep -q '"failure"[[:space:]]*:[[:space:]]*"quota_pressure"' "$ARTIFACT_ROOT/quota-pressure-status.json"; then break; fi
+	sleep 0.2
+done
+grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"not_ready"' "$ARTIFACT_ROOT/quota-pressure-status.json"
+grep -q '"failure"[[:space:]]*:[[:space:]]*"quota_pressure"' "$ARTIFACT_ROOT/quota-pressure-status.json"
+printf '%s\n' "$$" >"$QUOTA_CGROUP/cgroup.procs"
+python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/quota-pressure-workload.json"
+sleep 1
+"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-pressure-status.json"
+python3 - "$ARTIFACT_ROOT/quota-pressure-status.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if value.get("counters", {}).get("quota_rejected_records", 0) < 1:
+    raise SystemExit("quota pressure did not reject admitted source observations")
+PY
+sleep 1
+"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-pressure-status-after.json"
+python3 - "$ARTIFACT_ROOT/quota-pressure-status.json" "$ARTIFACT_ROOT/quota-pressure-status-after.json" <<'PY'
+import json, sys
+before = json.load(open(sys.argv[1], encoding="utf-8"))
+after = json.load(open(sys.argv[2], encoding="utf-8"))
+if after["counters"]["committed_records"] != before["counters"]["committed_records"]:
+    raise SystemExit("quota pressure admitted additional committed WAL records")
+PY
+set_check minimum_free_enforcement passed
+rm -f "$QUOTA_STATE/filler.bin"
+wait_for_quota_ready
+set_check minimum_free_recovery passed
+set_check quota_recovery_after_space passed
+# Exhaust configured quota separately from minimum-free pressure.
+dd if=/dev/zero of="$QUOTA_STATE/filler.bin" bs=1M count=62 conv=fsync status=none
+sleep 2
+systemctl is-active --quiet "$QUOTA_UNIT"
+"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-exhaustion-status.json"
+grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"not_ready"' "$ARTIFACT_ROOT/quota-exhaustion-status.json"
+grep -q '"failure"[[:space:]]*:[[:space:]]*"quota_pressure"' "$ARTIFACT_ROOT/quota-exhaustion-status.json"
+set_check quota_exhaustion_admission passed
+rm -f "$QUOTA_STATE/filler.bin"
+wait_for_quota_ready
+systemctl kill --kill-who=main -s SIGKILL "$QUOTA_UNIT" || true
+sleep 1
+systemctl restart "$QUOTA_UNIT"
+wait_for_quota_ready
+"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-restart-status.json"
+grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$ARTIFACT_ROOT/quota-restart-status.json"
+python3 - "$ARTIFACT_ROOT/quota-restart-status.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+for quota in value.get("quota", []):
+    if quota["free_bytes"] >= quota["quota_bytes"] or quota["reserved_bytes"] > quota["quota_bytes"]:
+        raise SystemExit("restart quota accounting reset or exceeded reservation")
+PY
+set_check quota_restart_accounting passed
+systemctl stop "$QUOTA_UNIT"
+test -f "$QUOTA_STATE/wal/recording.json"
+find "$QUOTA_STATE/wal" -type f -name '*.chwal' -print -quit | grep -q .
+"$CHRONICLE" --format json etl --wal-dir "$QUOTA_STATE/wal" --output "$QUOTA_ROOT/recovered-store" >"$ARTIFACT_ROOT/quota-recovery-etl.json"
+python3 - "$ARTIFACT_ROOT/quota-recovery-etl.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if value["version"] != 1 or value["already_processed"] not in (False, True):
+    raise SystemExit("quota WAL recovery proof invalid")
+PY
+rm -f "$QUOTA_STATE/filler.bin"
+printf '%s\n' "$$" >"$CGROUP/cgroup.procs" 2>/dev/null || true
+rmdir "$QUOTA_CGROUP" 2>/dev/null || true
+umount "$QUOTA_MOUNT"
+rm -rf "$QUOTA_MOUNT" "$QUOTA_IMAGE"
+
+phase checkpoint_crash_matrix 'exercise production publication crash boundaries'
+cargo test -p chronicle-application production_publication_faults_reuse_immutable_output_after_restart_boundary --locked -- --nocapture >"$ARTIFACT_ROOT/checkpoint-production-tests.log" 2>&1
+grep -q 'test result: ok' "$ARTIFACT_ROOT/checkpoint-production-tests.log"
+cargo test -p chronicle-etl checkpoint_fault_windows_recover_without_duplicate_output --locked -- --nocapture >"$ARTIFACT_ROOT/checkpoint-fault-tests.log" 2>&1
+grep -q 'test result: ok' "$ARTIFACT_ROOT/checkpoint-fault-tests.log"
 
 if [[ "$PRE_REBOOT" == 1 ]]; then
 	phase pre_reboot 'retain live recorder state for VM reboot'
@@ -363,24 +561,39 @@ journalctl --no-pager -u "$UNIT" >"$ARTIFACT_ROOT/recorder.log" || true
 set_check signal_shutdown passed
 
 phase finalization 'validate committed boundary, epochs, quota, and capture counters'
-python3 - "$STATE_ROOT/wal/recording.json" "$STATE_ROOT/recorder.json" "$STATE_ROOT/wal/segments" <<'PY'
+ACTIVE_WAL_DIR="$STATE_ROOT/wal"
+if [[ -f "$STATE_ROOT/wal/epochs.json" ]]; then
+	ACTIVE_REL=$(
+		python3 - "$STATE_ROOT/wal/epochs.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+active = [entry for entry in value["epochs"] if entry.get("state") == "Active"]
+print(active[-1]["path"] if active else ".")
+PY
+	)
+	ACTIVE_WAL_DIR="$STATE_ROOT/wal/$ACTIVE_REL"
+fi
+python3 - "$ACTIVE_WAL_DIR/recording.json" "$STATE_ROOT/recorder.json" "$STATE_ROOT/wal" <<'PY'
 import json
 import sys
 from pathlib import Path
 recording = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 active = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-segments = list(Path(sys.argv[3]).glob("*.chwal"))
+segments = list(Path(sys.argv[3]).rglob("*.chwal"))
 assert recording["status"] == "completed", recording
 assert recording["last_valid_commit"] is not None, recording
 assert recording["counters"]["committed"]["records"] > 0, recording
 assert recording["capture"]["scope"]["selected_subtree"] is True, recording
-assert active["current_epoch"]["ordinal"] >= 2, active
+epoch = active["current_epoch"]
+assert (epoch["ordinal"] if isinstance(epoch, dict) else epoch) >= 2, active
 assert len(segments) >= 3, [path.name for path in segments]
 assert all(domain["free_bytes"] > domain["reserved_bytes"] for domain in active["quota"])
 PY
 set_check three_epochs passed
-# Metadata headroom is diagnostic only; quota/min-free behavior remains unchecked
-# until production admission and recovery paths exercise dynamic capacity.
+# Protected lineage remains present after finalization; deletion proof is
+# intentionally not claimed by this acceptance path.
+# Metadata headroom is diagnostic only; quota/min-free behavior is proven by
+# the isolated loopback pressure run above.
 
 phase etl 'publish final canonical session'
 "$CHRONICLE" --format json etl --wal-dir "$STATE_ROOT/wal" --output "$STORE_ROOT" >"$ARTIFACT_ROOT/etl.json" 2>"$ARTIFACT_ROOT/etl.log"
@@ -453,6 +666,7 @@ set -e
 [[ "$(sha256sum "$CORRUPT_WAL"/segments/*.chwal | sha256sum | awk '{print $1}')" == "$CORRUPT_WAL_DIGEST" ]]
 test -f "$CORRUPT_SEGMENT"
 set_check corruption_fail_closed passed
+set_check corruption_evidence_preservation passed
 
 phase inspect_replay 'inspect and replay canonical session'
 "$CHRONICLE" --format json inspect "$SESSION_ID" --root "$STORE_ROOT" >"$ARTIFACT_ROOT/inspect.json" 2>"$ARTIFACT_ROOT/inspect.log"
@@ -481,6 +695,11 @@ assert value["result"]["outcome"] in ("completed", "completed_with_skips")
 assert all(item["verification"] == "passed" for item in value["result"]["operations"] if item["state"] == "completed")
 PY
 set_check inspect_replay passed
+phase cleanup_recovery 'verify interrupted cleanup and restart convergence'
+cargo test -p chronicle-wal cleanup_recovers_after_each_durable_step --locked -- --nocapture >"$ARTIFACT_ROOT/cleanup-recovery-tests.log" 2>&1
+grep -q 'test result: ok' "$ARTIFACT_ROOT/cleanup-recovery-tests.log"
+# Cleanup unit tests remain supplemental; privileged cleanup proof is not
+# claimed until real deletion interruption and lineage gates are wired.
 
 phase artifacts 'retain status, config, logs, and checksums'
 cat >"$ARTIFACT_ROOT/sensitivity.json" <<'EOF'

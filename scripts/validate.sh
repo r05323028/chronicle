@@ -256,6 +256,7 @@ run_fast() {
 	run_shell clippy "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
 	run_shell workspace-tests "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo test --workspace --all-features --locked"
 	run_shell openspec 'openspec validate --all --strict --no-interactive'
+	run_shell source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'"
 	printf '\nChanged-crate tests: covered by workspace unit-test invocation.\n'
 }
 
@@ -351,6 +352,7 @@ release)
 	run_shell release-clippy "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
 	run_shell release-tests "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo test --workspace --all-features --locked"
 	run_shell release-openspec 'openspec validate --all --strict --no-interactive'
+	run_shell release-source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'"
 	run_gate p1
 	run_gate p2
 	;;

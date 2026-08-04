@@ -67,6 +67,7 @@ pub struct RecorderOrchestrator<S> {
     last_outcome_ordinal: Option<u64>,
     epoch_ordinal: u64,
     started: bool,
+    admission_enabled: bool,
 }
 
 impl<S: CaptureSource> RecorderOrchestrator<S> {
@@ -95,6 +96,7 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
             last_outcome_ordinal: None,
             epoch_ordinal,
             started: false,
+            admission_enabled: true,
         }
     }
 
@@ -108,6 +110,14 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
     }
 
     pub fn poll(&mut self, now_millis: u64) -> Result<RecorderPoll, RecorderOrchestrationError> {
+        if !self.admission_enabled {
+            if let Some(event) = self.source.poll()? {
+                let bytes = encode_event(&event).map_or(0, |payload| payload.len() as u64);
+                self.ingest.record_quota_rejection(bytes);
+                return Ok(RecorderPoll::Backpressured(event));
+            }
+            return Ok(RecorderPoll::Idle);
+        }
         let Some(event) = self.source.poll()? else {
             return Ok(RecorderPoll::Idle);
         };
@@ -155,6 +165,14 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
 
     pub fn drain_ingest(&mut self, now_millis: u64) -> Result<(), chronicle_wal::WalError> {
         self.ingest.drain(now_millis)
+    }
+
+    pub fn set_admission_enabled(&mut self, enabled: bool) {
+        self.admission_enabled = enabled;
+    }
+
+    pub fn admission_enabled(&self) -> bool {
+        self.admission_enabled
     }
 
     pub fn request_shutdown(&mut self) -> Result<(), CaptureError> {
@@ -308,6 +326,7 @@ impl<S: CaptureSource> RecorderOrchestrator<S> {
             EpochOutcomeJournalV1::new(self.epoch_ordinal, Some(old_recording_id.0));
         self.last_outcome_ordinal = None;
         self.next_ingest_ordinal = 0;
+        self.admission_enabled = true;
         Ok(RecorderEpochBoundary {
             old_epoch_ordinal,
             new_epoch_ordinal: self.epoch_ordinal,

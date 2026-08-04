@@ -58,7 +58,7 @@ WAL, checkpoints, and canonical artifacts SHALL be documented as potentially con
 
 Operations guide SHALL document existing 8 MiB eBPF ring, 4096-event ingest queue, 4 MiB/10 ms group commit, 256 MiB default segment, per-epoch one-hour/4 GiB maxima, ETL connection/body/operation bounds, configured per-filesystem quota/minimum-free-space reserves, synchronized co-located writer reservations, expected temporary peak reservation, file-descriptor/thread/task use, and CPU/memory/disk monitoring signals. It SHALL distinguish configured limits from measured recommendations and SHALL not claim production scale without retained evidence.
 
-Recorder failure SHALL affect only configured scope/state root. It SHALL not kill captured workload, widen capture scope, replay traffic, delete unprocessed evidence, or block unrelated recorder instances using distinct roots. Capture/WAL failure SHALL stop affected recorder; ETL/store failure MAY allow capture only while quota headroom/policy permits. Corruption SHALL quarantine affected lineage and fail closed.
+Recorder failure SHALL affect only configured scope/state root. It SHALL not kill captured workload, widen capture scope, replay traffic, delete unprocessed evidence, or block unrelated recorder instances using distinct roots. Capture/WAL failure SHALL stop affected recorder; ETL/store failure MAY allow capture only while quota headroom/policy permits. Corruption SHALL preserve affected evidence in place and fail closed; retries and cleanup SHALL not make it authoritative.
 
 #### Scenario: ETL outage with disk headroom
 
@@ -104,7 +104,7 @@ Persistent startup failure from corruption/configuration/permission/quota SHALL 
 
 ### Requirement: Operational ownership and runbook are complete
 
-P2 documentation SHALL identify platform/operator owner for host prerequisites/capabilities/cgroup/state disk, application owner for selected workload scope and sensitive-data authorization, and Chronicle operator for configuration, health, retention, upgrades, evidence, and incident response. Runbook SHALL cover install/preflight/start/readiness/status/stop/restart, disk/ETL lag, corruption quarantine, forced termination, retention review, upgrade/rollback, evidence export, and leak checks.
+P2 documentation SHALL identify platform/operator owner for host prerequisites/capabilities/cgroup/state disk, application owner for selected workload scope and sensitive-data authorization, and Chronicle operator for configuration, health, retention, upgrades, evidence, and incident response. Runbook SHALL cover install/preflight/start/readiness/status/stop/restart, disk/ETL lag, corruption evidence preservation, forced termination, retention review, upgrade/rollback, evidence export, and leak checks.
 
 Documentation SHALL compare node daemon and sidecar trade-offs, name node daemon recommendation, list unsupported deployment models, and state failure impact/resource expectations. It SHALL not include Kubernetes manifests unless later OpenSpec change adds supported orchestration.
 

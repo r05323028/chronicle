@@ -12,10 +12,11 @@ use crate::{
 use chronicle_capture::{CaptureError, CaptureSource};
 use chronicle_common::SessionId;
 use chronicle_etl::{
-    CanonicalDeltaBatchV1, CheckpointLifecycle, CheckpointOwner, CommittedWalSnapshot,
-    DeltaBatchReference, ETL_PIPELINE_VERSION, INCREMENTAL_CHECKPOINT_SCHEMA_VERSION,
-    IncrementalEtlCheckpointV1, IncrementalProcessor, IncrementalResult, MarkerLineage,
-    SourceStatus, publish_delta_then_checkpoint, read_checkpoint,
+    CanonicalDeltaBatchV1, CheckpointFault, CheckpointLifecycle, CheckpointOwner,
+    CommittedWalSnapshot, DeltaBatchReference, ETL_PIPELINE_VERSION,
+    INCREMENTAL_CHECKPOINT_SCHEMA_VERSION, IncrementalEtlCheckpointV1, IncrementalProcessor,
+    IncrementalResult, MarkerLineage, SourceStatus, publish_delta_then_checkpoint,
+    publish_delta_then_checkpoint_with_fault, read_checkpoint,
 };
 use chronicle_protocol::ProtocolRegistry;
 use chronicle_protocol_builtins::registry;
@@ -64,6 +65,9 @@ pub struct ContinuousRecorderService<S> {
     incremental_session_id: SessionId,
     incremental_checkpoint: Option<IncrementalEtlCheckpointV1>,
     next_incremental_millis: u64,
+    checkpoint_fault: Option<CheckpointFault>,
+    last_wal_bytes: u64,
+    epoch_max_bytes: u64,
 }
 
 impl<S: CaptureSource> ContinuousRecorderService<S> {
@@ -80,16 +84,15 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         resume_etl: impl FnOnce() -> Result<(), RecorderStartupError>,
     ) -> Result<Self, ContinuousRecorderError> {
         let mut recorder = recorder;
-        let starting_epoch_ordinal = recorder.epoch_ordinal();
-        let mut incremental_worker = IncrementalWorker::new(IncrementalWorkerPolicy {
+        let incremental_worker = IncrementalWorker::new(IncrementalWorkerPolicy {
             max_lag_records: config.etl.max_lag_records,
             retry_attempts: config.etl.retry_attempts,
             backoff_millis: 10,
         })
         .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
-        incremental_worker.start();
         let incremental_registry =
             registry().map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        validate_checkpoint_before_capture(config, wal_directory.as_ref())?;
         let startup = RecorderStartup::start_post_foundation(
             config,
             recover_foundation,
@@ -102,7 +105,66 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             },
             resume_etl,
         )?;
+        Self::start_after_startup(
+            config,
+            wal_directory,
+            recorder,
+            startup,
+            incremental_worker,
+            incremental_registry,
+        )
+    }
+
+    pub fn start_with_prepared_startup(
+        config: &NormalizedRecorderConfig,
+        wal_directory: impl AsRef<Path>,
+        mut recorder: RecorderOrchestrator<S>,
+        startup: RecorderStartup,
+        establish_appendable: impl FnOnce() -> Result<(), RecorderStartupError>,
+        resume_etl: impl FnOnce() -> Result<(), RecorderStartupError>,
+    ) -> Result<Self, ContinuousRecorderError> {
+        validate_checkpoint_before_capture(config, wal_directory.as_ref())?;
+        let startup = startup.finish(
+            establish_appendable,
+            || {
+                recorder
+                    .start()
+                    .map_err(|_| RecorderStartupError::CaptureAttach)
+            },
+            resume_etl,
+        )?;
+        let incremental_worker = IncrementalWorker::new(IncrementalWorkerPolicy {
+            max_lag_records: config.etl.max_lag_records,
+            retry_attempts: config.etl.retry_attempts,
+            backoff_millis: 10,
+        })
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let incremental_registry =
+            registry().map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        Self::start_after_startup(
+            config,
+            wal_directory,
+            recorder,
+            startup,
+            incremental_worker,
+            incremental_registry,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn start_after_startup(
+        config: &NormalizedRecorderConfig,
+        wal_directory: impl AsRef<Path>,
+        recorder: RecorderOrchestrator<S>,
+        startup: RecorderStartup,
+        mut incremental_worker: IncrementalWorker,
+        incremental_registry: ProtocolRegistry,
+    ) -> Result<Self, ContinuousRecorderError> {
+        incremental_worker.start();
+        let starting_epoch_ordinal = recorder.epoch_ordinal();
         let wal_directory = wal_directory.as_ref().to_path_buf();
+        let last_wal_bytes = crate::recording_physical_wal_bytes(&wal_directory)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
         let checkpoint_path = wal_directory.join("incremental-etl-checkpoint.json");
         let incremental_checkpoint = match fs::metadata(&checkpoint_path) {
             Ok(_) => {
@@ -234,7 +296,16 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             incremental_session_id,
             incremental_checkpoint,
             next_incremental_millis: 0,
+            checkpoint_fault: None,
+            last_wal_bytes,
+            epoch_max_bytes: config.epoch.max_bytes,
         })
+    }
+
+    /// Inject one publication boundary failure for deterministic restart tests.
+    /// Fault is consumed exactly once by the next production publication.
+    pub fn set_checkpoint_fault(&mut self, fault: CheckpointFault) {
+        self.checkpoint_fault = Some(fault);
     }
 
     pub fn set_capture_metadata(
@@ -250,6 +321,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     pub fn poll(&mut self, now_millis: u64) -> Result<RecorderPoll, ContinuousRecorderError> {
         self.refresh_quota_metadata()?;
         let poll = self.recorder.poll(now_millis)?;
+        self.sync_active_progress();
         self.poll_incremental(now_millis)?;
         Ok(poll)
     }
@@ -270,12 +342,15 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         let mut incremental_result: Option<IncrementalResult> = None;
         let mut marker = None;
         let worker_result = self.incremental_worker.process_once(|| {
-            let snapshot = chronicle_wal::read_committed_snapshot_with_records(
+            let snapshot = match chronicle_wal::read_committed_snapshot_with_records(
                 &wal_directory,
                 recording_id,
                 chronicle_wal::DEFAULT_MAX_RECORD_BYTES,
-            )
-            .map_err(|_| IncrementalWorkerError::BatchFailed)?;
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(chronicle_wal::WalError::NoPublishedSegments) => return Ok(0),
+                Err(_) => return Err(IncrementalWorkerError::BatchFailed),
+            };
             if let Some(checkpoint) = &checkpoint
                 && checkpoint.marker.sequence < snapshot.snapshot.marker_sequence
             {
@@ -375,13 +450,20 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                     eprintln!("incremental publication failed: {error}");
                 }
                 if published {
-                    self.active_metadata.processing_readiness = RecorderReadiness::Ready;
-                    self.active_metadata.health = RecorderHealth::Healthy;
-                    self.active_metadata.failure = None;
+                    if self.active_metadata.failure == Some(MetadataCode::QuotaPressure) {
+                        self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+                        self.active_metadata.health = RecorderHealth::Degraded;
+                    } else {
+                        self.active_metadata.processing_readiness = RecorderReadiness::Ready;
+                        self.active_metadata.health = RecorderHealth::Healthy;
+                        self.active_metadata.failure = None;
+                    }
                 } else {
                     self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
                     self.active_metadata.health = RecorderHealth::Degraded;
-                    self.active_metadata.failure = Some(MetadataCode::StorageFailure);
+                    if self.active_metadata.failure != Some(MetadataCode::QuotaPressure) {
+                        self.active_metadata.failure = Some(MetadataCode::StorageFailure);
+                    }
                 }
                 self.active_metadata.lag.records = 0;
                 self.active_metadata.lag.age_seconds = 0;
@@ -391,7 +473,9 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                 eprintln!("incremental worker failed: {error}");
                 self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
                 self.active_metadata.health = RecorderHealth::Degraded;
-                self.active_metadata.failure = Some(MetadataCode::StorageFailure);
+                if self.active_metadata.failure != Some(MetadataCode::QuotaPressure) {
+                    self.active_metadata.failure = Some(MetadataCode::StorageFailure);
+                }
             }
         }
         write_recorder_metadata(&self.state_root, &self.active_metadata)
@@ -500,13 +584,24 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             .ok_or(crate::QuotaError::InvalidQuota)?;
         quota.refresh_from_filesystem()?;
         quota.reserve(ReservationKind::RecordingStore, bytes.len() as u64)?;
-        let publication = publish_delta_then_checkpoint(
-            &store,
-            key,
-            &batch,
-            &checkpoint,
-            self.wal_directory.join("incremental-etl-checkpoint.json"),
-        );
+        let publication = if let Some(fault) = self.checkpoint_fault.take() {
+            publish_delta_then_checkpoint_with_fault(
+                &store,
+                key,
+                &batch,
+                &checkpoint,
+                self.wal_directory.join("incremental-etl-checkpoint.json"),
+                Some(fault),
+            )
+        } else {
+            publish_delta_then_checkpoint(
+                &store,
+                key,
+                &batch,
+                &checkpoint,
+                self.wal_directory.join("incremental-etl-checkpoint.json"),
+            )
+        };
         let accounting = quota.rebuild_managed_usage();
         let release = quota.release(ReservationKind::RecordingStore, bytes.len() as u64);
         match (publication, accounting, release) {
@@ -552,16 +647,31 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     }
 
     fn refresh_quota_metadata(&mut self) -> Result<(), ContinuousRecorderError> {
+        let current_wal_bytes = crate::recording_physical_wal_bytes(&self.wal_directory)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        let wal_growth = current_wal_bytes.saturating_sub(self.last_wal_bytes);
         let mut pressure = false;
         let quota = self
             .startup
             .quota_authorities()
             .iter()
             .map(|authority| {
-                let free_bytes = authority.refresh_from_filesystem()?;
+                if wal_growth > 0
+                    && self
+                        .wal_directory
+                        .starts_with(Path::new(&authority.quota().domain))
+                {
+                    authority.consume(ReservationKind::Wal, wal_growth)?;
+                }
+                // Rebuild durable usage on every readiness poll. Refreshing
+                // only statvfs free space misses writes made by WAL/store
+                // publishers and can admit past quota after restart or
+                // concurrent publication.
+                let free_bytes = authority.rebuild_managed_usage()?;
                 let reserved_bytes = authority.reserved_bytes()?;
-                pressure |= reserved_bytes
-                    > free_bytes.saturating_sub(authority.quota().minimum_free_bytes);
+                pressure |= free_bytes < authority.quota().minimum_free_bytes
+                    || reserved_bytes
+                        > free_bytes.saturating_sub(authority.quota().minimum_free_bytes);
                 Ok(QuotaStatus {
                     domain: authority.quota().domain.clone(),
                     quota_bytes: authority.quota().quota_bytes,
@@ -570,17 +680,27 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                 })
             })
             .collect::<Result<Vec<_>, crate::QuotaError>>()?;
+        self.last_wal_bytes = current_wal_bytes;
         let changed = self.active_metadata.quota != quota;
         self.active_metadata.quota = quota;
         if pressure {
+            // Disk pressure is recoverable runtime backpressure, not a process
+            // failure. Stop admission before the next source poll, preserve
+            // committed WAL, and keep status/control-plane polling alive.
+            self.recorder.set_admission_enabled(false);
             self.active_metadata.capture_readiness = RecorderReadiness::NotReady;
-            self.active_metadata.health = RecorderHealth::Failed;
+            self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+            self.active_metadata.health = RecorderHealth::Degraded;
             self.active_metadata.failure = Some(MetadataCode::QuotaPressure);
-            write_recorder_metadata(&self.state_root, &self.active_metadata)
-                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
-            return Err(crate::QuotaError::InsufficientHeadroom.into());
+        } else {
+            self.recorder.set_admission_enabled(true);
+            if self.active_metadata.failure == Some(MetadataCode::QuotaPressure) {
+                self.active_metadata.capture_readiness = RecorderReadiness::Ready;
+                self.active_metadata.health = RecorderHealth::Healthy;
+                self.active_metadata.failure = None;
+            }
         }
-        if changed {
+        if changed || pressure || self.active_metadata.failure.is_none() {
             write_recorder_metadata(&self.state_root, &self.active_metadata)
                 .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
         }
@@ -593,7 +713,24 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         self.active_metadata.counters.captured_bytes = counters.accepted_into_queue.bytes;
         self.active_metadata.counters.committed_records = counters.committed.records;
         self.active_metadata.counters.committed_bytes = counters.committed.bytes;
+        self.active_metadata.counters.quota_rejected_records =
+            counters.rejected_due_to_quota.records;
+        self.active_metadata.counters.quota_rejected_bytes = counters.rejected_due_to_quota.bytes;
         self.active_metadata.updated_at_unix_seconds = unix_seconds();
+    }
+
+    pub fn reserve_successor_quota(
+        &self,
+        next_wal_directory: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<(), ContinuousRecorderError> {
+        let next_wal_directory = next_wal_directory.as_ref();
+        for authority in self.startup.quota_authorities() {
+            if next_wal_directory.starts_with(Path::new(&authority.quota().domain)) {
+                authority.reserve(ReservationKind::Wal, max_bytes)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn rollover(
@@ -630,6 +767,11 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         let boundary = self
             .recorder
             .rollover_to(next_writer, now_millis, outcome_path)?;
+        for authority in self.startup.quota_authorities() {
+            if old_wal_directory.starts_with(Path::new(&authority.quota().domain)) {
+                authority.release_prefix(ReservationKind::Wal, self.epoch_max_bytes)?;
+            }
+        }
         self.metadata.recording_id = boundary.old_recording_id;
         self.metadata
             .last_valid_commit
@@ -639,6 +781,8 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         let selector = self.metadata.selector.clone();
         let capture = self.metadata.capture.clone();
         self.wal_directory.clone_from(&next_wal_directory);
+        self.last_wal_bytes = crate::recording_physical_wal_bytes(&self.wal_directory)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
         self.metadata = RecordingMetadata {
             version: crate::RECORDING_METADATA_SCHEMA_VERSION,
             recording_id: boundary.new_recording_id,
@@ -722,6 +866,34 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     }
 }
 
+fn validate_checkpoint_before_capture(
+    config: &NormalizedRecorderConfig,
+    wal_directory: &Path,
+) -> Result<(), ContinuousRecorderError> {
+    let checkpoint_path = wal_directory.join("incremental-etl-checkpoint.json");
+    if !checkpoint_path.exists() {
+        return Ok(());
+    }
+    let checkpoint = read_checkpoint(&checkpoint_path)
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    let store = FilesystemRecordingStore::new(config.store_root.clone());
+    for output in &checkpoint.outputs {
+        let head = store
+            .head(&output.key)
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        if head.key != output.key
+            || head.kind != RecordingArtifactKind::CanonicalDeltaBatch
+            || head.checksum != output.digest
+            || head.bytes != output.bytes
+        {
+            return Err(ContinuousRecorderError::Incremental(
+                "checkpoint output artifact verification failed".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn digest_hex(value: &[u8; 32]) -> String {
     let mut output = String::with_capacity(64);
     for byte in value {
@@ -795,6 +967,105 @@ mod tests {
         }
         .normalize()
         .unwrap()
+    }
+
+    #[test]
+    fn production_publication_faults_reuse_immutable_output_after_restart_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-publication-fault-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let wal = root.join("wal");
+        let writer =
+            GroupCommitWalWriter::create(&wal, RecordingId::new(), DEFAULT_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        let source = FixtureCaptureSource::from_json(include_bytes!(
+            "../../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let recorder = RecorderOrchestrator::new(source, crate::RecordingIngest::new(writer));
+        let mut service = ContinuousRecorderService::start(
+            &config(&root),
+            &wal,
+            recorder,
+            || Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        service.set_checkpoint_fault(chronicle_etl::CheckpointFault::BeforeCheckpoint);
+        let output_dir = root.join("store/artifacts/deltas");
+        let output_files = || {
+            fs::read_dir(&output_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .flat_map(|directory| fs::read_dir(directory.path()).into_iter().flatten())
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    fs::read(entry.path())
+                        .ok()
+                        .map(|bytes| (entry.path(), bytes))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut orphaned = Vec::new();
+        for tick in 0..40 {
+            service.poll(tick * 250).unwrap();
+            orphaned = output_files();
+            if !orphaned.is_empty() && !wal.join("incremental-etl-checkpoint.json").exists() {
+                break;
+            }
+        }
+        assert!(!orphaned.is_empty());
+        assert!(!wal.join("incremental-etl-checkpoint.json").exists());
+        let recording_id = service.recorder().ingest().recording_id();
+        drop(service);
+        let writer = chronicle_wal::prepare_group_commit_reopen(
+            &wal,
+            recording_id,
+            DEFAULT_SEGMENT_BYTES,
+            chronicle_wal::DEFAULT_MAX_WAL_BYTES,
+            0,
+        )
+        .unwrap()
+        .apply()
+        .unwrap()
+        .0;
+        let source = FixtureCaptureSource::from_json(include_bytes!(
+            "../../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let recorder = RecorderOrchestrator::new(source, crate::RecordingIngest::new(writer));
+        let mut service = ContinuousRecorderService::start(
+            &config(&root),
+            &wal,
+            recorder,
+            || Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        for tick in 40..80 {
+            service.poll(tick * 250).unwrap();
+        }
+        assert!(wal.join("incremental-etl-checkpoint.json").exists());
+        let recovered = output_files();
+        for (path, bytes) in orphaned {
+            assert_eq!(
+                recovered
+                    .iter()
+                    .find(|(candidate, _)| *candidate == path)
+                    .map(|(_, value)| value),
+                Some(&bytes)
+            );
+        }
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

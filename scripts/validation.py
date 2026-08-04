@@ -109,6 +109,35 @@ def select(root: Path, paths: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def source_ownership(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Ensure every production application source has a validation owner."""
+    tracked_value = run(root, "git", "ls-files", "crates/chronicle-application/src")
+    if tracked_value == "not_checked":
+        tracked = [
+            str(path.relative_to(root))
+            for path in (root / "crates/chronicle-application/src").rglob("*.rs")
+        ]
+    else:
+        tracked = tracked_value.splitlines()
+    groups = cfg.get("groups", {})
+    owners: dict[str, list[str]] = {}
+    unowned: list[str] = []
+    for name in tracked:
+        if not name.endswith(".rs"):
+            continue
+        matches_for_file = [
+            group_name
+            for group_name, group in groups.items()
+            if "p2" in group.get("gates", [])
+            and any(matches(name, pattern) for pattern in group.get("paths", []))
+        ]
+        if matches_for_file:
+            owners[name] = sorted(matches_for_file)
+        else:
+            unowned.append(name)
+    return {"files": len(owners) + len(unowned), "owners": owners, "unowned": sorted(unowned)}
+
+
 def files_for_patterns(root: Path, patterns: list[str]) -> list[Path]:
     result: set[Path] = set()
     tracked = run(root, "git", "ls-files").splitlines()
@@ -436,6 +465,9 @@ def main() -> int:
     select_parser.add_argument("--config", type=Path)
     environment_parser = sub.add_parser("environment")
     environment_parser.add_argument("--root", type=Path, required=True)
+    ownership_parser = sub.add_parser("ownership")
+    ownership_parser.add_argument("--root", type=Path, required=True)
+    ownership_parser.add_argument("--config", type=Path)
     fp_parser = sub.add_parser("fingerprint")
     fp_parser.add_argument("--root", type=Path, required=True)
     fp_parser.add_argument("--gate", required=True)
@@ -464,6 +496,11 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "environment":
         print(json.dumps(environment(args.root), indent=2, sort_keys=True))
+    elif args.command == "ownership":
+        value = source_ownership(args.root, config(args.root, args.config))
+        print(json.dumps(value, indent=2, sort_keys=True))
+        if value["unowned"]:
+            return 1
     elif args.command == "select":
         cfg = config(args.root, args.config)
         paths = (

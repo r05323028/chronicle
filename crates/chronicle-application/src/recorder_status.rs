@@ -29,6 +29,7 @@ pub struct RecorderStatusV1 {
     pub capture_readiness: RecorderReadiness,
     pub processing_readiness: RecorderReadiness,
     pub health: RecorderHealth,
+    pub failure: Option<MetadataCode>,
     pub lifecycle: RecorderLifecycleState,
     pub recorder_id: uuid::Uuid,
     pub attempt_id: uuid::Uuid,
@@ -111,6 +112,7 @@ impl RecorderStatusV1 {
                 metadata.processing_readiness
             },
             health,
+            failure: metadata.failure,
             lifecycle: metadata.lifecycle,
             recorder_id: metadata.recorder_id,
             attempt_id: metadata.attempt_id,

@@ -58,6 +58,7 @@ impl RecorderMetadataV1 {
         }
         if self.lifecycle == RecorderLifecycleState::Running
             && self.capture_readiness != RecorderReadiness::Ready
+            && self.failure != Some(MetadataCode::QuotaPressure)
         {
             return Err(RecorderMetadataError::Contradiction);
         }
@@ -264,6 +265,10 @@ pub struct RecorderCounters {
     pub committed_bytes: u64,
     pub rollover_failure_records: u64,
     pub rollover_failure_bytes: u64,
+    #[serde(default)]
+    pub quota_rejected_records: u64,
+    #[serde(default)]
+    pub quota_rejected_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

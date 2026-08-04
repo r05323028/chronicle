@@ -41,7 +41,7 @@ Check status counters and quota/free bytes. Stop new admission when minimum-free
 
 ## Corruption and recovery
 
-Quarantine contradictory manifest, checkpoint, or digest artifacts. Preserve WAL commit markers and tombstones. Restart recorder; inspect status remediation and recovery evidence before resuming capture.
+Preserve contradictory manifest, checkpoint, or digest artifacts in place; they remain non-authoritative. Preserve WAL commit markers and tombstones. Restart recorder; inspect status remediation and recovery evidence before resuming capture.
 
 ## Evidence export
 

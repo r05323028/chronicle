@@ -99,7 +99,7 @@ Filesystem backend SHALL reject traversal, symlink escape, cross-filesystem publ
 
 ### Requirement: Artifact lifecycle is monotonic and retention-safe
 
-Immutable artifact lifecycle SHALL be `staged -> published -> referenced -> retention_eligible -> deleted`, with `quarantined` alternative on integrity/lineage conflict. Published transition SHALL require durable store confirmation; referenced SHALL require durable manifest/checkpoint; retention eligibility SHALL require policy and all dependent lineage; delete SHALL use exact key/digest precondition and durable tombstone/report. Automatic deletion SHALL not act on staged, unreferenced-young, conflicting, quarantined, or required-by-retained-lineage artifact.
+Immutable artifact lifecycle SHALL be `staged -> published -> referenced -> retention_eligible -> deleted`, with evidence-preservation alternative on integrity/lineage conflict. Published transition SHALL require durable store confirmation; referenced SHALL require durable manifest/checkpoint; retention eligibility SHALL require policy and all dependent lineage; delete SHALL use exact key/digest precondition and durable tombstone/report. Automatic deletion SHALL not act on staged, unreferenced-young, conflicting, quarantined, or required-by-retained-lineage artifact.
 
 Source WAL and derived canonical artifacts SHALL have independent retention classes. Deletion of one SHALL not imply deletion eligibility of other. Failed delete SHALL remain retryable and SHALL not make manifest claim object absent unless direct verification confirms.
 
@@ -111,7 +111,7 @@ Source WAL and derived canonical artifacts SHALL have independent retention clas
 #### Scenario: Delete precondition mismatch
 
 - **WHEN** key content differs from expected digest at deletion
-- **THEN** store quarantines/reports conflict and does not delete
+- **THEN** store preserves/reports conflict and does not delete
 
 ### Requirement: P2 upload boundary stops at sealed immutable artifacts
 

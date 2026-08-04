@@ -39,12 +39,16 @@ import sys
 
 path, phase, status, exit_code, require_empty = sys.argv[1:]
 report = json.load(open(path, encoding="utf-8"))
-assert report.get("phase") == phase
-assert report.get("status") == status
-assert report.get("exit_code") == int(exit_code)
-assert isinstance(report.get("not_checked"), list)
+checks = [
+    report.get("phase") == phase,
+    report.get("status") == status,
+    report.get("exit_code") == int(exit_code),
+    isinstance(report.get("not_checked"), list),
+]
 if require_empty == "true":
-    assert not report["not_checked"]
+    checks.append(not report["not_checked"])
+if not all(checks):
+    raise SystemExit(f"invalid acceptance report: {path}")
 PY
 }
 
@@ -114,7 +118,8 @@ SECOND_STATUS=0
 multipass exec "$VM" -- bash -lc "
   set -euo pipefail
   for stale in \$(systemctl list-units --all --plain --no-legend --type=service 'chronicle-p2-*.service' | awk '\$1 ~ /^chronicle-p2-/ {print \$1}'); do
-    sudo systemctl stop \"\$stale\" 2>/dev/null || true
+    sudo systemctl kill --kill-who=main -s SIGKILL \"\$stale\" 2>/dev/null || true
+    sudo systemctl reset-failed \"\$stale\" 2>/dev/null || true
   done
   test \"\$(git -C '$VM_ROOT' rev-parse HEAD)\" = '$SHA'
   test -f '$VM_ARTIFACTS/acceptance-report.json'
@@ -170,9 +175,10 @@ if [[ $SECOND_STATUS -eq 0 ]]; then
 	python3 - "$DEST/reboot-resume/acceptance-report.json" <<'PY'
 import json, sys
 report = json.load(open(sys.argv[1], encoding="utf-8"))
-assert report["git_commit_sha"] == report["expected_git_commit_sha"]
-assert report["status"] == "passed", report
-assert not report["not_checked"], report
+if report.get("git_commit_sha") != report.get("expected_git_commit_sha"):
+    raise SystemExit("acceptance commit mismatch")
+if report.get("status") != "passed" or report.get("not_checked"):
+    raise SystemExit(f"acceptance incomplete: {report}")
 PY
 fi
 if [[ -f "$DEST/artifact-manifest.sha256" ]]; then

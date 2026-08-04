@@ -108,6 +108,11 @@ ETL lag, retry, or retention backlog MAY make processing/overall health degraded
 - **WHEN** recorder process is alive but WAL recovery or appendable-epoch preparation is incomplete
 - **THEN** liveness is true, capture readiness is false, processing readiness is false or unknown, and overall health reports recovery state
 
+#### Scenario: Recoverable quota pressure
+
+- **WHEN** managed usage or minimum-free headroom crosses configured admission limits while recorder is running
+- **THEN** recorder remains alive, preserves committed WAL, stops new admission, reports capture readiness `not_ready`, health `degraded`, and bounded `quota_pressure` metadata, continues capacity polling, and resumes admission only after headroom is restored
+
 ### Requirement: Versioned active-recorder metadata
 
 Recorder SHALL atomically maintain private active metadata containing schema version, recorder identity, process-attempt identity, configuration digest, canonical cgroup path/stable ID/scope acknowledgement, lifecycle state, readiness, start/update times, boot/clock identity, current and previous epoch IDs/ordinals, active segment identity, final recovery-authoritative commit boundary, `IncrementalEtlCheckpoint v1` boundary and lag, retained physical bytes, quota/minimum-free-space state, categorized capture/WAL loss counters, last recovery result, and shutdown/failure code.

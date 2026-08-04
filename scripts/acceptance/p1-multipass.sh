@@ -84,10 +84,27 @@ printf '%s\n' "$SHA" >"$DEST/tested-commit.txt"
 	sha256sum -c artifact-manifest.sha256
 )
 printf '%s\n' "Retained evidence: $DEST"
-if [[ $REMOTE_STATUS -ne 0 ]]; then
-	if [[ -f "$DEST/acceptance-report.json" ]] && grep -q '\"status\": \"passed\"' "$DEST/acceptance-report.json"; then
-		REMOTE_STATUS=0
-	else
-		exit "$REMOTE_STATUS"
-	fi
+if [[ ! -f "$DEST/acceptance-report.json" ]]; then
+	exit "${REMOTE_STATUS:-1}"
 fi
+if ! python3 - "$DEST/acceptance-report.json" "$SHA" <<'PY'
+import json
+import sys
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = sys.argv[2]
+required = [
+    report.get("status") == "passed",
+    report.get("p1_retained_acceptance") == "complete"
+    or report.get("checks", {}).get("p1_retained_acceptance") == "complete",
+    report.get("git_commit_sha") == expected,
+    report.get("expected_git_commit_sha") == expected,
+    report.get("working_tree_dirty") is False,
+    report.get("tree_clean_for_entire_run") is True,
+]
+if not all(required):
+    raise SystemExit(f"incomplete P1 acceptance report: {report}")
+PY
+then
+	exit "${REMOTE_STATUS:-1}"
+fi
+REMOTE_STATUS=0

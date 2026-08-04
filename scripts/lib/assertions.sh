@@ -12,7 +12,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     value = json.load(source)
-helpers = {"len": len, "sum": sum, "all": all, "any": any}
+helpers = {"len": len, "sum": sum, "all": all, "any": any, "int": int}
 if not eval(sys.argv[2], {"__builtins__": {}, **helpers}, {"value": value}):
     raise SystemExit(f"JSON assertion failed: {sys.argv[2]}")
 PY

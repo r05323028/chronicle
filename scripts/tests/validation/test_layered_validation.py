@@ -191,6 +191,15 @@ class LayeredValidationTests(unittest.TestCase):
             1,
         )
 
+    def test_future_recorder_source_requires_p2_owner(self):
+        future = self.temp / "crates/chronicle-application/src/future_lifecycle.rs"
+        future.parent.mkdir(parents=True, exist_ok=True)
+        future.write_text("fn future_lifecycle() {}\n")
+        cfg = {"groups": {name: dict(group) for name, group in self.cfg["groups"].items()}}
+        cfg["groups"]["etl"]["paths"] = ["crates/chronicle-etl/**"]
+        ownership = validation.source_ownership(self.temp, cfg)
+        self.assertIn("crates/chronicle-application/src/future_lifecycle.rs", ownership["unowned"])
+
     def test_recorder_source_selects_p2_validation(self):
         result = validation.select(
             self.temp,

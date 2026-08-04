@@ -373,7 +373,6 @@ Age rotation SHALL use existing order: commit/sync all current-segment data with
 - **WHEN** process fails at any age-rotation write/sync/publish step
 - **THEN** recovery recognizes only existing validated commit/segment authority and resumes or fails by existing rules
 
-
 ### Requirement: Versioned crash-safe WAL manifest
 
 Each recording epoch SHALL have layout:
@@ -409,12 +408,11 @@ Manifest replacement SHALL use private temp write, file sync, atomic rename, the
 - **WHEN** segment set is complete and valid but manifest is absent
 - **THEN** recovery deterministically rebuilds manifest before readiness
 
-
 ### Requirement: Explicit segment lifecycle
 
-Segment lifecycle SHALL be `active -> sealed -> processed -> retention_eligible -> deleting -> deleted`, with `quarantined` terminal alternative for corruption or contradiction. Exactly one segment MAY be active per epoch. Only recovery-authoritative marker ending at or before sealed length MAY establish sealed range. Processed transition SHALL require durable ETL checkpoint that names exact segment digest/range and every required immutable publication. Retention eligibility SHALL additionally require configured retention policy. No transition SHALL regress or skip proof requirements.
+Segment lifecycle SHALL be `active -> sealed -> processed -> retention_eligible -> deleting -> deleted`; corruption or contradiction is a terminal evidence-preservation state. Exactly one segment MAY be active per epoch. Only recovery-authoritative marker ending at or before sealed length MAY establish sealed range. Processed transition SHALL require durable ETL checkpoint that names exact segment digest/range and every required immutable publication. Retention eligibility SHALL additionally require configured retention policy. No transition SHALL regress or skip proof requirements.
 
-Deleted entries SHALL remain bounded tombstones in manifest/epoch index until entire epoch retention record expires. Tombstone SHALL retain identity, range, digest, checkpoint/publication references, deletion reason/time, and cleanup transaction ID but no captured bytes. Quarantined segments SHALL never be auto-deleted.
+Deleted entries SHALL remain bounded tombstones in manifest/epoch index until entire epoch retention record expires. Tombstone SHALL retain identity, range, digest, checkpoint/publication references, deletion reason/time, and cleanup transaction ID but no captured bytes. Evidence-preservation segments SHALL never be auto-deleted.
 
 #### Scenario: Segment processed
 
@@ -429,8 +427,7 @@ Deleted entries SHALL remain bounded tombstones in manifest/epoch index until en
 #### Scenario: Corrupt sealed segment
 
 - **WHEN** sealed segment digest or committed content fails validation
-- **THEN** segment is quarantined/preserved and automatic cleanup stops for affected epoch
-
+- **THEN** segment remains preserved in place, is non-authoritative, and automatic cleanup stops for affected epoch
 
 ### Requirement: Checkpoint-gated cleanup transaction
 
@@ -453,12 +450,11 @@ Cleanup ordering SHALL be: persist `deleting` intent with transaction ID and exa
 - **WHEN** expected segment file is absent and no valid deletion tombstone/transaction proves removal
 - **THEN** recovery fails with missing committed data and does not continue
 
-
 ### Requirement: Retention policy is explicit and conservative
 
 Recorder configuration SHALL declare retention mode and bounds. P2 SHALL support `retain` and `delete_after` policy for local WAL; implicit deletion SHALL NOT occur. `delete_after` SHALL specify minimum age and MAY specify maximum retained bytes, but both remain subordinate to checkpoint-gated eligibility. Policy changes SHALL be recorded by configuration digest and SHALL NOT retroactively authorize cleanup until next successful reconciliation.
 
-Canonical outputs, checkpoints, manifests, and tombstones SHALL have separate retention classes from source WAL. Deleting source WAL SHALL preserve provenance that source was intentionally expired and SHALL not claim raw evidence remains available. Failed, quarantined, unprocessed, uncheckpointed, or policy-unexpired segments SHALL not be deleted automatically.
+Canonical outputs, checkpoints, manifests, and tombstones SHALL have separate retention classes from source WAL. Deleting source WAL SHALL preserve provenance that source was intentionally expired and SHALL not claim raw evidence remains available. Failed, corrupted, unprocessed, uncheckpointed, or policy-unexpired segments SHALL not be deleted automatically.
 
 #### Scenario: Retain policy
 
@@ -474,7 +470,6 @@ Canonical outputs, checkpoints, manifests, and tombstones SHALL have separate re
 
 - **WHEN** epoch ends failed with valid committed prefix and unresolved uncertain tail
 - **THEN** automatic cleanup preserves its WAL until operator resolves or policy explicitly covers verified data and uncertainty handling
-
 
 ### Requirement: Global quota and minimum-free-space protection
 
@@ -503,7 +498,6 @@ At pressure threshold recorder SHALL first run only already-eligible cleanup. It
 
 - **WHEN** canonical/store root resides on different filesystem from active WAL
 - **THEN** each filesystem enforces independent quota/minimum-free reserve and failure in store domain cannot consume WAL reserve
-
 
 ### Requirement: Lifecycle indexes remain bounded
 
@@ -546,7 +540,6 @@ Compaction SHALL use private temp-write, file sync, atomic rename, and directory
 - **WHEN** candidate source revision/digest is stale or candidate digest conflicts with its source index
 - **THEN** recovery rejects candidate, preserves old authoritative index, and does not install partial or guessed lineage
 
-
 ### Requirement: Continuous recovery reconciles manifest, files, and checkpoints
 
 Startup recovery SHALL enumerate recognized files deterministically, validate all non-deleted segment headers/envelopes/markers and sealed digests, reconcile manifest revision and deletion transactions, compare ETL checkpoints/publications, and derive exact active/sealed/processed/eligible states. Read-only validation of live active segment SHALL stop at stable recovery-authoritative marker snapshot and SHALL treat concurrently growing/partial suffix as mutable uncertainty, not corruption; only exclusive startup recovery MAY repair/truncate existing allowed final tail.
@@ -568,7 +561,6 @@ Manifest rebuild SHALL preserve existing segment ordinals, sequence ranges, comm
 - **WHEN** recovery runs twice over unchanged state after one allowed repair
 - **THEN** second run produces identical manifest/checkpoint states with no additional mutation
 
-
 ### Requirement: WAL lifecycle acceptance
 
 Automated tests SHALL cover size/age rotation, manifest atomicity/rebuild/contradiction, every segment transition, quota reservation, retention eligibility, cleanup crash points, corruption, live snapshot behavior, and deterministic recovery. Privileged acceptance SHALL retain machine-readable manifest, segment/checkpoint digests, quota/cleanup report, and environment/commit identity for real continuous capture across multiple rotations and restart.
@@ -581,4 +573,4 @@ Automated tests SHALL cover size/age rotation, manifest atomicity/rebuild/contra
 #### Scenario: Corruption detection proof
 
 - **WHEN** acceptance corrupts sealed segment before cleanup eligibility
-- **THEN** recorder quarantines/preserves evidence, blocks cleanup/readiness for affected lineage, and reports stable code
+- **THEN** recorder preserves evidence in place, blocks cleanup/readiness for affected lineage, and reports stable code
