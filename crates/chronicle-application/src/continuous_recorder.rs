@@ -502,13 +502,17 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                 }
             }
             if processor.last_marker_sequence() == Some(snapshot.snapshot.marker_sequence) {
-                if !processor.marker_digest_matches(&snapshot.snapshot.marker_digest)
-                    || snapshot
-                        .envelopes
-                        .iter()
-                        .any(|envelope| envelope.sequence > snapshot.snapshot.marker_sequence)
-                {
-                    eprintln!("incremental processor marker state mismatch");
+                let digest_matches = processor.marker_digest_matches(&snapshot.snapshot.marker_digest);
+                let has_ahead_envelope = snapshot
+                    .envelopes
+                    .iter()
+                    .any(|envelope| envelope.sequence > snapshot.snapshot.marker_sequence);
+                if !digest_matches || has_ahead_envelope {
+                    eprintln!(
+                        "incremental processor marker state mismatch: digest_matches={digest_matches} ahead={has_ahead_envelope} marker={} envelopes={}",
+                        snapshot.snapshot.marker_sequence,
+                        snapshot.envelopes.len()
+                    );
                     return Err(IncrementalWorkerError::BatchFailed);
                 }
                 return Ok(0);

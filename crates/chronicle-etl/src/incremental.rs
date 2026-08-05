@@ -143,9 +143,10 @@ impl IncrementalProcessor {
                     .zip(snapshot.segment_lineage)
                     .any(|(previous, current)| {
                         previous.ordinal != current.ordinal
-                            || previous.digest != hex_bytes(&current.digest)
                             || previous.first_sequence != current.first_sequence
                             || previous.last_sequence > current.last_sequence
+                            || (previous.last_sequence == current.last_sequence
+                                && previous.digest != hex_bytes(&current.digest))
                     }))
         {
             return Err(EtlError::SnapshotLineageMismatch);
@@ -510,5 +511,27 @@ mod tests {
             ),
             Err(EtlError::SnapshotLineageMismatch)
         ));
+
+        let envelope = WalRecordEnvelope {
+            sequence: 1,
+            ..envelope
+        };
+        let extended_lineage = [chronicle_wal::CommittedSegment {
+            digest: [3; 32],
+            last_sequence: 1,
+            ..first_lineage[0].clone()
+        }];
+        processor
+            .process_snapshot(
+                CommittedWalSnapshot {
+                    marker_sequence: 1,
+                    marker_digest: [1; 32],
+                    envelopes: std::slice::from_ref(&envelope),
+                    segment_lineage: &extended_lineage,
+                },
+                &registry,
+                SessionId::new(),
+            )
+            .unwrap();
     }
 }
