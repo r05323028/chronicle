@@ -57,7 +57,14 @@ pub fn recover_pending_checkpoint<S: RecordingStore>(
     let mut present = 0usize;
     for output in &candidate.outputs {
         match store.head(&output.key) {
-            Ok(_) => present += 1,
+            Ok(head)
+                if head.kind == RecordingArtifactKind::CanonicalDeltaBatch
+                    && head.checksum == output.digest
+                    && head.bytes == output.bytes =>
+            {
+                present += 1;
+            }
+            Ok(_) => return Err(PublicationError::Verification),
             Err(RecordingStoreError::NotFound) => {}
             Err(error) => return Err(PublicationError::Store(error)),
         }
@@ -69,10 +76,24 @@ pub fn recover_pending_checkpoint<S: RecordingStore>(
     if present != candidate.outputs.len() {
         return Err(PublicationError::OutputLineage);
     }
-    let mut outcome = ReconcileOutcome::AlreadyConsistent;
-    for output in &candidate.outputs {
-        outcome = reconcile_delta_checkpoint(store, &output.key, &candidate, checkpoint_path)?;
-    }
+    let outcome = match read_checkpoint(checkpoint_path) {
+        Ok(existing) if existing.encode()? == candidate.encode()? => {
+            ReconcileOutcome::AlreadyConsistent
+        }
+        Ok(existing)
+            if candidate.predecessor_digest.as_ref() == Some(&existing.checksum)
+                && existing.outputs.len() <= candidate.outputs.len()
+                && existing.outputs == candidate.outputs[..existing.outputs.len()] =>
+        {
+            write_checkpoint_atomic(checkpoint_path, &candidate)?;
+            ReconcileOutcome::AdoptedOutput
+        }
+        Err(CheckpointError::Io) => {
+            write_checkpoint_atomic(checkpoint_path, &candidate)?;
+            ReconcileOutcome::RepairedCheckpoint
+        }
+        Ok(_) | Err(_) => return Err(PublicationError::OutputLineage),
+    };
     remove_pending_checkpoint(&pending_path)?;
     Ok(Some(outcome))
 }
