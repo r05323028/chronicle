@@ -342,7 +342,7 @@ if [[ "$CRASH_MODE" == 1 ]]; then
 	sleep 1
 	systemctl kill --kill-who=main -s SIGKILL "$UNIT"
 	RECORDER_STATUS="$ARTIFACT_ROOT/recorder-restart-status.json" \
-		wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
+		wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
 	systemctl is-active --quiet "$UNIT"
 	set_check process_restart_readiness passed
 fi
@@ -580,7 +580,7 @@ PY
 systemctl kill --kill-who=main -s SIGKILL "$UNIT"
 rm -f "$CHECKPOINT_PAUSE_FILE"
 systemctl restart "$UNIT"
-wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
+wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
 PID_AFTER=$(systemctl show "$UNIT" -p ExecMainPID --value)
 test "$PID_BEFORE" != "$PID_AFTER"
 if find "$STATE_ROOT/wal" -type f -name '*.pending' -print -quit | grep -q .; then

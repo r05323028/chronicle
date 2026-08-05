@@ -150,11 +150,6 @@ wait_for_recorder_ready() {
 		case ${state%%|*} in
 		ready) return 0 ;;
 		failed)
-			if [[ ${state##*|} == true ]] && systemctl is-active --quiet "$UNIT"; then
-				printf '[%s] stale owner while active unit reacquires lease; waiting\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$ARTIFACT_ROOT/readiness-transitions.log"
-				sleep "$interval"
-				continue
-			fi
 			if [[ $allow_stale_owner == true && ${state##*|} == true ]]; then
 				printf '[%s] stale owner while recorder restarts; continuing\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$ARTIFACT_ROOT/readiness-transitions.log"
 			else
