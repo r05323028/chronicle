@@ -559,8 +559,17 @@ for _ in $(seq 1 120); do
 done
 test -f "$CHECKPOINT_READY_FILE"
 PENDING_BEFORE=$(find "$STATE_ROOT/wal" -type f -name '*.pending' -print -quit)
-DELTA_BEFORE=$(find "$STORE_ROOT/artifacts/deltas" -type f -print -quit)
-test -n "$PENDING_BEFORE" -a -f "$DELTA_BEFORE"
+test -n "$PENDING_BEFORE"
+DELTA_BEFORE=$(python3 - "$PENDING_BEFORE" "$STORE_ROOT" <<'PY'
+import json, sys
+from pathlib import Path
+pending = json.load(open(sys.argv[1], encoding="utf-8"))
+key = pending["outputs"][-1]["key"]
+path = Path(sys.argv[2], "artifacts", *key.split("/"))
+print(path)
+PY
+)
+test -f "$DELTA_BEFORE"
 PID_BEFORE=$(systemctl show "$UNIT" -p ExecMainPID --value)
 python3 - "$PENDING_BEFORE" "$DELTA_BEFORE" <<'PY'
 import json, sys

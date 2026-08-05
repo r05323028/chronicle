@@ -452,7 +452,10 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             ) {
                 Ok(snapshot) => snapshot,
                 Err(chronicle_wal::WalError::NoPublishedSegments) => return Ok(0),
-                Err(_) => return Err(IncrementalWorkerError::BatchFailed),
+                Err(error) => {
+                    eprintln!("incremental snapshot failed: {error}");
+                    return Err(IncrementalWorkerError::BatchFailed);
+                }
             };
             if let Some(checkpoint) = &checkpoint
                 && checkpoint.marker.sequence < snapshot.snapshot.marker_sequence
@@ -467,6 +470,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                         digest_hex(&digest)
                     });
                 if marker_digest.as_deref() != Some(checkpoint.marker.marker_digest.as_str()) {
+                    eprintln!("incremental checkpoint marker digest mismatch");
                     return Err(IncrementalWorkerError::BatchFailed);
                 }
             }
@@ -477,6 +481,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                         && checkpoint.marker.marker_digest
                             != digest_hex(&snapshot.snapshot.marker_digest)))
             {
+                eprintln!("incremental checkpoint recording or marker sequence mismatch");
                 return Err(IncrementalWorkerError::BatchFailed);
             }
             if let Some(checkpoint) = &checkpoint {
@@ -487,8 +492,12 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                     checkpoint.marker.segment_ordinal,
                     checkpoint.marker.sequence,
                 )
-                .map_err(|_| IncrementalWorkerError::BatchFailed)?;
+                .map_err(|error| {
+                    eprintln!("incremental checkpoint segment prefix failed: {error}");
+                    IncrementalWorkerError::BatchFailed
+                })?;
                 if digest_hex(&active_digest) != checkpoint.marker.active_segment_digest {
+                    eprintln!("incremental checkpoint lineage mismatch");
                     return Err(IncrementalWorkerError::BatchFailed);
                 }
             }
@@ -499,6 +508,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                         .iter()
                         .any(|envelope| envelope.sequence > snapshot.snapshot.marker_sequence)
                 {
+                    eprintln!("incremental processor marker state mismatch");
                     return Err(IncrementalWorkerError::BatchFailed);
                 }
                 return Ok(0);
@@ -514,7 +524,10 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                     protocol_registry,
                     session_id,
                 )
-                .map_err(|_| IncrementalWorkerError::BatchFailed)?;
+                .map_err(|error| {
+                    eprintln!("incremental processor snapshot failed: {error}");
+                    IncrementalWorkerError::BatchFailed
+                })?;
             let active_segment_digest = chronicle_wal::verified_segment_prefix_sha256(
                 &wal_directory,
                 recording_id,
@@ -522,7 +535,10 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                 snapshot.snapshot.marker_segment_ordinal,
                 snapshot.snapshot.marker_sequence,
             )
-            .map_err(|_| IncrementalWorkerError::BatchFailed)?;
+            .map_err(|error| {
+                eprintln!("incremental snapshot segment prefix failed: {error}");
+                IncrementalWorkerError::BatchFailed
+            })?;
             marker = Some((
                 snapshot.snapshot.marker_sequence,
                 snapshot.snapshot.marker_segment_ordinal,
