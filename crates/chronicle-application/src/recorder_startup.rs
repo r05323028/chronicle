@@ -1,10 +1,12 @@
 //! Ordered pre-ETL recorder startup.
 
 use crate::{
-    NormalizedRecorderConfig, QuotaError, QuotaReservationAuthority, RecorderHealth, RecorderLease,
-    RecorderLeaseError, RecorderLifecycle, RecorderLifecycleError, RecorderReadiness,
+    MetadataCode, NormalizedRecorderConfig, QuotaError, QuotaReservationAuthority, RecorderHealth,
+    RecorderLease, RecorderLeaseError, RecorderLifecycle, RecorderLifecycleError,
+    RecorderLifecycleState, RecorderReadiness, load_recorder_metadata, write_recorder_metadata,
 };
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,6 +17,8 @@ pub enum RecorderStartupError {
     Lifecycle(#[from] RecorderLifecycleError),
     #[error("recorder startup recovery failed")]
     Recovery,
+    #[error("recorder startup recovery failed: {0}")]
+    RecoveryDetail(String),
     #[error("recorder capture attachment failed")]
     CaptureAttach,
     #[error("recorder quota reservation failed")]
@@ -29,6 +33,7 @@ pub struct RecorderStartup {
     lease: RecorderLease,
     lifecycle: RecorderLifecycle,
     quotas: Vec<QuotaReservationAuthority>,
+    state_root: std::path::PathBuf,
 }
 
 impl RecorderStartup {
@@ -55,58 +60,70 @@ impl RecorderStartup {
             lease,
             lifecycle,
             quotas: Vec::new(),
+            state_root: config.state_root.clone(),
         })
     }
 
-    /// Completes startup after retention/quota activation. Recovery includes
+    /// Acquires lease and quota authority before recovery. Recovery includes
     /// state, WAL, manifest, checkpoint, and cleanup reconciliation; ETL is
     /// resumed only after capture is attached and appendability is durable.
     pub(crate) fn prepare_foundation(
         config: &NormalizedRecorderConfig,
-        recover_foundation: impl FnOnce() -> Result<(), RecorderStartupError>,
+        recover_foundation: impl FnOnce(
+            &[QuotaReservationAuthority],
+        ) -> Result<(), RecorderStartupError>,
+        reserve_quota: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
+    ) -> Result<Self, RecorderStartupError> {
+        Self::prepare_foundation_with_metadata(
+            config,
+            |_| Ok(()),
+            recover_foundation,
+            reserve_quota,
+        )
+    }
+
+    pub(crate) fn prepare_foundation_with_metadata(
+        config: &NormalizedRecorderConfig,
+        persist_metadata: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
+        recover_foundation: impl FnOnce(
+            &[QuotaReservationAuthority],
+        ) -> Result<(), RecorderStartupError>,
         reserve_quota: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
     ) -> Result<Self, RecorderStartupError> {
         let lease = RecorderLease::acquire(config)?;
         let mut lifecycle = RecorderLifecycle::new();
         lifecycle.begin_recovery()?;
-        if let Err(error) = recover_foundation() {
+        let quotas = build_quota_authorities(config)?;
+        if let Err(error) = persist_metadata(&quotas) {
             lifecycle.fail();
+            persist_startup_failure_at(&config.state_root, failure_code(&error));
             return Err(error);
         }
-        let quotas = config
-            .domains
-            .iter()
-            .map(|domain| {
-                let domain_root = Path::new(&domain.identity.canonical_root);
-                let managed_roots = [config.state_root.as_path(), config.store_root.as_path()]
-                    .into_iter()
-                    .filter(|root| root.starts_with(domain_root))
-                    .collect::<Vec<_>>();
-                QuotaReservationAuthority::from_filesystem_with_roots(
-                    &domain.identity.canonical_root,
-                    &managed_roots,
-                    domain.quota_bytes,
-                    domain.minimum_free_bytes,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         if quotas
             .iter()
             .any(|quota| quota.available_bytes() < quota.quota().minimum_free_bytes)
         {
             lifecycle.fail();
+            persist_startup_failure_at(&config.state_root, MetadataCode::QuotaPressure);
             return Err(RecorderStartupError::Quota(
                 QuotaError::InsufficientHeadroom,
             ));
         }
         if let Err(error) = reserve_quota(&quotas) {
             lifecycle.fail();
+            persist_startup_failure_at(&config.state_root, failure_code(&error));
+            return Err(error);
+        }
+        if let Err(error) = recover_foundation(&quotas) {
+            lifecycle.fail();
+            persist_startup_failure_at(&config.state_root, failure_code(&error));
             return Err(error);
         }
         Ok(Self {
             lease,
             lifecycle,
             quotas,
+            state_root: config.state_root.clone(),
         })
     }
 
@@ -118,14 +135,17 @@ impl RecorderStartup {
     ) -> Result<Self, RecorderStartupError> {
         if let Err(error) = establish_appendable() {
             self.lifecycle.fail();
+            persist_startup_failure_at(&self.state_root, failure_code(&error));
             return Err(error);
         }
         if let Err(error) = attach_capture() {
             self.lifecycle.fail();
+            persist_startup_failure_at(&self.state_root, failure_code(&error));
             return Err(error);
         }
         if let Err(error) = resume_etl() {
             self.lifecycle.fail();
+            persist_startup_failure_at(&self.state_root, failure_code(&error));
             return Err(error);
         }
         self.lifecycle.running(RecorderReadiness::Ready)?;
@@ -134,7 +154,9 @@ impl RecorderStartup {
 
     pub fn start_post_foundation(
         config: &NormalizedRecorderConfig,
-        recover_foundation: impl FnOnce() -> Result<(), RecorderStartupError>,
+        recover_foundation: impl FnOnce(
+            &[QuotaReservationAuthority],
+        ) -> Result<(), RecorderStartupError>,
         reserve_quota: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
         establish_appendable: impl FnOnce() -> Result<(), RecorderStartupError>,
         attach_capture: impl FnOnce() -> Result<(), RecorderStartupError>,
@@ -180,6 +202,59 @@ impl RecorderStartup {
     pub fn lease(&self) -> &RecorderLease {
         &self.lease
     }
+}
+
+pub(crate) fn build_quota_authorities(
+    config: &NormalizedRecorderConfig,
+) -> Result<Vec<QuotaReservationAuthority>, QuotaError> {
+    config
+        .domains
+        .iter()
+        .map(|domain| {
+            let domain_root = Path::new(&domain.identity.canonical_root);
+            let managed_roots = [config.state_root.as_path(), config.store_root.as_path()]
+                .into_iter()
+                .filter(|root| root.starts_with(domain_root))
+                .collect::<Vec<_>>();
+            QuotaReservationAuthority::from_filesystem_with_roots(
+                &domain.identity.canonical_root,
+                &managed_roots,
+                domain.quota_bytes,
+                domain.minimum_free_bytes,
+            )
+        })
+        .collect()
+}
+
+fn failure_code(error: &RecorderStartupError) -> MetadataCode {
+    match error {
+        RecorderStartupError::Recovery | RecorderStartupError::RecoveryDetail(_) => {
+            MetadataCode::RecoveryFailure
+        }
+        RecorderStartupError::Quota(_) => MetadataCode::QuotaPressure,
+        RecorderStartupError::Appendable => MetadataCode::AppendableFailure,
+        RecorderStartupError::CaptureAttach => MetadataCode::CaptureAttachFailure,
+        RecorderStartupError::EtlResume => MetadataCode::EtlResumeFailure,
+        RecorderStartupError::Lease(_) | RecorderStartupError::Lifecycle(_) => {
+            MetadataCode::StorageFailure
+        }
+    }
+}
+
+fn persist_startup_failure_at(state_root: &Path, code: MetadataCode) {
+    let Ok(mut metadata) = load_recorder_metadata(state_root) else {
+        return;
+    };
+    metadata.lifecycle = RecorderLifecycleState::Failed;
+    metadata.capture_readiness = RecorderReadiness::NotReady;
+    metadata.processing_readiness = RecorderReadiness::NotReady;
+    metadata.health = RecorderHealth::Failed;
+    metadata.failure = Some(code);
+    metadata.updated_at_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = write_recorder_metadata(state_root, &metadata);
 }
 
 #[cfg(test)]
@@ -240,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn post_foundation_startup_orders_recovery_quota_append_capture_etl() {
+    fn post_foundation_startup_orders_quota_recovery_append_capture_etl() {
         let root =
             std::env::temp_dir().join(format!("chronicle-post-startup-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -255,7 +330,7 @@ mod tests {
         let etl_order = Arc::clone(&order);
         let startup = RecorderStartup::start_post_foundation(
             &config(&root),
-            move || {
+            move |_quotas: &[QuotaReservationAuthority]| {
                 record("recover", &recovery_order);
                 Ok(())
             },
@@ -280,7 +355,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             *order.lock().unwrap(),
-            ["recover", "quota", "appendable", "attach", "etl"]
+            ["quota", "recover", "appendable", "attach", "etl"]
         );
         assert!(startup.capture_ready());
         assert_eq!(startup.processing_ready(), RecorderReadiness::Ready);
@@ -291,7 +366,7 @@ mod tests {
 
     #[test]
     fn post_foundation_failure_stops_before_later_steps() {
-        let expected = ["recover", "quota", "appendable", "attach", "etl"];
+        let expected = ["quota", "recover", "appendable", "attach", "etl"];
         for failed in expected {
             let root = std::env::temp_dir().join(format!(
                 "chronicle-post-failure-{failed}-{}",
@@ -314,7 +389,17 @@ mod tests {
                     Ok(())
                 }
             };
-            let recovery = make_step("recover", &order);
+            let recovery = {
+                let order = Arc::clone(&order);
+                move |_quotas: &[QuotaReservationAuthority]| {
+                    order.lock().unwrap().push("recover");
+                    if failed == "recover" {
+                        Err(RecorderStartupError::Recovery)
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
             let quota = Arc::clone(&order);
             let appendable = make_step("appendable", &order);
             let attach = make_step("attach", &order);
@@ -342,6 +427,32 @@ mod tests {
             assert_eq!(steps.as_slice(), &expected[..end]);
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn startup_errors_preserve_typed_failure_codes() {
+        assert_eq!(
+            failure_code(&RecorderStartupError::Recovery),
+            MetadataCode::RecoveryFailure
+        );
+        assert_eq!(
+            failure_code(&RecorderStartupError::Appendable),
+            MetadataCode::AppendableFailure
+        );
+        assert_eq!(
+            failure_code(&RecorderStartupError::CaptureAttach),
+            MetadataCode::CaptureAttachFailure
+        );
+        assert_eq!(
+            failure_code(&RecorderStartupError::EtlResume),
+            MetadataCode::EtlResumeFailure
+        );
+        assert_eq!(
+            failure_code(&RecorderStartupError::Quota(
+                QuotaError::InsufficientHeadroom
+            )),
+            MetadataCode::QuotaPressure
+        );
     }
 
     #[test]

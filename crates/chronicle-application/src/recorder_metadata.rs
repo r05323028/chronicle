@@ -288,6 +288,10 @@ pub enum MetadataCode {
     CorruptWal,
     CheckpointConflict,
     QuotaPressure,
+    RecoveryFailure,
+    AppendableFailure,
+    CaptureAttachFailure,
+    EtlResumeFailure,
     StorageFailure,
     ShutdownTimeout,
 }

@@ -476,7 +476,7 @@ fn resolve_path(path: &Path, must_exist_directory: bool) -> Result<PathBuf, Reco
         return Err(RecorderConfigError::UnsafePath);
     }
     let _ = missing;
-    Ok(resolved)
+    Ok(resolved.components().collect())
 }
 
 fn filesystem_device(path: &Path) -> Result<u64, RecorderConfigError> {
@@ -551,6 +551,8 @@ mod tests {
         let root = tempfile_root();
         let config = config(&root);
         let first = config.stable_digest().unwrap();
+        fs::create_dir_all(&config.state_root).unwrap();
+        fs::create_dir_all(&config.store_root).unwrap();
         let second = config.stable_digest().unwrap();
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);

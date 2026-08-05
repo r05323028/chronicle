@@ -208,6 +208,20 @@ impl IncrementalProcessor {
         })
     }
 
+    pub fn finalize(
+        &self,
+        registry: &ProtocolRegistry,
+        session_id: SessionId,
+    ) -> Result<EtlOutput, EtlError> {
+        self.pipeline.finish_reconstructed(
+            self.assembler.clone().finish(),
+            self.issues.clone(),
+            self.evidence.clone(),
+            registry,
+            session_id,
+        )
+    }
+
     pub fn last_marker_sequence(&self) -> Option<u64> {
         self.last_marker_sequence
     }

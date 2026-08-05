@@ -16,7 +16,7 @@ pub use incremental::{CommittedWalSnapshot, IncrementalProcessor, IncrementalRes
 pub use publication::{
     CheckpointFault, PublicationError, ReconcileOutcome, finalize_incremental_session,
     publish_delta_then_checkpoint, publish_delta_then_checkpoint_with_fault,
-    reconcile_delta_checkpoint, verify_one_shot_equivalence,
+    reconcile_delta_checkpoint, recover_pending_checkpoint, verify_one_shot_equivalence,
 };
 
 /// ETL input boundary before protocol-specific decoding.
@@ -66,6 +66,7 @@ pub enum EtlIssueKind {
     MalformedLossWindow,
     MalformedTerminalWalLoss,
     MalformedCommitMarker,
+    IncompleteSocketEvidence,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,10 +317,38 @@ impl EtlPipeline {
         let mut operation_count = 0;
 
         for connection in assembly.connections {
-            let connection_id = ConnectionId::new();
-            let incomplete =
-                reconstructed_connection_incomplete(&connection, &assembly.terminal_wal_losses);
-            let (client, server, attributes) = reconstructed_connection_identity(&connection)?;
+            let connection_id = deterministic_connection_id(&connection);
+            let (client, server, attributes, missing_socket_evidence) =
+                match reconstructed_connection_identity(&connection) {
+                    Ok(identity) => identity,
+                    Err(EtlError::MissingSocketEvidence) => {
+                        record_issue(
+                            &mut issues,
+                            self.max_issues,
+                            EtlIssue {
+                                sequence: connection
+                                    .events
+                                    .iter()
+                                    .find_map(|event| event.wal_sequence),
+                                kind: EtlIssueKind::IncompleteSocketEvidence,
+                                message:
+                                    "socket endpoint evidence did not cross recording boundary"
+                                        .into(),
+                            },
+                        )?;
+                        let mut attributes = Attributes::new();
+                        attributes.insert("chronicle.endpoint_evidence".into(), "missing".into());
+                        (
+                            Endpoint::new("unknown", 0),
+                            Endpoint::new("unknown", 0),
+                            attributes,
+                            true,
+                        )
+                    }
+                    Err(error) => return Err(error),
+                };
+            let incomplete = missing_socket_evidence
+                || reconstructed_connection_incomplete(&connection, &assembly.terminal_wal_losses);
             let neutral = connection.protocol_neutral();
             let mut frames = reconstructed_frames(&neutral);
             sort_reconstructed_frames(&connection, &mut frames);
@@ -337,7 +366,7 @@ impl EtlPipeline {
                 truncated: incomplete,
             };
             let first_sequence = protocol_stream.chunks.first().map(|chunk| chunk.sequence);
-            let (protocol, decoded_operations) = if let Some((registration, _)) =
+            let (protocol, mut decoded_operations) = if let Some((registration, _)) =
                 registry.detect(&protocol_stream, None)
             {
                 match decode_and_canonicalize(registration, &protocol_stream, &frames) {
@@ -379,6 +408,9 @@ impl EtlPipeline {
                     }],
                 )
             };
+            for decoded in &mut decoded_operations {
+                decoded.operation.id = deterministic_operation_id(&decoded.operation);
+            }
             operation_count = bounded_operation_count(operation_count, decoded_operations.len())?;
             for decoded in &decoded_operations {
                 let operation = &decoded.operation;
@@ -441,6 +473,29 @@ impl EtlPipeline {
     }
 }
 
+fn deterministic_operation_id(operation: &CanonicalOperation) -> OperationId {
+    let mut normalized = operation.clone();
+    normalized.id = OperationId(Uuid::nil());
+    let bytes = serde_json::to_vec(&normalized).unwrap_or_default();
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    OperationId(Uuid::from_bytes(digest[..16].try_into().unwrap_or([0; 16])))
+}
+
+fn deterministic_connection_id(connection: &ReconstructionConnection) -> ConnectionId {
+    let mut digest = Sha256::new();
+    digest.update(b"chronicle/connection/v1\0");
+    digest.update(format!("{:?}", connection.identity).as_bytes());
+    for sequence in connection
+        .events
+        .iter()
+        .filter_map(|event| event.wal_sequence)
+    {
+        digest.update(sequence.to_le_bytes());
+    }
+    let bytes: [u8; 32] = digest.finalize().into();
+    ConnectionId(Uuid::from_bytes(bytes[..16].try_into().unwrap_or([0; 16])))
+}
+
 fn bounded_operation_count(existing: usize, additional: usize) -> Result<usize, EtlError> {
     let count = existing.saturating_add(additional);
     if count > MAX_CANONICAL_OPERATIONS {
@@ -477,11 +532,14 @@ fn sort_reconstructed_frames(connection: &ReconstructionConnection, frames: &mut
 
 fn reconstructed_connection_identity(
     connection: &ReconstructionConnection,
-) -> Result<(Endpoint, Endpoint, Attributes), EtlError> {
+) -> Result<(Endpoint, Endpoint, Attributes, bool), EtlError> {
     match &connection.identity {
-        ReconstructionConnectionIdentity::Fixture(key) => {
-            Ok((key.client.clone(), key.server.clone(), Attributes::new()))
-        }
+        ReconstructionConnectionIdentity::Fixture(key) => Ok((
+            key.client.clone(),
+            key.server.clone(),
+            Attributes::new(),
+            false,
+        )),
         ReconstructionConnectionIdentity::Socket(socket) => {
             let evidence = connection
                 .events
@@ -535,7 +593,7 @@ fn reconstructed_connection_identity(
                     evidence.local_endpoint.clone(),
                 ),
             };
-            Ok((client, server, attributes))
+            Ok((client, server, attributes, false))
         }
     }
 }
@@ -1046,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_and_conflicting_socket_evidence_are_typed_failures() {
+    fn missing_socket_evidence_is_incomplete_but_conflict_fails_closed() {
         let recording_id = RecordingId::new();
         let active = endpoint_envelopes(
             recording_id,
@@ -1057,14 +1115,26 @@ mod tests {
             Endpoint::new("192.0.2.20", 8_080),
         );
         let pipeline = EtlPipeline::new(SessionLimits::default());
-        assert!(matches!(
-            pipeline.process_envelopes(
+        let incomplete = pipeline
+            .process_envelopes(
                 &[active[1].clone()],
                 &ProtocolRegistry::new(),
                 SessionId::new(),
-            ),
-            Err(EtlError::MissingSocketEvidence)
-        ));
+            )
+            .unwrap();
+        let connection = &incomplete.session.connections[0];
+        assert_eq!(connection.client, Endpoint::new("unknown", 0));
+        assert_eq!(connection.server, Endpoint::new("unknown", 0));
+        assert_eq!(
+            incomplete.session.connection_completeness.values().next(),
+            Some(&Completeness::Incomplete)
+        );
+        assert!(
+            incomplete
+                .issues
+                .iter()
+                .any(|issue| issue.kind == EtlIssueKind::IncompleteSocketEvidence)
+        );
 
         let mut conflicting = endpoint_envelopes(
             recording_id,
@@ -1085,6 +1155,27 @@ mod tests {
             ),
             Err(EtlError::ConflictingSocketEvidence)
         ));
+    }
+
+    #[test]
+    fn repeated_reconstruction_is_one_shot_equivalent() {
+        let recording_id = RecordingId::new();
+        let envelopes = endpoint_envelopes(
+            recording_id,
+            NetworkFamily::Ipv4,
+            SocketRole::Active,
+            PayloadDirection::Egress,
+            Endpoint::new("192.0.2.10", 41_000),
+            Endpoint::new("192.0.2.20", 8_080),
+        );
+        let pipeline = EtlPipeline::new(SessionLimits::default());
+        let first = pipeline
+            .process_envelopes(&envelopes, &ProtocolRegistry::new(), SessionId::new())
+            .unwrap();
+        let second = pipeline
+            .process_envelopes(&envelopes, &ProtocolRegistry::new(), first.session.id)
+            .unwrap();
+        verify_one_shot_equivalence(&first.session, &second.session).unwrap();
     }
 
     #[test]

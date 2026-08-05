@@ -10,18 +10,20 @@ use crate::{
     write_recorder_metadata, write_recording_metadata,
 };
 use chronicle_capture::{CaptureError, CaptureSource};
-use chronicle_common::SessionId;
+use chronicle_common::{RecordingId, SessionId};
 use chronicle_etl::{
     CanonicalDeltaBatchV1, CheckpointFault, CheckpointLifecycle, CheckpointOwner,
     CommittedWalSnapshot, DeltaBatchReference, ETL_PIPELINE_VERSION,
     INCREMENTAL_CHECKPOINT_SCHEMA_VERSION, IncrementalEtlCheckpointV1, IncrementalProcessor,
-    IncrementalResult, MarkerLineage, SourceStatus, publish_delta_then_checkpoint,
-    publish_delta_then_checkpoint_with_fault, read_checkpoint,
+    IncrementalResult, MarkerLineage, RecoveryAuthoritativeSnapshot, SegmentLineage, SourceStatus,
+    publish_delta_then_checkpoint, publish_delta_then_checkpoint_with_fault, read_checkpoint,
+    recover_pending_checkpoint,
 };
 use chronicle_protocol::ProtocolRegistry;
 use chronicle_protocol_builtins::registry;
 use chronicle_storage::{
-    FilesystemRecordingStore, RecordingArtifact, RecordingArtifactKind, RecordingStore,
+    FilesystemRecordingStore, FilesystemSessionStore, RecordingArtifact, RecordingArtifactKind,
+    RecordingStore,
 };
 use chronicle_wal::{GroupCommitWalWriter, WalError};
 use sha2::{Digest, Sha256};
@@ -76,7 +78,9 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         config: &NormalizedRecorderConfig,
         wal_directory: impl AsRef<Path>,
         recorder: RecorderOrchestrator<S>,
-        recover_foundation: impl FnOnce() -> Result<(), RecorderStartupError>,
+        recover_foundation: impl FnOnce(
+            &[crate::QuotaReservationAuthority],
+        ) -> Result<(), RecorderStartupError>,
         reserve_quota: impl FnOnce(
             &[crate::QuotaReservationAuthority],
         ) -> Result<(), RecorderStartupError>,
@@ -92,10 +96,21 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
         let incremental_registry =
             registry().map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
-        validate_checkpoint_before_capture(config, wal_directory.as_ref())?;
+        let expected_recording_id = recorder.ingest().recording_id();
+        let expected_epoch_ordinal = recorder.epoch_ordinal();
+        let checkpoint_path = wal_directory.as_ref().to_path_buf();
         let startup = RecorderStartup::start_post_foundation(
             config,
-            recover_foundation,
+            move |quotas| {
+                recover_foundation(quotas)?;
+                validate_checkpoint_before_capture(
+                    config,
+                    &checkpoint_path,
+                    expected_recording_id,
+                    expected_epoch_ordinal,
+                )
+                .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))
+            },
             reserve_quota,
             establish_appendable,
             || {
@@ -123,10 +138,18 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         establish_appendable: impl FnOnce() -> Result<(), RecorderStartupError>,
         resume_etl: impl FnOnce() -> Result<(), RecorderStartupError>,
     ) -> Result<Self, ContinuousRecorderError> {
-        validate_checkpoint_before_capture(config, wal_directory.as_ref())?;
+        let recording_id = recorder.ingest().recording_id();
+        let epoch_ordinal = recorder.epoch_ordinal();
         let startup = startup.finish(
             establish_appendable,
             || {
+                validate_checkpoint_before_capture(
+                    config,
+                    wal_directory.as_ref(),
+                    recording_id,
+                    epoch_ordinal,
+                )
+                .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
                 recorder
                     .start()
                     .map_err(|_| RecorderStartupError::CaptureAttach)
@@ -300,6 +323,86 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             last_wal_bytes,
             epoch_max_bytes: config.epoch.max_bytes,
         })
+    }
+
+    /// Finalizes the in-memory incremental reconstruction from verified
+    /// checkpoint lineage before standalone ETL verifies the same session.
+    pub fn finalize_incremental_session(&mut self) -> Result<(), ContinuousRecorderError> {
+        let recording_id = self.recorder.ingest().recording_id();
+        let session_id = self.incremental_session_id;
+        self.finalize_incremental_recording(recording_id, session_id)
+    }
+
+    fn finalize_incremental_recording(
+        &mut self,
+        recording_id: RecordingId,
+        session_id: SessionId,
+    ) -> Result<(), ContinuousRecorderError> {
+        match chronicle_wal::read_committed_snapshot_with_records(
+            &self.wal_directory,
+            recording_id,
+            chronicle_wal::DEFAULT_MAX_RECORD_BYTES,
+        ) {
+            Ok(snapshot) => {
+                self.incremental_processor
+                    .process_snapshot(
+                        CommittedWalSnapshot {
+                            marker_sequence: snapshot.snapshot.marker_sequence,
+                            marker_digest: snapshot.snapshot.marker_digest,
+                            envelopes: &snapshot.envelopes,
+                            segment_lineage: &snapshot.snapshot.segment_lineage,
+                        },
+                        &self.incremental_registry,
+                        session_id,
+                    )
+                    .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+            }
+            Err(chronicle_wal::WalError::NoPublishedSegments) => return Ok(()),
+            Err(error) => return Err(ContinuousRecorderError::Wal(error)),
+        }
+        let output = self
+            .incremental_processor
+            .finalize(&self.incremental_registry, session_id)
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let checkpoint = self
+            .incremental_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.checksum.clone());
+        let session_bytes = serde_json::to_vec(&output.session)
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?
+            .len() as u64;
+        let quota = self
+            .startup
+            .quota_authorities()
+            .iter()
+            .find(|authority| {
+                self.store_root
+                    .starts_with(Path::new(&authority.quota().domain))
+            })
+            .ok_or(crate::QuotaError::InvalidQuota)?;
+        let manifest_reservation = session_bytes.saturating_mul(2);
+        quota.reserve(ReservationKind::FinalSession, manifest_reservation)?;
+        if let Err(error) = quota.reserve(ReservationKind::Manifest, manifest_reservation) {
+            let _ = quota.release(ReservationKind::FinalSession, manifest_reservation);
+            return Err(error.into());
+        }
+        let publication = chronicle_etl::finalize_incremental_session(
+            &FilesystemSessionStore::new(self.store_root.clone()),
+            &output,
+            checkpoint,
+        );
+        let accounting = quota.rebuild_managed_usage();
+        let release_final = quota.release(ReservationKind::FinalSession, manifest_reservation);
+        let release_manifest = quota.release(ReservationKind::Manifest, manifest_reservation);
+        if let Err(publication) = publication {
+            return Err(ContinuousRecorderError::Incremental(format!(
+                "final session publication failed: {publication}; accounting={accounting:?}; release_final={release_final:?}; release_manifest={release_manifest:?}"
+            )));
+        }
+        accounting?;
+        release_final?;
+        release_manifest?;
+        Ok(())
     }
 
     /// Inject one publication boundary failure for deterministic restart tests.
@@ -583,7 +686,17 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             })
             .ok_or(crate::QuotaError::InvalidQuota)?;
         quota.refresh_from_filesystem()?;
-        quota.reserve(ReservationKind::RecordingStore, bytes.len() as u64)?;
+        let checkpoint_bytes = checkpoint
+            .encode()
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?
+            .len() as u64;
+        let recording_reservation = bytes.len() as u64;
+        let checkpoint_reservation = checkpoint_bytes.saturating_mul(2);
+        quota.reserve(ReservationKind::RecordingStore, recording_reservation)?;
+        if let Err(error) = quota.reserve(ReservationKind::Checkpoint, checkpoint_reservation) {
+            let _ = quota.release(ReservationKind::RecordingStore, recording_reservation);
+            return Err(error.into());
+        }
         let publication = if let Some(fault) = self.checkpoint_fault.take() {
             publish_delta_then_checkpoint_with_fault(
                 &store,
@@ -603,37 +716,17 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             )
         };
         let accounting = quota.rebuild_managed_usage();
-        let release = quota.release(ReservationKind::RecordingStore, bytes.len() as u64);
-        match (publication, accounting, release) {
-            (Err(publication), Err(accounting), Err(release)) => {
-                return Err(ContinuousRecorderError::Incremental(format!(
-                    "publication failed: {publication}; quota accounting failed: {accounting}; quota release failed: {release}"
-                )));
-            }
-            (Err(publication), Err(accounting), Ok(())) => {
-                return Err(ContinuousRecorderError::Incremental(format!(
-                    "publication failed: {publication}; quota accounting failed: {accounting}"
-                )));
-            }
-            (Err(publication), Ok(_), Err(release)) => {
-                return Err(ContinuousRecorderError::Incremental(format!(
-                    "publication failed: {publication}; quota release failed: {release}"
-                )));
-            }
-            (Err(publication), Ok(_), Ok(())) => {
-                return Err(ContinuousRecorderError::Incremental(
-                    publication.to_string(),
-                ));
-            }
-            (Ok(_), Err(accounting), Err(release)) => {
-                return Err(ContinuousRecorderError::Incremental(format!(
-                    "quota accounting failed: {accounting}; quota release failed: {release}"
-                )));
-            }
-            (Ok(_), Err(accounting), Ok(())) => return Err(accounting.into()),
-            (Ok(_), Ok(_), Err(release)) => return Err(release.into()),
-            (Ok(_), Ok(_), Ok(())) => {}
+        let release_recording =
+            quota.release(ReservationKind::RecordingStore, recording_reservation);
+        let release_checkpoint = quota.release(ReservationKind::Checkpoint, checkpoint_reservation);
+        if let Err(publication) = publication {
+            return Err(ContinuousRecorderError::Incremental(format!(
+                "publication failed: {publication}; accounting={accounting:?}; release_recording={release_recording:?}; release_checkpoint={release_checkpoint:?}"
+            )));
         }
+        accounting?;
+        release_recording?;
+        release_checkpoint?;
         let checkpoint =
             read_checkpoint(self.wal_directory.join("incremental-etl-checkpoint.json"))
                 .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
@@ -733,6 +826,20 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         Ok(())
     }
 
+    pub fn release_successor_quota(
+        &self,
+        next_wal_directory: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<(), ContinuousRecorderError> {
+        let next_wal_directory = next_wal_directory.as_ref();
+        for authority in self.startup.quota_authorities() {
+            if next_wal_directory.starts_with(Path::new(&authority.quota().domain)) {
+                authority.release(ReservationKind::Wal, max_bytes)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn rollover(
         &mut self,
         now_millis: u64,
@@ -763,10 +870,12 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     ) -> Result<RecorderEpochBoundary, ContinuousRecorderError> {
         let next_wal_directory = next_wal_directory.as_ref().to_path_buf();
         let old_wal_directory = self.wal_directory.clone();
+        let old_session_id = self.incremental_session_id;
         self.sync_active_progress();
         let boundary = self
             .recorder
             .rollover_to(next_writer, now_millis, outcome_path)?;
+        self.finalize_incremental_recording(boundary.old_recording_id, old_session_id)?;
         for authority in self.startup.quota_authorities() {
             if old_wal_directory.starts_with(Path::new(&authority.quota().domain)) {
                 authority.release_prefix(ReservationKind::Wal, self.epoch_max_bytes)?;
@@ -869,14 +978,76 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
 fn validate_checkpoint_before_capture(
     config: &NormalizedRecorderConfig,
     wal_directory: &Path,
+    recording_id: RecordingId,
+    epoch_ordinal: u64,
 ) -> Result<(), ContinuousRecorderError> {
     let checkpoint_path = wal_directory.join("incremental-etl-checkpoint.json");
+    let store = FilesystemRecordingStore::new(config.store_root.clone());
+    recover_pending_checkpoint(&store, &checkpoint_path)
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
     if !checkpoint_path.exists() {
         return Ok(());
     }
     let checkpoint = read_checkpoint(&checkpoint_path)
         .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
-    let store = FilesystemRecordingStore::new(config.store_root.clone());
+    checkpoint
+        .validate()
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    let config_digest = config
+        .stable_digest()
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    if checkpoint.config_digest != config_digest
+        || checkpoint.canonical_schema_version != chronicle_canonical::CANONICAL_SCHEMA_VERSION
+        || checkpoint.pipeline_version != ETL_PIPELINE_VERSION
+    {
+        return Err(ContinuousRecorderError::Incremental(format!(
+            "checkpoint configuration or pipeline contradiction: config={} expected={} schema={} pipeline={}",
+            checkpoint.config_digest,
+            config_digest,
+            checkpoint.canonical_schema_version,
+            checkpoint.pipeline_version,
+        )));
+    }
+    let committed = chronicle_wal::read_committed_snapshot_with_records(
+        wal_directory,
+        recording_id,
+        chronicle_wal::DEFAULT_MAX_RECORD_BYTES,
+    )
+    .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    let active_segment_digest = chronicle_wal::verified_segment_prefix_sha256(
+        wal_directory,
+        recording_id,
+        &committed.envelopes,
+        committed.snapshot.marker_segment_ordinal,
+        committed.snapshot.marker_sequence,
+    )
+    .map(|digest| digest_hex(&digest))
+    .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    let authoritative = RecoveryAuthoritativeSnapshot {
+        recording_id: recording_id.0,
+        epoch_ordinal,
+        marker: MarkerLineage {
+            sequence: committed.snapshot.marker_sequence,
+            segment_ordinal: committed.snapshot.marker_segment_ordinal,
+            marker_digest: digest_hex(&committed.snapshot.marker_digest),
+            active_segment_digest,
+        },
+        segment_lineage: committed
+            .snapshot
+            .segment_lineage
+            .iter()
+            .map(|segment| SegmentLineage {
+                ordinal: segment.ordinal,
+                digest: digest_hex(&segment.digest),
+                first_sequence: segment.first_sequence,
+                last_sequence: segment.last_sequence,
+            })
+            .collect(),
+        pipeline_version: ETL_PIPELINE_VERSION.into(),
+    };
+    checkpoint
+        .validate_against(&authoritative)
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
     for output in &checkpoint.outputs {
         let head = store
             .head(&output.key)
@@ -989,7 +1160,7 @@ mod tests {
             &config(&root),
             &wal,
             recorder,
-            || Ok(()),
+            |_| Ok(()),
             |_| Ok(()),
             || Ok(()),
             || Ok(()),
@@ -1044,7 +1215,7 @@ mod tests {
             &config(&root),
             &wal,
             recorder,
-            || Ok(()),
+            |_| Ok(()),
             |_| Ok(()),
             || Ok(()),
             || Ok(()),
@@ -1087,7 +1258,7 @@ mod tests {
             &config(&root),
             &wal,
             recorder,
-            || Ok(()),
+            |_| Ok(()),
             |_| Ok(()),
             || Ok(()),
             || Ok(()),
@@ -1137,6 +1308,13 @@ mod tests {
         assert_eq!(
             stopped.counters.committed_records,
             result.counters.committed.records
+        );
+        let incremental_session = SessionId(service.recorder().ingest().recording_id().0);
+        service.finalize_incremental_session().unwrap();
+        assert!(
+            chronicle_storage::FilesystemSessionStore::new(config(&root).store_root)
+                .hydrate(incremental_session)
+                .is_ok()
         );
         drop(service);
         let registry = registry().unwrap();

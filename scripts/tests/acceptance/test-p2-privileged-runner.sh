@@ -34,7 +34,8 @@ import sys
 report = json.load(open(sys.argv[1], encoding="utf-8"))
 assert report["version"] == 1
 assert report["task"] == "8.4"
-assert report["status"] == "not_checked"
+assert report["status"] in {"not_checked", "failed"}
+assert report["working_tree_dirty"] or report["status"] == "not_checked"
 assert report["checks"]["host_reboot_recovery"] == "not_checked"
 assert report["checks"]["systemd_type_simple"] == "not_checked"
 PY

@@ -24,6 +24,7 @@ SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
 COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
 RECORDER_STATUS="$ARTIFACT_ROOT/recorder-status.json"
 CHECKS_JSON="$ARTIFACT_ROOT/checks.json"
+CHECKPOINT_PAUSE_FILE="$STATE_ROOT/wal/checkpoint-pause.control"
 UPSTREAM_PID=""
 CURRENT_PHASE="initializing"
 READINESS_TIMEOUT=${CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS:-180}
@@ -90,15 +91,20 @@ if check_file.exists():
     checks.update(json.loads(check_file.read_text(encoding="utf-8")))
 not_checked = sorted(name for name, value in checks.items() if value == "not_checked")
 failed = sorted(name for name, value in checks.items() if value not in {"passed", "not_checked"})
-report_status = "passed" if status == "0" and not not_checked and not failed else ("not_checked" if status in {"0", "77"} and not failed else "failed")
+end_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+dirty = bool(subprocess.check_output(
+    ["git", "status", "--porcelain", "--untracked-files=all"], text=True
+).strip())
+identity_ok = end_commit == commit and not dirty and (not expected or expected == commit)
+report_status = "passed" if status == "0" and identity_ok and not not_checked and not failed else ("not_checked" if status in {"0", "77"} and identity_ok and not failed else "failed")
 summary.write_text(json.dumps({
     "version": 1,
+    "gate": "p2",
     "task": "8.4",
     "git_commit_sha": commit,
+    "end_git_commit_sha": end_commit,
     "expected_git_commit_sha": expected or None,
-    "working_tree_dirty": bool(subprocess.check_output(
-        ["git", "status", "--porcelain", "--untracked-files=all"], text=True
-    ).strip()),
+    "working_tree_dirty": dirty,
     "kernel_version": __import__("platform").release(),
     "architecture": __import__("platform").machine(),
     "acceptance_mode": mode,
@@ -129,6 +135,12 @@ cleanup() {
 on_exit() {
 	local rc=$?
 	cleanup
+	local end_sha
+	end_sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'unavailable')
+	if [[ "$rc" == 0 ]] && { [[ "$end_sha" != "$SHA" ]] || [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=all)" ]]; }; then
+		rc=1
+		CURRENT_PHASE="identity_validation"
+	fi
 	write_report "$rc"
 	if [[ -d "$ARTIFACT_ROOT" && "$PRE_REBOOT" != 1 ]]; then
 		find "$ARTIFACT_ROOT" -type f ! -name artifact-manifest.sha256 ! -name '.tmp-*' -print0 |
@@ -225,6 +237,7 @@ PORT=$(cat "$ARTIFACT_ROOT/upstream.port")
 
 phase start 'start foreground recorder under systemd Type=simple'
 systemd-run --quiet --unit="$UNIT" --working-directory="$ROOT" \
+	--setenv=CHRONICLE_CHECKPOINT_PAUSE_FILE="$CHECKPOINT_PAUSE_FILE" \
 	--property=Type=simple --property=KillSignal=SIGTERM --property=TimeoutStopSec=45s \
 	--property=Restart=on-failure --property=RestartSec=1s \
 	--property=NoNewPrivileges=no \
@@ -329,7 +342,7 @@ if [[ "$CRASH_MODE" == 1 ]]; then
 	sleep 1
 	systemctl kill --kill-who=main -s SIGKILL "$UNIT"
 	RECORDER_STATUS="$ARTIFACT_ROOT/recorder-restart-status.json" \
-		wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL" --allow-stale-owner
+		wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
 	systemctl is-active --quiet "$UNIT"
 	set_check process_restart_readiness passed
 fi
@@ -537,10 +550,47 @@ umount "$QUOTA_MOUNT"
 rm -rf "$QUOTA_MOUNT" "$QUOTA_IMAGE"
 
 phase checkpoint_crash_matrix 'exercise production publication crash boundaries'
-cargo test -p chronicle-application production_publication_faults_reuse_immutable_output_after_restart_boundary --locked -- --nocapture >"$ARTIFACT_ROOT/checkpoint-production-tests.log" 2>&1
-grep -q 'test result: ok' "$ARTIFACT_ROOT/checkpoint-production-tests.log"
-cargo test -p chronicle-etl checkpoint_fault_windows_recover_without_duplicate_output --locked -- --nocapture >"$ARTIFACT_ROOT/checkpoint-fault-tests.log" 2>&1
-grep -q 'test result: ok' "$ARTIFACT_ROOT/checkpoint-fault-tests.log"
+: >"$CHECKPOINT_PAUSE_FILE"
+python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/checkpoint-crash-workload.json"
+CHECKPOINT_READY_FILE="${CHECKPOINT_PAUSE_FILE%.*}.ready"
+for _ in $(seq 1 120); do
+	[[ -f "$CHECKPOINT_READY_FILE" ]] && break
+	sleep 0.25
+done
+test -f "$CHECKPOINT_READY_FILE"
+PENDING_BEFORE=$(find "$STATE_ROOT/wal" -type f -name '*.pending' -print -quit)
+DELTA_BEFORE=$(find "$STORE_ROOT/artifacts/deltas" -type f -print -quit)
+test -n "$PENDING_BEFORE" -a -f "$DELTA_BEFORE"
+PID_BEFORE=$(systemctl show "$UNIT" -p ExecMainPID --value)
+python3 - "$PENDING_BEFORE" "$DELTA_BEFORE" <<'PY'
+import json, sys
+pending = json.load(open(sys.argv[1], encoding="utf-8"))
+artifact = json.load(open(sys.argv[2], encoding="utf-8"))
+assert any(output["key"] == artifact["key"] and output["digest"] == artifact["checksum"] for output in pending["outputs"])
+PY
+systemctl kill --kill-who=main -s SIGKILL "$UNIT"
+rm -f "$CHECKPOINT_PAUSE_FILE"
+systemctl restart "$UNIT"
+wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
+PID_AFTER=$(systemctl show "$UNIT" -p ExecMainPID --value)
+test "$PID_BEFORE" != "$PID_AFTER"
+if find "$STATE_ROOT/wal" -type f -name '*.pending' -print -quit | grep -q .; then
+	echo 'checkpoint pending artifact survived restart' >&2
+	exit 1
+fi
+CHECKPOINT_AFTER=$(find "$STATE_ROOT/wal" -type f -name 'incremental-etl-checkpoint.json' -print -quit)
+test -f "$CHECKPOINT_AFTER"
+python3 - "$CHECKPOINT_AFTER" "$DELTA_BEFORE" "$STORE_ROOT/artifacts" <<'PY'
+import json, sys
+checkpoint = json.load(open(sys.argv[1], encoding="utf-8"))
+artifact = json.load(open(sys.argv[2], encoding="utf-8"))
+assert any(output["key"] == artifact["key"] and output["digest"] == artifact["checksum"] for output in checkpoint["outputs"])
+from pathlib import Path
+matches = list(Path(sys.argv[3]).rglob(Path(artifact["key"]).name))
+assert len(matches) == 1, matches
+PY
+set_check checkpoint_output_committed_checkpoint_missing passed
+set_check checkpoint_committed_status_missing passed
 
 if [[ "$PRE_REBOOT" == 1 ]]; then
 	phase pre_reboot 'retain live recorder state for VM reboot'

@@ -9,7 +9,8 @@ use chronicle_storage::{
     FilesystemSessionStore, PublishSession, PutIfAbsent, RecordingArtifact, RecordingArtifactKind,
     RecordingStore, RecordingStoreError,
 };
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +42,39 @@ pub enum PublicationError {
 pub enum CheckpointFault {
     BeforeCheckpoint,
     AfterCheckpoint,
+}
+
+pub fn recover_pending_checkpoint<S: RecordingStore>(
+    store: &S,
+    checkpoint_path: impl AsRef<Path>,
+) -> Result<Option<ReconcileOutcome>, PublicationError> {
+    let checkpoint_path = checkpoint_path.as_ref();
+    let pending_path = pending_checkpoint_path(checkpoint_path);
+    if !pending_path.exists() {
+        return Ok(None);
+    }
+    let candidate = read_checkpoint(&pending_path)?;
+    let mut present = 0usize;
+    for output in &candidate.outputs {
+        match store.head(&output.key) {
+            Ok(_) => present += 1,
+            Err(RecordingStoreError::NotFound) => {}
+            Err(error) => return Err(PublicationError::Store(error)),
+        }
+    }
+    if present == 0 {
+        remove_pending_checkpoint(&pending_path)?;
+        return Ok(None);
+    }
+    if present != candidate.outputs.len() {
+        return Err(PublicationError::OutputLineage);
+    }
+    let mut outcome = ReconcileOutcome::AlreadyConsistent;
+    for output in &candidate.outputs {
+        outcome = reconcile_delta_checkpoint(store, &output.key, &candidate, checkpoint_path)?;
+    }
+    remove_pending_checkpoint(&pending_path)?;
+    Ok(Some(outcome))
 }
 
 pub fn reconcile_delta_checkpoint<S: RecordingStore>(
@@ -104,7 +138,11 @@ pub fn finalize_incremental_session(
                 .iter()
                 .map(|issue| format!("{:?}", issue.kind))
                 .collect(),
-            replayability: Vec::new(),
+            replayability: output
+                .issues
+                .iter()
+                .map(|issue| format!("{:?}", issue.kind))
+                .collect(),
             complete: output.issues.is_empty(),
         })
         .map_err(|error| PublicationError::FinalSession(error.to_string()))
@@ -130,6 +168,9 @@ pub fn publish_delta_then_checkpoint_with_fault<S: RecordingStore>(
 ) -> Result<PutIfAbsent, PublicationError> {
     batch.validate()?;
     checkpoint.validate()?;
+    let checkpoint_path = checkpoint_path.as_ref();
+    let pending_path = pending_checkpoint_path(checkpoint_path);
+    write_checkpoint_atomic(&pending_path, checkpoint)?;
     let key = key.into();
     let artifact = RecordingArtifact::new(
         key.clone(),
@@ -159,11 +200,47 @@ pub fn publish_delta_then_checkpoint_with_fault<S: RecordingStore>(
     if fault == Some(CheckpointFault::BeforeCheckpoint) {
         return Err(PublicationError::InjectedFault);
     }
+    wait_for_checkpoint_commit()?;
     write_checkpoint_atomic(checkpoint_path, checkpoint)?;
     if fault == Some(CheckpointFault::AfterCheckpoint) {
         return Err(PublicationError::InjectedFault);
     }
+    remove_pending_checkpoint(&pending_path)?;
     Ok(outcome)
+}
+
+fn wait_for_checkpoint_commit() -> Result<(), PublicationError> {
+    let Ok(control_path) = std::env::var("CHRONICLE_CHECKPOINT_PAUSE_FILE") else {
+        return Ok(());
+    };
+    let control_path = PathBuf::from(control_path);
+    if !control_path.exists() {
+        return Ok(());
+    }
+    let ready_path = control_path.with_extension("ready");
+    fs::write(&ready_path, std::process::id().to_string())
+        .map_err(|_| PublicationError::Checkpoint(CheckpointError::Io))?;
+    while control_path.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = fs::remove_file(ready_path);
+    Ok(())
+}
+
+fn pending_checkpoint_path(checkpoint_path: &Path) -> PathBuf {
+    let name = checkpoint_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkpoint.json");
+    checkpoint_path.with_file_name(format!(".{name}.pending"))
+}
+
+fn remove_pending_checkpoint(path: &Path) -> Result<(), CheckpointError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(CheckpointError::Io),
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +322,12 @@ mod tests {
             Err(PublicationError::InjectedFault)
         ));
         assert!(!checkpoint_path.exists());
+        assert!(
+            recover_pending_checkpoint(&store, &checkpoint_path)
+                .unwrap()
+                .is_some()
+        );
+        assert!(checkpoint_path.exists());
         publish_delta_then_checkpoint(&store, key, &batch, &checkpoint, &checkpoint_path).unwrap();
         assert!(matches!(
             publish_delta_then_checkpoint_with_fault(

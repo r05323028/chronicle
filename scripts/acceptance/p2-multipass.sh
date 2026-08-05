@@ -12,7 +12,7 @@ fi
 
 VM_ROOT=/home/ubuntu/chronicle-p2-acceptance
 VM_ARTIFACTS=/home/ubuntu/p2-artifacts/$SHA/$(date -u +%Y%m%dT%H%M%SZ)-$$
-DEST=${CHRONICLE_ACCEPTANCE_DEST:-"$ROOT/target/validation-evidence/privileged/$SHA/ubuntu-24.04"}
+DEST=${CHRONICLE_ACCEPTANCE_DEST:-"$ROOT/target/validation-evidence/privileged/p2/$SHA/ubuntu-24.04"}
 COMPACT=${CHRONICLE_ACCEPTANCE_COMPACT:-0}
 CARGO_TARGET_DIR_VM=${CARGO_TARGET_DIR:-/home/ubuntu/chronicle-target}
 EBPF_TARGET_DIR_VM=${CHRONICLE_EBPF_TARGET_DIR:-/home/ubuntu/chronicle-ebpf-target}
