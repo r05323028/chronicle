@@ -170,8 +170,28 @@ impl IncrementalEtlCheckpointV1 {
         {
             return Err(CheckpointError::WrongEpoch);
         }
-        if self.marker != snapshot.marker || self.segment_lineage != snapshot.segment_lineage {
-            return Err(CheckpointError::LineageMismatch);
+        if self.marker.sequence > snapshot.marker.sequence
+            || self.marker.segment_ordinal > snapshot.marker.segment_ordinal
+        {
+            return Err(CheckpointError::AheadOfMarker);
+        }
+        if self.marker.sequence == snapshot.marker.sequence {
+            if self.marker != snapshot.marker || self.segment_lineage != snapshot.segment_lineage {
+                return Err(CheckpointError::LineageMismatch);
+            }
+        } else {
+            let lineage_is_prefix = self.segment_lineage.len() <= snapshot.segment_lineage.len()
+                && self
+                    .segment_lineage
+                    .iter()
+                    .zip(&snapshot.segment_lineage)
+                    .all(|(checkpoint, authority)| checkpoint == authority);
+            if !lineage_is_prefix
+                || self.marker.segment_ordinal == snapshot.marker.segment_ordinal
+                    && self.segment_lineage != snapshot.segment_lineage
+            {
+                return Err(CheckpointError::LineageMismatch);
+            }
         }
         if self.pipeline_version != snapshot.pipeline_version {
             return Err(CheckpointError::PipelineMismatch);
@@ -439,6 +459,17 @@ mod tests {
             pipeline_version: value.pipeline_version.clone(),
         };
         assert_eq!(value.validate_against(&snapshot), Ok(()));
+        let mut advanced = snapshot.clone();
+        advanced.marker.sequence = 8;
+        advanced.marker.segment_ordinal = 1;
+        advanced.marker.marker_digest = "f".repeat(64);
+        advanced.marker.active_segment_digest = "g".repeat(64);
+        assert_eq!(value.validate_against(&advanced), Ok(()));
+        advanced.segment_lineage[0].digest = "h".repeat(64);
+        assert_eq!(
+            value.validate_against(&advanced),
+            Err(CheckpointError::LineageMismatch)
+        );
         let mut wrong = snapshot;
         wrong.epoch_ordinal += 1;
         assert_eq!(
