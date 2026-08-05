@@ -389,10 +389,7 @@ fn hex_bytes(value: &[u8; 32]) -> String {
 }
 
 fn digest_hex(value: &[u8; 32]) -> String {
-    Sha256::digest(value)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex_bytes(value)
 }
 
 #[cfg(test)]
@@ -437,6 +434,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn restart_rejects_wal_sequence_gap_and_lineage_fork() {
         let mut processor = IncrementalProcessor::new(SessionLimits::default());
         let registry = ProtocolRegistry::default();
@@ -452,6 +450,27 @@ mod tests {
                 SessionId::new(),
             )
             .unwrap();
+        let state = processor.state_snapshot();
+        let mut restored = IncrementalProcessor::new(SessionLimits::default());
+        restored.restore_state(state);
+        assert!(restored.marker_digest_matches(&[0; 32]));
+        let session_id = SessionId::new();
+        let recording_id = uuid::Uuid::new_v4();
+        let decoder = processor
+            .decoder_state(session_id, recording_id, 0, 0, hex_bytes(&[0; 32]))
+            .unwrap();
+        let mut decoder_restored = IncrementalProcessor::new(SessionLimits::default());
+        decoder_restored
+            .restore_decoder_state(
+                &decoder,
+                session_id,
+                recording_id,
+                0,
+                0,
+                &hex_bytes(&[0; 32]),
+            )
+            .unwrap();
+        assert!(decoder_restored.marker_digest_matches(&[0; 32]));
         let envelope = WalRecordEnvelope {
             recording_id: chronicle_common::RecordingId::new(),
             sequence: 5,
