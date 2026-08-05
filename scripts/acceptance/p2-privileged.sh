@@ -587,7 +587,7 @@ if find "$STATE_ROOT/wal" -type f -name '*.pending' -print -quit | grep -q .; th
 	echo 'checkpoint pending artifact survived restart' >&2
 	exit 1
 fi
-CHECKPOINT_AFTER=$(find "$STATE_ROOT/wal" -type f -name 'incremental-etl-checkpoint.json' -print -quit)
+CHECKPOINT_AFTER="$(dirname "$PENDING_BEFORE")/incremental-etl-checkpoint.json"
 test -f "$CHECKPOINT_AFTER"
 python3 - "$CHECKPOINT_AFTER" "$DELTA_BEFORE" "$STORE_ROOT/artifacts" <<'PY'
 import json, sys
