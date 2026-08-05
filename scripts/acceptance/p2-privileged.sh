@@ -595,8 +595,8 @@ checkpoint = json.load(open(sys.argv[1], encoding="utf-8"))
 artifact = json.load(open(sys.argv[2], encoding="utf-8"))
 assert any(output["key"] == artifact["key"] and output["digest"] == artifact["checksum"] for output in checkpoint["outputs"])
 from pathlib import Path
-matches = list(Path(sys.argv[3]).rglob(Path(artifact["key"]).name))
-assert len(matches) == 1, matches
+artifact_path = Path(sys.argv[3], *artifact["key"].split("/"))
+assert artifact_path.is_file(), artifact_path
 PY
 set_check checkpoint_output_committed_checkpoint_missing passed
 set_check checkpoint_committed_status_missing passed
