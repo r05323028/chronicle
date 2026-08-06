@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,6 +58,49 @@ class AcceptanceRunnerTests(unittest.TestCase):
         p1 = set(report.profile_scenarios(self.definition, "p1"))
         p2 = set(report.profile_scenarios(self.definition, "p2"))
         self.assertTrue(p1 < p2)
+
+    def test_dispatcher_honors_configured_order(self):
+        sandbox = self.temp / "dispatcher"
+        (sandbox / "scripts/acceptance/lib/scenarios/p1").mkdir(parents=True)
+        shutil.copy2(ROOT / "scripts/acceptance/lib/scenario-dispatch.sh", sandbox / "dispatcher.sh")
+        scenarios = ["capture-basic", "wal-recovery", "replay", "resource-cleanup"]
+        for scenario in scenarios:
+            function = f"scenario_p1_{scenario.replace('-', '_')}"
+            (sandbox / "scripts/acceptance/lib/scenarios/p1" / f"{scenario}.sh").write_text(
+                f"{function}() {{ printf '%s\\n' '{scenario}'; }}\n"
+            )
+        command = sandbox / "run-dispatcher.sh"
+        command.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"ROOT={sandbox}\n"
+            f"source {sandbox}/dispatcher.sh\n"
+            "die() { exit 1; }\n"
+            "CHRONICLE_ACCEPTANCE_SCENARIOS='replay,capture-basic,wal-recovery,resource-cleanup'\n"
+            "run_scenario_plan p1\n"
+        )
+        output = subprocess.check_output(["bash", str(command)], text=True)
+        actual = [line for line in output.splitlines() if not line.startswith("[scenario]")]
+        self.assertEqual(actual, ["replay", "capture-basic", "wal-recovery", "resource-cleanup"])
+        command.write_text(command.read_text().replace(
+            "replay,capture-basic,wal-recovery,resource-cleanup",
+            "replay,replay,capture-basic,wal-recovery,resource-cleanup",
+        ))
+        self.assertNotEqual(subprocess.run(["bash", str(command)], check=False).returncode, 0)
+
+    def test_dispatch_order_and_implementations_are_complete(self):
+        for profile in ("p1", "p2"):
+            selected = report.profile_scenarios(self.definition, profile)
+            ordered = report.dispatch_scenarios(self.definition, profile)
+            self.assertEqual(set(selected), set(ordered))
+            self.assertEqual(len(selected), len(ordered))
+            self.assertTrue(all((ROOT / "scripts/acceptance/lib/scenarios" / profile / f"{scenario}.sh").is_file() for scenario in selected))
+        p1 = report.dispatch_scenarios(self.definition, "p1")
+        p2 = report.dispatch_scenarios(self.definition, "p2")
+        self.assertEqual([scenario for scenario in p2 if scenario in p1], p1)
+        dispatcher = (ROOT / "scripts/acceptance/lib/scenario-dispatch.sh").read_text()
+        self.assertNotIn("profile-p1.sh", dispatcher)
+        self.assertNotIn("profile-p2.sh", dispatcher)
 
     def test_all_deduplicates_to_p2_superset(self):
         with mock.patch.object(runner, "run_profile", return_value=0) as run:
@@ -141,6 +185,24 @@ class AcceptanceRunnerTests(unittest.TestCase):
         args = runner.parser().parse_args(["--profile", "p1", "--executor", "multipass", "--no-reuse", "--evidence-root", str(self.temp / "receipts")])
         candidate = self.temp / "candidate"
         candidate.mkdir()
+        candidate_value = report.make_report(
+            run_id="source",
+            profile="p2",
+            executor="multipass",
+            selected=selected,
+            completed=selected,
+            failed=[],
+            skipped=[],
+            not_checked=[],
+            phases=[{"name": "run", "status": "passed"}],
+            source=self.source,
+            environment_value={**self.environment, "executor": "multipass"},
+            return_code=0,
+            guest_source={"records": [{"run_id": "source", "fingerprint": "fp-a"}]},
+        )
+        report.write_report(candidate / "acceptance-report.json", candidate_value)
+        (candidate / "payload.txt").write_text("immutable\n")
+        report.write_manifest(candidate)
         receipt_status = runner.write_reuse_receipt(
             args,
             "p1",
@@ -149,19 +211,56 @@ class AcceptanceRunnerTests(unittest.TestCase):
             self.source,
             {**self.environment, "executor": "multipass"},
             candidate,
-            {"guest_source": {"records": [{"run_id": "source", "fingerprint": "fp-a"}]}},
+            candidate_value,
         )
         self.assertEqual(receipt_status, 0)
         receipt = next((self.temp / "receipts").glob("p1/fp-a/*/acceptance-report.json"))
         value = self._read_report(receipt)
         self.assertTrue(value["reuse"]["reused"])
         self.assertEqual(value["reuse"]["from"], str(candidate))
+        self.assertTrue(value["reuse"]["origin"]["manifest_sha256"])
+        self.assertTrue(report.report_is_compatible(
+            value,
+            fingerprint="fp-a",
+            required=selected,
+            environment_value={**self.environment, "executor": "multipass"},
+            release=False,
+            source=self.source,
+            root=receipt.parent,
+        ))
+        (candidate / "payload.txt").write_text("tampered\n")
+        self.assertFalse(report.report_is_compatible(
+            value,
+            fingerprint="fp-a",
+            required=selected,
+            environment_value={**self.environment, "executor": "multipass"},
+            release=False,
+            source=self.source,
+            root=receipt.parent,
+        ))
+
+    def test_unknown_source_identity_cannot_be_release_eligible(self):
+        source = report.source_provenance(self.temp, "fp-a")
+        self.assertTrue(source["identity_error"])
+        value = report.make_report(
+            run_id="unknown-source", profile="p1", executor="local", selected=["capture-basic"],
+            completed=["capture-basic"], failed=[], skipped=[], not_checked=[],
+            phases=[{"name": "run", "status": "passed"}], source=source,
+            environment_value=self.environment, return_code=0,
+        )
+        self.assertFalse(value["release_eligible"])
 
     def test_guest_identity_mismatch_rejects_resume(self):
         runtime = self.temp / "runtime"
         runtime.mkdir()
         (runtime / "guest-source.json").write_text(json.dumps({"run_id": "wrong", "fingerprint": "fp-a", "working_tree_dirty": False}))
         _, valid = runner.guest_identity(runtime, "run-a", "fp-a", False)
+        self.assertFalse(valid)
+        (runtime / "guest-source.json").write_text(json.dumps({
+            "run_id": "run-a", "fingerprint": "fp-a", "commit_sha": "not_checked",
+            "tree_sha": "tree-a", "working_tree_dirty": False,
+        }))
+        _, valid = runner.guest_identity(runtime, "run-a", "fp-a", True)
         self.assertFalse(valid)
 
     def test_snapshot_inputs_exclude_docs(self):

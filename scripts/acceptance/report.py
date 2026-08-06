@@ -16,6 +16,10 @@ FINGERPRINT_VERSION = 2
 COMPATIBILITY_VERSION = 1
 
 
+def _known_identity(value: Any) -> bool:
+    return isinstance(value, str) and value not in {"", "not_checked", "unknown", "unavailable"}
+
+
 def load_scenarios(path: Path) -> dict[str, Any]:
     with path.open("rb") as handle:
         value = tomllib.load(handle)
@@ -24,6 +28,18 @@ def load_scenarios(path: Path) -> dict[str, Any]:
     p2 = set(profiles.get("p2", {}).get("scenarios", []))
     if not p1.issubset(p2):
         raise ValueError("p2 profile must include every p1 scenario")
+    scenario_definitions = value.get("scenarios", {})
+    for profile in ("p1", "p2"):
+        selected = list(profiles.get(profile, {}).get("scenarios", []))
+        if any(scenario not in scenario_definitions for scenario in selected):
+            raise ValueError(f"{profile} selects undefined scenario")
+        ordered = list(profiles.get(profile, {}).get("execution_order", selected))
+        if set(ordered) != set(selected) or len(ordered) != len(selected):
+            raise ValueError(f"{profile} execution_order must contain each selected scenario exactly once")
+        for scenario in selected:
+            implementation = path.parent / "lib" / "scenarios" / profile / f"{scenario}.sh"
+            if not implementation.is_file():
+                raise ValueError(f"missing central implementation: {implementation}")
     return value
 
 
@@ -33,23 +49,38 @@ def profile_scenarios(definition: dict[str, Any], profile: str) -> list[str]:
     return list(definition["profiles"][profile]["scenarios"])
 
 
-def _git(root: Path, *args: str) -> str | None:
+def dispatch_scenarios(definition: dict[str, Any], profile: str) -> list[str]:
+    """Return centrally ordered scenario IDs, validating configured coverage."""
+    selected = profile_scenarios(definition, profile)
+    ordered = list(definition["profiles"][profile].get("execution_order", selected))
+    if set(ordered) != set(selected) or len(ordered) != len(selected):
+        raise ValueError(f"{profile} execution_order must contain each selected scenario exactly once")
+    return ordered
+
+
+def _git_value(root: Path, *args: str) -> tuple[str | None, bool]:
     try:
         value = subprocess.check_output(
             ["git", "-C", str(root), *args], text=True, stderr=subprocess.DEVNULL
         ).strip()
     except (OSError, subprocess.CalledProcessError):
-        return None
-    return value or None
+        return None, True
+    return value or None, False
 
 
 def source_provenance(root: Path, fingerprint: str) -> dict[str, Any]:
-    dirty = _git(root, "status", "--porcelain", "--untracked-files=all")
+    commit, commit_error = _git_value(root, "rev-parse", "HEAD")
+    tree, tree_error = _git_value(root, "rev-parse", "HEAD^{tree}")
+    dirty, status_error = _git_value(root, "status", "--porcelain", "--untracked-files=all")
+    identity_errors = [
+        name for name, failed in (("commit", commit_error), ("tree", tree_error), ("status", status_error)) if failed
+    ]
     return {
-        "commit_sha": _git(root, "rev-parse", "HEAD"),
-        "tree_sha": _git(root, "rev-parse", "HEAD^{tree}"),
+        "commit_sha": commit,
+        "tree_sha": tree,
         "fingerprint": fingerprint,
-        "working_tree_dirty": dirty is not None and bool(dirty),
+        "working_tree_dirty": bool(dirty) if not status_error else None,
+        "identity_error": ",".join(identity_errors) or None,
     }
 
 
@@ -233,9 +264,11 @@ def make_report(
         status == "passed"
         and not skipped
         and not not_checked
-        and not source.get("working_tree_dirty", True)
-        and bool(source.get("commit_sha"))
-        and bool(source.get("tree_sha"))
+        and isinstance(source.get("working_tree_dirty"), bool)
+        and not source.get("working_tree_dirty")
+        and not source.get("identity_error")
+        and _known_identity(source.get("commit_sha"))
+        and _known_identity(source.get("tree_sha"))
         and source_stable
         and guest_source_ok
         and all(phase.get("status") == "passed" for phase in phases)
@@ -268,6 +301,29 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def verify_reuse_chain(value: dict[str, Any], *, max_depth: int = 8, seen: set[str] | None = None) -> bool:
+    reuse = value.get("reuse", {})
+    if not reuse.get("reused"):
+        return True
+    origin = reuse.get("origin", {})
+    origin_root = Path(origin.get("root", ""))
+    manifest_path = origin_root / str(origin.get("manifest", "artifact-manifest.sha256"))
+    if not origin_root.is_dir() or not manifest_path.is_file() or max_depth <= 0:
+        return False
+    if sha256(manifest_path) != origin.get("manifest_sha256") or not verify_manifest(origin_root):
+        return False
+    seen = set() if seen is None else seen
+    key = str(origin_root.resolve())
+    if key in seen:
+        return False
+    seen.add(key)
+    try:
+        origin_report = json.loads((origin_root / "acceptance-report.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(origin_report, dict) and verify_reuse_chain(origin_report, max_depth=max_depth - 1, seen=seen)
+
+
 def report_is_compatible(
     report: dict[str, Any], *, fingerprint: str, required: Iterable[str], environment_value: dict[str, Any],
     release: bool, source: dict[str, Any], root: Path,
@@ -276,6 +332,8 @@ def report_is_compatible(
     if report.get("schema_version") != SCHEMA_VERSION or report.get("compatibility_version") != COMPATIBILITY_VERSION:
         return False
     if report.get("status") != "passed" or report.get("source", {}).get("fingerprint") != fingerprint:
+        return False
+    if not verify_reuse_chain(report):
         return False
     if not required_set.issubset(set(report.get("completed_scenarios", []))):
         return False
@@ -298,9 +356,19 @@ def report_is_compatible(
         candidate_source = report.get("source", {})
         if not report.get("release_eligible"):
             return False
-        if candidate_source.get("commit_sha") != source.get("commit_sha") or candidate_source.get("tree_sha") != source.get("tree_sha"):
+        if (
+            not _known_identity(candidate_source.get("commit_sha"))
+            or not _known_identity(candidate_source.get("tree_sha"))
+            or candidate_source.get("commit_sha") != source.get("commit_sha")
+            or candidate_source.get("tree_sha") != source.get("tree_sha")
+        ):
             return False
-        if candidate_source.get("working_tree_dirty"):
+        if (
+            "identity_error" not in candidate_source
+            or candidate_source.get("identity_error")
+            or not isinstance(candidate_source.get("working_tree_dirty"), bool)
+            or candidate_source.get("working_tree_dirty")
+        ):
             return False
         guest_records = report.get("guest_source", {}).get("records", [])
         if any(

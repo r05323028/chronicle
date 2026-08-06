@@ -100,13 +100,19 @@ def collect_environment(executor: str, vm: str) -> dict[str, Any]:
     return {**value, "executor": executor}
 
 
+def known_identity(value: Any) -> bool:
+    return isinstance(value, str) and value not in {"", "not_checked", "unknown", "unavailable"}
+
+
 def release_source_errors(source: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    if source.get("identity_error"):
+        errors.append(f"source identity unavailable: {source['identity_error']}")
     if source.get("working_tree_dirty"):
         errors.append("working tree is dirty")
-    if not source.get("commit_sha"):
+    if not known_identity(source.get("commit_sha")):
         errors.append("commit SHA is unknown")
-    if not source.get("tree_sha"):
+    if not known_identity(source.get("tree_sha")):
         errors.append("tree SHA is unknown")
     return errors
 
@@ -165,7 +171,15 @@ def guest_identity(runtime_root: Path, run_id: str, fingerprint: str, release: b
     valid = all(
         value.get("run_id") == run_id
         and value.get("fingerprint") == fingerprint
-        and (not release or (not value.get("working_tree_dirty") and value.get("commit_sha") and value.get("tree_sha")))
+        and (
+            not release
+            or (
+                isinstance(value.get("working_tree_dirty"), bool)
+                and not value.get("working_tree_dirty")
+                and known_identity(value.get("commit_sha"))
+                and known_identity(value.get("tree_sha"))
+            )
+        )
         for value in records
     )
     return {"records": records, "final": records[-1]}, valid
@@ -184,6 +198,10 @@ def write_reuse_receipt(
     receipt_id = now_run_id()
     receipt_root = args.evidence_root.resolve() / profile / fingerprint / receipt_id
     receipt_root.mkdir(parents=True, exist_ok=False)
+    origin_manifest = candidate_root / "artifact-manifest.sha256"
+    if not origin_manifest.is_file():
+        raise RuntimeError(f"reusable evidence manifest missing: {origin_manifest}")
+    origin_manifest_sha256 = report.sha256(origin_manifest)
     value = report.make_report(
         run_id=receipt_id,
         profile=profile,
@@ -208,6 +226,11 @@ def write_reuse_receipt(
     )
     value["status"] = "passed"
     value["release_eligible"] = bool(args.release and value["release_eligible"])
+    value["reuse"]["origin"] = {
+        "root": str(candidate_root),
+        "manifest": origin_manifest.name,
+        "manifest_sha256": origin_manifest_sha256,
+    }
     write_evidence(receipt_root, value)
     print(f"REUSED evidence: {candidate_root}")
     print(f"Reuse receipt: {receipt_root}")
@@ -275,6 +298,8 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
             "CHRONICLE_ACCEPTANCE_RELEASE": "1" if args.release else "0",
             "CHRONICLE_ACCEPTANCE_EXPECTED_SHA": source_start.get("commit_sha") or "",
             "CHRONICLE_ACCEPTANCE_MODE": "full",
+            "CHRONICLE_ACCEPTANCE_SCENARIOS": ",".join(report.dispatch_scenarios(definition, profile)),
+            "CHRONICLE_ACCEPTANCE_P1_SCENARIOS": ",".join(report.dispatch_scenarios(definition, "p1")),
         }
     )
     print(f"Running profile={profile} executor={args.executor} fingerprint={fingerprint}")
@@ -287,6 +312,7 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
         (p1_artifact_root / ".chronicle-acceptance-root").write_text("chronicle-p1-acceptance-root-v1\n", encoding="utf-8")
         p1_env = env.copy()
         p1_env["CHRONICLE_ACCEPTANCE_PROFILE"] = "p1"
+        p1_env["CHRONICLE_ACCEPTANCE_SCENARIOS"] = ",".join(report.dispatch_scenarios(definition, "p1"))
         p1_env["CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT"] = str(p1_artifact_root)
         p1_process = subprocess.run(
             ["bash", str(ROOT / "scripts/acceptance/lib/profile-p1.sh")],
@@ -303,6 +329,7 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
         )
         if (p2_artifact_root / "acceptance-report.json").is_file():
             shutil.copy2(p2_artifact_root / "acceptance-report.json", assertions_root / "acceptance-report.json")
+            shutil.copy2(p2_artifact_root / "acceptance-report.json", runtime_root / "acceptance-report.json")
         return_code = p2_process.returncode if p2_process.returncode else (p1_return_code or 0)
     else:
         if args.executor == "local":

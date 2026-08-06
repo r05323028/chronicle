@@ -69,6 +69,10 @@ transfer_source() {
 
 run_remote() {
 	local profile=$1 artifact_root=$2 extra=$3
+	local scenarios=${CHRONICLE_ACCEPTANCE_SCENARIOS:-}
+	if [[ "$profile" == p1 ]]; then
+		scenarios=${CHRONICLE_ACCEPTANCE_P1_SCENARIOS:-$scenarios}
+	fi
 	multipass exec "$VM" -- bash -lc "
 		set +e
 		cd '$VM_SOURCE_ROOT'
@@ -80,6 +84,7 @@ run_remote() {
 			CHRONICLE_ACCEPTANCE_RELEASE='$RELEASE' \\
 			CHRONICLE_ACCEPTANCE_EXPECTED_SHA='${CHRONICLE_ACCEPTANCE_EXPECTED_SHA:-}' \\
 			CHRONICLE_ACCEPTANCE_MODE=full \\
+			CHRONICLE_ACCEPTANCE_SCENARIOS='$scenarios' \\
 			CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT='$artifact_root' \\
 			CARGO_TARGET_DIR=/home/ubuntu/chronicle-target \\
 			CHRONICLE_EBPF_TARGET_DIR=/home/ubuntu/chronicle-ebpf-target \\

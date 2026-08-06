@@ -11,6 +11,7 @@ scenarios = [
   "replay",
   "resource-cleanup",
 ]
+execution_order = ["capture-basic", "wal-recovery", "replay", "resource-cleanup"]
 
 [profiles.p2]
 scenarios = [
@@ -26,6 +27,7 @@ scenarios = [
   "corruption-quarantine",
   "reboot-recovery",
 ]
+execution_order = ["capture-basic", "recorder-readiness", "incremental-etl", "quota-pressure", "checkpoint-kill-restart", "reboot-recovery", "wal-recovery", "corruption-quarantine", "replay", "retention-interruption", "resource-cleanup"]
 
 [scenarios.capture-basic]
 capabilities = ["privileged", "ebpf"]

@@ -237,8 +237,13 @@ PY
 			run_shell ebpf-build 'cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release --locked'
 			printf 'eBPF source changed: minimal privileged smoke selects P1 smoke path.\n'
 			if [[ ${CHRONICLE_SKIP_PRIVILEGED_SMOKE:-false} != true ]]; then
-				"$ROOT/scripts/acceptance.sh" --profile p1 --executor multipass --vm "$VM" \
-					--evidence-root "$WORKDIR/p1-smoke-source" --no-reuse --compact
+				if [[ $DRY_RUN == true || $DRY_RUN == 1 ]]; then
+					printf 'WOULD RUN privileged P1 smoke: %q ' "$ROOT/scripts/acceptance.sh" --profile p1 --executor multipass --vm "$VM" --evidence-root "$WORKDIR/p1-smoke-source" --no-reuse --compact
+					printf '\n'
+				else
+					"$ROOT/scripts/acceptance.sh" --profile p1 --executor multipass --vm "$VM" \
+						--evidence-root "$WORKDIR/p1-smoke-source" --no-reuse --compact
+				fi
 			fi
 			;;
 		wal)
