@@ -37,7 +37,14 @@ def load_scenarios(path: Path) -> dict[str, Any]:
         if set(ordered) != set(selected) or len(ordered) != len(selected):
             raise ValueError(f"{profile} execution_order must contain each selected scenario exactly once")
         for scenario in selected:
-            implementation = path.parent / "lib" / "scenarios" / profile / f"{scenario}.sh"
+            scenario_root = path.parent / "lib" / "scenarios"
+            shared = scenario_root / "shared" / f"{scenario}.sh"
+            profile_impl = scenario_root / "extensions" / profile / f"{scenario}.sh"
+            profile_only = scenario_root / profile / f"{scenario}.sh"
+            if shared.is_file():
+                implementation = profile_impl
+            else:
+                implementation = profile_only
             if not implementation.is_file():
                 raise ValueError(f"missing central implementation: {implementation}")
     return value

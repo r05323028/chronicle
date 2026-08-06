@@ -303,50 +303,21 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
         }
     )
     print(f"Running profile={profile} executor={args.executor} fingerprint={fingerprint}")
-    p1_return_code: int | None = None
-    if args.executor == "local" and profile == "p2":
-        p1_artifact_root = assertions_root / "p1"
-        p2_artifact_root = assertions_root / "p2"
-        p1_artifact_root.mkdir()
-        p2_artifact_root.mkdir()
-        (p1_artifact_root / ".chronicle-acceptance-root").write_text("chronicle-p1-acceptance-root-v1\n", encoding="utf-8")
-        p1_env = env.copy()
-        p1_env["CHRONICLE_ACCEPTANCE_PROFILE"] = "p1"
-        p1_env["CHRONICLE_ACCEPTANCE_SCENARIOS"] = ",".join(report.dispatch_scenarios(definition, "p1"))
-        p1_env["CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT"] = str(p1_artifact_root)
-        p1_process = subprocess.run(
-            ["bash", str(ROOT / "scripts/acceptance/lib/profile-p1.sh")],
-            cwd=ROOT,
-            env=p1_env,
-        )
-        p1_return_code = p1_process.returncode
-        p2_env = env.copy()
-        p2_env["CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT"] = str(p2_artifact_root)
-        p2_process = subprocess.run(
-            ["bash", str(ROOT / "scripts/acceptance/lib/profile-p2.sh")],
-            cwd=ROOT,
-            env=p2_env,
-        )
-        if (p2_artifact_root / "acceptance-report.json").is_file():
-            shutil.copy2(p2_artifact_root / "acceptance-report.json", assertions_root / "acceptance-report.json")
-            shutil.copy2(p2_artifact_root / "acceptance-report.json", runtime_root / "acceptance-report.json")
-        return_code = p2_process.returncode if p2_process.returncode else (p1_return_code or 0)
+    if args.executor == "local":
+        command = ["bash", str(ROOT / f"scripts/acceptance/lib/profile-{profile}.sh")]
     else:
-        if args.executor == "local":
-            command = ["bash", str(ROOT / f"scripts/acceptance/lib/profile-{profile}.sh")]
-        else:
-            command = [
-                "bash",
-                str(ROOT / "scripts/acceptance/lib/multipass.sh"),
-                profile,
-                args.vm,
-                str(runtime_root),
-                "1" if args.release else "0",
-            ]
-        completed_process = subprocess.run(command, cwd=ROOT, env=env)
-        return_code = completed_process.returncode
-        if args.executor == "local" and (assertions_root / "acceptance-report.json").is_file():
-            shutil.copy2(assertions_root / "acceptance-report.json", runtime_root / "acceptance-report.json")
+        command = [
+            "bash",
+            str(ROOT / "scripts/acceptance/lib/multipass.sh"),
+            profile,
+            args.vm,
+            str(runtime_root),
+            "1" if args.release else "0",
+        ]
+    completed_process = subprocess.run(command, cwd=ROOT, env=env)
+    return_code = completed_process.returncode
+    if args.executor == "local" and (assertions_root / "acceptance-report.json").is_file():
+        shutil.copy2(assertions_root / "acceptance-report.json", runtime_root / "acceptance-report.json")
 
     legacy_path = runtime_root / "acceptance-report.json"
     legacy: dict[str, Any] | None = None
@@ -358,22 +329,15 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
         except (OSError, json.JSONDecodeError):
             legacy = None
     p1_legacy: dict[str, Any] | None = None
-    if profile == "p2":
-        p1_path = assertions_root / "p1/acceptance-report.json"
-        if p1_path.is_file():
-            try:
-                value = json.loads(p1_path.read_text(encoding="utf-8"))
-                if isinstance(value, dict):
-                    p1_legacy = value
-            except (OSError, json.JSONDecodeError):
-                p1_legacy = None
+    if profile == "p2" and legacy:
+        p1_legacy = {"status": legacy.get("status"), "checks": legacy.get("checks", {})}
     status, completed, failed, not_checked = report.normalize_legacy_report(
         definition, profile, legacy, selected, return_code
     )
     if profile == "p2":
         p1_selected = report.profile_scenarios(definition, "p1")
         _, p1_completed, p1_failed, p1_not_checked = report.normalize_legacy_report(
-            definition, "p1", p1_legacy, p1_selected, p1_return_code or 77
+            definition, "p1", p1_legacy, p1_selected, return_code
         )
         for scenario in p1_selected:
             if scenario in p1_completed:

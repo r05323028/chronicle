@@ -28,5 +28,10 @@ assert value["result"]["outcome"] in ("completed", "completed_with_skips")
 assert all(item["verification"] == "passed" for item in value["result"]["operations"] if item["state"] == "completed")
 PY
 set_check inspect_replay passed
+if run_compat_command replay-matrix cargo test -p chronicle-replay --locked execution_stops_on_transport_or_verification_and_accounts_for_skips; then
+	set_check replay_matrix passed
+else
+	set_check replay_matrix failed
+fi
 
 }

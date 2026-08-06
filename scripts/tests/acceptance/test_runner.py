@@ -94,13 +94,27 @@ class AcceptanceRunnerTests(unittest.TestCase):
             ordered = report.dispatch_scenarios(self.definition, profile)
             self.assertEqual(set(selected), set(ordered))
             self.assertEqual(len(selected), len(ordered))
-            self.assertTrue(all((ROOT / "scripts/acceptance/lib/scenarios" / profile / f"{scenario}.sh").is_file() for scenario in selected))
+            scenario_root = ROOT / "scripts/acceptance/lib/scenarios"
+            self.assertTrue(all(
+                (scenario_root / "shared" / f"{scenario}.sh").is_file()
+                and (scenario_root / "extensions" / profile / f"{scenario}.sh").is_file()
+                or (scenario_root / profile / f"{scenario}.sh").is_file()
+                for scenario in selected
+            ))
+        for scenario in report.profile_scenarios(self.definition, "p1"):
+            self.assertTrue((scenario_root / "shared" / f"{scenario}.sh").is_file())
+            self.assertFalse((scenario_root / "p1" / f"{scenario}.sh").exists())
+            self.assertFalse((scenario_root / "p2" / f"{scenario}.sh").exists())
         p1 = report.dispatch_scenarios(self.definition, "p1")
         p2 = report.dispatch_scenarios(self.definition, "p2")
         self.assertEqual([scenario for scenario in p2 if scenario in p1], p1)
         dispatcher = (ROOT / "scripts/acceptance/lib/scenario-dispatch.sh").read_text()
         self.assertNotIn("profile-p1.sh", dispatcher)
         self.assertNotIn("profile-p2.sh", dispatcher)
+        multipass = (ROOT / "scripts/acceptance/lib/multipass.sh").read_text()
+        self.assertNotIn("run_remote p1", multipass.split("else", 1)[1])
+        self.assertIn('status = value.get("status", "not_checked")', multipass)
+        self.assertNotIn("p1_artifact_root", (ROOT / "scripts/acceptance/runner.py").read_text())
 
     def test_all_deduplicates_to_p2_superset(self):
         with mock.patch.object(runner, "run_profile", return_value=0) as run:

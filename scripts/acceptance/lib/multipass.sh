@@ -139,20 +139,23 @@ if [[ "$PROFILE" == p1 ]]; then
 	if [[ -f "$DEST/assertions/acceptance-report.json" ]]; then
 		cp "$DEST/assertions/acceptance-report.json" "$DEST/acceptance-report.json"
 	fi
-	printf '%s\n' '[{"name":"run","status":"passed"}]' >"$DEST/phases.json" || true
+	python3 - "$DEST/phases.json" "$DEST/acceptance-report.json" "$REMOTE_STATUS" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+report_path = Path(sys.argv[2])
+exit_code = int(sys.argv[3])
+try:
+    value = json.loads(report_path.read_text(encoding="utf-8"))
+    status = value.get("status", "not_checked")
+except (OSError, json.JSONDecodeError):
+    status = "passed" if exit_code == 0 else ("not_checked" if exit_code == 77 else "failed")
+path.write_text(json.dumps([{"name": "run", "status": status}], indent=2) + "\n", encoding="utf-8")
+PY
 else
-	# P2 explicitly runs the full P1 profile first; reuse is valid only then.
-	set +e
-	run_remote p1 "$VM_ARTIFACTS/p1" ""
-	P1_STATUS=$?
-	set -e
 	PRE_ROOT="$VM_ARTIFACTS/p2/pre-reboot"
 	POST_ROOT="$VM_ARTIFACTS/p2/post-reboot"
 	DOMAIN_ROOT="$VM_RUN_ROOT/domain"
-	P1_FAILURE=0
-	if [[ "$P1_STATUS" -ne 0 && "$P1_STATUS" -ne 77 ]]; then
-		P1_FAILURE=$P1_STATUS
-	fi
 	set +e
 	run_remote p2 "$PRE_ROOT" "CHRONICLE_ACCEPTANCE_PRE_REBOOT=1 CHRONICLE_ACCEPTANCE_DOMAIN_ROOT='$DOMAIN_ROOT' CHRONICLE_ACCEPTANCE_STATE_ROOT='$DOMAIN_ROOT/state' CHRONICLE_ACCEPTANCE_STORE_ROOT='$DOMAIN_ROOT/store'"
 	PRE_STATUS=$?
@@ -169,9 +172,6 @@ else
 		POST_STATUS=$?
 		set -e
 		REMOTE_STATUS=$POST_STATUS
-		if [[ "$REMOTE_STATUS" -eq 0 && "$P1_FAILURE" -ne 0 ]]; then
-			REMOTE_STATUS=$P1_FAILURE
-		fi
 	fi
 	transfer_artifacts || true
 	if [[ -f "$DEST/assertions/p2/post-reboot/acceptance-report.json" ]]; then

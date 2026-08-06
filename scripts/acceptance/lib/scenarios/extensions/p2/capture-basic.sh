@@ -93,6 +93,6 @@ if [[ "$REBOOT_RESUME" == 1 ]]; then
 	set_check host_reboot_recovery passed
 	set_check pre_reboot_persistence passed
 fi
-
+set_check privileged_acceptance passed
 
 }

@@ -87,5 +87,14 @@ with open(sys.argv[3], "a", encoding="utf-8") as handle:
 PY
 set_check one_shot_equivalence passed
 
+p1_wal_status=passed
+run_compat_command wal-feasibility cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture || p1_wal_status=failed
+run_compat_command wal-tests cargo test -p chronicle-wal --locked || p1_wal_status=failed
+set_check wal_fault_matrix "$p1_wal_status"
+
+p1_ingest_status=passed
+run_compat_command ingest-limit cargo test -p chronicle-application --locked ingest_discards_only_wal_limit_suffix_and_wal_limit_wins_duration_tie || p1_ingest_status=failed
+run_compat_command ingest-bounds cargo test -p chronicle-application --locked production_recording_bounds_enforce_duration_and_wal_limits || p1_ingest_status=failed
+set_check ingest_limit_matrix "$p1_ingest_status"
 
 }

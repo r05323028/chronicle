@@ -8,9 +8,17 @@ source_scenarios() {
 	local profile=$1 scenario
 	shift
 	for scenario in "$@"; do
-		[[ -f "$SCENARIO_ROOT/$profile/$scenario.sh" ]] || die "scenario $scenario is not implemented for $profile"
-		# shellcheck source=/dev/null
-		source "$SCENARIO_ROOT/$profile/$scenario.sh"
+		if [[ -f "$SCENARIO_ROOT/shared/$scenario.sh" ]]; then
+			# shellcheck source=/dev/null
+			source "$SCENARIO_ROOT/shared/$scenario.sh"
+			[[ -f "$SCENARIO_ROOT/extensions/$profile/$scenario.sh" ]] || die "missing $profile extension for shared scenario $scenario"
+			# shellcheck source=/dev/null
+			source "$SCENARIO_ROOT/extensions/$profile/$scenario.sh"
+		else
+			[[ -f "$SCENARIO_ROOT/$profile/$scenario.sh" ]] || die "scenario $scenario is not implemented for $profile"
+			# shellcheck source=/dev/null
+			source "$SCENARIO_ROOT/$profile/$scenario.sh"
+		fi
 	done
 }
 
@@ -38,7 +46,11 @@ run_scenario_plan() {
 	[[ "$unique_count" == "${#selected[@]}" ]] || die "scenario selection is duplicated for $profile"
 	source_scenarios "$profile" "${selected[@]}"
 	for scenario in "${selected[@]}"; do
-		function="scenario_${profile}_${scenario//-/_}"
+		if [[ -f "$SCENARIO_ROOT/shared/$scenario.sh" ]]; then
+			function="scenario_${scenario//-/_}"
+		else
+			function="scenario_${profile}_${scenario//-/_}"
+		fi
 		declare -F "$function" >/dev/null || die "scenario function missing: $function"
 		if declare -F log >/dev/null; then
 			log "[scenario] $profile/$scenario"
