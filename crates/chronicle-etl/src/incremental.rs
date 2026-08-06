@@ -9,6 +9,8 @@ use crate::{
 use chronicle_canonical::CanonicalOperation;
 use chronicle_common::{OperationId, SessionId};
 use chronicle_protocol::ProtocolRegistry;
+use std::collections::BTreeMap;
+
 use chronicle_session::{ReconstructionAssembler, ReconstructionLimits, SessionLimits};
 use chronicle_wal::WalRecordEnvelope;
 use sha2::{Digest, Sha256};
@@ -214,13 +216,34 @@ impl IncrementalProcessor {
         registry: &ProtocolRegistry,
         session_id: SessionId,
     ) -> Result<EtlOutput, EtlError> {
-        self.pipeline.finish_reconstructed(
+        let mut output = self.pipeline.finish_reconstructed(
             self.assembler.clone().finish(),
             self.issues.clone(),
             self.evidence.clone(),
             registry,
             session_id,
-        )
+        )?;
+        let mut operation_ids = BTreeMap::new();
+        for connection in &mut output.session.connections {
+            for operation in &mut connection.operations {
+                let previous = operation.id;
+                let current = operation_id_from_key(&operation_key(operation));
+                operation_ids.insert(previous, current);
+                operation.id = current;
+            }
+        }
+        output.session.operation_completeness = output
+            .session
+            .operation_completeness
+            .into_iter()
+            .map(|(id, completeness)| (operation_ids.get(&id).copied().unwrap_or(id), completeness))
+            .collect();
+        for entry in &mut output.session.timeline {
+            if let Some(id) = operation_ids.get(&entry.operation_id) {
+                entry.operation_id = *id;
+            }
+        }
+        Ok(output)
     }
 
     pub fn last_marker_sequence(&self) -> Option<u64> {
