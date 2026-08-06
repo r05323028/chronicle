@@ -202,6 +202,7 @@ pub fn cleanup_finalized_segment_with_policy(
     if fault == Some(CleanupFault::AfterTrashSync) {
         return Err(RetentionError::Interrupted);
     }
+    wait_for_cleanup_commit()?;
     write_tombstone(&target, &intent)?;
     if fault == Some(CleanupFault::AfterTombstoneSync) {
         return Err(RetentionError::Interrupted);
@@ -343,6 +344,20 @@ fn write_intent(path: &Path, intent: &CleanupIntent) -> Result<(), RetentionErro
     file.write_all(&serde_json::to_vec(intent).map_err(|_| RetentionError::Io)?)
         .map_err(|_| RetentionError::Io)?;
     file.sync_all().map_err(|_| RetentionError::Io)
+}
+
+fn wait_for_cleanup_commit() -> Result<(), RetentionError> {
+    let Ok(control_path) = std::env::var("CHRONICLE_CLEANUP_PAUSE_FILE") else {
+        return Ok(());
+    };
+    let control_path = Path::new(&control_path);
+    let ready_path = control_path.with_extension("ready");
+    fs::write(&ready_path, b"ready").map_err(|_| RetentionError::Io)?;
+    while control_path.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = fs::remove_file(ready_path);
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), RetentionError> {
