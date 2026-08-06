@@ -571,7 +571,8 @@ if ((${#PENDING_FILES[@]} != 1)); then
 	exit 1
 fi
 PENDING_BEFORE=${PENDING_FILES[0]}
-DELTA_BEFORE=$(python3 - "$PENDING_BEFORE" "$STORE_ROOT" <<'PY'
+DELTA_BEFORE=$(
+	python3 - "$PENDING_BEFORE" "$STORE_ROOT" <<'PY'
 import json, sys
 from pathlib import Path
 pending = json.load(open(sys.argv[1], encoding="utf-8"))
