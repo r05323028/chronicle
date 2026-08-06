@@ -36,16 +36,26 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Run Chronicle acceptance scenarios")
     value.add_argument("--profile", choices=("p1", "p2", "all"), required=True)
     value.add_argument("--executor", choices=("local", "multipass"), default="local")
-    value.add_argument("--release", action="store_true", help="require release-grade source identity")
+    value.add_argument(
+        "--release", action="store_true", help="require release-grade source identity"
+    )
     value.add_argument("--no-reuse", action="store_true", help="force a fresh run")
-    value.add_argument("--compact", action="store_true", help="retain compact successful evidence")
-    value.add_argument("--vm", default=os.environ.get("CHRONICLE_MULTIPASS_VM", "chronicle-ubuntu"))
-    value.add_argument("--evidence-root", type=Path, default=ROOT / "target/validation-evidence/acceptance")
+    value.add_argument(
+        "--compact", action="store_true", help="retain compact successful evidence"
+    )
+    value.add_argument(
+        "--vm", default=os.environ.get("CHRONICLE_MULTIPASS_VM", "chronicle-ubuntu")
+    )
+    value.add_argument(
+        "--evidence-root",
+        type=Path,
+        default=ROOT / "target/validation-evidence/acceptance",
+    )
     return value
 
 
 def multipass_environment(vm: str) -> dict[str, Any] | None:
-    script = r'''
+    script = r"""
 import json, os, platform, subprocess
 from pathlib import Path
 release = {}
@@ -67,15 +77,22 @@ try:
 except (OSError, subprocess.CalledProcessError):
     rustc = "not_checked"
 print(json.dumps({"os": platform.system(), "ubuntu": release.get("VERSION_ID", "not_checked"), "architecture": platform.machine(), "kernel": platform.release(), "rustc": rustc, "target": os.environ.get("CARGO_BUILD_TARGET", "host"), "btf": Path("/sys/kernel/btf/vmlinux").is_file(), "cgroup_v2": Path("/sys/fs/cgroup/cgroup.controllers").is_file(), "capabilities": caps}))
-'''
+"""
     encoded = base64.b64encode(script.encode()).decode()
-    command = "sudo -E env HOME=/home/ubuntu PATH=\"$PATH\" python3 -c " + shlex.quote(f"import base64; exec(base64.b64decode('{encoded}'))")
+    command = 'sudo -E env HOME=/home/ubuntu PATH="$PATH" python3 -c ' + shlex.quote(
+        f"import base64; exec(base64.b64decode('{encoded}'))"
+    )
     try:
         state = subprocess.check_output(
             ["multipass", "info", vm], text=True, stderr=subprocess.DEVNULL, timeout=30
         )
         if "State: Running" not in state:
-            subprocess.run(["multipass", "start", vm], check=True, timeout=60, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["multipass", "start", vm],
+                check=True,
+                timeout=60,
+                stdout=subprocess.DEVNULL,
+            )
         value = subprocess.check_output(
             ["multipass", "exec", vm, "--", "bash", "-lc", command],
             text=True,
@@ -85,7 +102,12 @@ print(json.dumps({"os": platform.system(), "ubuntu": release.get("VERSION_ID", "
         parsed = json.loads(value)
         if isinstance(parsed, dict):
             return parsed
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+    ):
         return None
     return None
 
@@ -101,7 +123,12 @@ def collect_environment(executor: str, vm: str) -> dict[str, Any]:
 
 
 def known_identity(value: Any) -> bool:
-    return isinstance(value, str) and value not in {"", "not_checked", "unknown", "unavailable"}
+    return isinstance(value, str) and value not in {
+        "",
+        "not_checked",
+        "unknown",
+        "unavailable",
+    }
 
 
 def release_source_errors(source: dict[str, Any]) -> list[str]:
@@ -157,7 +184,9 @@ def write_evidence(root: Path, value: dict[str, Any]) -> None:
     report.write_manifest(root)
 
 
-def guest_identity(runtime_root: Path, run_id: str, fingerprint: str, release: bool) -> tuple[dict[str, Any] | None, bool]:
+def guest_identity(
+    runtime_root: Path, run_id: str, fingerprint: str, release: bool
+) -> tuple[dict[str, Any] | None, bool]:
     records: list[dict[str, Any]] = []
     for path in sorted(runtime_root.rglob("guest-source.json")):
         try:
@@ -237,14 +266,19 @@ def write_reuse_receipt(
     return 0
 
 
-def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, Any]) -> int:
+def run_profile(
+    args: argparse.Namespace, profile: str, definition: dict[str, Any]
+) -> int:
     selected = report.profile_scenarios(definition, profile)
     fingerprint, fingerprint_payload = source_fingerprint(profile, args.executor)
     source_start = report.source_provenance(ROOT, fingerprint)
     if args.release:
         errors = release_source_errors(source_start)
         if errors:
-            print(f"release source validation failed: {', '.join(errors)}", file=sys.stderr)
+            print(
+                f"release source validation failed: {', '.join(errors)}",
+                file=sys.stderr,
+            )
             return 2
     try:
         environment_value = collect_environment(args.executor, args.vm)
@@ -280,9 +314,12 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
     runtime_root.mkdir(parents=True, exist_ok=False)
     assertions_root = runtime_root / "assertions"
     assertions_root.mkdir()
-    (assertions_root / ".chronicle-acceptance-root").write_text("chronicle-unified-acceptance-root-v1\n", encoding="utf-8")
+    (assertions_root / ".chronicle-acceptance-root").write_text(
+        "chronicle-unified-acceptance-root-v1\n", encoding="utf-8"
+    )
     (runtime_root / "fingerprint.json").write_text(
-        json.dumps(fingerprint_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(fingerprint_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     (runtime_root / "environment.json").write_text(
         json.dumps(environment_value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -298,11 +335,17 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
             "CHRONICLE_ACCEPTANCE_RELEASE": "1" if args.release else "0",
             "CHRONICLE_ACCEPTANCE_EXPECTED_SHA": source_start.get("commit_sha") or "",
             "CHRONICLE_ACCEPTANCE_MODE": "full",
-            "CHRONICLE_ACCEPTANCE_SCENARIOS": ",".join(report.dispatch_scenarios(definition, profile)),
-            "CHRONICLE_ACCEPTANCE_P1_SCENARIOS": ",".join(report.dispatch_scenarios(definition, "p1")),
+            "CHRONICLE_ACCEPTANCE_SCENARIOS": ",".join(
+                report.dispatch_scenarios(definition, profile)
+            ),
+            "CHRONICLE_ACCEPTANCE_P1_SCENARIOS": ",".join(
+                report.dispatch_scenarios(definition, "p1")
+            ),
         }
     )
-    print(f"Running profile={profile} executor={args.executor} fingerprint={fingerprint}")
+    print(
+        f"Running profile={profile} executor={args.executor} fingerprint={fingerprint}"
+    )
     if args.executor == "local":
         command = ["bash", str(ROOT / f"scripts/acceptance/lib/profile-{profile}.sh")]
     else:
@@ -316,8 +359,14 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
         ]
     completed_process = subprocess.run(command, cwd=ROOT, env=env)
     return_code = completed_process.returncode
-    if args.executor == "local" and (assertions_root / "acceptance-report.json").is_file():
-        shutil.copy2(assertions_root / "acceptance-report.json", runtime_root / "acceptance-report.json")
+    if (
+        args.executor == "local"
+        and (assertions_root / "acceptance-report.json").is_file()
+    ):
+        shutil.copy2(
+            assertions_root / "acceptance-report.json",
+            runtime_root / "acceptance-report.json",
+        )
 
     legacy_path = runtime_root / "acceptance-report.json"
     legacy: dict[str, Any] | None = None
@@ -367,9 +416,15 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
             phase_evidence_error = True
     else:
         phases = [{"name": "run", "status": "passed" if status == "passed" else status}]
-    if not isinstance(phases, list) or not phases or any(
-        not isinstance(phase, dict) or not phase.get("name") or phase.get("status") not in {"passed", "failed", "not_checked"}
-        for phase in phases
+    if (
+        not isinstance(phases, list)
+        or not phases
+        or any(
+            not isinstance(phase, dict)
+            or not phase.get("name")
+            or phase.get("status") not in {"passed", "failed", "not_checked"}
+            for phase in phases
+        )
     ):
         phase_evidence_error = True
         phases = []
@@ -395,7 +450,9 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
                 final_environment = {**guest, "executor": args.executor}
         except (OSError, json.JSONDecodeError):
             pass
-    guest_source, guest_source_ok = guest_identity(runtime_root, run_id, fingerprint, args.release)
+    guest_source, guest_source_ok = guest_identity(
+        runtime_root, run_id, fingerprint, args.release
+    )
     if args.executor == "multipass" and not guest_source_ok and status == "passed":
         status = "failed"
         failed = list(selected)
@@ -414,9 +471,7 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
         source=source,
         environment_value=final_environment,
         return_code=return_code if status != "passed" else 0,
-        legacy=(
-            {"p1": p1_legacy, "p2": legacy} if profile == "p2" else legacy
-        ),
+        legacy=({"p1": p1_legacy, "p2": legacy} if profile == "p2" else legacy),
         release_requested=args.release,
         source_stable=bool(source["stable"]),
         reuse_requested=not args.no_reuse,
@@ -425,11 +480,18 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
     )
     # Normalize status from legacy report into the central result.
     final_report["status"] = status
-    final_report["release_eligible"] = bool(final_report["release_eligible"] and status == "passed")
+    final_report["release_eligible"] = bool(
+        final_report["release_eligible"] and status == "passed"
+    )
     if args.compact and status == "passed":
         final_report["legacy_report"] = None
         for child in runtime_root.iterdir():
-            if child.name not in {"fingerprint.json", "environment.json", "guest-environment.json", "phases.json"}:
+            if child.name not in {
+                "fingerprint.json",
+                "environment.json",
+                "guest-environment.json",
+                "phases.json",
+            }:
                 try:
                     if child.is_dir():
                         shutil.rmtree(child, ignore_errors=True)

@@ -17,7 +17,12 @@ COMPATIBILITY_VERSION = 1
 
 
 def _known_identity(value: Any) -> bool:
-    return isinstance(value, str) and value not in {"", "not_checked", "unknown", "unavailable"}
+    return isinstance(value, str) and value not in {
+        "",
+        "not_checked",
+        "unknown",
+        "unavailable",
+    }
 
 
 def load_scenarios(path: Path) -> dict[str, Any]:
@@ -35,7 +40,9 @@ def load_scenarios(path: Path) -> dict[str, Any]:
             raise ValueError(f"{profile} selects undefined scenario")
         ordered = list(profiles.get(profile, {}).get("execution_order", selected))
         if set(ordered) != set(selected) or len(ordered) != len(selected):
-            raise ValueError(f"{profile} execution_order must contain each selected scenario exactly once")
+            raise ValueError(
+                f"{profile} execution_order must contain each selected scenario exactly once"
+            )
         for scenario in selected:
             scenario_root = path.parent / "lib" / "scenarios"
             shared = scenario_root / "shared" / f"{scenario}.sh"
@@ -61,7 +68,9 @@ def dispatch_scenarios(definition: dict[str, Any], profile: str) -> list[str]:
     selected = profile_scenarios(definition, profile)
     ordered = list(definition["profiles"][profile].get("execution_order", selected))
     if set(ordered) != set(selected) or len(ordered) != len(selected):
-        raise ValueError(f"{profile} execution_order must contain each selected scenario exactly once")
+        raise ValueError(
+            f"{profile} execution_order must contain each selected scenario exactly once"
+        )
     return ordered
 
 
@@ -78,9 +87,17 @@ def _git_value(root: Path, *args: str) -> tuple[str | None, bool]:
 def source_provenance(root: Path, fingerprint: str) -> dict[str, Any]:
     commit, commit_error = _git_value(root, "rev-parse", "HEAD")
     tree, tree_error = _git_value(root, "rev-parse", "HEAD^{tree}")
-    dirty, status_error = _git_value(root, "status", "--porcelain", "--untracked-files=all")
+    dirty, status_error = _git_value(
+        root, "status", "--porcelain", "--untracked-files=all"
+    )
     identity_errors = [
-        name for name, failed in (("commit", commit_error), ("tree", tree_error), ("status", status_error)) if failed
+        name
+        for name, failed in (
+            ("commit", commit_error),
+            ("tree", tree_error),
+            ("status", status_error),
+        )
+        if failed
     ]
     return {
         "commit_sha": commit,
@@ -145,7 +162,11 @@ def environment_projection(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def environments_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    return bool(left) and bool(right) and environment_projection(left) == environment_projection(right)
+    return (
+        bool(left)
+        and bool(right)
+        and environment_projection(left) == environment_projection(right)
+    )
 
 
 def sha256(path: Path) -> str:
@@ -160,10 +181,14 @@ def write_manifest(root: Path) -> Path:
     manifest = root / "artifact-manifest.sha256"
     entries: list[str] = []
     for path in sorted(
-        path for path in root.rglob("*") if path.is_file() and path.name != "artifact-manifest.sha256"
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.name != "artifact-manifest.sha256"
     ):
         entries.append(f"{sha256(path)}  {path.relative_to(root)}")
-    manifest.write_text("\n".join(entries) + ("\n" if entries else ""), encoding="utf-8")
+    manifest.write_text(
+        "\n".join(entries) + ("\n" if entries else ""), encoding="utf-8"
+    )
     return manifest
 
 
@@ -197,20 +222,15 @@ def verify_manifest(root: Path) -> bool:
 def _legacy_checks(profile: str, legacy: dict[str, Any]) -> dict[str, str]:
     checks = legacy.get("checks", {})
     if profile == "p1":
-        return {
-            key: value
-            for key, value in checks.items()
-            if isinstance(value, str)
-        }
-    return {
-        key: value
-        for key, value in checks.items()
-        if isinstance(value, str)
-    }
+        return {key: value for key, value in checks.items() if isinstance(value, str)}
+    return {key: value for key, value in checks.items() if isinstance(value, str)}
 
 
 def normalize_legacy_report(
-    definition: dict[str, Any], profile: str, legacy: dict[str, Any] | None, selected: list[str],
+    definition: dict[str, Any],
+    profile: str,
+    legacy: dict[str, Any] | None,
+    selected: list[str],
     return_code: int,
 ) -> tuple[str, list[str], list[str], list[str]]:
     """Map existing assertion reports into central scenario status."""
@@ -264,7 +284,11 @@ def make_report(
     guest_source: dict[str, Any] | None = None,
     guest_source_ok: bool = True,
 ) -> dict[str, Any]:
-    status = "passed" if not failed and not not_checked and set(selected) <= set(completed) else "not_checked"
+    status = (
+        "passed"
+        if not failed and not not_checked and set(selected) <= set(completed)
+        else "not_checked"
+    )
     if failed or return_code not in {0, 77}:
         status = "failed"
     release_eligible = (
@@ -280,7 +304,9 @@ def make_report(
         and guest_source_ok
         and bool(phases)
         and all(
-            isinstance(phase, dict) and phase.get("name") and phase.get("status") == "passed"
+            isinstance(phase, dict)
+            and phase.get("name")
+            and phase.get("status") == "passed"
             for phase in phases
         )
     )
@@ -309,19 +335,27 @@ def make_report(
 
 
 def write_report(path: Path, report: dict[str, Any]) -> None:
-    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
-def verify_reuse_chain(value: dict[str, Any], *, max_depth: int = 8, seen: set[str] | None = None) -> bool:
+def verify_reuse_chain(
+    value: dict[str, Any], *, max_depth: int = 8, seen: set[str] | None = None
+) -> bool:
     reuse = value.get("reuse", {})
     if not reuse.get("reused"):
         return True
     origin = reuse.get("origin", {})
     origin_root = Path(origin.get("root", ""))
-    manifest_path = origin_root / str(origin.get("manifest", "artifact-manifest.sha256"))
+    manifest_path = origin_root / str(
+        origin.get("manifest", "artifact-manifest.sha256")
+    )
     if not origin_root.is_dir() or not manifest_path.is_file() or max_depth <= 0:
         return False
-    if sha256(manifest_path) != origin.get("manifest_sha256") or not verify_manifest(origin_root):
+    if sha256(manifest_path) != origin.get("manifest_sha256") or not verify_manifest(
+        origin_root
+    ):
         return False
     seen = set() if seen is None else seen
     key = str(origin_root.resolve())
@@ -329,31 +363,57 @@ def verify_reuse_chain(value: dict[str, Any], *, max_depth: int = 8, seen: set[s
         return False
     seen.add(key)
     try:
-        origin_report = json.loads((origin_root / "acceptance-report.json").read_text(encoding="utf-8"))
+        origin_report = json.loads(
+            (origin_root / "acceptance-report.json").read_text(encoding="utf-8")
+        )
     except (OSError, json.JSONDecodeError):
         return False
-    return isinstance(origin_report, dict) and verify_reuse_chain(origin_report, max_depth=max_depth - 1, seen=seen)
+    return isinstance(origin_report, dict) and verify_reuse_chain(
+        origin_report, max_depth=max_depth - 1, seen=seen
+    )
 
 
 def report_is_compatible(
-    report: dict[str, Any], *, fingerprint: str, required: Iterable[str], environment_value: dict[str, Any],
-    release: bool, source: dict[str, Any], root: Path,
+    report: dict[str, Any],
+    *,
+    fingerprint: str,
+    required: Iterable[str],
+    environment_value: dict[str, Any],
+    release: bool,
+    source: dict[str, Any],
+    root: Path,
 ) -> bool:
     required_set = set(required)
-    if report.get("schema_version") != SCHEMA_VERSION or report.get("compatibility_version") != COMPATIBILITY_VERSION:
+    if (
+        report.get("schema_version") != SCHEMA_VERSION
+        or report.get("compatibility_version") != COMPATIBILITY_VERSION
+    ):
         return False
-    if report.get("status") != "passed" or report.get("source", {}).get("fingerprint") != fingerprint:
+    if (
+        report.get("status") != "passed"
+        or report.get("source", {}).get("fingerprint") != fingerprint
+    ):
         return False
     if not verify_reuse_chain(report):
         return False
     if not required_set.issubset(set(report.get("completed_scenarios", []))):
         return False
-    if report.get("failed_scenarios") or report.get("skipped_scenarios") or report.get("not_checked_scenarios"):
+    if (
+        report.get("failed_scenarios")
+        or report.get("skipped_scenarios")
+        or report.get("not_checked_scenarios")
+    ):
         return False
     phases = report.get("phases")
-    if not isinstance(phases, list) or not phases or any(
-        not isinstance(phase, dict) or not phase.get("name") or phase.get("status") != "passed"
-        for phase in phases
+    if (
+        not isinstance(phases, list)
+        or not phases
+        or any(
+            not isinstance(phase, dict)
+            or not phase.get("name")
+            or phase.get("status") != "passed"
+            for phase in phases
+        )
     ):
         return False
     if not environments_compatible(report.get("environment", {}), environment_value):
@@ -363,7 +423,10 @@ def report_is_compatible(
         if not isinstance(guest, dict) or not guest.get("records"):
             return False
         if any(
-            (not report.get("reuse", {}).get("reused") and record.get("run_id") != report.get("run_id"))
+            (
+                not report.get("reuse", {}).get("reused")
+                and record.get("run_id") != report.get("run_id")
+            )
             or record.get("fingerprint") != fingerprint
             for record in guest["records"]
             if isinstance(record, dict)

@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: capture-basic.
 scenario_p2_capture_basic() {
-phase environment 'validate supported host and collect source provenance'
-if [[ "$REBOOT_RESUME" == 1 ]]; then
-	[[ -f "$STATE_ROOT/wal/recording.json" ]] || exit 1
-fi
-mkdir -p "$STATE_ROOT" "$STORE_ROOT"
-mkdir "$CGROUP"
-CGROUP_ID=$(stat -c '%i' "$CGROUP")
+	phase environment 'validate supported host and collect source provenance'
+	if [[ "$REBOOT_RESUME" == 1 ]]; then
+		[[ -f "$STATE_ROOT/wal/recording.json" ]] || exit 1
+	fi
+	mkdir -p "$STATE_ROOT" "$STORE_ROOT"
+	mkdir "$CGROUP"
+	CGROUP_ID=$(stat -c '%i' "$CGROUP")
 
-phase build 'build Linux eBPF object and Chronicle CLI'
-EBPF_TARGET_DIR=${CHRONICLE_EBPF_TARGET_DIR:-"$ROOT/ebpf/target"}
-cargo +nightly build -Z build-std=core --manifest-path "$ROOT/ebpf/Cargo.toml" --target bpfel-unknown-none --release --locked
-CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build -p chronicle-cli --features linux-ebpf --locked
+	phase build 'build Linux eBPF object and Chronicle CLI'
+	EBPF_TARGET_DIR=${CHRONICLE_EBPF_TARGET_DIR:-"$ROOT/ebpf/target"}
+	cargo +nightly build -Z build-std=core --manifest-path "$ROOT/ebpf/Cargo.toml" --target bpfel-unknown-none --release --locked
+	CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build -p chronicle-cli --features linux-ebpf --locked
 
-phase config 'write short-epoch recorder configuration'
-cat >"$CONFIG" <<EOF
+	phase config 'write short-epoch recorder configuration'
+	cat >"$CONFIG" <<EOF
 version = 1
 state_root = "$STATE_ROOT"
 store_root = "$STORE_ROOT"
@@ -57,38 +57,38 @@ timeout_seconds = 30
 level = "info"
 EOF
 
-phase workload 'start loopback HTTP workload'
-python3 "$DRIVER" serve --port-file "$ARTIFACT_ROOT/upstream.port" --requests "$ARTIFACT_ROOT/upstream-requests.jsonl" >"$ARTIFACT_ROOT/upstream.log" 2>&1 &
-UPSTREAM_PID=$!
-for _ in $(seq 1 100); do
-	[[ -s "$ARTIFACT_ROOT/upstream.port" ]] && break
-	sleep 0.1
-done
-PORT=$(cat "$ARTIFACT_ROOT/upstream.port")
+	phase workload 'start loopback HTTP workload'
+	python3 "$DRIVER" serve --port-file "$ARTIFACT_ROOT/upstream.port" --requests "$ARTIFACT_ROOT/upstream-requests.jsonl" >"$ARTIFACT_ROOT/upstream.log" 2>&1 &
+	UPSTREAM_PID=$!
+	for _ in $(seq 1 100); do
+		[[ -s "$ARTIFACT_ROOT/upstream.port" ]] && break
+		sleep 0.1
+	done
+	PORT=$(cat "$ARTIFACT_ROOT/upstream.port")
 
-phase start 'start foreground recorder under systemd Type=simple'
-systemd-run --quiet --unit="$UNIT" --working-directory="$ROOT" \
-	--setenv=CHRONICLE_CHECKPOINT_PAUSE_FILE="$CHECKPOINT_PAUSE_FILE" \
-	--property=Type=simple --property=KillSignal=SIGTERM --property=TimeoutStopSec=45s \
-	--property=Restart=on-failure --property=RestartSec=1s \
-	--property=NoNewPrivileges=no \
-	"$CHRONICLE" --format json recorder --config "$CONFIG"
-for _ in $(seq 1 30); do
-	if systemctl is-active --quiet "$UNIT"; then
-		break
+	phase start 'start foreground recorder under systemd Type=simple'
+	systemd-run --quiet --unit="$UNIT" --working-directory="$ROOT" \
+		--setenv=CHRONICLE_CHECKPOINT_PAUSE_FILE="$CHECKPOINT_PAUSE_FILE" \
+		--property=Type=simple --property=KillSignal=SIGTERM --property=TimeoutStopSec=45s \
+		--property=Restart=on-failure --property=RestartSec=1s \
+		--property=NoNewPrivileges=no \
+		"$CHRONICLE" --format json recorder --config "$CONFIG"
+	for _ in $(seq 1 30); do
+		if systemctl is-active --quiet "$UNIT"; then
+			break
+		fi
+		sleep 1
+	done
+	if ! systemctl is-active --quiet "$UNIT"; then
+		collect_recorder_readiness_diagnostics
+		exit 1
 	fi
-	sleep 1
-done
-if ! systemctl is-active --quiet "$UNIT"; then
-	collect_recorder_readiness_diagnostics
-	exit 1
-fi
-[[ "$(systemctl show "$UNIT" -p Type --value)" == simple ]]
-set_check systemd_type_simple passed
+	[[ "$(systemctl show "$UNIT" -p Type --value)" == simple ]]
+	set_check systemd_type_simple passed
 
-phase readiness 'poll recorder status before workload admission'
-# Contract requires capture_readiness=ready and state=ready before admission.
-wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
-set_check privileged_acceptance passed
+	phase readiness 'poll recorder status before workload admission'
+	# Contract requires capture_readiness=ready and state=ready before admission.
+	wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
+	set_check privileged_acceptance passed
 
 }

@@ -200,7 +200,6 @@ if [[ "$RELEASE_MODE" == 1 ]]; then
 	}
 fi
 
-
 # shellcheck source=scripts/acceptance/lib/scenario-dispatch.sh
 source "$ROOT/scripts/acceptance/lib/scenario-dispatch.sh"
 run_scenario_plan p2

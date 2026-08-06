@@ -289,15 +289,15 @@ on_exit() {
 	if [[ $status -eq 0 && $cleanup_status -ne 0 ]]; then
 		status=1
 	fi
-if full_mode; then
-		if [[ $RELEASE_MODE == 1 && ( $END_SHA != "$START_SHA" || -n $(git -C "$ROOT" status --porcelain --untracked-files=all) ) ]]; then
+	if full_mode; then
+		if [[ $RELEASE_MODE == 1 && ($END_SHA != "$START_SHA" || -n $(git -C "$ROOT" status --porcelain --untracked-files=all)) ]]; then
 			TREE_CLEAN=false
 			status=1
 		fi
 		if [[ $status -eq 0 && $SIGNAL_RESULT == passed && $CGROUP_MATRIX_RESULT == passed && $SHARED_RUNTIME_RESULT == passed ]]; then
 			F2_11_RESULT=passed
 		fi
-fi
+	fi
 	write_summary "$status"
 	exit "$status"
 }
@@ -340,7 +340,6 @@ if full_mode && [[ $RELEASE_MODE == 1 ]]; then
 fi
 export CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR"
 log "Acceptance mode: $ACCEPTANCE_MODE"
-
 
 # shellcheck source=scripts/acceptance/lib/scenario-dispatch.sh
 source "$ROOT/scripts/acceptance/lib/scenario-dispatch.sh"
