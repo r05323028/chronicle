@@ -47,7 +47,9 @@ for needle in \
 	'--property=Type=simple' \
 	'cgroup v2' \
 	'capture_readiness' \
-	'artifact-manifest.sha256'; do
+	'artifact-manifest.sha256' \
+	'CHECKPOINT_READY_FILE' \
+	'expected one pending checkpoint'; do
 	grep -Fq -- "$needle" "$SCRIPT"
 done
 for needle in \

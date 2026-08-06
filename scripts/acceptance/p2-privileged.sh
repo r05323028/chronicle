@@ -25,6 +25,7 @@ COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
 RECORDER_STATUS="$ARTIFACT_ROOT/recorder-status.json"
 CHECKS_JSON="$ARTIFACT_ROOT/checks.json"
 CHECKPOINT_PAUSE_FILE="$STATE_ROOT/wal/checkpoint-pause.control"
+CHECKPOINT_READY_FILE="${CHECKPOINT_PAUSE_FILE%.*}.ready"
 UPSTREAM_PID=""
 CURRENT_PHASE="initializing"
 READINESS_TIMEOUT=${CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS:-180}
@@ -32,6 +33,7 @@ READINESS_INTERVAL=${CHRONICLE_ACCEPTANCE_READINESS_INTERVAL_SECONDS:-1}
 source "$ROOT/scripts/acceptance/recorder-readiness.sh"
 
 mkdir -p "$ARTIFACT_ROOT"
+rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
 printf '%s\n' 'chronicle-p2-acceptance-root-v1' >"$ARTIFACT_ROOT/.chronicle-acceptance-root"
 exec > >(tee -a "$COMMAND_LOG") 2>&1
 
@@ -119,6 +121,7 @@ PY
 
 cleanup() {
 	set +e
+	rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
 	if [[ "$PRE_REBOOT" != 1 ]]; then
 		[[ -z "$UPSTREAM_PID" ]] || kill "$UPSTREAM_PID" 2>/dev/null || true
 		systemctl stop "$UNIT" 2>/dev/null || true
@@ -550,16 +553,24 @@ umount "$QUOTA_MOUNT"
 rm -rf "$QUOTA_MOUNT" "$QUOTA_IMAGE"
 
 phase checkpoint_crash_matrix 'exercise production publication crash boundaries'
+rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
 : >"$CHECKPOINT_PAUSE_FILE"
 python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/checkpoint-crash-workload.json"
-CHECKPOINT_READY_FILE="${CHECKPOINT_PAUSE_FILE%.*}.ready"
 for _ in $(seq 1 120); do
 	[[ -f "$CHECKPOINT_READY_FILE" ]] && break
 	sleep 0.25
 done
 test -f "$CHECKPOINT_READY_FILE"
-PENDING_BEFORE=$(find "$STATE_ROOT/wal" -type f -name '*.pending' -print -quit)
-test -n "$PENDING_BEFORE"
+PENDING_FILES=()
+while IFS= read -r -d '' pending; do
+	PENDING_FILES+=("$pending")
+done < <(find "$STATE_ROOT/wal" -type f -name '*.pending' -print0)
+if ((${#PENDING_FILES[@]} != 1)); then
+	printf 'expected one pending checkpoint, found %s:\n' "${#PENDING_FILES[@]}" >&2
+	printf '%s\n' "${PENDING_FILES[@]}" >&2
+	exit 1
+fi
+PENDING_BEFORE=${PENDING_FILES[0]}
 DELTA_BEFORE=$(python3 - "$PENDING_BEFORE" "$STORE_ROOT" <<'PY'
 import json, sys
 from pathlib import Path

@@ -995,6 +995,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_checkpoint_before_capture(
     config: &NormalizedRecorderConfig,
     wal_directory: &Path,
@@ -1043,6 +1044,36 @@ fn validate_checkpoint_before_capture(
     )
     .map(|digest| digest_hex(&digest))
     .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    if checkpoint.marker.sequence < committed.snapshot.marker_sequence {
+        let marker_digest = committed
+            .envelopes
+            .iter()
+            .find(|envelope| envelope.sequence == checkpoint.marker.sequence)
+            .and_then(|envelope| chronicle_wal::encode_envelope(envelope).ok())
+            .map(|bytes| {
+                let digest: [u8; 32] = Sha256::digest(bytes).into();
+                digest_hex(&digest)
+            });
+        if marker_digest.as_deref() != Some(checkpoint.marker.marker_digest.as_str()) {
+            return Err(ContinuousRecorderError::Incremental(
+                "checkpoint historical marker digest mismatch".into(),
+            ));
+        }
+    }
+    let checkpoint_active_digest = chronicle_wal::verified_segment_prefix_sha256(
+        wal_directory,
+        recording_id,
+        &committed.envelopes,
+        checkpoint.marker.segment_ordinal,
+        checkpoint.marker.sequence,
+    )
+    .map(|digest| digest_hex(&digest))
+    .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    if checkpoint_active_digest != checkpoint.marker.active_segment_digest {
+        return Err(ContinuousRecorderError::Incremental(
+            "checkpoint active segment digest mismatch".into(),
+        ));
+    }
     let authoritative = RecoveryAuthoritativeSnapshot {
         recording_id: recording_id.0,
         epoch_ordinal,
