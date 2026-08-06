@@ -146,9 +146,16 @@ def files_for_patterns(root: Path, patterns: list[str]) -> list[Path]:
             path = root / name
             if path.is_file():
                 result.add(path)
-    for pattern in patterns:
-        for path in root.glob(pattern):
-            if path.is_file():
+    # Git-aware lookup above covers tracked files. Walk the checkout as well so
+    # untracked acceptance-sensitive source is fingerprinted exactly as tested.
+    ignored = {".git", "target", "graphify-out", ".venv", "node_modules"}
+    for directory, directories, names in os.walk(root):
+        directories[:] = [name for name in directories if name not in ignored]
+        base = Path(directory)
+        for name in names:
+            path = base / name
+            relative = str(path.relative_to(root))
+            if any(matches(relative, pattern) for pattern in patterns):
                 result.add(path)
     return sorted(result)
 
@@ -206,6 +213,9 @@ def fingerprint(
     gate: str,
     cfg: dict[str, Any],
     environment_override: dict[str, Any] | None = None,
+    *,
+    profile: str | None = None,
+    executor: str | None = None,
 ) -> dict[str, Any]:
     gate_cfg = cfg.get("gates", {}).get(gate)
     if not gate_cfg:
@@ -222,12 +232,59 @@ def fingerprint(
         {"path": str(path.relative_to(root)), "sha256": digest(path)} for path in paths
     ]
     payload = {
+        "fingerprint_version": 2,
         "version": cfg.get("version", 1),
         "gate": gate,
+        "profile": profile or gate,
+        "executor": executor or "validation",
         "inputs": inputs,
+        # Environment is compatibility metadata, not source identity. Keeping it
+        # outside the hashed payload permits equivalent source trees to reuse only
+        # when the executor separately proves environment compatibility.
         "environment": environment_override or environment(root),
         "validation_config_sha256": digest(root / "validation/groups.toml"),
         "checks": gate_cfg.get("checks", []),
+    }
+    fingerprint_payload = {key: value for key, value in payload.items() if key != "environment"}
+    encoded = json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
+    return {"fingerprint": hashlib.sha256(encoded).hexdigest(), **payload}
+
+
+def acceptance_fingerprint(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Fingerprint union of P1/P2 acceptance-sensitive source, independent of profile."""
+    patterns: list[str] = []
+    checks: set[str] = set()
+    for gate in ("p1", "p2"):
+        gate_cfg = cfg.get("gates", {}).get(gate, {})
+        for group_name in gate_cfg.get("source_groups", []):
+            patterns.extend(cfg.get("groups", {}).get(group_name, {}).get("paths", []))
+        patterns.extend(gate_cfg.get("acceptance_paths", []))
+        patterns.extend(gate_cfg.get("build_inputs", []))
+        checks.update(gate_cfg.get("checks", []))
+    patterns.extend(
+        [
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            "crates/**",
+            "ebpf/**",
+            "scripts/acceptance.sh",
+            "scripts/acceptance/**",
+            "scripts/validation.py",
+            "scripts/validate.sh",
+            "validation/**",
+        ]
+    )
+    paths = files_for_patterns(root, sorted(set(patterns)))
+    inputs = [
+        {"path": str(path.relative_to(root)), "sha256": digest(path)}
+        for path in paths
+    ]
+    payload = {
+        "fingerprint_version": 2,
+        "inputs": inputs,
+        "validation_config_sha256": digest(root / "validation/groups.toml"),
+        "checks": sorted(checks),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return {"fingerprint": hashlib.sha256(encoded).hexdigest(), **payload}
@@ -406,7 +463,8 @@ def reuse(args: argparse.Namespace) -> int:
             or not manifest.get("executed")
             or manifest.get("fingerprint") != args.fingerprint
             or (
-                getattr(args, "commit", None)
+                getattr(args, "release", False)
+                and getattr(args, "commit", None)
                 and manifest.get("original_commit") != args.commit
             )
         ):
@@ -493,6 +551,7 @@ def main() -> int:
     reuse_parser.add_argument("--fingerprint", required=True)
     reuse_parser.add_argument("--checks", default="")
     reuse_parser.add_argument("--commit")
+    reuse_parser.add_argument("--release", action="store_true")
     args = parser.parse_args()
     if args.command == "environment":
         print(json.dumps(environment(args.root), indent=2, sort_keys=True))

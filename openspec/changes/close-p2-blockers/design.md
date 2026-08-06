@@ -1,6 +1,6 @@
 ## Context
 
-P2 currently spans recorder startup, epoch catalog/WAL recovery, incremental ETL, quota, retention, and privileged acceptance. Existing helpers and unit tests cover pieces, but several helpers are not wired into production and acceptance scripts leave required scenarios `not_checked`. Recovery must be owned by the recorder lease and quota authority; generated evidence must prove one exact commit.
+P2 currently spans recorder startup, epoch catalog/WAL recovery, incremental ETL, quota, retention, and privileged acceptance. Existing helpers and unit tests cover pieces, but several helpers are not wired into production and acceptance scripts leave required scenarios `not_checked`. Recovery must be owned by the recorder lease and quota authority. Acceptance evidence identifies tested content with an acceptance-sensitive fingerprint; commit/tree SHA remains provenance and becomes an exact identity gate only for release evidence.
 
 ## Goals / Non-Goals
 
@@ -25,7 +25,7 @@ P2 currently spans recorder startup, epoch catalog/WAL recovery, incremental ETL
 4. **Incremental output is authoritative.** Stop/finalization reconstructs the session from verified delta/checkpoint lineage, compares it with clean one-shot ETL, and publishes through the session store. Standalone ETL remains an independent diagnostic path.
 5. **No cross-epoch identity inheritance.** Boundary-incomplete payload is preserved as typed incomplete/non-replayable evidence. Predecessor socket envelopes and protocol state never enter successor reconstruction.
 6. **Quota and retention are application-owned.** Every actual durable peak is reserved. Finalized cleanup requires lifecycle-index proof and protected-lineage checks; corruption remains preserved and fail-closed.
-7. **Evidence is gate-specific and exact-SHA.** P1 and P2 artifacts use separate namespaces. End-of-run SHA/tree checks, complete check sets, real process interruption, and independent review are mandatory before release validation.
+7. **Evidence is profile-aware and fingerprinted.** One runner selects P1/P2 scenarios and local/Multipass execution modes. Evidence uses `acceptance/<profile>/<fingerprint>/<run-id>/`, verifies scenario coverage, schema, environment, and artifact manifests, and permits compatible P2 evidence to satisfy P1. Normal development accepts dirty trees and reuses equivalent content without commit equality. Release validation additionally requires clean known start/end commit/tree identity, complete coverage, and release-eligible evidence.
 
 ## Risks / Trade-offs
 

@@ -1,0 +1,87 @@
+schema_version = 1
+runner_schema_version = 2
+compatibility_version = 1
+
+# Scenario IDs are the acceptance contract. Executors run these through one
+# profile runtime; profiles only select capability coverage.
+[profiles.p1]
+scenarios = [
+  "capture-basic",
+  "wal-recovery",
+  "replay",
+  "resource-cleanup",
+]
+
+[profiles.p2]
+scenarios = [
+  "capture-basic",
+  "wal-recovery",
+  "replay",
+  "resource-cleanup",
+  "recorder-readiness",
+  "incremental-etl",
+  "checkpoint-kill-restart",
+  "quota-pressure",
+  "retention-interruption",
+  "corruption-quarantine",
+  "reboot-recovery",
+]
+
+[scenarios.capture-basic]
+capabilities = ["privileged", "ebpf"]
+phases = ["environment", "capture"]
+legacy_p1_checks = ["privileged_acceptance"]
+legacy_p2_checks = ["systemd_type_simple", "three_epochs"]
+
+[scenarios.wal-recovery]
+capabilities = ["privileged", "wal"]
+phases = ["capture", "recovery"]
+legacy_p1_checks = ["wal_fault_matrix", "ingest_limit_matrix"]
+legacy_p2_checks = ["checkpoint_output_committed_checkpoint_missing", "checkpoint_committed_status_missing"]
+
+[scenarios.replay]
+capabilities = ["privileged", "replay"]
+phases = ["replay"]
+legacy_p1_checks = ["replay_matrix"]
+legacy_p2_checks = ["inspect_replay", "one_shot_equivalence"]
+
+[scenarios.resource-cleanup]
+capabilities = ["privileged", "cleanup"]
+phases = ["cleanup"]
+legacy_p1_checks = ["cgroup_matrix", "privileged_signal", "format_check", "workspace_check"]
+legacy_p2_checks = ["resource_cleanup", "signal_shutdown"]
+
+[scenarios.recorder-readiness]
+capabilities = ["privileged", "systemd", "cgroup-v2", "btf"]
+phases = ["readiness"]
+legacy_p2_checks = ["incremental_worker", "process_restart_readiness"]
+
+[scenarios.incremental-etl]
+capabilities = ["privileged", "etl"]
+phases = ["incremental", "finalization"]
+legacy_p2_checks = ["incremental_worker", "standalone_etl_live_rejection", "one_shot_equivalence"]
+
+[scenarios.checkpoint-kill-restart]
+capabilities = ["privileged", "crash-recovery"]
+phases = ["checkpoint_crash_matrix"]
+legacy_p2_checks = ["checkpoint_output_committed_checkpoint_missing", "checkpoint_committed_status_missing"]
+
+[scenarios.quota-pressure]
+capabilities = ["privileged", "quota"]
+phases = ["quota_pressure"]
+legacy_p2_checks = ["quota_exhaustion_admission", "quota_restart_accounting", "quota_recovery_after_space", "minimum_free_enforcement", "minimum_free_recovery"]
+
+[scenarios.retention-interruption]
+capabilities = ["privileged", "retention", "crash-recovery"]
+phases = ["cleanup_recovery"]
+legacy_p2_checks = ["cleanup_interrupted_recovery", "cleanup_protected_lineage", "cleanup_restart_consistency"]
+
+[scenarios.corruption-quarantine]
+capabilities = ["privileged", "corruption"]
+phases = ["corruption"]
+legacy_p2_checks = ["corruption_fail_closed", "corruption_evidence_preservation"]
+
+[scenarios.reboot-recovery]
+capabilities = ["privileged", "reboot", "persistent-state"]
+phases = ["pre_reboot", "post_reboot"]
+legacy_p2_checks = ["pre_reboot_persistence", "host_reboot_recovery"]

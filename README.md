@@ -33,7 +33,7 @@ Replay depends only on canonical sessions and protocol interfaces. It does not d
 A generated registration is not support. Fake and bounded HTTP/1.1 are functional.
 
 | Protocol | Detection | Decode | Canonicalize | Replay | Verify |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | Fake (functional scaffold) | Available | Available | Available | Available | Available |
 | HTTP/1.1 | Available | Available | Available | Available | Available |
 | PostgreSQL | Planned | Planned | Planned | Planned | Planned |
@@ -89,7 +89,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-Rootless CI runs workspace tests and isolated eBPF compilation. Real eBPF runtime coverage is opt-in and retained by `./scripts/acceptance/p1-privileged.sh`; skipped privileged runs are not passed off as runtime coverage.
+Rootless CI runs workspace tests and isolated eBPF compilation. Real eBPF runtime coverage is opt-in through `./scripts/acceptance.sh --profile p1|p2 --executor local|multipass`; skipped privileged runs are not passed off as runtime coverage. Development evidence uses acceptance-sensitive fingerprints; `--release` enables exact clean source checks.
 
 No checked-in configuration should contain secrets. `postgres.connection_url_env` names an environment variable rather than storing credentials.
 

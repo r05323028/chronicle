@@ -115,9 +115,10 @@ Documentation SHALL compare node daemon and sidecar trade-offs, name node daemon
 
 ### Requirement: Production deployment acceptance is retained separately
 
-Rootless tests SHALL validate configuration parsing, state/status schemas, systemd unit text/static safety, failure-policy decisions, and runbook commands without claiming eBPF. Privileged acceptance SHALL run exact committed build on Ubuntu 24.04 with systemd or faithful service-manager scope, real cgroup v2/eBPF capture, multiple epochs/segments, SIGTERM, forced crash/restart, ETL lag/recovery, disk pressure, and cleanup/leak verification. Evidence SHALL include commit, kernel/architecture, capabilities, unit/config digest, lifecycle timeline, artifact checksums, and explicit checked/not-checked claims.
+Rootless tests SHALL validate configuration parsing, state/status schemas, systemd unit text/static safety, failure-policy decisions, and runbook commands without claiming eBPF. Privileged acceptance SHALL run the acceptance-sensitive source snapshot on supported Ubuntu 24.04 with systemd or faithful service-manager scope, real cgroup v2/eBPF capture, multiple epochs/segments, SIGTERM, forced crash/restart, ETL lag/recovery, disk pressure, and cleanup/leak verification. Evidence SHALL include acceptance fingerprint, source commit/tree provenance, kernel/architecture, capabilities, unit/config digest, lifecycle timeline, artifact checksums, and explicit checked/not-checked claims; exact source identity is release-only.
 
 #### Scenario: Production model evidence
 
 - **WHEN** privileged deployment acceptance passes
-- **THEN** retained report proves recommended placement, continuous operation, restart, resource/failure behavior, and cleanup for exact environment without treating OpenSpec validation as runtime proof
+- **THEN** retained report proves recommended placement, continuous operation, restart, resource/failure behavior, and cleanup for compatible environment without treating OpenSpec validation as runtime proof
+- **AND THEN** release reports additionally prove clean stable source identity

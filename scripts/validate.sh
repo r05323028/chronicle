@@ -114,48 +114,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ensure_vm_mount() {
-	local state
-	command -v multipass >/dev/null 2>&1 || {
-		printf '%s\n' 'multipass is required for privileged validation' >&2
-		return 1
-	}
-	state=$(multipass info "$VM" 2>/dev/null | awk '/State:/ {print $2; exit}')
-	if [[ $state != Running ]]; then
-		multipass start "$VM"
-	fi
-	if ! multipass exec "$VM" -- test -f /mnt/chronicle/scripts/validation.py; then
-		multipass mount "$ROOT" "$VM:/mnt/chronicle"
-	fi
-	multipass exec "$VM" -- test -f /mnt/chronicle/scripts/validation.py
-}
-
-vm_environment() {
-	ensure_vm_mount
-	local value
-	value=$(multipass exec "$VM" -- bash -lc \
-		'cd /mnt/chronicle && sudo -E env HOME=/home/ubuntu PATH="$PATH" python3 scripts/validation.py environment --root /mnt/chronicle')
-	printf '%s' "$value" | python3 -c '
-import json
-import sys
-value = json.load(sys.stdin)
-capabilities = value.get("capabilities", {})
-if not any(int(raw, 16) for raw in capabilities.values() if raw):
-    raise SystemExit("privileged VM environment has no effective capabilities")
-print(json.dumps(value, indent=2, sort_keys=True))
-'
-}
-
-checks_for() {
-	python3 - "$CONFIG" "$1" <<'PY'
-import sys
-import tomllib
-from pathlib import Path
-config = tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(",".join(config["gates"][sys.argv[2]].get("checks", [])))
-PY
-}
-
 run_step() {
 	local name=$1
 	shift
@@ -195,60 +153,25 @@ run_shell() {
 	fi
 }
 
-fingerprint_for() {
-	local gate=$1
-	local environment_file=$2
-	local out="$WORKDIR/$gate-fingerprint.json"
-	python3 "$HELPER" fingerprint --root "$ROOT" --gate "$gate" --config "$CONFIG" \
-		--environment "$environment_file" >"$out"
-	python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fingerprint"])' "$out"
-}
-
 run_gate() {
-	local gate=$1 fp source dest status environment_file checks
-	status=0
-	environment_file="$WORKDIR/$gate-environment.json"
-	checks=$(checks_for "$gate")
-	vm_environment >"$environment_file"
-	fp=$(fingerprint_for "$gate" "$environment_file")
-	printf '\nGate %s fingerprint: %s\n' "$gate" "$fp"
-	if [[ $REUSE_EVIDENCE == true && $DRY_RUN != true && $DRY_RUN != 1 ]]; then
-		if reused=$(python3 "$HELPER" reuse --evidence-root "$EVIDENCE_ROOT" --gate "$gate" --fingerprint "$fp" --checks "$checks" --commit "$(git -C "$ROOT" rev-parse HEAD)" 2>/dev/null); then
-			printf 'REUSED evidence: %s\n' "$reused"
-			printf '%s reused\n' "$gate" >>"$WORKDIR/reused.txt"
-			return 0
-		fi
-		printf 'Evidence not reusable: fingerprint or manifest mismatch.\n'
+	local gate=$1 status=0
+	local -a command=("$ROOT/scripts/acceptance.sh" --profile "$gate" --executor multipass --vm "$VM" --evidence-root "$EVIDENCE_ROOT/acceptance")
+	if [[ $MODE == release ]]; then
+		command+=(--release)
 	fi
-	source="$WORKDIR/$gate-source"
-	dest="$EVIDENCE_ROOT/$gate"
-	mkdir -p "$source"
+	if [[ $REUSE_EVIDENCE != true ]]; then
+		command+=(--no-reuse)
+	fi
+	if [[ $ARTIFACT_MODE != release ]]; then
+		command+=(--compact)
+	fi
 	if [[ $DRY_RUN == true || $DRY_RUN == 1 ]]; then
-		printf 'WOULD RUN complete %s gate via existing Multipass acceptance.\n' "$gate"
+		printf 'WOULD RUN unified acceptance: %q ' "${command[@]}"
+		printf '\n'
 		return 0
 	fi
-	local compact=1
-	if [[ $gate == p1 ]]; then
-		CHRONICLE_ACCEPTANCE_DEST="$source" CHRONICLE_ACCEPTANCE_COMPACT="$compact" \
-			CHRONICLE_ACCEPTANCE_MODE=full CARGO_TARGET_DIR=/home/ubuntu/chronicle-target \
-			CHRONICLE_EBPF_TARGET_DIR=/home/ubuntu/chronicle-ebpf-target \
-			"$ROOT/scripts/acceptance/p1-multipass.sh" "$VM" || status=$?
-	else
-		CHRONICLE_ACCEPTANCE_DEST="$source" CHRONICLE_ACCEPTANCE_COMPACT="$compact" \
-			CARGO_TARGET_DIR=/home/ubuntu/chronicle-target \
-			CHRONICLE_EBPF_TARGET_DIR=/home/ubuntu/chronicle-ebpf-target \
-			"$ROOT/scripts/acceptance/p2-multipass.sh" "$VM" || status=$?
-	fi
-	if [[ $status -eq 0 ]]; then
-		python3 "$HELPER" compact --source "$source" --dest "$dest" --gate "$gate" --status passed \
-			--fingerprint "$fp" --commit "$(git -C "$ROOT" rev-parse HEAD)" \
-			--checks "$checks" --environment "$environment_file" --artifact-mode "$ARTIFACT_MODE"
-	else
-		python3 "$HELPER" compact --source "$source" --dest "$dest" --gate "$gate" --status failed \
-			--fingerprint "$fp" --commit "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)" \
-			--checks "$checks" --environment "$environment_file" --artifact-mode "$ARTIFACT_MODE" || true
-		return "$status"
-	fi
+	run_step "acceptance-$gate" "${command[@]}" || status=$?
+	return "$status"
 }
 
 run_fast() {
@@ -314,8 +237,8 @@ PY
 			run_shell ebpf-build 'cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release --locked'
 			printf 'eBPF source changed: minimal privileged smoke selects P1 smoke path.\n'
 			if [[ ${CHRONICLE_SKIP_PRIVILEGED_SMOKE:-false} != true ]]; then
-				CHRONICLE_ACCEPTANCE_MODE=smoke CHRONICLE_ACCEPTANCE_DEST="$WORKDIR/p1-smoke-source" \
-					CHRONICLE_ACCEPTANCE_COMPACT=1 "$ROOT/scripts/acceptance/p1-multipass.sh" "$VM"
+				"$ROOT/scripts/acceptance.sh" --profile p1 --executor multipass --vm "$VM" \
+					--evidence-root "$WORKDIR/p1-smoke-source" --no-reuse --compact
 			fi
 			;;
 		wal)
@@ -353,8 +276,9 @@ release)
 	run_shell release-tests "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo test --workspace --all-features --locked"
 	run_shell release-openspec 'openspec validate --all --strict --no-interactive'
 	run_shell release-source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'"
-	run_gate p1
-	run_gate p2
+	release_command=("$ROOT/scripts/acceptance.sh" --profile all --executor multipass --vm "$VM" --evidence-root "$EVIDENCE_ROOT/acceptance" --release)
+	if [[ $REUSE_EVIDENCE != true ]]; then release_command+=(--no-reuse); fi
+	run_step acceptance-release "${release_command[@]}"
 	;;
 help | -h | --help) usage ;;
 *)

@@ -49,12 +49,13 @@ Targeted mode SHALL accept `--changed-since <git-ref>`, inspect changed paths, s
 
 ### Requirement: Fingerprinted evidence reuse
 
-Each P1/P2 gate SHALL compute a deterministic fingerprint from only gate-relevant source/build/acceptance inputs, Cargo.lock, compiler version, target architecture, Ubuntu/kernel/BTF/cgroup capability values, and validation configuration. Evidence SHALL record fingerprint, original commit, creation date, environment, covered checks, and executed/reused status. `--reuse-evidence` SHALL reuse only matching valid successful evidence and SHALL report reuse explicitly; `--force` SHALL disable reuse for a fresh gate run. Acceptance script, relevant source, compiler, kernel, architecture, or validation-contract changes SHALL prevent reuse.
+Each P1/P2 acceptance profile SHALL compute a deterministic acceptance-sensitive fingerprint from source/build/acceptance inputs, Cargo.lock, toolchain inputs, and validation configuration. Environment identity (OS, Ubuntu version, architecture, kernel, BTF/cgroup capabilities, compiler, and executor) SHALL be stored and compared separately, never used as the source fingerprint alone. Evidence SHALL record fingerprint, source provenance including commit/tree SHA and dirty state, creation date, environment, profile scenario coverage, and executed/reused status. `scripts/acceptance.sh` SHALL reuse only matching successful evidence by default; `--no-reuse` SHALL force a fresh run. Acceptance-sensitive source or validation-contract changes SHALL prevent reuse; unrelated documentation changes SHALL not.
 
 #### Scenario: Unchanged gate reuse
 
-- **WHEN** valid evidence with matching fingerprint exists and reuse is requested
-- **THEN** expensive gate is skipped and original fingerprint, commit, date, environment, and covered checks are printed
+- **WHEN** valid evidence with matching fingerprint, scenario coverage, schema, manifest, and compatible environment exists
+- **THEN** expensive acceptance is skipped and reuse status, source provenance, environment, and covered scenarios are printed
+- **AND THEN** commit equality is not required outside release mode
 
 #### Scenario: Relevant input invalidation
 
@@ -87,7 +88,7 @@ Successful fast, targeted, and gate runs SHALL retain at most compact metadata (
 
 ### Requirement: VM-local caches
 
-Privileged validation SHALL reuse an existing Multipass Ubuntu instance when available, mount source at `/mnt/chronicle`, use VM-local `/home/ubuntu/chronicle-target` for `CARGO_TARGET_DIR` and `/home/ubuntu/.cargo` for Cargo cache, and bootstrap missing dependencies without reinstalling an existing toolchain on every run. Build outputs SHALL be treated as caches and SHALL never be uploaded as evidence.
+Privileged validation SHALL reuse an existing Multipass Ubuntu instance when available, transfer an immutable snapshot of the acceptance-sensitive checkout (including dirty development changes), use VM-local `/home/ubuntu/chronicle-target` for `CARGO_TARGET_DIR` and `/home/ubuntu/.cargo` for Cargo cache, and bootstrap missing dependencies without reinstalling an existing toolchain on every run. Build outputs SHALL be treated as caches and SHALL never be uploaded as evidence. Release mode SHALL additionally require clean, known start/end commit/tree identity.
 
 #### Scenario: Cache reuse
 

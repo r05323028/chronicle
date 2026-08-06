@@ -90,8 +90,9 @@ gates = ["p1", "p2"]
 [gates.p1]
 source_groups = ["ebpf", "replay", "acceptance", "build_tooling"]
 acceptance_paths = [
-  "scripts/acceptance/p1-multipass.sh",
-  "scripts/acceptance/p1-privileged.sh",
+  "scripts/acceptance.sh",
+  "scripts/acceptance/**",
+  "validation/groups.toml",
 ]
 build_inputs = ["ebpf/**", "ebpf-feasibility/**"]
 checks = ["P1 complete privileged acceptance"]
@@ -99,8 +100,9 @@ checks = ["P1 complete privileged acceptance"]
 [gates.p2]
 source_groups = ["wal", "etl", "acceptance", "build_tooling"]
 acceptance_paths = [
-  "scripts/acceptance/p2-multipass.sh",
-  "scripts/acceptance/p2-privileged.sh",
+  "scripts/acceptance.sh",
+  "scripts/acceptance/**",
+  "validation/groups.toml",
 ]
 build_inputs = ["ebpf/**", "ebpf-feasibility/**"]
 checks = [

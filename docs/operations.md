@@ -89,8 +89,10 @@ Validation entry point:
 ```bash
 ./scripts/validate.sh fast
 ./scripts/validate.sh targeted --changed-since origin/main
-./scripts/validate.sh gate p1
-./scripts/validate.sh gate p2
+./scripts/acceptance.sh --profile p1 --executor multipass
+./scripts/acceptance.sh --profile p2 --executor multipass
+./scripts/acceptance.sh --profile p2 --executor multipass --release
+./scripts/acceptance.sh --profile p2 --executor multipass --no-reuse
 ./scripts/validate.sh release --reuse-evidence
 ```
 
@@ -98,9 +100,9 @@ Validation entry point:
 
 Fast and targeted modes use local checks and default to failure-only artifacts. Successful gate artifacts contain only `summary.json`, `environment.json`, `manifest.json`, and `checksums.txt`; failure artifacts contain a bounded reproducer and failure-listed WAL/session data. Never upload `target/`, Cargo caches, VM filesystems, or complete successful WAL directories. Retention guidance: no upload or 1–3 days for fast/targeted successes, about 7 days for gate successes, about 14 days for gate failures, and long-term for release evidence.
 
-Privileged caches stay in reused Multipass VM paths `/home/ubuntu/chronicle-target`, `/home/ubuntu/chronicle-ebpf-target`, and `/home/ubuntu/.cargo`; wrappers verify or create source mount `/mnt/chronicle` before cloning. `--reuse-evidence` matches gate fingerprints built from relevant source, acceptance/build inputs, Cargo.lock, and toolchain/environment data collected inside the VM. It never uses the whole repository commit as the only key.
+Privileged caches stay in reused Multipass VM paths `/home/ubuntu/chronicle-target`, `/home/ubuntu/chronicle-ebpf-target`, and `/home/ubuntu/.cargo`; the unified executor transfers an immutable source snapshot so dirty development changes are tested, not discarded. Evidence lives under `target/validation-evidence/acceptance/<profile>/<fingerprint>/<run-id>/`. Reuse matches acceptance-sensitive source fingerprint, scenario coverage, report schema, manifest integrity, and compatible executor/environment. Commit/tree SHA is provenance only during development; release mode additionally requires clean stable exact identity.
 
-`scripts/acceptance/` contains authoritative privileged execution. `scripts/tests/acceptance/` contains rootless acceptance-runner checks; run them alongside `python3 scripts/tests/validation/test_layered_validation.py` and `bash scripts/tests/acceptance/test-p2-readiness.sh` for tooling coverage.
+`scripts/acceptance.sh` is the only user-facing acceptance entrypoint. `scripts/acceptance/scenarios.toml` defines scenario/profile coverage, `runner.py` owns selection/fingerprint/report/reuse, and `lib/multipass.sh` owns VM lifecycle, snapshot transfer, reboot, and artifacts. Profile scripts retain actual privileged assertions. `scripts/acceptance/p1-*.sh` and `p2-*.sh` remain thin deprecated compatibility wrappers. Run `python3 scripts/tests/acceptance/test_runner.py`, `python3 scripts/tests/validation/test_layered_validation.py`, and `bash scripts/tests/acceptance/test-p2-readiness.sh` for tooling coverage.
 
 P2 readiness contract: `recorder-status` now reports machine-readable `state` values (`starting`, `recovering`, `loading_ebpf`, `ready`, `degraded`, `failed`) alongside liveness, lifecycle, capture readiness, processing readiness, and health. Workload admission waits for `state=ready`; systemd `active` alone is insufficient. Polling prints state transitions, tolerates temporary status-command failures, stops immediately on terminal failure, and uses configurable timeout/interval values (`CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_READINESS_INTERVAL_SECONDS`).
 

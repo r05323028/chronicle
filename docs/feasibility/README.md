@@ -47,8 +47,10 @@ Use one entry point. Portable work stays local; targeted work selects only affec
 ```bash
 ./scripts/validate.sh fast
 ./scripts/validate.sh targeted --changed-since origin/main
-./scripts/validate.sh gate p1
-./scripts/validate.sh gate p2
+./scripts/acceptance.sh --profile p1 --executor multipass
+./scripts/acceptance.sh --profile p2 --executor multipass
+./scripts/acceptance.sh --profile p2 --executor multipass --release
+./scripts/acceptance.sh --profile p2 --executor multipass --no-reuse
 ./scripts/validate.sh release --reuse-evidence
 ```
 
@@ -66,9 +68,9 @@ Wrappers reuse existing `chronicle-ubuntu`, bootstrap missing packages once, and
 
 Successful fast/targeted runs retain no artifact by default. Successful gates retain compact metadata; failures retain only a summary, failed log, reproducer, kernel log, and failure-listed WAL/session data. Release retains complete evidence. Use `--no-artifact` or `--keep-workdir` for local control.
 
-`validation/groups.toml` owns path-to-group selection. Targeted output always lists changed paths, selected groups, skipped groups, and reasons. Gate fingerprints include only owned source/build/acceptance inputs plus toolchain and environment collected inside the VM; unrelated documentation does not invalidate P1/P2 evidence.
+`validation/groups.toml` owns path-to-group selection. Targeted output always lists changed paths, selected groups, skipped groups, and reasons. Acceptance fingerprints include only acceptance-sensitive source/build inputs and validation configuration; environment is compared separately. Unrelated documentation does not invalidate compatible evidence. P2 evidence may satisfy P1 when scenario coverage and environment match; P1 evidence never satisfies P2.
 
-Direct `p1-privileged.sh` and `p1-multipass.sh` calls remain compatibility paths. Use `gate p1` or `release` for retained exact-commit evidence; both require a clean source checkout and preserve the complete P1 report contract.
+`scripts/acceptance.sh` is the single runner. Normal runs allow dirty source and record commit/tree as provenance. `--release` requires clean stable exact source identity and complete release-eligible evidence. Legacy P1/P2 scripts remain deprecation wrappers only.
 
 Historical verification measurements (temporary clean snapshot `5b3f49c9…`; not current retained acceptance evidence):
 

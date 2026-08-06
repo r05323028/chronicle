@@ -256,7 +256,6 @@ Live ETL SHALL use read-only snapshot semantics and SHALL never repair, truncate
 - **WHEN** writer appends while ETL reads active segment
 - **THEN** ETL remains bounded by chosen marker and never repairs mutable suffix
 
-
 ### Requirement: FinalSessionCheckpoint v1 and IncrementalEtlCheckpoint v1 are distinct
 
 `FinalSessionCheckpoint v1` SHALL remain the existing P1 stopped-recording checkpoint artifact and SHALL not be extended to represent live incremental state. It owns final-session ETL/publication lifecycle and existing P1 finalization behavior.
@@ -282,7 +281,6 @@ Live ETL SHALL use read-only snapshot semantics and SHALL never repair, truncate
 - **WHEN** pending connection/operation state exceeds existing deterministic limit
 - **THEN** ETL applies existing typed incomplete/truncated/fail behavior and never emits silent partial checkpoint
 
-
 ### Requirement: Deterministic immutable incremental publication
 
 ETL SHALL publish completed canonical operations/evidence as immutable bounded batches keyed deterministically by recording epoch, pipeline version, exact source WAL provenance, and canonical content. Batch ordering SHALL derive from capture/WAL provenance, not poll interval, worker timing, checkpoint grouping, or restart count. Existing canonical types and completeness/provenance semantics SHALL be reused; P2 SHALL NOT redefine HTTP protocol meaning or weaken Canonical Session v1 validation.
@@ -303,7 +301,6 @@ Publication SHALL use `RecordingStore` put-if-absent semantics. Existing same ke
 
 - **WHEN** deterministic key exists with different bytes or provenance
 - **THEN** ETL fails and does not overwrite or advance checkpoint
-
 
 ### Requirement: Publication-before-checkpoint crash safety
 
@@ -326,7 +323,6 @@ Crash before publication SHALL replay input. Crash during publication SHALL veri
 - **WHEN** checkpoint is durable but WAL manifest still labels segment sealed
 - **THEN** reconciliation marks segment processed from verified checkpoint/output proof
 
-
 ### Requirement: Duplicate prevention uses lineage, not event heuristics
 
 ETL SHALL identify already-consumed input by exact epoch/segment/sequence/marker and digest lineage. It SHALL identify already-published output by deterministic key plus content/provenance digest. It SHALL NOT deduplicate operations only by timestamp, HTTP fields, payload equality, socket tuple, or process ID. Same captured operation observed twice at distinct WAL provenance SHALL remain two observations unless existing TCP retransmission rules prove duplicate byte range.
@@ -342,7 +338,6 @@ Checkpoint lineage SHALL form one unambiguous chain. Forked checkpoints, predece
 
 - **WHEN** two checkpoint revisions claim same predecessor with conflicting input/output digest
 - **THEN** reconciliation fails without choosing by timestamp
-
 
 ### Requirement: Resume preserves provenance and clock domains
 
@@ -360,7 +355,6 @@ Long-lived connection crossing segment snapshots SHALL retain one connection gen
 - **WHEN** TCP connection remains open across bounded recording epoch boundary
 - **THEN** each epoch preserves its observed evidence and old epoch does not claim complete operation from future epoch bytes
 
-
 ### Requirement: Incremental lag and backpressure are bounded and visible
 
 ETL queue, worker count, checkpoint state, output batch size, retry count/backoff, and maximum lag thresholds SHALL be configured/documented and bounded. Recorder capture/WAL durability SHALL not wait for ETL publication during normal operation. ETL lag SHALL gate retention and may trigger warning/not-ready according to policy, but SHALL not cause unprocessed WAL deletion. Quota exhaustion caused by ETL lag SHALL stop capture through WAL quota policy with exact counters rather than drop already accepted data silently.
@@ -377,7 +371,6 @@ Health/status SHALL expose committed marker, checkpoint marker, lag records/byte
 - **WHEN** unprocessed WAL reaches reserved quota and no segment is eligible
 - **THEN** recorder stops/fails visibly rather than delete or skip input
 
-
 ### Requirement: Incremental and one-shot ETL remain equivalent
 
 P1 standalone ETL SHALL remain supported for stopped recordings. For one final committed epoch snapshot, incremental execution and clean one-shot execution SHALL produce same deterministic Canonical Session v1, session/connection/operation IDs, timeline order, payload digests, completeness, replayability, provenance, and issue ordering. Incremental-only batch/checkpoint metadata SHALL not change replay semantics.
@@ -392,16 +385,14 @@ P1 standalone ETL SHALL remain supported for stopped recordings. For one final c
 - **WHEN** ETL is killed at every publication/checkpoint boundary then resumed
 - **THEN** final output matches uninterrupted run with no duplicate/missing operation
 
-
 ### Requirement: Incremental ETL acceptance
 
-Rootless automated tests SHALL include snapshot concurrency, serialized-state round trip, fragmented long-lived HTTP across segments, loss windows, bounds, publication/checkpoint fault matrix, fork/corruption detection, quota lag, and one-shot equivalence. Privileged acceptance SHALL prove incremental processing of real eBPF WAL during continuous recording, ETL process crash/restart, deterministic final output, and retained checkpoint/publication evidence tied to exact commit/environment.
+Rootless automated tests SHALL include snapshot concurrency, serialized-state round trip, fragmented long-lived HTTP across segments, loss windows, bounds, publication/checkpoint fault matrix, fork/corruption detection, quota lag, and one-shot equivalence. Privileged acceptance SHALL prove incremental processing of real eBPF WAL during continuous recording, ETL process crash/restart, deterministic final output, and retained checkpoint/publication evidence tied to acceptance fingerprint, compatible environment, and source provenance. Exact commit/tree identity is release-only.
 
 #### Scenario: Privileged incremental proof
 
 - **WHEN** real workload produces committed records during multi-segment recording and ETL is terminated/restarted
 - **THEN** checkpoint resumes from validated lineage, final output is deterministic, and no committed operation is duplicated or omitted
-
 
 ### Requirement: Decoder snapshot and cursor restoration fail closed
 

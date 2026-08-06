@@ -317,7 +317,6 @@ Command SHALL emit one bounded startup result after capture readiness or termina
 - **WHEN** SIGTERM arrives and graceful drain succeeds
 - **THEN** recorder exits 0 with termination-signal state after final WAL/checkpoint/metadata ordering
 
-
 ### Requirement: Non-mutating recorder status command
 
 CLI SHALL provide `recorder-status --state-root DIR` with global human/JSON format. It SHALL delegate to application diagnostics, acquire no writer ownership, perform no repair/cleanup/ETL/capture/replay, and render bounded versioned health, liveness, capture-readiness, processing-readiness, overall-health, lifecycle, watermark, lag, quota, counter, and recovery fields. If live owner cannot be proven or state is stale/contradictory, output SHALL say so without promoting metadata claims.
@@ -337,7 +336,6 @@ CLI SHALL provide `recorder-status --state-root DIR` with global human/JSON form
 - **WHEN** user requests JSON
 - **THEN** stdout is one valid bounded versioned object through existing atomic renderer
 
-
 ### Requirement: P1 one-shot commands remain available
 
 Existing fixture/production `record`, standalone `etl`, `doctor`, `inspect`, and `replay` commands and their safety/exit contracts SHALL remain supported. `record` and standalone `etl` SHALL reject mutation against a WAL/store filesystem domain owned by a live recorder; read-only `doctor`, `inspect`, and `replay` may continue. `record` SHALL remain bounded and SHALL NOT silently become daemon mode. `etl` SHALL continue to process stopped P1/P2 epochs; incremental ETL lifecycle belongs to recorder application service. Replay defaults and authorization SHALL remain unchanged.
@@ -352,10 +350,9 @@ Existing fixture/production `record`, standalone `etl`, `doctor`, `inspect`, and
 - **WHEN** stopped epoch is passed to `etl`
 - **THEN** one-shot deterministic publication remains available and equivalent to finalized incremental result
 
-
 ### Requirement: P2 CLI and documentation acceptance
 
-CLI contract tests SHALL cover recorder/status grammar, atomic startup/status JSON, signal exits, stale ownership, failure mapping, safe output, and unchanged P1 commands. Operations docs SHALL include systemd foreground invocation, private configuration, status, stop/restart, recovery, quota/retention, and supported-host example. Privileged acceptance SHALL invoke recorder under recommended service placement and retain exact command/config digest/output/evidence; fixture tests SHALL not claim daemon eBPF acceptance.
+CLI contract tests SHALL cover recorder/status grammar, atomic startup/status JSON, signal exits, stale ownership, failure mapping, safe output, and unchanged P1 commands. Operations docs SHALL include systemd foreground invocation, private configuration, status, stop/restart, recovery, quota/retention, and supported-host example. Privileged acceptance SHALL invoke recorder under recommended service placement and retain acceptance fingerprint, source provenance, exact command/config digest/output/evidence, and environment compatibility; fixture tests SHALL not claim daemon eBPF acceptance. Exact commit/tree identity is release-only.
 
 #### Scenario: CLI regression suite
 

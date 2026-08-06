@@ -8,7 +8,7 @@ Chronicle still has unproven and partially wired P2 behavior around lease-owned 
 - Make epoch rollover recoverable, quota-safe, and free of empty epochs.
 - Finalize incremental ETL from verified delta/checkpoint lineage and preserve epoch-boundary incompleteness without predecessor state injection.
 - Wire production quota accounting, retention cleanup, corruption fail-closed behavior, and lifecycle-index bounds.
-- Strengthen privileged acceptance with real kill/restart/reboot/cleanup evidence, exact-SHA checks, complete check status, and gate-separated artifacts.
+- Strengthen privileged acceptance with real kill/restart/reboot/cleanup evidence, unified profile/executor orchestration, fingerprinted reusable artifacts, complete check status, and release-only exact source identity checks.
 - Correct OpenSpec task/evidence records after implementation and independent review.
 
 ## Capabilities

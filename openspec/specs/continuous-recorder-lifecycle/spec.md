@@ -218,7 +218,7 @@ Compaction SHALL replace eligible history with a deterministic bounded lineage a
 
 ### Requirement: Lifecycle acceptance is evidence-based
 
-Rootless automated tests SHALL prove state transitions, exclusive ownership, rollover, graceful timeout, crash-point recovery, metadata reconciliation, bounded lifecycle compaction, and no duplicate epoch assignment with deterministic fake capture/WAL/storage adapters. Privileged acceptance SHALL separately prove supported Ubuntu 24.04 real eBPF continuous operation, signal handling, process restart, cgroup/eBPF cleanup, and retained machine-readable evidence tied to exact commit/environment. OpenSpec validation SHALL NOT count as runtime acceptance.
+Rootless automated tests SHALL prove state transitions, exclusive ownership, rollover, graceful timeout, crash-point recovery, metadata reconciliation, bounded lifecycle compaction, and no duplicate epoch assignment with deterministic fake capture/WAL/storage adapters. Privileged acceptance SHALL separately prove supported Ubuntu 24.04 real eBPF continuous operation, signal handling, process restart, cgroup/eBPF cleanup, and retained machine-readable evidence tied to acceptance fingerprint, compatible environment, and source provenance. Exact commit/tree identity is required only for release-eligible evidence. OpenSpec validation SHALL NOT count as runtime acceptance.
 
 #### Scenario: Continuous operation proof
 

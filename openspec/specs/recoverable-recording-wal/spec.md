@@ -563,7 +563,7 @@ Manifest rebuild SHALL preserve existing segment ordinals, sequence ranges, comm
 
 ### Requirement: WAL lifecycle acceptance
 
-Automated tests SHALL cover size/age rotation, manifest atomicity/rebuild/contradiction, every segment transition, quota reservation, retention eligibility, cleanup crash points, corruption, live snapshot behavior, and deterministic recovery. Privileged acceptance SHALL retain machine-readable manifest, segment/checkpoint digests, quota/cleanup report, and environment/commit identity for real continuous capture across multiple rotations and restart.
+Automated tests SHALL cover size/age rotation, manifest atomicity/rebuild/contradiction, every segment transition, quota reservation, retention eligibility, cleanup crash points, corruption, live snapshot behavior, and deterministic recovery. Privileged acceptance SHALL retain machine-readable manifest, segment/checkpoint digests, quota/cleanup report, acceptance fingerprint, compatible environment, and source provenance for real continuous capture across multiple rotations and restart. Exact commit/tree identity is release-only.
 
 #### Scenario: Rotation and recovery proof
 

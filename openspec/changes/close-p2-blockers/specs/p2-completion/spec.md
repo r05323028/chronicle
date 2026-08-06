@@ -90,18 +90,30 @@ Production quota accounting SHALL cover every durable transaction peak, rebuild 
 
 ### Requirement: Privileged acceptance proves P2 truthfully
 
-Privileged acceptance SHALL execute real process interruption, restart, reboot, quota, corruption, cleanup, replay, and resource-cleanup scenarios; retain artifacts under a gate-specific exact-SHA namespace; and fail when any required check is `not_checked`.
+Privileged acceptance SHALL execute real process interruption, restart, reboot, quota, corruption, cleanup, replay, and resource-cleanup scenarios through the unified profile runner; retain artifacts under `acceptance/<profile>/<fingerprint>/<run-id>/`; verify scenario coverage, compatible environment, and artifact manifests; and fail when any required check is `not_checked`.
 
-#### Scenario: Exact-SHA report
+#### Scenario: Development provenance report
 
-- **WHEN** privileged acceptance completes
-- **THEN** start and end commit/tree identity match
-- **AND THEN** report task identity matches P2, status is `passed`, and no required check is `not_checked`
+- **WHEN** normal privileged acceptance completes, including with uncommitted source
+- **THEN** report records commit SHA, tree SHA when known, acceptance fingerprint, dirty state, environment, and run identity
+- **AND THEN** status reflects actual scenario results without requiring commit equality or a clean tree
+
+#### Scenario: Release-grade exact identity
+
+- **WHEN** `scripts/acceptance.sh --profile p2 --executor multipass --release` completes
+- **THEN** clean known start/end commit and tree identity match for the complete run
+- **AND THEN** report is `release_eligible`, status is `passed`, manifest and required scenario coverage are complete, and no required check is `not_checked`
 
 #### Scenario: Crash and cleanup evidence
 
 - **WHEN** recorder or cleanup is interrupted at a durable boundary
 - **THEN** restart convergence, immutable evidence, protected lineage, process cleanup, cgroup cleanup, and eBPF cleanup are machine-validated
+
+#### Scenario: Compatible evidence reuse
+
+- **WHEN** a prior P2 run has matching fingerprint, schema, environment, complete manifest, and all required scenarios passed
+- **THEN** it may satisfy a P1 request when P1 scenarios are a subset
+- **AND THEN** P1 evidence never satisfies P2 and commit equality is not required outside release mode
 
 #### Scenario: Reboot evidence
 

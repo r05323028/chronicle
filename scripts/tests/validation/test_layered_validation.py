@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import contextlib
+import importlib.util
 import io
 import json
 import shutil
-import importlib.util
 import sys
 import tempfile
 import unittest
@@ -76,7 +76,7 @@ class LayeredValidationTests(unittest.TestCase):
             first, validation.fingerprint(self.temp, "p1", self.cfg)["fingerprint"]
         )
 
-    def test_fingerprint_uses_supplied_environment(self):
+    def test_fingerprint_keeps_environment_out_of_source_identity(self):
         vm_environment = {
             "rustc": "rustc vm",
             "architecture": "aarch64",
@@ -91,11 +91,17 @@ class LayeredValidationTests(unittest.TestCase):
             "fingerprint"
         ]
         vm_environment["kernel"] = "6.8.1"
-        self.assertNotEqual(
+        self.assertEqual(
             first,
             validation.fingerprint(self.temp, "p1", self.cfg, vm_environment)[
                 "fingerprint"
             ],
+        )
+        self.assertEqual(
+            "6.8.1",
+            validation.fingerprint(self.temp, "p1", self.cfg, vm_environment)[
+                "environment"
+            ]["kernel"],
         )
 
     def test_no_artifact_does_not_create_output(self):
@@ -258,7 +264,7 @@ class LayeredValidationTests(unittest.TestCase):
                     commit="new-sha",
                 )
             ),
-            1,
+            0,
         )
 
     def test_failure_artifact_contains_reproducer_inputs_only(self):
