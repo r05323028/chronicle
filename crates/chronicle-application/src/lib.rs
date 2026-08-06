@@ -1740,11 +1740,34 @@ struct TerminalDiscardAccumulator {
 
 impl RecordingIngest {
     pub fn new(writer: GroupCommitWalWriter) -> Self {
+        let authority = writer.authority().clone();
+        let counters = RecordingCounters {
+            committed: RecordByteCount {
+                records: authority.durable_record_count,
+                bytes: authority.durable_payload_bytes,
+            },
+            ..RecordingCounters::default()
+        };
+        let last_valid_commit = authority
+            .marker_sequence
+            .zip(authority.durable_through_sequence)
+            .zip(authority.segment_ordinal)
+            .map(
+                |((marker_sequence, durable_through_sequence), segment_ordinal)| {
+                    RecordingCommitBoundary {
+                        marker_sequence,
+                        durable_through_sequence,
+                        durable_record_count: authority.durable_record_count,
+                        durable_payload_bytes: authority.durable_payload_bytes,
+                        segment_ordinal,
+                    }
+                },
+            );
         Self {
             writer,
             queue: VecDeque::with_capacity(INGEST_QUEUE_CAPACITY),
             state: IngestState::Accepting,
-            counters: RecordingCounters::default(),
+            counters,
             written: RecordByteCount::default(),
             written_records: BTreeMap::new(),
             written_capture_timestamps: BTreeMap::new(),
@@ -1752,7 +1775,7 @@ impl RecordingIngest {
             terminal_discarded: BTreeMap::new(),
             terminal_discarded_without_time: RecordByteCount::default(),
             terminal_wal_loss: None,
-            last_valid_commit: None,
+            last_valid_commit,
         }
     }
 
