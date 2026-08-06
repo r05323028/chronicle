@@ -185,6 +185,24 @@ class AcceptanceRunnerTests(unittest.TestCase):
         candidate = self._read_report(root / "acceptance-report.json")
         self.assertFalse(report.report_is_compatible(candidate, fingerprint="fp-a", required=p2, environment_value=self.environment, release=False, source=self.source, root=root))
 
+    def test_empty_phase_evidence_cannot_pass_or_reuse(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        value = report.make_report(
+            run_id="empty-phases", profile="p1", executor="local", selected=selected,
+            completed=selected, failed=[], skipped=[], not_checked=[], phases=[],
+            source={**self.source, "identity_error": None}, environment_value=self.environment,
+            return_code=0,
+        )
+        self.assertFalse(value["release_eligible"])
+        root = self.temp / "empty-phases"
+        root.mkdir()
+        report.write_report(root / "acceptance-report.json", value)
+        report.write_manifest(root)
+        self.assertFalse(report.report_is_compatible(
+            value, fingerprint="fp-a", required=selected, environment_value=self.environment,
+            release=False, source=self.source, root=root,
+        ))
+
     def test_environment_mismatch_and_manifest_corruption_reject_reuse(self):
         p1 = report.profile_scenarios(self.definition, "p1")
         root = self._write_evidence("p1", p1, p1)
@@ -305,6 +323,10 @@ class AcceptanceRunnerTests(unittest.TestCase):
         )
         self.assertEqual(value["run_id"], "run-reboot")
         self.assertEqual([phase["name"] for phase in value["phases"]], ["pre_reboot", "post_reboot"])
+        reboot = (ROOT / "scripts/acceptance/lib/scenarios/p2/reboot-recovery.sh").read_text()
+        self.assertIn("incremental-etl-checkpoint.json", reboot)
+        self.assertIn("committed(post)", reboot)
+        self.assertIn("epoch(post)", reboot)
 
     def test_profiles_share_acceptance_fingerprint(self):
         self.assertEqual(

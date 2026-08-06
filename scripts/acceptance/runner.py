@@ -358,15 +358,26 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
             completed = []
             not_checked = []
     phases_path = runtime_root / "phases.json"
+    phase_evidence_error = False
     if phases_path.is_file():
         try:
             phases = json.loads(phases_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             phases = []
+            phase_evidence_error = True
     else:
         phases = [{"name": "run", "status": "passed" if status == "passed" else status}]
-    if not isinstance(phases, list):
+    if not isinstance(phases, list) or not phases or any(
+        not isinstance(phase, dict) or not phase.get("name") or phase.get("status") not in {"passed", "failed", "not_checked"}
+        for phase in phases
+    ):
+        phase_evidence_error = True
         phases = []
+    if phase_evidence_error:
+        status = "failed"
+        failed = list(selected)
+        completed = []
+        not_checked = []
 
     source_end = report.source_provenance(ROOT, fingerprint)
     source = {

@@ -89,10 +89,6 @@ set_check systemd_type_simple passed
 phase readiness 'poll recorder status before workload admission'
 # Contract requires capture_readiness=ready and state=ready before admission.
 wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
-if [[ "$REBOOT_RESUME" == 1 ]]; then
-	set_check host_reboot_recovery passed
-	set_check pre_reboot_persistence passed
-fi
 set_check privileged_acceptance passed
 
 }

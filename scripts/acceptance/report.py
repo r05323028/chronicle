@@ -278,7 +278,11 @@ def make_report(
         and _known_identity(source.get("tree_sha"))
         and source_stable
         and guest_source_ok
-        and all(phase.get("status") == "passed" for phase in phases)
+        and bool(phases)
+        and all(
+            isinstance(phase, dict) and phase.get("name") and phase.get("status") == "passed"
+            for phase in phases
+        )
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -345,6 +349,12 @@ def report_is_compatible(
     if not required_set.issubset(set(report.get("completed_scenarios", []))):
         return False
     if report.get("failed_scenarios") or report.get("skipped_scenarios") or report.get("not_checked_scenarios"):
+        return False
+    phases = report.get("phases")
+    if not isinstance(phases, list) or not phases or any(
+        not isinstance(phase, dict) or not phase.get("name") or phase.get("status") != "passed"
+        for phase in phases
+    ):
         return False
     if not environments_compatible(report.get("environment", {}), environment_value):
         return False
