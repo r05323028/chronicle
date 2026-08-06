@@ -86,7 +86,12 @@ run_remote() {
 			$extra \\
 			'$VM_SOURCE_ROOT/scripts/acceptance/lib/profile-$profile.sh'
 		status=\$?
-		sudo -E env HOME=/home/ubuntu PATH=\"\$PATH\" python3 '$VM_SOURCE_ROOT/scripts/validation.py' environment --root '$VM_SOURCE_ROOT' | sudo tee '$VM_ARTIFACTS/guest-environment.json' >/dev/null || true
+		sudo -E env HOME=/home/ubuntu PATH=\"\$PATH\" python3 '$VM_SOURCE_ROOT/scripts/validation.py' environment --root '$VM_SOURCE_ROOT' | sudo tee '$artifact_root/guest-environment.json' >/dev/null || true
+		guest_commit=\$(git -C '$VM_SOURCE_ROOT' rev-parse HEAD 2>/dev/null || printf not_checked)
+		guest_tree=\$(git -C '$VM_SOURCE_ROOT' rev-parse HEAD^{tree} 2>/dev/null || printf not_checked)
+		guest_dirty=0
+		if [[ -n \"\$(git -C '$VM_SOURCE_ROOT' status --porcelain --untracked-files=all 2>/dev/null)\" ]]; then guest_dirty=1; fi
+		printf '{\"run_id\":\"%s\",\"fingerprint\":\"%s\",\"commit_sha\":\"%s\",\"tree_sha\":\"%s\",\"working_tree_dirty\":%s}\n' \"$RUN_ID\" \"${CHRONICLE_ACCEPTANCE_SOURCE_FINGERPRINT:-}\" \"\$guest_commit\" \"\$guest_tree\" \"\$guest_dirty\" | sudo tee '$artifact_root/guest-source.json' >/dev/null
 		sudo chown -R ubuntu:ubuntu '$VM_ARTIFACTS' 2>/dev/null || true
 		exit \$status
 	"

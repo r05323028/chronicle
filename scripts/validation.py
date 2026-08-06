@@ -261,6 +261,7 @@ def acceptance_fingerprint(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
         patterns.extend(gate_cfg.get("acceptance_paths", []))
         patterns.extend(gate_cfg.get("build_inputs", []))
         checks.update(gate_cfg.get("checks", []))
+    patterns = [pattern for pattern in patterns if not pattern.startswith("docs/")]
     patterns.extend(
         [
             "Cargo.toml",

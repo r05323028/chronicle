@@ -58,6 +58,12 @@ class AcceptanceRunnerTests(unittest.TestCase):
         p2 = set(report.profile_scenarios(self.definition, "p2"))
         self.assertTrue(p1 < p2)
 
+    def test_all_deduplicates_to_p2_superset(self):
+        with mock.patch.object(runner, "run_profile", return_value=0) as run:
+            self.assertEqual(runner.main(["--profile", "all", "--no-reuse"]), 0)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[1], "p2")
+
     def test_parser_selects_executor_and_no_reuse(self):
         args = runner.parser().parse_args(["--profile", "p2", "--executor", "multipass", "--no-reuse"])
         self.assertEqual(args.executor, "multipass")
@@ -90,6 +96,13 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertEqual(value["status"], "passed")
         self.assertTrue(value["release_eligible"])
         self.assertEqual(value["not_checked_scenarios"], [])
+        value = report.make_report(
+            run_id="run-no-reuse", profile="p1", executor="local", selected=selected,
+            completed=selected, failed=[], skipped=[], not_checked=[],
+            phases=[{"name": "run", "status": "passed"}], source=self.source,
+            environment_value=self.environment, return_code=0, reuse_requested=False,
+        )
+        self.assertFalse(value["reuse"]["requested"])
 
     def _write_evidence(self, profile, selected, completed, environment=None, source=None):
         root = self.temp / "evidence" / profile / "fp-a" / "run-a"
@@ -122,6 +135,51 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertFalse(report.report_is_compatible(candidate, fingerprint="fp-a", required=p1, environment_value=changed, release=False, source=self.source, root=root))
         (root / "acceptance-report.json").write_text("corrupt\n")
         self.assertFalse(report.verify_manifest(root))
+
+    def test_reuse_receipt_records_p2_to_p1_source(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        args = runner.parser().parse_args(["--profile", "p1", "--executor", "multipass", "--no-reuse", "--evidence-root", str(self.temp / "receipts")])
+        candidate = self.temp / "candidate"
+        candidate.mkdir()
+        receipt_status = runner.write_reuse_receipt(
+            args,
+            "p1",
+            selected,
+            "fp-a",
+            self.source,
+            {**self.environment, "executor": "multipass"},
+            candidate,
+            {"guest_source": {"records": [{"run_id": "source", "fingerprint": "fp-a"}]}},
+        )
+        self.assertEqual(receipt_status, 0)
+        receipt = next((self.temp / "receipts").glob("p1/fp-a/*/acceptance-report.json"))
+        value = self._read_report(receipt)
+        self.assertTrue(value["reuse"]["reused"])
+        self.assertEqual(value["reuse"]["from"], str(candidate))
+
+    def test_guest_identity_mismatch_rejects_resume(self):
+        runtime = self.temp / "runtime"
+        runtime.mkdir()
+        (runtime / "guest-source.json").write_text(json.dumps({"run_id": "wrong", "fingerprint": "fp-a", "working_tree_dirty": False}))
+        _, valid = runner.guest_identity(runtime, "run-a", "fp-a", False)
+        self.assertFalse(valid)
+
+    def test_snapshot_inputs_exclude_docs(self):
+        cfg = validation.config(ROOT)
+        inputs = validation.acceptance_fingerprint(ROOT, cfg)["inputs"]
+        self.assertTrue(inputs)
+        self.assertTrue(all(not item["path"].startswith("docs/") for item in inputs))
+        self.assertIn("--exclude='./docs'", (ROOT / "scripts/acceptance/lib/multipass.sh").read_text())
+
+    def test_p2_common_coverage_requires_p1_pass(self):
+        p1 = report.profile_scenarios(self.definition, "p1")
+        status, completed, failed, not_checked = report.normalize_legacy_report(
+            self.definition, "p1", {"status": "failed", "checks": {}}, p1, 1
+        )
+        self.assertEqual(status, "failed")
+        self.assertEqual(completed, [])
+        self.assertEqual(set(failed), set(p1))
+        self.assertEqual(not_checked, [])
 
     def test_reboot_phases_are_single_run(self):
         selected = report.profile_scenarios(self.definition, "p2")

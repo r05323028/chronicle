@@ -141,6 +141,79 @@ def compatible_evidence(
     return None
 
 
+def write_evidence(root: Path, value: dict[str, Any]) -> None:
+    value["artifact_manifest"] = {"file": "artifact-manifest.sha256", "complete": False}
+    report_path = root / "acceptance-report.json"
+    report.write_report(report_path, value)
+    manifest = report.write_manifest(root)
+    value["artifact_manifest"] = {"file": manifest.name, "complete": True}
+    report.write_report(report_path, value)
+    report.write_manifest(root)
+
+
+def guest_identity(runtime_root: Path, run_id: str, fingerprint: str, release: bool) -> tuple[dict[str, Any] | None, bool]:
+    records: list[dict[str, Any]] = []
+    for path in sorted(runtime_root.rglob("guest-source.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    if not records:
+        return None, False
+    valid = all(
+        value.get("run_id") == run_id
+        and value.get("fingerprint") == fingerprint
+        and (not release or (not value.get("working_tree_dirty") and value.get("commit_sha") and value.get("tree_sha")))
+        for value in records
+    )
+    return {"records": records, "final": records[-1]}, valid
+
+
+def write_reuse_receipt(
+    args: argparse.Namespace,
+    profile: str,
+    selected: list[str],
+    fingerprint: str,
+    source: dict[str, Any],
+    environment_value: dict[str, Any],
+    candidate_root: Path,
+    candidate_report: dict[str, Any],
+) -> int:
+    receipt_id = now_run_id()
+    receipt_root = args.evidence_root.resolve() / profile / fingerprint / receipt_id
+    receipt_root.mkdir(parents=True, exist_ok=False)
+    value = report.make_report(
+        run_id=receipt_id,
+        profile=profile,
+        executor=args.executor,
+        selected=selected,
+        completed=selected,
+        failed=[],
+        skipped=[],
+        not_checked=[],
+        phases=[{"name": "reuse", "status": "passed"}],
+        source={**source, "reused_from": str(candidate_root)},
+        environment_value=environment_value,
+        return_code=0,
+        reused=True,
+        reused_from=str(candidate_root),
+        legacy={"source_evidence": str(candidate_root)},
+        release_requested=args.release,
+        source_stable=True,
+        reuse_requested=True,
+        guest_source=candidate_report.get("guest_source"),
+        guest_source_ok=bool(candidate_report.get("guest_source")),
+    )
+    value["status"] = "passed"
+    value["release_eligible"] = bool(args.release and value["release_eligible"])
+    write_evidence(receipt_root, value)
+    print(f"REUSED evidence: {candidate_root}")
+    print(f"Reuse receipt: {receipt_root}")
+    return 0
+
+
 def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, Any]) -> int:
     selected = report.profile_scenarios(definition, profile)
     fingerprint, fingerprint_payload = source_fingerprint(profile, args.executor)
@@ -167,9 +240,16 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
         )
         if reused:
             path, candidate = reused
-            print(f"REUSED evidence: {path}")
-            print(json.dumps({"reused": True, "run_id": candidate.get("run_id"), "profile": candidate.get("profile"), "fingerprint": fingerprint}, sort_keys=True))
-            return 0
+            return write_reuse_receipt(
+                args,
+                profile,
+                selected,
+                fingerprint,
+                report.source_provenance(ROOT, fingerprint),
+                environment_value,
+                path,
+                candidate,
+            )
 
     run_id = now_run_id()
     run_root = evidence_root / profile / fingerprint / run_id
@@ -305,14 +385,20 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
         "stable": source_start == source_end,
     }
     final_environment = environment_value
-    guest_environment_path = runtime_root / "guest-environment.json"
-    if guest_environment_path.is_file():
+    guest_environment_paths = sorted(runtime_root.rglob("guest-environment.json"))
+    if guest_environment_paths:
         try:
-            guest = json.loads(guest_environment_path.read_text(encoding="utf-8"))
+            guest = json.loads(guest_environment_paths[-1].read_text(encoding="utf-8"))
             if isinstance(guest, dict):
                 final_environment = {**guest, "executor": args.executor}
         except (OSError, json.JSONDecodeError):
             pass
+    guest_source, guest_source_ok = guest_identity(runtime_root, run_id, fingerprint, args.release)
+    if args.executor == "multipass" and not guest_source_ok and status == "passed":
+        status = "failed"
+        failed = list(selected)
+        completed = []
+        not_checked = []
     final_report = report.make_report(
         run_id=run_id,
         profile=profile,
@@ -331,6 +417,9 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
         ),
         release_requested=args.release,
         source_stable=bool(source["stable"]),
+        reuse_requested=not args.no_reuse,
+        guest_source=guest_source,
+        guest_source_ok=guest_source_ok if args.executor == "multipass" else True,
     )
     # Normalize status from legacy report into the central result.
     final_report["status"] = status
@@ -346,14 +435,7 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
                         child.unlink(missing_ok=True)
                 except OSError:
                     pass
-    final_report["artifact_manifest"] = {"file": "artifact-manifest.sha256", "complete": False}
-    final_report_path = run_root / "acceptance-report.json"
-    report.write_report(final_report_path, final_report)
-    manifest = report.write_manifest(run_root)
-    final_report["artifact_manifest"] = {"file": manifest.name, "complete": True}
-    report.write_report(final_report_path, final_report)
-    # The report changed after its first manifest entry; refresh manifest once.
-    report.write_manifest(run_root)
+    write_evidence(run_root, final_report)
     print(f"Evidence: {run_root}")
     if status == "passed":
         return 0
@@ -363,7 +445,9 @@ def run_profile(args: argparse.Namespace, profile: str, definition: dict[str, An
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     definition = report.load_scenarios(ROOT / "scripts/acceptance/scenarios.toml")
-    profiles = ("p1", "p2") if args.profile == "all" else (args.profile,)
+    profiles = ("p2",) if args.profile == "all" else (args.profile,)
+    if args.profile == "all":
+        print("Profile all: executing P2 superset once; P1 scenarios are included.")
     statuses = [run_profile(args, profile, definition) for profile in profiles]
     if any(status not in {0} for status in statuses):
         return next(status for status in statuses if status != 0)

@@ -222,6 +222,9 @@ def make_report(
     legacy: dict[str, Any] | None = None,
     release_requested: bool = False,
     source_stable: bool = True,
+    reuse_requested: bool = True,
+    guest_source: dict[str, Any] | None = None,
+    guest_source_ok: bool = True,
 ) -> dict[str, Any]:
     status = "passed" if not failed and not not_checked and set(selected) <= set(completed) else "not_checked"
     if failed or return_code not in {0, 77}:
@@ -234,6 +237,7 @@ def make_report(
         and bool(source.get("commit_sha"))
         and bool(source.get("tree_sha"))
         and source_stable
+        and guest_source_ok
         and all(phase.get("status") == "passed" for phase in phases)
     )
     return {
@@ -250,7 +254,8 @@ def make_report(
         "phases": phases,
         "source": source,
         "environment": environment_value,
-        "reuse": {"requested": True, "reused": reused, "from": reused_from},
+        "guest_source": guest_source,
+        "reuse": {"requested": reuse_requested, "reused": reused, "from": reused_from},
         "release_requested": release_requested,
         "release_eligible": release_eligible,
         "status": status,
@@ -278,6 +283,17 @@ def report_is_compatible(
         return False
     if not environments_compatible(report.get("environment", {}), environment_value):
         return False
+    if report.get("executor") == "multipass":
+        guest = report.get("guest_source", {})
+        if not isinstance(guest, dict) or not guest.get("records"):
+            return False
+        if any(
+            (not report.get("reuse", {}).get("reused") and record.get("run_id") != report.get("run_id"))
+            or record.get("fingerprint") != fingerprint
+            for record in guest["records"]
+            if isinstance(record, dict)
+        ):
+            return False
     if release:
         candidate_source = report.get("source", {})
         if not report.get("release_eligible"):
@@ -285,6 +301,14 @@ def report_is_compatible(
         if candidate_source.get("commit_sha") != source.get("commit_sha") or candidate_source.get("tree_sha") != source.get("tree_sha"):
             return False
         if candidate_source.get("working_tree_dirty"):
+            return False
+        guest_records = report.get("guest_source", {}).get("records", [])
+        if any(
+            record.get("commit_sha") != source.get("commit_sha")
+            or record.get("tree_sha") != source.get("tree_sha")
+            or record.get("working_tree_dirty")
+            for record in guest_records
+        ):
             return False
     return verify_manifest(root)
 
