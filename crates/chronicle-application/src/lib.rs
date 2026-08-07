@@ -13,6 +13,7 @@ mod recorder_orchestration;
 mod recorder_quota;
 mod recorder_startup;
 mod recorder_status;
+mod rollover_transition;
 
 pub use cgroup_selection::{
     CgroupSelection, CgroupSelectionError, CgroupSelector, PidCgroupSelection,
@@ -52,13 +53,19 @@ pub use recorder_orchestration::{
     RecorderOrchestrator, RecorderPoll,
 };
 pub use recorder_quota::{
-    CapacityProvider, DomainQuota, QUOTA_ENFORCEMENT_ENABLED, QuotaError, QuotaReservation,
-    QuotaReservationAuthority, ReservationKind, StatvfsCapacityProvider,
+    CapacityProvider, DomainQuota, QUOTA_ENFORCEMENT_ENABLED, QuotaError, QuotaPressureKind,
+    QuotaReservation, QuotaReservationAuthority, ReservationKind, StatvfsCapacityProvider,
+    classify_quota_pressure,
 };
 pub use recorder_startup::{RecorderStartup, RecorderStartupError};
 pub use recorder_status::{
     RECORDER_STATUS_SCHEMA_VERSION, RecorderStatusError, RecorderStatusState, RecorderStatusV1,
     SegmentCounts, StatusRemediation,
+};
+pub use rollover_transition::{
+    ROLLOVER_TRANSITION_FILE, ROLLOVER_TRANSITION_SCHEMA_VERSION, RolloverTransitionError,
+    RolloverTransitionPhase, RolloverTransitionV1, load_transition, remove_transition,
+    write_transition_atomic,
 };
 
 use chronicle_canonical::{
@@ -84,17 +91,16 @@ use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
 use chronicle_wal::{
     COMMIT_MARKER_FRAME_LEN, DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_WAL_BYTES,
-    DEFAULT_SEGMENT_BYTES, GroupCommitWalWriter, MAX_SEGMENT_BYTES, MIN_SEGMENT_BYTES, RecordKind,
-    RecordingLock, RecoveryReopenPreview, RecoveryReopenReport, RecoveryRepair, RecoveryScan,
-    SEGMENT_HEADER_LEN, TERMINAL_WAL_LOSS_SCHEMA_VERSION, TerminalWalLoss,
-    TerminalWalLossAmbiguity, TerminalWalLossInterval, TerminalWalLossReason, WalCheckpoint,
-    WalError, WalRecordEnvelope, encode_envelope, encode_terminal_wal_loss,
+    DEFAULT_SEGMENT_BYTES, GroupCommitWalWriter, LifecycleEpochEntry, LifecycleIndexV1,
+    MAX_SEGMENT_BYTES, MIN_SEGMENT_BYTES, RecordKind, RecordingLock, RecoveryReopenPreview,
+    RecoveryReopenReport, RecoveryRepair, RecoveryScan, SEGMENT_HEADER_LEN,
+    TERMINAL_WAL_LOSS_SCHEMA_VERSION, TerminalWalLoss, TerminalWalLossAmbiguity,
+    TerminalWalLossInterval, TerminalWalLossReason, WalCheckpoint, WalError, WalRecordEnvelope,
+    cleanup_finalized_segment_verified, encode_envelope, encode_terminal_wal_loss,
     prepare_group_commit_reopen_from_scan, verified_snapshot_sha256,
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-use chronicle_wal::{
-    cleanup_finalized_segment_verified, prepare_group_commit_reopen, recover_cleanup,
-};
+use chronicle_wal::{prepare_group_commit_reopen, recover_cleanup};
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
@@ -110,8 +116,9 @@ use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
 };
+use std::time::{Duration, SystemTime};
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const RECORDING_METADATA_SCHEMA_VERSION: u16 = 1;
@@ -800,22 +807,11 @@ pub fn record_live_ebpf(
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 #[allow(clippy::too_many_lines)]
 fn recover_cleanup_for_root(root: &Path) -> Result<(), RecorderStartupError> {
-    let mut directories = vec![root.to_path_buf()];
-    let epochs = root.join("epochs");
-    if epochs.exists() {
-        let entries = fs::read_dir(&epochs).map_err(|_| RecorderStartupError::Recovery)?;
-        for entry in entries {
-            let entry = entry.map_err(|_| RecorderStartupError::Recovery)?;
-            if entry
-                .file_type()
-                .map_err(|_| RecorderStartupError::Recovery)?
-                .is_dir()
-            {
-                directories.push(entry.path());
-            }
-        }
-    }
-    for directory in directories {
+    // The cleanup intent is written beside its source segment (inside the
+    // epoch's segments directory), so the recovery scan must descend into
+    // every subdirectory of the WAL root.
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -823,21 +819,296 @@ fn recover_cleanup_for_root(root: &Path) -> Result<(), RecorderStartupError> {
         };
         for entry in entries {
             let entry = entry.map_err(|_| RecorderStartupError::Recovery)?;
-            let file_name = entry.file_name();
-            if entry
+            let path = entry.path();
+            let file_type = entry
                 .file_type()
-                .map_err(|_| RecorderStartupError::Recovery)?
-                .is_file()
-                && file_name.to_string_lossy().starts_with("cleanup-intent")
+                .map_err(|_| RecorderStartupError::Recovery)?;
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cleanup-intent")
             {
-                recover_cleanup(entry.path()).map_err(|_| RecorderStartupError::Recovery)?;
+                recover_cleanup(&path).map_err(|_| RecorderStartupError::Recovery)?;
             }
         }
     }
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+fn rollover_path_matches(expected: &str, actual: &Path) -> bool {
+    match (fs::canonicalize(expected), fs::canonicalize(actual)) {
+        (Ok(expected), Ok(actual)) => expected == actual,
+        _ => Path::new(expected) == actual,
+    }
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+#[allow(clippy::too_many_lines)]
+fn recover_rollover_transition_for_root(
+    state_root: &Path,
+    root: &Path,
+    catalog: Option<&mut EpochCatalogV1>,
+    quotas: &[QuotaReservationAuthority],
+    configured_reservation_bytes: u64,
+) -> Result<(), RecorderStartupError> {
+    let Some(transition) = load_transition(state_root)
+        .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    let successor = PathBuf::from(&transition.new_path);
+    if !successor.starts_with(root) {
+        return Err(RecorderStartupError::RecoveryDetail(
+            "rollover successor escaped catalog root".into(),
+        ));
+    }
+    if transition.reservation_bytes != configured_reservation_bytes {
+        return Err(RecorderStartupError::RecoveryDetail(
+            "rollover reservation does not match configured epoch limit".into(),
+        ));
+    }
+    if !quotas.is_empty() {
+        let authorities = quotas
+            .iter()
+            .filter(|quota| successor.starts_with(Path::new(&quota.quota().domain)))
+            .collect::<Vec<_>>();
+        if authorities.len() != 1
+            || transition.reservation_bytes > authorities[0].quota().quota_bytes
+        {
+            return Err(RecorderStartupError::RecoveryDetail(
+                "rollover successor quota domain or reservation mismatch".into(),
+            ));
+        }
+    }
+    let (catalog_old_matches, catalog_successor_matches) =
+        if let Some(catalog_view) = catalog.as_ref() {
+            let old = catalog_view.epochs.iter().any(|entry| {
+                entry.ordinal == transition.old_epoch_ordinal
+                    && entry.recording_id.0 == transition.old_recording_id
+                    && rollover_path_matches(&transition.old_path, &root.join(&entry.path))
+            });
+            let successor_entry = catalog_view.epochs.iter().any(|entry| {
+                entry.ordinal == transition.new_epoch_ordinal
+                    && entry.recording_id.0 == transition.new_recording_id
+                    && entry.predecessor
+                        == Some(chronicle_common::RecordingId(transition.old_recording_id))
+                    && rollover_path_matches(&transition.new_path, &root.join(&entry.path))
+            });
+            (old, successor_entry)
+        } else {
+            (true, false)
+        };
+    if !catalog_old_matches {
+        return Err(RecorderStartupError::RecoveryDetail(
+            "rollover transition predecessor identity mismatch".into(),
+        ));
+    }
+    let physical_bytes = if successor.exists() {
+        recording_physical_wal_bytes(&successor)
+            .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?
+    } else {
+        0
+    };
+    if physical_bytes > transition.reservation_bytes {
+        return Err(RecorderStartupError::RecoveryDetail(
+            "rollover successor exceeded reserved quota".into(),
+        ));
+    }
+    let metadata = load_recording_metadata(&successor)
+        .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+    if let Some(metadata) = &metadata
+        && metadata.recording_id.0 != transition.new_recording_id
+    {
+        return Err(RecorderStartupError::RecoveryDetail(
+            "rollover successor metadata identity mismatch".into(),
+        ));
+    }
+    let committed = if successor.exists() && successor.join("segments").is_dir() {
+        match chronicle_wal::read_committed_snapshot_with_records(
+            &successor,
+            chronicle_common::RecordingId(transition.new_recording_id),
+            chronicle_wal::DEFAULT_MAX_RECORD_BYTES,
+        ) {
+            Ok(_) => true,
+            Err(chronicle_wal::WalError::NoPublishedSegments) => false,
+            Err(error) => {
+                return Err(RecorderStartupError::RecoveryDetail(error.to_string()));
+            }
+        }
+    } else {
+        false
+    };
+    if metadata.is_none() && committed {
+        return Err(RecorderStartupError::RecoveryDetail(
+            "rollover successor has committed evidence without metadata".into(),
+        ));
+    }
+    if metadata.is_some() && !catalog_successor_matches {
+        return Err(RecorderStartupError::RecoveryDetail(
+            "rollover transition successor identity mismatch".into(),
+        ));
+    }
+    if metadata.is_none() && successor.exists() {
+        fs::remove_dir_all(&successor).map_err(|error| {
+            RecorderStartupError::RecoveryDetail(format!(
+                "rollover successor rollback failed: {error}"
+            ))
+        })?;
+    }
+    let Some(catalog) = catalog else {
+        if metadata.is_some() {
+            return Err(RecorderStartupError::RecoveryDetail(
+                "rollover successor metadata has no catalog authority".into(),
+            ));
+        }
+        for quota in quotas {
+            quota
+                .rebuild_managed_usage()
+                .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+        }
+        remove_transition(state_root)
+            .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+        return Ok(());
+    };
+    catalog
+        .recover_prepared_tail(root)
+        .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+    if metadata.is_some()
+        && catalog.active().map(|entry| entry.recording_id.0) != Some(transition.new_recording_id)
+    {
+        return Err(RecorderStartupError::RecoveryDetail(
+            "rollover successor was not activated".into(),
+        ));
+    }
+    for quota in quotas {
+        quota
+            .rebuild_managed_usage()
+            .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+    }
+    remove_transition(state_root)
+        .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+    Ok(())
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+pub(crate) const LIFECYCLE_INDEX_FILE: &str = "lifecycle-index.json";
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+pub(crate) const LIFECYCLE_INDEX_MAX_ENTRIES: usize = 4096;
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+pub(crate) const LIFECYCLE_INDEX_MAX_BYTES: usize = 1 << 20;
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+pub(crate) fn load_lifecycle_index(root: &Path) -> Result<LifecycleIndexV1, ApplicationError> {
+    match fs::read(root.join(LIFECYCLE_INDEX_FILE)) {
+        Ok(bytes) => {
+            let index: LifecycleIndexV1 = serde_json::from_slice(&bytes)
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            index
+                .validate()
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            Ok(index)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LifecycleIndexV1 {
+            version: 1,
+            generation: 0,
+            transaction_id: String::new(),
+            source_revision: 0,
+            source_digest: String::new(),
+            first_retained_epoch: 0,
+            last_compacted_epoch: None,
+            entries: Vec::new(),
+            max_entries: LIFECYCLE_INDEX_MAX_ENTRIES,
+            max_bytes: LIFECYCLE_INDEX_MAX_BYTES,
+        }),
+        Err(error) => Err(ApplicationError::Io(error)),
+    }
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+pub(crate) fn save_lifecycle_index(
+    root: &Path,
+    index: &LifecycleIndexV1,
+) -> Result<(), ApplicationError> {
+    index
+        .validate()
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    write_private_atomic_json(root, LIFECYCLE_INDEX_FILE, index, None)
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+pub(crate) fn mark_epoch_cleanup_complete(
+    index: &mut LifecycleIndexV1,
+    ordinal: u64,
+    digest: String,
+) {
+    match index
+        .entries
+        .iter_mut()
+        .find(|entry| entry.epoch_ordinal == ordinal)
+    {
+        Some(entry) => entry.cleanup_complete = true,
+        None => index.entries.push(LifecycleEpochEntry {
+            epoch_ordinal: ordinal,
+            predecessor_epoch: ordinal.checked_sub(1),
+            digest,
+            cleanup_complete: true,
+        }),
+    }
+    index.entries.sort_by_key(|entry| entry.epoch_ordinal);
+}
+
+/// Drop the oldest half of cleanup-complete entries once the entry bound is
+/// reached, keeping full lineage of not-yet-cleaned epochs.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+pub(crate) fn compact_lifecycle_index(
+    index: &mut LifecycleIndexV1,
+) -> Result<bool, ApplicationError> {
+    if index.entries.len() < index.max_entries {
+        return Ok(false);
+    }
+    let retain_from = index.entries[index.max_entries / 2].epoch_ordinal;
+    index
+        .compact(retain_from)
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    Ok(true)
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-ebpf")),
+    allow(dead_code)
+)]
+#[allow(clippy::too_many_lines)]
 fn apply_retention_cleanup(
     root: &Path,
     catalog: &EpochCatalogV1,
@@ -852,6 +1123,9 @@ fn apply_retention_cleanup(
         return Ok(());
     };
     let active_path = catalog.active().map(|entry| root.join(&entry.path));
+    let mut index = load_lifecycle_index(root)?;
+    let mut cleaned_epochs = BTreeSet::new();
+    let mut cleaned_digests = BTreeMap::new();
     let now = SystemTime::now();
     let mut candidates = Vec::new();
     for entry in &catalog.epochs {
@@ -894,16 +1168,26 @@ fn apply_retention_cleanup(
         if !eligible {
             break;
         }
-        let quota = quotas
+        let authorities = quotas
             .iter()
-            .find(|quota| source.starts_with(Path::new(&quota.quota().domain)))
-            .ok_or_else(|| {
-                ApplicationError::InvalidConfig("retention source is outside quota domain".into())
-            })?;
+            .filter(|quota| source.starts_with(Path::new(&quota.quota().domain)))
+            .collect::<Vec<_>>();
+        if authorities.len() != 1 {
+            return Err(ApplicationError::InvalidConfig(
+                "retention source must belong to exactly one quota domain".into(),
+            ));
+        }
+        let quota = authorities[0];
         quota
             .reserve(ReservationKind::Trash, bytes)
             .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-        let source_bytes = fs::read(&source).map_err(ApplicationError::Io)?;
+        let source_bytes = match fs::read(&source) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = quota.release(ReservationKind::Trash, bytes);
+                return Err(ApplicationError::Io(error));
+            }
+        };
         let digest: [u8; 32] = Sha256::digest(&source_bytes).into();
         let digest = sha256_string(&digest)
             .trim_start_matches("sha256:")
@@ -930,55 +1214,100 @@ fn apply_retention_cleanup(
             .rebuild_managed_usage()
             .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
         retained = retained.saturating_sub(bytes);
+        cleaned_epochs.insert(ordinal);
+        cleaned_digests.insert(ordinal, digest);
+    }
+    if !cleaned_epochs.is_empty() {
+        for ordinal in cleaned_epochs {
+            let Some(entry) = catalog.epochs.iter().find(|entry| entry.ordinal == ordinal) else {
+                continue;
+            };
+            let directory = root.join(&entry.path);
+            let remaining = match fs::read_dir(directory.join("segments")) {
+                Ok(entries) => entries
+                    .filter_map(Result::ok)
+                    .any(|item| item.path().extension().is_some_and(|ext| ext == "chwal")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(ApplicationError::Io(error)),
+            };
+            if !remaining {
+                let digest = cleaned_digests.remove(&ordinal).unwrap_or_default();
+                mark_epoch_cleanup_complete(&mut index, ordinal, digest);
+            }
+        }
+        compact_lifecycle_index(&mut index)?;
+        save_lifecycle_index(root, &index)?;
     }
     Ok(())
-}
-
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-fn apply_retention_cleanup_with_ownership(
-    root: &Path,
-    catalog: &EpochCatalogV1,
-    config: &NormalizedRecorderConfig,
-) -> Result<(), ApplicationError> {
-    let _lease = RecorderLease::acquire(config)
-        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-    let quotas = recorder_startup::build_quota_authorities(config)
-        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-    apply_retention_cleanup(root, catalog, config, &quotas)
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 fn reserve_recording_quota(
     config: &NormalizedRecorderConfig,
-    wal_directory: &Path,
+    wal_root: &Path,
     current_wal_bytes: u64,
     quotas: &[QuotaReservationAuthority],
 ) -> Result<(), RecorderStartupError> {
-    for quota in quotas {
-        quota.refresh_from_filesystem()?;
-        let domain = Path::new(&quota.quota().domain);
-        if wal_directory.starts_with(domain) {
-            quota.reserve(
-                ReservationKind::Wal,
-                config.epoch.max_bytes.saturating_sub(current_wal_bytes),
-            )?;
+    let wal_authorities = quotas
+        .iter()
+        .filter(|quota| wal_root.starts_with(Path::new(&quota.quota().domain)))
+        .collect::<Vec<_>>();
+    if wal_authorities.len() != 1 {
+        return Err(RecorderStartupError::RecoveryDetail(
+            "WAL root must belong to exactly one quota domain".into(),
+        ));
+    }
+    let wal_quota = wal_authorities[0];
+    wal_quota.register_managed_root(wal_root)?;
+    wal_quota.refresh_from_filesystem()?;
+    let wal_reservation = config.epoch.max_bytes.saturating_sub(current_wal_bytes);
+    if wal_reservation > 0 {
+        wal_quota.reserve(ReservationKind::Wal, wal_reservation)?;
+    }
+
+    let store_authorities = quotas
+        .iter()
+        .filter(|quota| {
+            config
+                .store_root
+                .starts_with(Path::new(&quota.quota().domain))
+        })
+        .collect::<Vec<_>>();
+    if store_authorities.len() != 1 {
+        if wal_reservation > 0 {
+            let _ = wal_quota.release(ReservationKind::Wal, wal_reservation);
         }
-        if config.store_root.starts_with(domain) {
-            quota.reserve(ReservationKind::Staging, config.store.max_staging_bytes)?;
+        return Err(RecorderStartupError::RecoveryDetail(
+            "store root must belong to exactly one quota domain".into(),
+        ));
+    }
+    let store_quota = store_authorities[0];
+    if let Err(error) = store_quota.refresh_from_filesystem() {
+        if wal_reservation > 0 {
+            let _ = wal_quota.release(ReservationKind::Wal, wal_reservation);
         }
+        return Err(error.into());
+    }
+    if let Err(error) =
+        store_quota.reserve(ReservationKind::Staging, config.store.max_staging_bytes)
+    {
+        if wal_reservation > 0 {
+            let _ = wal_quota.release(ReservationKind::Wal, wal_reservation);
+        }
+        return Err(error.into());
     }
     Ok(())
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-fn persist_recovering_recorder_metadata(
+fn persist_startup_recorder_metadata(
     config: &NormalizedRecorderConfig,
     catalog: Option<&EpochCatalogV1>,
     quotas: &[QuotaReservationAuthority],
+    lifecycle: RecorderLifecycleState,
+    recorder_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
 ) -> Result<(), RecorderStartupError> {
-    let recorder_id = catalog
-        .and_then(|value| value.active())
-        .map_or_else(uuid::Uuid::new_v4, |entry| entry.recording_id.0);
     let current_epoch = catalog.and_then(|value| {
         value.active().map(|entry| EpochMetadata {
             ordinal: entry.ordinal,
@@ -1006,11 +1335,11 @@ fn persist_recovering_recorder_metadata(
         &RecorderMetadataV1 {
             version: RECORDER_METADATA_SCHEMA_VERSION,
             recorder_id,
-            attempt_id: uuid::Uuid::new_v4(),
+            attempt_id,
             config_digest,
             scope: config.scope.clone(),
             boot_clock_identity: "continuous-recorder".into(),
-            lifecycle: RecorderLifecycleState::Recovering,
+            lifecycle,
             capture_readiness: RecorderReadiness::NotReady,
             processing_readiness: RecorderReadiness::NotReady,
             health: RecorderHealth::Degraded,
@@ -1105,17 +1434,37 @@ pub fn record_continuous_ebpf(
             "WAL, state, and store must share a managed filesystem domain".into(),
         ));
     }
-    if !wal_directory.exists() && epoch_catalog.is_none() {
-        preflight_wal_destination(&wal_directory, bounds)?;
-    }
     let initial_wal_directory = wal_directory.clone();
     let initial_wal_bytes = recording_physical_wal_bytes(&initial_wal_directory)?;
     let metadata_catalog = epoch_catalog.clone();
+    let startup_recorder_id = metadata_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.active())
+        .map_or_else(uuid::Uuid::new_v4, |entry| entry.recording_id.0);
+    let startup_attempt_id = uuid::Uuid::new_v4();
     let startup = RecorderStartup::prepare_foundation_with_metadata(
         config,
-        |quotas| persist_recovering_recorder_metadata(config, metadata_catalog.as_ref(), quotas),
-        |_quotas| {
+        |quotas, lifecycle| {
+            persist_startup_recorder_metadata(
+                config,
+                metadata_catalog.as_ref(),
+                quotas,
+                lifecycle,
+                startup_recorder_id,
+                startup_attempt_id,
+            )
+        },
+        |quotas| {
             recover_cleanup_for_root(&root_wal_directory)?;
+            load_lifecycle_index(&root_wal_directory)
+                .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+            recover_rollover_transition_for_root(
+                &config.state_root,
+                &root_wal_directory,
+                epoch_catalog.as_mut(),
+                quotas,
+                config.epoch.max_bytes,
+            )?;
             if let Some(catalog) = epoch_catalog.as_mut() {
                 catalog
                     .recover_prepared_tail(&root_wal_directory)
@@ -1123,7 +1472,7 @@ pub fn record_continuous_ebpf(
             }
             Ok(())
         },
-        |quotas| reserve_recording_quota(config, &initial_wal_directory, initial_wal_bytes, quotas),
+        |quotas| reserve_recording_quota(config, &root_wal_directory, initial_wal_bytes, quotas),
     )
     .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
     if let Some(catalog) = &epoch_catalog {
@@ -1255,6 +1604,10 @@ pub fn record_continuous_ebpf(
             .write_atomic(&root_wal_directory)
             .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
     }
+    if !wal_directory.exists() && epoch_catalog.is_none() {
+        // WAL destination mutation and appendability preflight require startup ownership.
+        preflight_wal_destination(&wal_directory, bounds)?;
+    }
     let recording_id = existing_recording_id.unwrap_or_else(RecordingId::new);
     let writer = if wal_directory.exists() {
         prepare_group_commit_reopen(
@@ -1288,6 +1641,7 @@ pub fn record_continuous_ebpf(
     let mut service = ContinuousRecorderService::start_with_prepared_startup(
         config,
         &wal_directory,
+        starting_epoch_ordinal,
         recorder,
         startup,
         || Ok(()),
@@ -1343,6 +1697,15 @@ pub fn record_continuous_ebpf(
             service
                 .reserve_successor_quota(&next_wal_directory, config.epoch.max_bytes)
                 .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            if let Err(error) = service.begin_rollover_transition(
+                &next_wal_directory,
+                next_recording_id,
+                config.epoch.max_bytes,
+            ) {
+                let _ =
+                    service.release_successor_quota(&next_wal_directory, config.epoch.max_bytes);
+                return Err(ApplicationError::InvalidConfig(error.to_string()));
+            }
             let old_wal_directory = wal_directory.clone();
             let old_path = old_wal_directory
                 .strip_prefix(&root_wal_directory)
@@ -1382,13 +1745,17 @@ pub fn record_continuous_ebpf(
             if let Err(error) = catalog.write_atomic(&root_wal_directory) {
                 let _ =
                     service.release_successor_quota(&next_wal_directory, config.epoch.max_bytes);
+                let _ = service.complete_rollover_transition();
                 return Err(ApplicationError::InvalidConfig(error.to_string()));
             }
             if let Err(error) = fs::create_dir_all(&next_wal_directory) {
                 let _ = catalog.epochs.pop();
-                let _ = catalog.write_atomic(&root_wal_directory);
+                let catalog_rolled_back = catalog.write_atomic(&root_wal_directory).is_ok();
                 let _ =
                     service.release_successor_quota(&next_wal_directory, config.epoch.max_bytes);
+                if catalog_rolled_back {
+                    let _ = service.complete_rollover_transition();
+                }
                 return Err(ApplicationError::Io(error));
             }
             let next_writer = match GroupCommitWalWriter::create_with_total_limit_and_age(
@@ -1404,9 +1771,12 @@ pub fn record_continuous_ebpf(
                 Err(error) => {
                     let _ = fs::remove_dir_all(&next_wal_directory);
                     let _ = catalog.epochs.pop();
-                    let _ = catalog.write_atomic(&root_wal_directory);
+                    let catalog_rolled_back = catalog.write_atomic(&root_wal_directory).is_ok();
                     let _ = service
                         .release_successor_quota(&next_wal_directory, config.epoch.max_bytes);
+                    if catalog_rolled_back {
+                        let _ = service.complete_rollover_transition();
+                    }
                     return Err(error.into());
                 }
             };
@@ -1418,17 +1788,12 @@ pub fn record_continuous_ebpf(
             ) {
                 Ok(boundary) => boundary,
                 Err(error) => {
-                    let _ = fs::remove_dir_all(&next_wal_directory);
-                    let _ = catalog.epochs.pop();
-                    let _ = catalog.write_atomic(&root_wal_directory);
-                    let _ = service
-                        .release_successor_quota(&next_wal_directory, config.epoch.max_bytes);
+                    // Service may have crossed a durable boundary; leave evidence
+                    // and transition journal for lease-owned restart recovery.
                     return Err(ApplicationError::InvalidConfig(error.to_string()));
                 }
             };
             if boundary.new_recording_id != next_recording_id {
-                let _ =
-                    service.release_successor_quota(&next_wal_directory, config.epoch.max_bytes);
                 return Err(ApplicationError::RecordingMetadataValidation(
                     "successor recording identity changed during handoff".into(),
                 ));
@@ -1438,6 +1803,9 @@ pub fn record_continuous_ebpf(
                 .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
             catalog
                 .write_atomic(&root_wal_directory)
+                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+            service
+                .complete_rollover_transition()
                 .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
             wal_directory = next_wal_directory;
             epoch_started = Instant::now();
@@ -1457,7 +1825,6 @@ pub fn record_continuous_ebpf(
         .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
     let last_valid_commit = service.recorder().ingest().commit_boundary();
     let recording_id = service.recorder().ingest().recording_id();
-    drop(service);
     let registry = chronicle_protocol_builtins::registry()?;
     let epoch_directories = if let Some(catalog) = &epoch_catalog {
         let mut directories = Vec::with_capacity(catalog.epochs.len());
@@ -1497,14 +1864,47 @@ pub fn record_continuous_ebpf(
     } else {
         vec![root_wal_directory.clone()]
     };
-    for directory in epoch_directories {
-        if has_published_wal(&directory)? {
-            process_and_publish_recording_wal(&directory, &config.store_root, &registry)?;
+    let store_authorities = service
+        .startup()
+        .quota_authorities()
+        .iter()
+        .filter(|quota| {
+            config
+                .store_root
+                .starts_with(Path::new(&quota.quota().domain))
+        })
+        .collect::<Vec<_>>();
+    if store_authorities.len() != 1 {
+        return Err(ApplicationError::InvalidConfig(
+            "store root must belong to exactly one quota domain".into(),
+        ));
+    }
+    let store_quota = store_authorities[0];
+    let etl_result = (|| {
+        for directory in epoch_directories {
+            if has_published_wal(&directory)? {
+                process_and_publish_recording_wal_owned(
+                    &directory,
+                    &config.store_root,
+                    &registry,
+                    store_quota,
+                )?;
+            }
         }
-    }
-    if let Some(catalog) = &epoch_catalog {
-        apply_retention_cleanup_with_ownership(&root_wal_directory, catalog, config)?;
-    }
+        if let Some(catalog) = &epoch_catalog {
+            apply_retention_cleanup(
+                &root_wal_directory,
+                catalog,
+                config,
+                service.startup().quota_authorities(),
+            )?;
+        }
+        Ok::<(), ApplicationError>(())
+    })();
+    let release_result = service.release_production_reservations();
+    etl_result?;
+    release_result.map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    drop(service);
     Ok(ProductionRecordingResult {
         recording_id,
         status: result.status,
@@ -3859,15 +4259,88 @@ pub struct PublishedRecordingResult {
     pub checkpoint: RecordingEtlCheckpoint,
 }
 
+struct QuotaPublicationReservation<'a> {
+    authority: &'a QuotaReservationAuthority,
+    final_bytes: u64,
+    manifest_bytes: u64,
+    checkpoint_bytes: Option<u64>,
+}
+
+impl Drop for QuotaPublicationReservation<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .authority
+            .release(ReservationKind::FinalSession, self.final_bytes);
+        let _ = self
+            .authority
+            .release(ReservationKind::Manifest, self.manifest_bytes);
+        if let Some(bytes) = self.checkpoint_bytes {
+            let _ = self.authority.release(ReservationKind::Checkpoint, bytes);
+        }
+    }
+}
+
+fn reserve_publication_peak(
+    authority: &QuotaReservationAuthority,
+    session_bytes: u64,
+) -> Result<QuotaPublicationReservation<'_>, ApplicationError> {
+    let final_bytes = session_bytes.saturating_mul(2);
+    authority
+        .reserve(ReservationKind::FinalSession, final_bytes)
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    if let Err(error) = authority.reserve(ReservationKind::Manifest, final_bytes) {
+        let _ = authority.release(ReservationKind::FinalSession, final_bytes);
+        return Err(ApplicationError::InvalidConfig(error.to_string()));
+    }
+    Ok(QuotaPublicationReservation {
+        authority,
+        final_bytes,
+        manifest_bytes: final_bytes,
+        checkpoint_bytes: None,
+    })
+}
+
+impl QuotaPublicationReservation<'_> {
+    fn reserve_checkpoint(&mut self, bytes: u64) -> Result<(), ApplicationError> {
+        let reservation = bytes.saturating_mul(2);
+        self.authority
+            .reserve(ReservationKind::Checkpoint, reservation)
+            .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+        self.checkpoint_bytes = Some(reservation);
+        Ok(())
+    }
+}
+
 /// Processes one finalized recording and atomically publishes its deterministic session.
 pub fn process_and_publish_recording_wal(
     wal_directory: impl AsRef<Path>,
     root: impl AsRef<Path>,
     registry: &ProtocolRegistry,
 ) -> Result<PublishedRecordingResult, ApplicationError> {
+    process_and_publish_recording_wal_inner(wal_directory, root, registry, None, false)
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn process_and_publish_recording_wal_owned(
+    wal_directory: impl AsRef<Path>,
+    root: impl AsRef<Path>,
+    registry: &ProtocolRegistry,
+    quota: &QuotaReservationAuthority,
+) -> Result<PublishedRecordingResult, ApplicationError> {
+    process_and_publish_recording_wal_inner(wal_directory, root, registry, Some(quota), true)
+}
+
+fn process_and_publish_recording_wal_inner(
+    wal_directory: impl AsRef<Path>,
+    root: impl AsRef<Path>,
+    registry: &ProtocolRegistry,
+    quota: Option<&QuotaReservationAuthority>,
+    lease_owned: bool,
+) -> Result<PublishedRecordingResult, ApplicationError> {
     let wal_directory = wal_directory.as_ref();
     let root = root.as_ref();
-    if let Some(state_root) = wal_directory.parent()
+    if !lease_owned
+        && let Some(state_root) = wal_directory.parent()
         && RecorderLease::state_is_owned(state_root)
             .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?
     {
@@ -3902,6 +4375,10 @@ pub fn process_and_publish_recording_wal(
         complete,
     };
     let session_id = expected.session.id;
+    let session_bytes = serde_json::to_vec(&expected.session)?.len() as u64;
+    let mut quota_reservation = quota
+        .map(|authority| reserve_publication_peak(authority, session_bytes))
+        .transpose()?;
     let store = FilesystemSessionStore::new(root);
     let already_published = match store.publish(expected.clone()) {
         Ok(()) => false,
@@ -3933,7 +4410,12 @@ pub fn process_and_publish_recording_wal(
         shutdown_reason: processed.shutdown_reason,
         counters: processed.counters,
     };
+    if let Some(reservation) = quota_reservation.as_mut() {
+        let checkpoint_bytes = serde_json::to_vec(&checkpoint)?.len() as u64;
+        reservation.reserve_checkpoint(checkpoint_bytes)?;
+    }
     write_private_atomic_json(wal_directory, "etl-checkpoint.json", &checkpoint, None)?;
+    drop(quota_reservation);
     Ok(PublishedRecordingResult {
         session_id,
         already_published,
@@ -4816,6 +5298,35 @@ mod tests {
     }
 
     #[test]
+    fn publication_reservations_release_on_success_and_failure() {
+        let authority = QuotaReservationAuthority::new(DomainQuota {
+            domain: "domain".into(),
+            quota_bytes: 1_000,
+            minimum_free_bytes: 10,
+            free_bytes: 1_000,
+        })
+        .unwrap();
+        {
+            let mut reservation = reserve_publication_peak(&authority, 100).unwrap();
+            reservation.reserve_checkpoint(100).unwrap();
+            assert!(authority.reserved_bytes().unwrap() > 0);
+        }
+        assert_eq!(authority.reserved_bytes().unwrap(), 0);
+
+        let authority = QuotaReservationAuthority::new(DomainQuota {
+            domain: "domain".into(),
+            quota_bytes: 100,
+            minimum_free_bytes: 10,
+            free_bytes: 100,
+        })
+        .unwrap();
+        let mut reservation = reserve_publication_peak(&authority, 20).unwrap();
+        assert!(reservation.reserve_checkpoint(100).is_err());
+        drop(reservation);
+        assert_eq!(authority.reserved_bytes().unwrap(), 0);
+    }
+
+    #[test]
     fn production_signal_stop_keeps_first_signal_and_flags_second() {
         let stop = ProductionSignalStop::default();
         assert!(stop.request_interrupt());
@@ -4842,6 +5353,112 @@ mod tests {
     }
 
     #[test]
+    fn rollover_transition_rolls_back_unpublished_successor() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-rollover-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state_root = root.join("state");
+        let successor = root.join("epochs/1");
+        std::fs::create_dir_all(&successor).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        let old_id = chronicle_common::RecordingId::new();
+        let new_id = chronicle_common::RecordingId::new();
+        let mut catalog = EpochCatalogV1::new(EpochCatalogEntry {
+            ordinal: 0,
+            recording_id: old_id,
+            predecessor: None,
+            path: ".".into(),
+            state: EpochCatalogState::Active,
+        })
+        .unwrap();
+        catalog
+            .append(EpochCatalogEntry {
+                ordinal: 1,
+                recording_id: new_id,
+                predecessor: Some(old_id),
+                path: "epochs/1".into(),
+                state: EpochCatalogState::Prepared,
+            })
+            .unwrap();
+        catalog.write_atomic(&root).unwrap();
+        let transition =
+            RolloverTransitionV1::new(0, 1, old_id.0, new_id.0, root.join("."), &successor, 1024)
+                .unwrap();
+        write_transition_atomic(&state_root, &transition).unwrap();
+
+        recover_rollover_transition_for_root(&state_root, &root, Some(&mut catalog), &[], 1024)
+            .unwrap();
+
+        assert!(!successor.exists());
+        assert_eq!(catalog.epochs.len(), 1);
+        assert_eq!(catalog.active().unwrap().recording_id, old_id);
+        assert!(load_transition(&state_root).unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rollover_transition_adopts_published_successor() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-rollover-forward-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state_root = root.join("state");
+        let successor = root.join("epochs/1");
+        std::fs::create_dir_all(&successor).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+        let old_id = chronicle_common::RecordingId::new();
+        let new_id = chronicle_common::RecordingId::new();
+        let mut catalog = EpochCatalogV1::new(EpochCatalogEntry {
+            ordinal: 0,
+            recording_id: old_id,
+            predecessor: None,
+            path: ".".into(),
+            state: EpochCatalogState::Active,
+        })
+        .unwrap();
+        catalog
+            .append(EpochCatalogEntry {
+                ordinal: 1,
+                recording_id: new_id,
+                predecessor: Some(old_id),
+                path: "epochs/1".into(),
+                state: EpochCatalogState::Prepared,
+            })
+            .unwrap();
+        catalog.write_atomic(&root).unwrap();
+        write_recording_metadata(
+            &successor,
+            &RecordingMetadata {
+                version: RECORDING_METADATA_SCHEMA_VERSION,
+                recording_id: new_id,
+                selector: None,
+                status: RecordingStatus::Recording,
+                shutdown_reason: None,
+                last_valid_commit: None,
+                counters: RecordingCounters::default(),
+                terminal_wal_loss: None,
+                capture: None,
+            },
+        )
+        .unwrap();
+        let transition =
+            RolloverTransitionV1::new(0, 1, old_id.0, new_id.0, root.join("."), &successor, 1024)
+                .unwrap();
+        write_transition_atomic(&state_root, &transition).unwrap();
+        catalog.activate_latest().unwrap();
+        catalog.write_atomic(&root).unwrap();
+
+        recover_rollover_transition_for_root(&state_root, &root, Some(&mut catalog), &[], 1024)
+            .unwrap();
+
+        assert_eq!(catalog.active().unwrap().recording_id, new_id);
+        assert_eq!(catalog.epochs[0].state, EpochCatalogState::Finalized);
+        assert!(load_transition(&state_root).unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn physical_wal_size_counts_nested_segment_files_only() {
         let directory = ingest_directory("physical-size");
         let nested = directory.join("segments/nested");
@@ -4852,6 +5469,222 @@ mod tests {
 
         assert_eq!(recording_physical_wal_bytes(&directory).unwrap(), 8);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_index_round_trips_and_rejects_corruption() {
+        let directory = ingest_directory("lifecycle-index");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut index = load_lifecycle_index(&directory).unwrap();
+        assert!(index.entries.is_empty());
+        mark_epoch_cleanup_complete(&mut index, 3, "a".repeat(64));
+        save_lifecycle_index(&directory, &index).unwrap();
+        let loaded = load_lifecycle_index(&directory).unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert!(loaded.entries[0].cleanup_complete);
+        assert_eq!(loaded.entries[0].epoch_ordinal, 3);
+        std::fs::write(directory.join(LIFECYCLE_INDEX_FILE), b"not json").unwrap();
+        assert!(load_lifecycle_index(&directory).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_index_compacts_oldest_complete_entries() {
+        let mut index = LifecycleIndexV1 {
+            version: 1,
+            generation: 0,
+            transaction_id: "tx".into(),
+            source_revision: 1,
+            source_digest: "b".repeat(64),
+            first_retained_epoch: 0,
+            last_compacted_epoch: None,
+            entries: (0..4)
+                .map(|epoch| LifecycleEpochEntry {
+                    epoch_ordinal: epoch,
+                    predecessor_epoch: epoch.checked_sub(1),
+                    digest: "a".repeat(64),
+                    cleanup_complete: true,
+                })
+                .collect(),
+            max_entries: 4,
+            max_bytes: 1 << 20,
+        };
+        assert!(compact_lifecycle_index(&mut index).unwrap());
+        assert_eq!(index.entries.len(), 2);
+        assert_eq!(index.entries[0].epoch_ordinal, 2);
+        assert_eq!(index.generation, 1);
+        assert_eq!(index.last_compacted_epoch, Some(1));
+        assert_eq!(index.first_retained_epoch, 2);
+        assert!(!compact_lifecycle_index(&mut index).unwrap());
+    }
+
+    fn retention_config(root: &std::path::Path, min_age_seconds: u64) -> NormalizedRecorderConfig {
+        RecorderConfigV1 {
+            version: 1,
+            scope: RecorderScopeConfig {
+                cgroup_path: root.to_path_buf(),
+                cgroup_id: 1,
+                shared_scope_acknowledged: true,
+            },
+            state_root: root.join("state"),
+            store_root: root.join("store"),
+            domain_lock_root: root.to_path_buf(),
+            epoch: EpochConfig {
+                max_age_seconds: 3600,
+                max_bytes: chronicle_wal::DEFAULT_MAX_WAL_BYTES,
+            },
+            segment: SegmentConfig {
+                max_age_seconds: 300,
+                max_bytes: chronicle_wal::DEFAULT_SEGMENT_BYTES,
+            },
+            domains: vec![FilesystemDomainConfig {
+                root: root.to_path_buf(),
+                quota_bytes: 8 * 1024 * 1024 * 1024,
+                minimum_free_bytes: 1024 * 1024,
+            }],
+            retention: Some(RetentionMode::DeleteAfter {
+                min_age_seconds,
+                max_retained_bytes: None,
+            }),
+            etl: EtlConfig {
+                batch_records: 4096,
+                max_lag_records: 4096,
+                retry_attempts: 1,
+            },
+            store: StoreConfig {
+                backend: StoreBackend::Filesystem,
+                max_batch_bytes: 1024,
+                max_staging_bytes: 4096,
+            },
+            shutdown: ShutdownConfig {
+                timeout_seconds: 30,
+            },
+            logging: LoggingConfig {
+                level: LogLevel::Info,
+            },
+        }
+        .normalize()
+        .unwrap()
+    }
+
+    fn retention_catalog() -> EpochCatalogV1 {
+        let old_id = RecordingId::new();
+        let new_id = RecordingId::new();
+        let catalog = EpochCatalogV1 {
+            version: 1,
+            epochs: vec![
+                EpochCatalogEntry {
+                    ordinal: 0,
+                    recording_id: old_id,
+                    predecessor: None,
+                    path: "epochs/0".into(),
+                    state: EpochCatalogState::Finalized,
+                },
+                EpochCatalogEntry {
+                    ordinal: 1,
+                    recording_id: new_id,
+                    predecessor: Some(old_id),
+                    path: "epochs/1".into(),
+                    state: EpochCatalogState::Active,
+                },
+            ],
+        };
+        catalog.validate().unwrap();
+        catalog
+    }
+
+    #[test]
+    fn retention_cleanup_persists_lifecycle_index_and_deletes_proof_eligible_segments() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-retention-index-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = retention_config(&root, 1);
+        let root = Path::new(&config.domains[0].identity.canonical_root).to_path_buf();
+        let catalog = retention_catalog();
+        let segment = root.join("epochs/0/segments/old.chwal");
+        std::fs::create_dir_all(segment.parent().unwrap()).unwrap();
+        std::fs::write(&segment, vec![0_u8; 64]).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let quotas = recorder_startup::build_quota_authorities(&config).unwrap();
+        apply_retention_cleanup(&root, &catalog, &config, &quotas).unwrap();
+        assert!(!segment.exists());
+        let index = load_lifecycle_index(&root).unwrap();
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].epoch_ordinal, 0);
+        assert!(index.entries[0].cleanup_complete);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_segment_cleanup_is_refused_and_evidence_stays_byte_identical() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-retention-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let segment = root.join("epochs/0/segments/old.chwal");
+        std::fs::create_dir_all(segment.parent().unwrap()).unwrap();
+        let evidence = vec![0x5a_u8; 128];
+        std::fs::write(&segment, &evidence).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let intent = root.join("epochs/0/segments/cleanup-intent-0-tampered.json");
+        // Tampered proof: expected digest does not match the segment bytes, so
+        // deletion is refused and the evidence must remain untouched.
+        let result = cleanup_finalized_segment_verified(
+            &segment,
+            "f".repeat(64).as_str(),
+            root.join("retention-trash"),
+            &intent,
+            "epoch-0-tampered",
+        );
+        assert_eq!(result, Err(chronicle_wal::RetentionError::DigestMismatch));
+        assert_eq!(fs::read(&segment).unwrap(), evidence);
+        assert!(!root.join("retention-trash/epoch-0-tampered").exists());
+        // A restart retries the same tampered cleanup; deletion is refused
+        // again and the evidence remains byte-identical.
+        let retry = cleanup_finalized_segment_verified(
+            &segment,
+            "f".repeat(64).as_str(),
+            root.join("retention-trash"),
+            &intent,
+            "epoch-0-tampered",
+        );
+        assert_eq!(retry, Err(chronicle_wal::RetentionError::DigestMismatch));
+        assert_eq!(fs::read(&segment).unwrap(), evidence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protected_lineage_is_preserved_byte_identical_across_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-retention-protected-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = retention_config(&root, 3600);
+        let root = Path::new(&config.domains[0].identity.canonical_root).to_path_buf();
+        let catalog = retention_catalog();
+        // Active-epoch segment is protected lineage; young finalized-epoch
+        // segment is not yet retention-eligible.
+        let active_segment = root.join("epochs/1/segments/live.chwal");
+        let young_segment = root.join("epochs/0/segments/young.chwal");
+        std::fs::create_dir_all(active_segment.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(young_segment.parent().unwrap()).unwrap();
+        let active_evidence = vec![0x11_u8; 32];
+        let young_evidence = vec![0x22_u8; 32];
+        std::fs::write(&active_segment, &active_evidence).unwrap();
+        std::fs::write(&young_segment, &young_evidence).unwrap();
+        let quotas = recorder_startup::build_quota_authorities(&config).unwrap();
+        apply_retention_cleanup(&root, &catalog, &config, &quotas).unwrap();
+        // Restart simulation: a second cleanup pass must still refuse deletion
+        // and leave every protected byte identical.
+        apply_retention_cleanup(&root, &catalog, &config, &quotas).unwrap();
+        assert_eq!(fs::read(&active_segment).unwrap(), active_evidence);
+        assert_eq!(fs::read(&young_segment).unwrap(), young_evidence);
+        assert!(load_lifecycle_index(&root).unwrap().entries.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn ingest_directory(label: &str) -> PathBuf {
@@ -5435,6 +6268,83 @@ mod tests {
         let scan = scan_wal(&directory, recorded.recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
         assert_eq!(scan.committed[0].sequence, 1);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repeated_identical_capture_is_deduplicated_in_final_session() {
+        use chronicle_capture::InMemoryCaptureSource;
+
+        // The same capture events written twice produce identical canonical
+        // operations whose deterministic ids collide; the final session must
+        // keep one occurrence so publication validation succeeds.
+        let root =
+            std::env::temp_dir().join(format!("chronicle-app-dedup-{}", uuid::Uuid::new_v4()));
+        let wal_directory = root.join("wal");
+        // Two distinct capture sequences carrying byte-identical requests:
+        // the canonical operations are identical (deterministic ids collide).
+        let mut events = test_capture_events(b"GET / HTTP/1.1\r\nHost: example\r\n\r\n".to_vec());
+        let mut replay = test_capture_events(b"GET / HTTP/1.1\r\nHost: example\r\n\r\n".to_vec());
+        if let CaptureEvent {
+            kind: CaptureEventKind::PayloadFragment(fragment),
+            ..
+        } = &mut replay[1]
+        {
+            fragment.sequence.tcp_sequence = 2;
+        }
+        events.extend(replay);
+        assert_eq!(events.len(), 4);
+        let recorded = write_capture_to_wal(
+            &mut InMemoryCaptureSource::new(events),
+            &wal_directory,
+            8192,
+        )
+        .unwrap();
+        assert_eq!(recorded.record_count, 4);
+        let recording_id = recorded.recording_id;
+        write_recording_metadata(
+            &wal_directory,
+            &RecordingMetadata {
+                version: RECORDING_METADATA_SCHEMA_VERSION,
+                recording_id,
+                selector: None,
+                status: RecordingStatus::Completed,
+                shutdown_reason: Some(ShutdownReason::SourceCompleted),
+                last_valid_commit: None,
+                counters: RecordingCounters::default(),
+                terminal_wal_loss: None,
+                capture: None,
+            },
+        )
+        .unwrap();
+        reconcile_recording_metadata(&wal_directory, recording_id, None).unwrap();
+        let registry = chronicle_protocol_builtins::registry().unwrap();
+        let published =
+            process_and_publish_recording_wal(&wal_directory, &root, &registry).unwrap();
+        let inspection = inspect_session(&root, published.session_id).unwrap();
+        let session = FilesystemSessionStore::new(&root)
+            .hydrate(published.session_id)
+            .unwrap();
+        session.validate().unwrap();
+        let ids = session
+            .connections
+            .iter()
+            .flat_map(|connection| connection.operations.iter().map(|operation| operation.id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids.len(),
+            ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+        assert!(!ids.is_empty());
+        assert!(inspection.integrity_valid);
+        assert!(
+            FilesystemSessionStore::new(&root)
+                .hydrate(published.session_id)
+                .is_ok()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

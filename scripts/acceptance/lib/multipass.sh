@@ -164,7 +164,10 @@ else
 		REMOTE_STATUS=$PRE_STATUS
 	fi
 	if [[ "$PRE_STATUS" -eq 0 || "$PRE_STATUS" -eq 77 ]]; then
-		multipass restart "$VM"
+		# The restart command can error on the ssh drop mid-reboot while the
+		# VM still reboots cleanly; verify via wait_for_vm instead of aborting.
+		multipass restart "$VM" 2>/dev/null || multipass stop "$VM" >/dev/null 2>&1 || true
+		multipass start "$VM" >/dev/null 2>&1 || true
 		wait_for_vm
 		transfer_source
 		set +e

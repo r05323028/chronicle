@@ -44,6 +44,44 @@ phase() {
 	printf '[%s] %s\n' "$1" "$2"
 }
 
+# Waits until the unit is active, its restart counter is stable, and the
+# recorder status is fresh (written after the unit's latest start). Restart
+# attempts can transiently fail closed on WAL lock contention while systemd
+# auto-restart converges, and the status file of a killed predecessor must
+# not satisfy readiness.
+wait_for_unit_stable() {
+	local unit=${1:?unit required}
+	local status_root=${2:-$STATE_ROOT}
+	local attempts=${3:-90}
+	local restarts_before restarts_after stable=0
+	restarts_before=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || printf '0')
+	for _ in $(seq 1 "$attempts"); do
+		if systemctl is-active --quiet "$unit"; then
+			restarts_after=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || printf '0')
+			if [[ "$restarts_after" == "$restarts_before" ]]; then
+				stable=$((stable + 1))
+			else
+				stable=0
+				restarts_before=$restarts_after
+			fi
+			if ((stable >= 2)); then
+				local started
+				started=$(systemctl show "$unit" -p ActiveEnterTimestamp --value 2>/dev/null || printf '')
+				local start_epoch=0 status_mtime=0
+				if [[ -n "$started" ]] && command -v date >/dev/null 2>&1; then
+					start_epoch=$(date -d "$started" +%s 2>/dev/null || printf '0')
+				fi
+				status_mtime=$(stat -c %Y "$status_root/recorder.json" 2>/dev/null || printf '0')
+				if ((start_epoch == 0)) || ((status_mtime >= start_epoch)); then
+					return 0
+				fi
+			fi
+		fi
+		sleep 1
+	done
+	return 1
+}
+
 set_check() {
 	python3 - "$CHECKS_JSON" "$1" "$2" <<'PY'
 import json, sys

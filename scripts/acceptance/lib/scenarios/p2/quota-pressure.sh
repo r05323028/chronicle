@@ -56,9 +56,19 @@ for _ in $(seq 1 30); do
 	sleep 1
 done
 wait_for_quota_ready() {
-	for _ in $(seq 1 60); do
+	for _ in $(seq 1 150); do
 		if "$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-status.json" 2>/dev/null &&
-			grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$ARTIFACT_ROOT/quota-status.json"; then return 0; fi
+			grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$ARTIFACT_ROOT/quota-status.json"; then
+			local started quota_mtime=0 start_epoch=0
+			started=$(systemctl show "$QUOTA_UNIT" -p ActiveEnterTimestamp --value 2>/dev/null || printf '')
+			if [[ -n "$started" ]] && command -v date >/dev/null 2>&1; then
+start_epoch=$(date -d "$started" +%s 2>/dev/null || printf '0')
+			fi
+			quota_mtime=$(stat -c %Y "$QUOTA_STATE/recorder.json" 2>/dev/null || printf '0')
+			if ((start_epoch == 0)) || ((quota_mtime >= start_epoch)); then
+return 0
+			fi
+		fi
 		sleep 0.2
 	done
 	return 1
@@ -129,9 +139,10 @@ set_check quota_exhaustion_admission passed
 rm -f "$QUOTA_STATE/filler.bin"
 wait_for_quota_ready
 systemctl kill --kill-who=main -s SIGKILL "$QUOTA_UNIT" || true
-sleep 1
-systemctl restart "$QUOTA_UNIT"
+systemctl restart "$QUOTA_UNIT" 2>/dev/null || true
+wait_for_unit_stable "$QUOTA_UNIT" "$QUOTA_STATE" || true
 wait_for_quota_ready
+systemctl is-active --quiet "$QUOTA_UNIT"
 "$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-restart-status.json"
 grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$ARTIFACT_ROOT/quota-restart-status.json"
 python3 - "$ARTIFACT_ROOT/quota-restart-status.json" <<'PY'

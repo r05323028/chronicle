@@ -177,6 +177,10 @@ impl IncrementalProcessor {
         )?;
         let mut emitted_operation_keys = self.emitted_operation_keys.clone();
         for connection in &mut output.session.connections {
+            // Keep the last occurrence of each key so a deterministic id that
+            // reappears in a later session after crash recovery keeps the
+            // connection/timeline context of that later session.
+            connection.operations.reverse();
             connection.operations.retain_mut(|operation| {
                 let key = operation_key(operation);
                 if emitted_operation_keys.insert(key.clone()) {
@@ -186,6 +190,7 @@ impl IncrementalProcessor {
                     false
                 }
             });
+            connection.operations.reverse();
         }
         self.assembler = assembler;
         self.evidence = evidence;
@@ -223,20 +228,36 @@ impl IncrementalProcessor {
             registry,
             session_id,
         )?;
+        // Deterministic operation ids collide for repeated identical traffic,
+        // so the final session must deduplicate exactly like incremental batch
+        // output: keep the last occurrence of each operation key.
+        let mut emitted_operation_keys = BTreeSet::new();
         let mut operation_ids = BTreeMap::new();
         for connection in &mut output.session.connections {
-            for operation in &mut connection.operations {
-                let previous = operation.id;
-                let current = operation_id_from_key(&operation_key(operation));
-                operation_ids.insert(previous, current);
-                operation.id = current;
-            }
+            connection.operations.reverse();
+            connection.operations.retain_mut(|operation| {
+                let key = operation_key(operation);
+                if emitted_operation_keys.insert(key.clone()) {
+                    let previous = operation.id;
+                    let current = operation_id_from_key(&key);
+                    operation_ids.insert(previous, current);
+                    operation.id = current;
+                    true
+                } else {
+                    false
+                }
+            });
+            connection.operations.reverse();
         }
         output.session.operation_completeness = output
             .session
             .operation_completeness
             .into_iter()
-            .map(|(id, completeness)| (operation_ids.get(&id).copied().unwrap_or(id), completeness))
+            .filter_map(|(id, completeness)| {
+                operation_ids
+                    .get(&id)
+                    .map(|current| (*current, completeness))
+            })
             .collect();
         for entry in &mut output.session.timeline {
             if let Some(id) = operation_ids.get(&entry.operation_id) {

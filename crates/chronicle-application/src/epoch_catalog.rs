@@ -422,7 +422,17 @@ mod tests {
         let mut loaded = EpochCatalogV1::load(&root).unwrap();
         loaded.recover_prepared_tail(&root).unwrap();
         assert_eq!(loaded.active().unwrap().recording_id, second);
+        assert_eq!(
+            loaded
+                .epochs
+                .iter()
+                .filter(|entry| entry.state == EpochCatalogState::Active)
+                .count(),
+            1
+        );
         assert_eq!(loaded.epochs[0].state, EpochCatalogState::Finalized);
+        assert_eq!(loaded.epochs[0].recording_id, first);
+        assert_eq!(loaded.epochs[0].predecessor, None);
         assert_eq!(
             fs::read(root.join("recording.json")).unwrap(),
             predecessor_bytes

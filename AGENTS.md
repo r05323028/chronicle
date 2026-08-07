@@ -15,10 +15,41 @@ If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is 
 This project has a graphify knowledge graph at graphify-out/.
 
 Rules:
+
 - Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
 - If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
 - After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
 <!-- GRAPHIFY_END -->
+
+## Bounded Command Execution
+
+Do not run potentially blocking commands without a bounded timeout.
+
+This applies to:
+
+- Tests and builds
+- Package installation
+- Network operations
+- Docker, Kubernetes, Multipass, SSH, and other remote commands
+- Service start, stop, restart, and readiness checks
+- Long-running application processes
+- Polling loops
+- Acceptance and privileged tests
+
+Choose the timeout based on the expected workload and environment. Use a duration that is long enough for a healthy run, but never allow an unbounded wait.
+
+Suggested ranges:
+
+- Status and readiness checks: 30-120 seconds
+- Targeted tests and builds: 5-15 minutes
+- Full workspace validation: 15-30 minutes
+- VM bootstrap and privileged acceptance: 30-60 minutes
+
+Prefer the repository timeout wrapper when available:
+
+```bash
+./scripts/run-with-timeout.sh <duration> <command> [arguments...]
+```
 
 ## Linux-only validation on macOS
 

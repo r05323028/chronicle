@@ -58,7 +58,10 @@ impl RecorderMetadataV1 {
         }
         if self.lifecycle == RecorderLifecycleState::Running
             && self.capture_readiness != RecorderReadiness::Ready
-            && self.failure != Some(MetadataCode::QuotaPressure)
+            && !matches!(
+                self.failure,
+                Some(MetadataCode::QuotaPressure | MetadataCode::TerminalQuotaPressure)
+            )
         {
             return Err(RecorderMetadataError::Contradiction);
         }
@@ -288,6 +291,7 @@ pub enum MetadataCode {
     CorruptWal,
     CheckpointConflict,
     QuotaPressure,
+    TerminalQuotaPressure,
     RecoveryFailure,
     AppendableFailure,
     CaptureAttachFailure,

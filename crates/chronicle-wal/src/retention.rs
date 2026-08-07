@@ -266,7 +266,9 @@ pub fn recover_cleanup_with_policy(
                 .map_err(|_| RetentionError::InvalidIntent)?;
             if recorded.transaction_id == intent.transaction_id && recorded.digest == intent.digest
             {
-                Ok(CleanupOutcome::Recovered)
+                let outcome = CleanupOutcome::Recovered;
+                remove_intent(intent_path)?;
+                Ok(outcome)
             } else {
                 Err(RetentionError::InvalidIntent)
             }
@@ -287,7 +289,9 @@ pub fn recover_cleanup_with_policy(
     write_tombstone(&target, &intent)?;
     fs::remove_file(&target).map_err(|_| RetentionError::Io)?;
     sync_directory(trash_root)?;
-    Ok(CleanupOutcome::Recovered)
+    let outcome = CleanupOutcome::Recovered;
+    remove_intent(intent_path)?;
+    Ok(outcome)
 }
 
 fn cleanup_target(
@@ -323,6 +327,14 @@ fn write_tombstone(target: &Path, intent: &CleanupIntent) -> Result<(), Retentio
     )
     .map_err(|_| RetentionError::Io)?;
     sync_directory(target.parent().ok_or(RetentionError::UnsafePath)?)
+}
+
+fn remove_intent(intent_path: &Path) -> Result<(), RetentionError> {
+    fs::remove_file(intent_path).map_err(|_| RetentionError::Io)?;
+    if let Some(parent) = intent_path.parent() {
+        sync_directory(parent).map_err(|_| RetentionError::Io)?;
+    }
+    Ok(())
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {

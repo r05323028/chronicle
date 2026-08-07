@@ -7,7 +7,8 @@ use crate::{
     RecorderHealth, RecorderLifecycleError, RecorderMetadataV1, RecorderOrchestrationError,
     RecorderOrchestrator, RecorderPoll, RecorderReadiness, RecorderStartup, RecorderStartupError,
     RecordingCaptureMetadata, RecordingMetadata, RecordingStatus, ReservationKind,
-    write_recorder_metadata, write_recording_metadata,
+    RolloverTransitionPhase, RolloverTransitionV1, load_transition, write_recorder_metadata,
+    write_recording_metadata, write_transition_atomic,
 };
 use chronicle_capture::{CaptureError, CaptureSource};
 use chronicle_common::{RecordingId, SessionId};
@@ -44,6 +45,8 @@ pub enum ContinuousRecorderError {
     Capture(#[from] CaptureError),
     #[error(transparent)]
     Wal(#[from] WalError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error("recorder metadata persistence failed: {0}")]
     Metadata(String),
     #[error("incremental ETL failed: {0}")]
@@ -133,6 +136,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     pub fn start_with_prepared_startup(
         config: &NormalizedRecorderConfig,
         wal_directory: impl AsRef<Path>,
+        authoritative_epoch_ordinal: u64,
         mut recorder: RecorderOrchestrator<S>,
         startup: RecorderStartup,
         establish_appendable: impl FnOnce() -> Result<(), RecorderStartupError>,
@@ -143,11 +147,16 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         let startup = startup.finish(
             establish_appendable,
             || {
+                if epoch_ordinal != authoritative_epoch_ordinal {
+                    return Err(RecorderStartupError::RecoveryDetail(
+                        "recorder epoch does not match authoritative catalog".into(),
+                    ));
+                }
                 validate_checkpoint_before_capture(
                     config,
                     wal_directory.as_ref(),
                     recording_id,
-                    epoch_ordinal,
+                    authoritative_epoch_ordinal,
                 )
                 .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
                 recorder
@@ -371,15 +380,19 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         let session_bytes = serde_json::to_vec(&output.session)
             .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?
             .len() as u64;
-        let quota = self
+        let authorities = self
             .startup
             .quota_authorities()
             .iter()
-            .find(|authority| {
+            .filter(|authority| {
                 self.store_root
                     .starts_with(Path::new(&authority.quota().domain))
             })
-            .ok_or(crate::QuotaError::InvalidQuota)?;
+            .collect::<Vec<_>>();
+        if authorities.len() != 1 {
+            return Err(crate::QuotaError::InvalidQuota.into());
+        }
+        let quota = authorities[0];
         let manifest_reservation = session_bytes.saturating_mul(2);
         quota.reserve(ReservationKind::FinalSession, manifest_reservation)?;
         if let Err(error) = quota.reserve(ReservationKind::Manifest, manifest_reservation) {
@@ -573,9 +586,15 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                     eprintln!("incremental publication failed: {error}");
                 }
                 if published {
-                    if self.active_metadata.failure == Some(MetadataCode::QuotaPressure) {
+                    if matches!(
+                        self.active_metadata.failure,
+                        Some(MetadataCode::QuotaPressure | MetadataCode::TerminalQuotaPressure,)
+                    ) {
                         self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
-                        self.active_metadata.health = RecorderHealth::Degraded;
+                        if self.active_metadata.failure != Some(MetadataCode::TerminalQuotaPressure)
+                        {
+                            self.active_metadata.health = RecorderHealth::Degraded;
+                        }
                     } else {
                         self.active_metadata.processing_readiness = RecorderReadiness::Ready;
                         self.active_metadata.health = RecorderHealth::Healthy;
@@ -583,8 +602,13 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                     }
                 } else {
                     self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
-                    self.active_metadata.health = RecorderHealth::Degraded;
-                    if self.active_metadata.failure != Some(MetadataCode::QuotaPressure) {
+                    if self.active_metadata.failure != Some(MetadataCode::TerminalQuotaPressure) {
+                        self.active_metadata.health = RecorderHealth::Degraded;
+                    }
+                    if !matches!(
+                        self.active_metadata.failure,
+                        Some(MetadataCode::QuotaPressure | MetadataCode::TerminalQuotaPressure,)
+                    ) {
                         self.active_metadata.failure = Some(MetadataCode::StorageFailure);
                     }
                 }
@@ -595,8 +619,13 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             Err(error) => {
                 eprintln!("incremental worker failed: {error}");
                 self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
-                self.active_metadata.health = RecorderHealth::Degraded;
-                if self.active_metadata.failure != Some(MetadataCode::QuotaPressure) {
+                if self.active_metadata.failure != Some(MetadataCode::TerminalQuotaPressure) {
+                    self.active_metadata.health = RecorderHealth::Degraded;
+                }
+                if !matches!(
+                    self.active_metadata.failure,
+                    Some(MetadataCode::QuotaPressure | MetadataCode::TerminalQuotaPressure)
+                ) {
                     self.active_metadata.failure = Some(MetadataCode::StorageFailure);
                 }
             }
@@ -696,15 +725,19 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             checksum: String::new(),
         };
         let store = FilesystemRecordingStore::new(self.store_root.clone());
-        let quota = self
+        let authorities = self
             .startup
             .quota_authorities()
             .iter()
-            .find(|authority| {
+            .filter(|authority| {
                 self.store_root
                     .starts_with(Path::new(&authority.quota().domain))
             })
-            .ok_or(crate::QuotaError::InvalidQuota)?;
+            .collect::<Vec<_>>();
+        if authorities.len() != 1 {
+            return Err(crate::QuotaError::InvalidQuota.into());
+        }
+        let quota = authorities[0];
         quota.refresh_from_filesystem()?;
         let checkpoint_bytes = checkpoint
             .encode()
@@ -796,7 +829,28 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         self.last_wal_bytes = current_wal_bytes;
         let changed = self.active_metadata.quota != quota;
         self.active_metadata.quota = quota;
-        if pressure {
+        let terminal = pressure
+            && self.startup.quota_authorities().iter().any(|authority| {
+                crate::classify_quota_pressure(
+                    authority.available_bytes(),
+                    authority.reserved_bytes().unwrap_or(0),
+                    authority.quota().quota_bytes,
+                    authority.quota().minimum_free_bytes,
+                    authority.managed_bytes(),
+                ) == crate::QuotaPressureKind::Terminal
+            });
+        if self.active_metadata.failure == Some(MetadataCode::TerminalQuotaPressure) {
+            // Terminal quota pressure latches: required headroom cannot be
+            // restored without deleting protected or corrupt evidence, so the
+            // recorder stays explicitly failed until an operator intervenes.
+            self.recorder.set_admission_enabled(false);
+        } else if terminal {
+            self.recorder.set_admission_enabled(false);
+            self.active_metadata.capture_readiness = RecorderReadiness::NotReady;
+            self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+            self.active_metadata.health = RecorderHealth::Failed;
+            self.active_metadata.failure = Some(MetadataCode::TerminalQuotaPressure);
+        } else if pressure {
             // Disk pressure is recoverable runtime backpressure, not a process
             // failure. Stop admission before the next source poll, preserve
             // committed WAL, and keep status/control-plane polling alive.
@@ -832,17 +886,134 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         self.active_metadata.updated_at_unix_seconds = unix_seconds();
     }
 
+    pub fn begin_rollover_transition(
+        &self,
+        next_wal_directory: impl AsRef<Path>,
+        next_recording_id: RecordingId,
+        reservation_bytes: u64,
+    ) -> Result<(), ContinuousRecorderError> {
+        let next_wal_directory = next_wal_directory.as_ref();
+        if reservation_bytes != self.epoch_max_bytes
+            || self
+                .startup
+                .quota_authorities()
+                .iter()
+                .filter(|authority| {
+                    next_wal_directory.starts_with(Path::new(&authority.quota().domain))
+                })
+                .count()
+                != 1
+        {
+            return Err(ContinuousRecorderError::Metadata(
+                "rollover successor quota domain or reservation mismatch".into(),
+            ));
+        }
+        if load_transition(&self.state_root)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?
+            .is_some()
+        {
+            return Err(ContinuousRecorderError::Metadata(
+                "rollover transition already exists".into(),
+            ));
+        }
+        let transition = RolloverTransitionV1::new(
+            self.recorder.epoch_ordinal(),
+            self.recorder.epoch_ordinal().saturating_add(1),
+            self.recorder.ingest().recording_id().0,
+            next_recording_id.0,
+            &self.wal_directory,
+            next_wal_directory,
+            reservation_bytes,
+        )
+        .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        write_transition_atomic(&self.state_root, &transition)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        Ok(())
+    }
+
+    fn ensure_rollover_transition(
+        &self,
+        next_wal_directory: &Path,
+        next_recording_id: RecordingId,
+    ) -> Result<(), ContinuousRecorderError> {
+        let Some(transition) = load_transition(&self.state_root)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?
+        else {
+            return Err(ContinuousRecorderError::Metadata(
+                "rollover transition missing before successor mutation".into(),
+            ));
+        };
+        if transition.phase != RolloverTransitionPhase::Prepared
+            || transition.old_epoch_ordinal != self.recorder.epoch_ordinal()
+            || transition.old_recording_id != self.recorder.ingest().recording_id().0
+            || transition.old_path != self.wal_directory.to_string_lossy()
+            || transition.new_recording_id != next_recording_id.0
+            || transition.new_path != next_wal_directory.to_string_lossy()
+            || transition.reservation_bytes != self.epoch_max_bytes
+        {
+            return Err(ContinuousRecorderError::Metadata(
+                "rollover transition identity or quota mismatch".into(),
+            ));
+        }
+        if self
+            .startup
+            .quota_authorities()
+            .iter()
+            .filter(|authority| {
+                next_wal_directory.starts_with(Path::new(&authority.quota().domain))
+            })
+            .count()
+            != 1
+        {
+            return Err(ContinuousRecorderError::Metadata(
+                "rollover successor quota domain mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn advance_rollover_transition(
+        &self,
+        phase: RolloverTransitionPhase,
+    ) -> Result<(), ContinuousRecorderError> {
+        let transition = load_transition(&self.state_root)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?
+            .ok_or_else(|| {
+                ContinuousRecorderError::Metadata("rollover transition missing".into())
+            })?;
+        let transition = transition
+            .with_phase(phase)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        write_transition_atomic(&self.state_root, &transition)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        Ok(())
+    }
+
     pub fn reserve_successor_quota(
         &self,
         next_wal_directory: impl AsRef<Path>,
         max_bytes: u64,
     ) -> Result<(), ContinuousRecorderError> {
         let next_wal_directory = next_wal_directory.as_ref();
-        for authority in self.startup.quota_authorities() {
-            if next_wal_directory.starts_with(Path::new(&authority.quota().domain)) {
-                authority.reserve(ReservationKind::Wal, max_bytes)?;
-            }
+        if max_bytes != self.epoch_max_bytes {
+            return Err(ContinuousRecorderError::Metadata(
+                "successor reservation does not match configured epoch limit".into(),
+            ));
         }
+        let authorities = self
+            .startup
+            .quota_authorities()
+            .iter()
+            .filter(|authority| {
+                next_wal_directory.starts_with(Path::new(&authority.quota().domain))
+            })
+            .collect::<Vec<_>>();
+        if authorities.len() != 1 {
+            return Err(ContinuousRecorderError::Metadata(
+                "rollover successor quota domain mismatch".into(),
+            ));
+        }
+        authorities[0].reserve(ReservationKind::Wal, max_bytes)?;
         Ok(())
     }
 
@@ -852,11 +1023,25 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         max_bytes: u64,
     ) -> Result<(), ContinuousRecorderError> {
         let next_wal_directory = next_wal_directory.as_ref();
-        for authority in self.startup.quota_authorities() {
-            if next_wal_directory.starts_with(Path::new(&authority.quota().domain)) {
-                authority.release(ReservationKind::Wal, max_bytes)?;
-            }
+        if max_bytes != self.epoch_max_bytes {
+            return Err(ContinuousRecorderError::Metadata(
+                "successor reservation does not match configured epoch limit".into(),
+            ));
         }
+        let authorities = self
+            .startup
+            .quota_authorities()
+            .iter()
+            .filter(|authority| {
+                next_wal_directory.starts_with(Path::new(&authority.quota().domain))
+            })
+            .collect::<Vec<_>>();
+        if authorities.len() != 1 {
+            return Err(ContinuousRecorderError::Metadata(
+                "rollover successor quota domain mismatch".into(),
+            ));
+        }
+        authorities[0].release(ReservationKind::Wal, max_bytes)?;
         Ok(())
     }
 
@@ -889,12 +1074,16 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         outcome_path: impl AsRef<Path>,
     ) -> Result<RecorderEpochBoundary, ContinuousRecorderError> {
         let next_wal_directory = next_wal_directory.as_ref().to_path_buf();
+        let next_recording_id = next_writer.recording_id();
+        self.ensure_rollover_transition(&next_wal_directory, next_recording_id)?;
+        self.advance_rollover_transition(RolloverTransitionPhase::SuccessorCreated)?;
         let old_wal_directory = self.wal_directory.clone();
         let old_session_id = self.incremental_session_id;
         self.sync_active_progress();
         let boundary = self
             .recorder
             .rollover_to(next_writer, now_millis, outcome_path)?;
+        self.advance_rollover_transition(RolloverTransitionPhase::BoundaryCommitted)?;
         self.finalize_incremental_recording(boundary.old_recording_id, old_session_id)?;
         for authority in self.startup.quota_authorities() {
             if old_wal_directory.starts_with(Path::new(&authority.quota().domain)) {
@@ -925,6 +1114,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         };
         write_recording_metadata(&self.wal_directory, &self.metadata)
             .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        self.advance_rollover_transition(RolloverTransitionPhase::MetadataPublished)?;
         self.incremental_processor =
             IncrementalProcessor::new(chronicle_session::SessionLimits::default());
         self.incremental_session_id = SessionId(boundary.new_recording_id.0);
@@ -943,6 +1133,27 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         write_recorder_metadata(&self.state_root, &self.active_metadata)
             .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
         Ok(boundary)
+    }
+
+    pub fn complete_rollover_transition(&self) -> Result<(), ContinuousRecorderError> {
+        crate::remove_transition(&self.state_root)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn release_production_reservations(&self) -> Result<(), ContinuousRecorderError> {
+        for authority in self.startup.quota_authorities() {
+            for kind in [
+                ReservationKind::Wal,
+                ReservationKind::Staging,
+                ReservationKind::Trash,
+            ] {
+                authority
+                    .release_all(kind)
+                    .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn shutdown(
@@ -1144,6 +1355,10 @@ mod tests {
     use chronicle_protocol_builtins::registry;
     use chronicle_wal::{DEFAULT_SEGMENT_BYTES, GroupCommitWalWriter};
     use std::fs;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     fn config(root: &std::path::Path) -> crate::NormalizedRecorderConfig {
         RecorderConfigV1 {
@@ -1189,6 +1404,339 @@ mod tests {
         }
         .normalize()
         .unwrap()
+    }
+
+    fn pressure_config(root: &std::path::Path) -> crate::NormalizedRecorderConfig {
+        let mut config = config(root);
+        config.domains[0].quota_bytes = 1_000_000;
+        config.domains[0].minimum_free_bytes = 100_000;
+        config
+    }
+
+    fn start_pressure_service(
+        config: &crate::NormalizedRecorderConfig,
+    ) -> ContinuousRecorderService<FixtureCaptureSource> {
+        let wal = Path::new(&config.domains[0].identity.canonical_root).join("wal");
+        let writer =
+            GroupCommitWalWriter::create(&wal, RecordingId::new(), DEFAULT_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        let source = FixtureCaptureSource::from_json(include_bytes!(
+            "../../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let recorder = RecorderOrchestrator::new(source, crate::RecordingIngest::new(writer));
+        ContinuousRecorderService::start(
+            config,
+            &wal,
+            recorder,
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn quota_pressure_is_terminal_without_cleanup_candidates_and_latches() {
+        let root =
+            std::env::temp_dir().join(format!("chronicle-quota-terminal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let config = pressure_config(&root);
+        let mut service = start_pressure_service(&config);
+        fs::create_dir_all(root.join("store")).unwrap();
+        // Durable managed usage alone exceeds the 1 MiB quota ceiling.
+        fs::write(root.join("store/fill"), vec![0_u8; 1_050_000]).unwrap();
+        service.poll(0).unwrap();
+        assert_eq!(
+            service.active_metadata.failure,
+            Some(crate::MetadataCode::TerminalQuotaPressure)
+        );
+        assert_eq!(
+            service.active_metadata.health,
+            crate::RecorderHealth::Failed
+        );
+        assert_eq!(
+            service.active_metadata.capture_readiness,
+            crate::RecorderReadiness::NotReady
+        );
+        assert!(!service.recorder().admission_enabled());
+        fs::remove_file(root.join("store/fill")).unwrap();
+        service.poll(1).unwrap();
+        assert_eq!(
+            service.active_metadata.failure,
+            Some(crate::MetadataCode::TerminalQuotaPressure)
+        );
+        assert_eq!(
+            service.active_metadata.health,
+            crate::RecorderHealth::Failed
+        );
+        assert!(!service.recorder().admission_enabled());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn persist_test_startup_metadata(
+        config: &crate::NormalizedRecorderConfig,
+        quotas: &[crate::QuotaReservationAuthority],
+        lifecycle: crate::RecorderLifecycleState,
+        recorder_id: uuid::Uuid,
+        attempt_id: uuid::Uuid,
+    ) -> Result<(), RecorderStartupError> {
+        let config_digest = config
+            .stable_digest()
+            .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+        crate::write_recorder_metadata(
+            &config.state_root,
+            &crate::RecorderMetadataV1 {
+                version: crate::RECORDER_METADATA_SCHEMA_VERSION,
+                recorder_id,
+                attempt_id,
+                config_digest,
+                scope: config.scope.clone(),
+                boot_clock_identity: "continuous-recorder-test".into(),
+                lifecycle,
+                capture_readiness: RecorderReadiness::NotReady,
+                processing_readiness: RecorderReadiness::Unknown,
+                health: RecorderHealth::Degraded,
+                current_epoch: None,
+                previous_epoch: None,
+                active_segment: None,
+                commit: None,
+                incremental_checkpoint: None,
+                lag: crate::LagSummary {
+                    records: 0,
+                    bytes: 0,
+                    age_seconds: 0,
+                },
+                quota: quotas
+                    .iter()
+                    .map(|quota| crate::QuotaStatus {
+                        domain: quota.quota().domain.clone(),
+                        quota_bytes: quota.quota().quota_bytes,
+                        free_bytes: quota.available_bytes(),
+                        reserved_bytes: quota.reserved_bytes().unwrap(),
+                    })
+                    .collect(),
+                counters: crate::RecorderCounters::default(),
+                recovery: Some(crate::RecoverySummary {
+                    code: crate::MetadataCode::CrashRecovered,
+                    repaired_tail: false,
+                }),
+                shutdown: None,
+                failure: None,
+                updated_at_unix_seconds: 0,
+                checksum: String::new(),
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))
+    }
+
+    struct StartProbe(Arc<AtomicBool>);
+
+    impl CaptureSource for StartProbe {
+        fn start(&mut self) -> Result<(), CaptureError> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn next_event(&mut self) -> Result<Option<chronicle_capture::CaptureEvent>, CaptureError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn rollover_requires_prepared_transition_before_successor_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-rollover-journal-boundary-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = config(&root);
+        let wal = root.join("wal");
+        let writer =
+            GroupCommitWalWriter::create(&wal, RecordingId::new(), DEFAULT_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        let source = FixtureCaptureSource::from_json(include_bytes!(
+            "../../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let recorder = RecorderOrchestrator::new(source, crate::RecordingIngest::new(writer));
+        let mut service = ContinuousRecorderService::start(
+            &config,
+            &wal,
+            recorder,
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        let next = root.join("next");
+        let next_writer =
+            GroupCommitWalWriter::create(&next, RecordingId::new(), DEFAULT_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        let result = service.rollover_to(&next, next_writer, 1, root.join("outcome.json"));
+        assert!(
+            matches!(result, Err(ContinuousRecorderError::Metadata(message)) if message.contains("missing before successor mutation"))
+        );
+        assert!(
+            crate::load_transition(&config.state_root)
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quota_denial_leaves_no_rollover_journal_or_successor() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-rollover-quota-denial-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = config(&root);
+        let wal = root.join("wal");
+        let writer =
+            GroupCommitWalWriter::create(&wal, RecordingId::new(), DEFAULT_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        let source = FixtureCaptureSource::from_json(include_bytes!(
+            "../../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let recorder = RecorderOrchestrator::new(source, crate::RecordingIngest::new(writer));
+        let service = ContinuousRecorderService::start(
+            &config,
+            &wal,
+            recorder,
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        let successor = root.join("successor");
+        let result = service.reserve_successor_quota(&successor, u64::MAX);
+        assert!(result.is_err());
+        assert!(!successor.exists());
+        assert!(
+            crate::load_transition(&config.state_root)
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rollover_failure_retains_prepared_evidence_for_restart_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-rollover-failure-boundary-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = config(&root);
+        let wal = root.join("wal");
+        let writer =
+            GroupCommitWalWriter::create(&wal, RecordingId::new(), DEFAULT_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        let source = FixtureCaptureSource::from_json(include_bytes!(
+            "../../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let recorder = RecorderOrchestrator::new(source, crate::RecordingIngest::new(writer));
+        let mut service = ContinuousRecorderService::start(
+            &config,
+            &wal,
+            recorder,
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        for tick in 0..20 {
+            service.poll(tick * 250).unwrap();
+        }
+        let old_metadata = fs::read(wal.join("recording.json")).unwrap();
+        let next =
+            std::path::PathBuf::from(&config.domains[0].identity.canonical_root).join("next");
+        let next_id = RecordingId::new();
+        service
+            .reserve_successor_quota(&next, config.epoch.max_bytes)
+            .unwrap();
+        service
+            .begin_rollover_transition(&next, next_id, config.epoch.max_bytes)
+            .unwrap();
+        let next_writer =
+            GroupCommitWalWriter::create(&next, next_id, DEFAULT_SEGMENT_BYTES, 1, 0).unwrap();
+        let outcome_directory = root.join("outcome-directory");
+        fs::create_dir_all(&outcome_directory).unwrap();
+        let result = service.rollover_to(&next, next_writer, 1, &outcome_directory);
+        assert!(result.is_err());
+        assert_eq!(
+            crate::load_transition(&config.state_root)
+                .unwrap()
+                .unwrap()
+                .phase,
+            crate::RolloverTransitionPhase::SuccessorCreated
+        );
+        assert!(next.exists());
+        assert_eq!(fs::read(wal.join("recording.json")).unwrap(), old_metadata);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_startup_rejects_non_authoritative_epoch_before_capture() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-authoritative-epoch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = config(&root);
+        let wal = root.join("wal");
+        let writer =
+            GroupCommitWalWriter::create(&wal, RecordingId::new(), DEFAULT_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        let started = Arc::new(AtomicBool::new(false));
+        let recorder = RecorderOrchestrator::new(
+            StartProbe(Arc::clone(&started)),
+            crate::RecordingIngest::new(writer),
+        );
+        let recorder_id = uuid::Uuid::new_v4();
+        let attempt_id = uuid::Uuid::new_v4();
+        let startup = RecorderStartup::prepare_foundation_with_metadata(
+            &config,
+            |quotas, lifecycle| {
+                persist_test_startup_metadata(&config, quotas, lifecycle, recorder_id, attempt_id)
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let result = ContinuousRecorderService::start_with_prepared_startup(
+            &config,
+            &wal,
+            1,
+            recorder,
+            startup,
+            || Ok(()),
+            || Ok(()),
+        );
+        assert!(matches!(
+            result,
+            Err(ContinuousRecorderError::Startup(
+                RecorderStartupError::RecoveryDetail(_)
+            ))
+        ));
+        assert!(!started.load(Ordering::SeqCst));
+        let metadata = crate::load_recorder_metadata(&config.state_root).unwrap();
+        assert_eq!(metadata.lifecycle, crate::RecorderLifecycleState::Failed);
+        assert_eq!(metadata.capture_readiness, RecorderReadiness::NotReady);
+        assert_eq!(metadata.processing_readiness, RecorderReadiness::NotReady);
+        assert_eq!(metadata.failure, Some(crate::MetadataCode::RecoveryFailure));
+        assert_eq!(metadata.recorder_id, recorder_id);
+        assert_eq!(metadata.attempt_id, attempt_id);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1286,6 +1834,94 @@ mod tests {
                 Some(&bytes)
             );
         }
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finalize_deduplicates_repeated_operations_after_restart_boundary() {
+        // A restart replays the same capture source into the same epoch, so the
+        // assembler holds identical requests twice. Deterministic operation ids
+        // collide; finalization must deduplicate like incremental batches do.
+        let root =
+            std::env::temp_dir().join(format!("chronicle-finalize-dedup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let wal = root.join("wal");
+        let writer =
+            GroupCommitWalWriter::create(&wal, RecordingId::new(), DEFAULT_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        let source = FixtureCaptureSource::from_json(include_bytes!(
+            "../../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let recorder = RecorderOrchestrator::new(source, crate::RecordingIngest::new(writer));
+        let mut service = ContinuousRecorderService::start(
+            &config(&root),
+            &wal,
+            recorder,
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        for tick in 0..12 {
+            service.poll(tick * 250).unwrap();
+        }
+        assert!(wal.join("incremental-etl-checkpoint.json").exists());
+        let recording_id = service.recorder().ingest().recording_id();
+        drop(service);
+        let writer = chronicle_wal::prepare_group_commit_reopen(
+            &wal,
+            recording_id,
+            DEFAULT_SEGMENT_BYTES,
+            chronicle_wal::DEFAULT_MAX_WAL_BYTES,
+            0,
+        )
+        .unwrap()
+        .apply()
+        .unwrap()
+        .0;
+        let source = FixtureCaptureSource::from_json(include_bytes!(
+            "../../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let recorder = RecorderOrchestrator::new(source, crate::RecordingIngest::new(writer));
+        let mut service = ContinuousRecorderService::start(
+            &config(&root),
+            &wal,
+            recorder,
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        for tick in 12..24 {
+            service.poll(tick * 250).unwrap();
+        }
+        // Rollover finalizes the epoch whose reconstruction contains the
+        // replayed identical requests; deduplication must keep it publishable.
+        service
+            .rollover(6000, root.join("epoch-outcomes.json"))
+            .unwrap();
+        service.finalize_incremental_session().unwrap();
+        let session = chronicle_storage::FilesystemSessionStore::new(config(&root).store_root)
+            .hydrate(SessionId(recording_id.0))
+            .unwrap();
+        let ids = session
+            .connections
+            .iter()
+            .flat_map(|connection| connection.operations.iter().map(|op| op.id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids.len(),
+            ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+        session.validate().unwrap();
         drop(service);
         fs::remove_dir_all(root).unwrap();
     }

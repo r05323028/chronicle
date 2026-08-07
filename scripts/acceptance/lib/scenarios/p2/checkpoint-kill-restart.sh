@@ -40,7 +40,9 @@ assert any(output["key"] == artifact["key"] and output["digest"] == artifact["ch
 PY
 systemctl kill --kill-who=main -s SIGKILL "$UNIT"
 rm -f "$CHECKPOINT_PAUSE_FILE"
-systemctl restart "$UNIT"
+# The unit restarts itself on failure; a manual restart would race the
+# auto-restart and can double-start the recorder (WAL lock contention).
+wait_for_unit_stable "$UNIT"
 wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
 PID_AFTER=$(systemctl show "$UNIT" -p ExecMainPID --value)
 test "$PID_BEFORE" != "$PID_AFTER"

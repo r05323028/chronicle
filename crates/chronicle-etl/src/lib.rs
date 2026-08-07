@@ -47,7 +47,7 @@ use chronicle_wal::{
     decode_commit_marker, decode_terminal_wal_loss, encode_envelope,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -411,6 +411,14 @@ impl EtlPipeline {
             for decoded in &mut decoded_operations {
                 decoded.operation.id = deterministic_operation_id(&decoded.operation);
             }
+            // Deterministic operation ids collide for repeated identical
+            // traffic within one recording, so keep the last occurrence of
+            // each operation in the final session (incremental batch output
+            // applies the same deduplication).
+            let mut emitted_operation_ids = BTreeSet::new();
+            decoded_operations.reverse();
+            decoded_operations.retain(|decoded| emitted_operation_ids.insert(decoded.operation.id));
+            decoded_operations.reverse();
             operation_count = bounded_operation_count(operation_count, decoded_operations.len())?;
             for decoded in &decoded_operations {
                 let operation = &decoded.operation;

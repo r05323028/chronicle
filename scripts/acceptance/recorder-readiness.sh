@@ -148,7 +148,25 @@ wait_for_recorder_ready() {
 			last_state=$state
 		fi
 		case ${state%%|*} in
-		ready) return 0 ;;
+		ready)
+			# Reject a stale status written by a killed predecessor: the
+			# recorder's state file must be newer than the unit's latest start,
+			# otherwise the recorder is still mid-startup.
+			if [[ -n "${UNIT:-}" ]]; then
+				local started
+				started=$(systemctl show "$UNIT" -p ActiveEnterTimestamp --value 2>/dev/null || printf '')
+				local start_epoch=0 status_mtime=0
+				if [[ -n "$started" ]] && command -v date >/dev/null 2>&1; then
+					start_epoch=$(date -d "$started" +%s 2>/dev/null || printf '0')
+				fi
+				status_mtime=$(stat -c %Y "$STATE_ROOT/recorder.json" 2>/dev/null || printf '0')
+				if ((start_epoch != 0)) && ((status_mtime < start_epoch)); then
+					sleep "$interval"
+					continue
+				fi
+			fi
+			return 0
+			;;
 		failed)
 			if [[ $allow_stale_owner == true && ${state##*|} == true ]]; then
 				printf '[%s] stale owner while recorder restarts; continuing\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$ARTIFACT_ROOT/readiness-transitions.log"

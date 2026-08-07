@@ -76,7 +76,7 @@ impl RecorderStartup {
     ) -> Result<Self, RecorderStartupError> {
         Self::prepare_foundation_with_metadata(
             config,
-            |_| Ok(()),
+            |_, _| Ok(()),
             recover_foundation,
             reserve_quota,
         )
@@ -84,7 +84,10 @@ impl RecorderStartup {
 
     pub(crate) fn prepare_foundation_with_metadata(
         config: &NormalizedRecorderConfig,
-        persist_metadata: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
+        mut persist_metadata: impl FnMut(
+            &[QuotaReservationAuthority],
+            RecorderLifecycleState,
+        ) -> Result<(), RecorderStartupError>,
         recover_foundation: impl FnOnce(
             &[QuotaReservationAuthority],
         ) -> Result<(), RecorderStartupError>,
@@ -92,9 +95,14 @@ impl RecorderStartup {
     ) -> Result<Self, RecorderStartupError> {
         let lease = RecorderLease::acquire(config)?;
         let mut lifecycle = RecorderLifecycle::new();
-        lifecycle.begin_recovery()?;
         let quotas = build_quota_authorities(config)?;
-        if let Err(error) = persist_metadata(&quotas) {
+        if let Err(error) = persist_metadata(&quotas, RecorderLifecycleState::Starting) {
+            lifecycle.fail();
+            persist_startup_failure_at(&config.state_root, failure_code(&error));
+            return Err(error);
+        }
+        lifecycle.begin_recovery()?;
+        if let Err(error) = persist_metadata(&quotas, RecorderLifecycleState::Recovering) {
             lifecycle.fail();
             persist_startup_failure_at(&config.state_root, failure_code(&error));
             return Err(error);
@@ -266,7 +274,10 @@ mod tests {
         StoreConfig,
     };
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     fn config(root: &std::path::Path) -> crate::NormalizedRecorderConfig {
         RecorderConfigV1 {
@@ -312,6 +323,41 @@ mod tests {
         }
         .normalize()
         .unwrap()
+    }
+
+    #[test]
+    fn competing_lease_blocks_wal_establishment_before_callback() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-startup-lease-boundary-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = config(&root);
+        let wal = root.join("wal");
+        let wal_for_callback = wal.clone();
+        let _owner = RecorderLease::acquire(&config).unwrap();
+        let attempted = Arc::new(AtomicBool::new(false));
+        let attempted_callback = Arc::clone(&attempted);
+        let result = RecorderStartup::start(
+            &config,
+            move || {
+                attempted_callback.store(true, Ordering::SeqCst);
+                chronicle_wal::GroupCommitWalWriter::create(
+                    &wal_for_callback,
+                    chronicle_common::RecordingId::new(),
+                    chronicle_wal::DEFAULT_SEGMENT_BYTES,
+                    1,
+                    0,
+                )
+                .map(|_| ())
+                .map_err(|_| RecorderStartupError::Appendable)
+            },
+            || Ok(()),
+        );
+        assert!(matches!(result, Err(RecorderStartupError::Lease(_))));
+        assert!(!attempted.load(Ordering::SeqCst));
+        assert!(!wal.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -453,6 +499,93 @@ mod tests {
             )),
             MetadataCode::QuotaPressure
         );
+    }
+
+    #[test]
+    fn startup_persists_starting_and_recovering_before_recovery_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-startup-metadata-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = config(&root);
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let state_order = Arc::clone(&states);
+        let state_root = config.state_root.clone();
+        let scope = config.scope.clone();
+        let config_digest = config.stable_digest().unwrap();
+        let recorder_id = uuid::Uuid::new_v4();
+        let attempt_id = uuid::Uuid::new_v4();
+        let result = RecorderStartup::prepare_foundation_with_metadata(
+            &config,
+            move |quotas, lifecycle| {
+                state_order.lock().unwrap().push(lifecycle);
+                crate::write_recorder_metadata(
+                    &state_root,
+                    &crate::RecorderMetadataV1 {
+                        version: crate::RECORDER_METADATA_SCHEMA_VERSION,
+                        recorder_id,
+                        attempt_id,
+                        config_digest: config_digest.clone(),
+                        scope: scope.clone(),
+                        boot_clock_identity: "startup-test".into(),
+                        lifecycle,
+                        capture_readiness: RecorderReadiness::NotReady,
+                        processing_readiness: RecorderReadiness::Unknown,
+                        health: RecorderHealth::Degraded,
+                        current_epoch: None,
+                        previous_epoch: None,
+                        active_segment: None,
+                        commit: None,
+                        incremental_checkpoint: None,
+                        lag: crate::LagSummary {
+                            records: 0,
+                            bytes: 0,
+                            age_seconds: 0,
+                        },
+                        quota: quotas
+                            .iter()
+                            .map(|quota| crate::QuotaStatus {
+                                domain: quota.quota().domain.clone(),
+                                quota_bytes: quota.quota().quota_bytes,
+                                free_bytes: quota.available_bytes(),
+                                reserved_bytes: quota.reserved_bytes().unwrap(),
+                            })
+                            .collect(),
+                        counters: crate::RecorderCounters::default(),
+                        recovery: Some(crate::RecoverySummary {
+                            code: MetadataCode::CrashRecovered,
+                            repaired_tail: false,
+                        }),
+                        shutdown: None,
+                        failure: None,
+                        updated_at_unix_seconds: 0,
+                        checksum: String::new(),
+                    },
+                )
+                .map(|_| ())
+                .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))
+            },
+            move |_| Err(RecorderStartupError::Recovery),
+            |_| Ok(()),
+        );
+        assert!(matches!(result, Err(RecorderStartupError::Recovery)));
+        assert_eq!(
+            *states.lock().unwrap(),
+            [
+                RecorderLifecycleState::Starting,
+                RecorderLifecycleState::Recovering
+            ]
+        );
+        let metadata = crate::load_recorder_metadata(&config.state_root).unwrap();
+        assert_eq!(metadata.lifecycle, RecorderLifecycleState::Failed);
+        assert_eq!(metadata.recorder_id, recorder_id);
+        assert_eq!(metadata.attempt_id, attempt_id);
+        assert_eq!(metadata.capture_readiness, RecorderReadiness::NotReady);
+        assert_eq!(metadata.processing_readiness, RecorderReadiness::NotReady);
+        assert_eq!(metadata.health, RecorderHealth::Failed);
+        assert_eq!(metadata.failure, Some(MetadataCode::RecoveryFailure));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

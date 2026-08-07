@@ -52,8 +52,20 @@ if [[ "$CRASH_MODE" == 1 ]]; then
 	phase crash_restart 'kill recorder process and verify systemd recovery'
 	printf '%s\n' "$$" >"$CGROUP/cgroup.procs"
 	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/pre-crash-workload.json"
-	sleep 1
+	# Pause publication at the post-delta commit boundary so the SIGKILL
+	# lands deterministically in a recoverable state: the pending checkpoint
+	# already references a published delta, so restart reconciliation adopts
+	# it instead of failing closed on a partial publication.
+	: >"$CHECKPOINT_PAUSE_FILE"
+	for _ in $(seq 1 60); do
+		[[ -f "$CHECKPOINT_READY_FILE" ]] && break
+		sleep 0.25
+	done
 	systemctl kill --kill-who=main -s SIGKILL "$UNIT"
+	rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
+	# The unit restarts itself on failure; a manual restart would race the
+	# auto-restart and can double-start the recorder (WAL lock contention).
+	wait_for_unit_stable "$UNIT"
 	RECORDER_STATUS="$ARTIFACT_ROOT/recorder-restart-status.json" \
 		wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
 	systemctl is-active --quiet "$UNIT"
