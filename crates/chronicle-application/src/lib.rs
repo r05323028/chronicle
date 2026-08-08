@@ -3,6 +3,8 @@
 #[allow(unsafe_code)] // bootstrap credential hardening uses raw descriptor and sigaction syscalls
 mod bootstrap;
 mod cgroup_selection;
+#[allow(unsafe_code)] // bootstrap spawn uses pre_exec descriptor manipulation
+mod command_record;
 mod continuous_recorder;
 mod data_dir;
 mod domain_lock;
@@ -25,6 +27,10 @@ pub use bootstrap::{BOOTSTRAP_FAILURE_EXIT, run_bootstrap};
 pub use cgroup_selection::{
     CgroupSelection, CgroupSelectionError, CgroupSelector, PidCgroupSelection,
     preflight_cgroup_selection, preflight_pid_cgroup_selection,
+};
+pub use command_record::{
+    COMMAND_RECORD_ATTACH_DEADLINE, COMMAND_RECORD_SCOPE_PREFIX, ChildStdio, CommandRecordOptions,
+    CommandRecordResult, record_command,
 };
 pub use continuous_recorder::{ContinuousRecorderError, ContinuousRecorderService};
 pub use data_dir::{DataDirSource, ResolvedDataDir, ensure_private_data_dir, resolve_data_dir};
@@ -626,7 +632,7 @@ impl Default for ProductionRecordingBounds {
 }
 
 /// Signal state shared by platform adapters and synchronous recording.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ProductionSignalStop(Arc<AtomicU8>);
 
 impl ProductionSignalStop {
@@ -759,7 +765,7 @@ pub fn preflight_production_record(
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
+pub(crate) fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
     chronicle_capture_ebpf::probe_embedded()
         .is_ready()
         .then_some(())
@@ -769,7 +775,7 @@ fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
 }
 
 #[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
-fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
+pub(crate) fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
     Err(ApplicationError::ProductionPreflight(
         "Linux eBPF capture unavailable",
     ))
@@ -1945,7 +1951,7 @@ pub fn record_continuous_ebpf(
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-fn live_capture_metadata(
+pub(crate) fn live_capture_metadata(
     selection: &CgroupSelection,
     bounds: ProductionRecordingBounds,
 ) -> Result<RecordingCaptureMetadata, ApplicationError> {
@@ -1993,7 +1999,7 @@ fn live_capture_metadata(
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-fn monotonic_millis() -> u64 {
+pub(crate) fn monotonic_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

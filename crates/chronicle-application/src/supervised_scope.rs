@@ -138,7 +138,7 @@ impl ScopeClock for RealClock {
 
 /// Linux supervised scope. `#[cfg]`-gated: non-Linux callers get a typed
 /// [`ScopeError::UnsupportedPlatform`] from the exported constructors.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SupervisedScope {
     path: PathBuf,
     identity: ScopeIdentity,
@@ -315,12 +315,21 @@ impl SupervisedScope {
 
 fn read_identity(path: &Path) -> Result<ScopeIdentity, ScopeError> {
     let canonical_path = fs::canonicalize(path)?;
-    let contents = fs::read_to_string(path.join(CGROUP_ID))
-        .map_err(|error| ScopeError::CgroupIdUnavailable(error.to_string()))?;
-    let cgroup_id = contents
-        .trim()
-        .parse::<u64>()
-        .map_err(|error| ScopeError::CgroupIdUnavailable(error.to_string()))?;
+    let cgroup_id = match fs::read_to_string(path.join(CGROUP_ID)) {
+        Ok(contents) => contents
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| ScopeError::CgroupIdUnavailable(error.to_string()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Kernels without an exposed `cgroup.id` file: for cgroup v2 the
+            // kernel cgroup id (as seen by `bpf_get_current_cgroup_id`) equals
+            // the cgroupfs directory inode, so the inode is the stable id the
+            // capture adapter matches against.
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(path)?.ino()
+        }
+        Err(error) => return Err(ScopeError::CgroupIdUnavailable(error.to_string())),
+    };
     Ok(ScopeIdentity {
         canonical_path,
         cgroup_id,
@@ -378,6 +387,10 @@ pub fn preflight_scope_access(
     delegated_root: &Path,
     uid: u32,
 ) -> Result<(), ScopeError> {
+    // Root can already reach any cgroup; access separation is moot.
+    if uid == 0 {
+        return Ok(());
+    }
     if !hierarchy_root.is_absolute() || !delegated_root.is_absolute() {
         return Err(ScopeError::UnsafeName(delegated_root.display().to_string()));
     }

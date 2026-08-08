@@ -22,6 +22,7 @@ chronicle-protocol = { path = "../chronicle-protocol" }
 chronicle-protocol-builtins = { path = "../chronicle-protocol-builtins" }
 chronicle-replay = { path = "../chronicle-replay" }
 clap.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

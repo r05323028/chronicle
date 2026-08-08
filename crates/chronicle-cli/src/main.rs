@@ -7,8 +7,9 @@ use chronicle_application::{
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::{
-    CgroupSelector, ProductionRecordingBounds, ProductionSignalStop, load_recording_metadata,
-    mark_recording_forced_termination, record_continuous_ebpf, record_live_ebpf,
+    CgroupSelector, ChildExitResult, ChildStdio, CleanupOutcome, CommandRecordOptions,
+    CommandRecordResult, ProductionRecordingBounds, ProductionSignalStop, load_recording_metadata,
+    mark_recording_forced_termination, record_command, record_continuous_ebpf, record_live_ebpf,
     recording_physical_wal_bytes,
 };
 use chronicle_common::escape_control;
@@ -797,10 +798,7 @@ fn public_record(
         cgroup,
         ..
     } = args;
-    // Stubs: the record-orchestration tasks replace these with the real
-    // workflows. The data directory/format/config are threaded through so the
-    // orchestration lands on the same resolution path.
-    let _ = (&cli_data_dir, config, format, &name, &duration);
+    let _ = (config, format, &name, &duration);
     if retry.is_some() {
         return Err(ApplicationError::NotImplemented("record --retry"));
     }
@@ -808,11 +806,186 @@ fn public_record(
         return Err(ApplicationError::NotImplemented("record --pid/--cgroup"));
     }
     if !command.is_empty() {
-        return Err(ApplicationError::NotImplemented("record -- COMMAND"));
+        return record_command_mode(command, name, duration, cli_data_dir, config, format);
     }
     Err(ApplicationError::ProductionPreflight(
         "record requires one of: -- COMMAND..., --pid PID, --cgroup PATH, or --retry RECORDING",
     ))
+}
+
+/// Command mode: supervised-scope record of `-- COMMAND...`.
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn record_command_mode(
+    command: Vec<String>,
+    name: Option<String>,
+    duration: Option<u64>,
+    cli_data_dir: Option<&Path>,
+    config: &AppConfig,
+    format: Format,
+) -> Result<(String, i32), ApplicationError> {
+    use rustix::process::{getegid, geteuid};
+    let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
+    let stop = ProductionSignalStop::default();
+    spawn_command_signal_watcher(stop.clone());
+    let result = record_command(CommandRecordOptions {
+        command,
+        name,
+        duration_seconds: duration.unwrap_or(600),
+        data_dir,
+        domain_lock_root: config.domain_lock_root.clone(),
+        child_stdout: if matches!(format, Format::Json) {
+            ChildStdio::Null
+        } else {
+            ChildStdio::Inherit
+        },
+        child_stderr: if matches!(format, Format::Json) {
+            ChildStdio::Null
+        } else {
+            ChildStdio::Inherit
+        },
+        invoking_uid: geteuid().as_raw(),
+        invoking_gid: getegid().as_raw(),
+        stop,
+    })?;
+    // Exit: orphan cleanup is a typed failure (3); otherwise the recording
+    // outcome drives the code (completed 0, failed 3).
+    let code = if matches!(result.cleanup, CleanupOutcome::TimedOut { .. })
+        || !matches!(result.status, RecordingStatus::Completed)
+    {
+        3
+    } else {
+        0
+    };
+    let output = render_command_record(&result, format)?;
+    Ok((output, code))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+fn record_command_mode(
+    _command: Vec<String>,
+    _name: Option<String>,
+    _duration: Option<u64>,
+    _cli_data_dir: Option<&Path>,
+    _config: &AppConfig,
+    _format: Format,
+) -> Result<(String, i32), ApplicationError> {
+    Err(ApplicationError::UnsupportedLivePreflight(
+        "command-mode recording requires the Linux eBPF build",
+    ))
+}
+
+/// Signal watcher for command mode (no WAL marker: the recording directory is
+/// internal to the orchestration; a second signal just exits).
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn spawn_command_signal_watcher(stop: ProductionSignalStop) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
+            return;
+        };
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        loop {
+            let interrupt_received = tokio::select! {
+                _ = interrupt.recv() => true,
+                _ = terminate.recv() => false,
+            };
+            if !if interrupt_received {
+                stop.request_interrupt()
+            } else {
+                stop.request_termination()
+            } {
+                std::process::exit(if interrupt_received { 130 } else { 143 });
+            }
+        }
+    });
+}
+
+/// Human/JSON record completion summary (v1). Formalized further by the
+/// output-contract task; raw argv never appears in output.
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn render_command_record(
+    result: &CommandRecordResult,
+    format: Format,
+) -> Result<String, ApplicationError> {
+    let id = result.recording_id.to_cli_string();
+    match format {
+        Format::Human => {
+            let status = match &result.status {
+                RecordingStatus::Completed => "complete",
+                RecordingStatus::Failed => "failed",
+                RecordingStatus::Aborted => "aborted",
+                _ => "interrupted",
+            };
+            let reason = result
+                .shutdown_reason
+                .map(|reason| format!(" ({reason:?})"))
+                .unwrap_or_default();
+            let duration = format_duration_millis(result.duration_ms);
+            let mut lines = vec![format!("Recording {status}{reason}.")];
+            lines.push(format!("  id: {id}"));
+            lines.push(format!("  duration: {duration}"));
+            lines.push(format!("  operations: {}", result.committed_records));
+            lines.push("  dropped: 0".to_owned());
+            if let Some(child_exit) = &result.child_exit {
+                lines.push(format!("  child: {child_exit:?}"));
+            }
+            if matches!(result.cleanup, CleanupOutcome::TimedOut { .. }) {
+                lines.push(
+                    "  warning: supervised scope still populated; orphan processes may remain"
+                        .to_owned(),
+                );
+            }
+            lines.push("Try:".to_owned());
+            lines.push(format!("  chronicle inspect {id}"));
+            lines.push("  chronicle replay <id> -- COMMAND...".to_owned());
+            Ok(lines.join(
+                "
+",
+            ))
+        }
+        Format::Json => {
+            #[derive(Serialize)]
+            struct RecordResultJson<'a> {
+                version: u8,
+                recording_id: String,
+                name: Option<&'a str>,
+                status: &'a str,
+                shutdown_reason: Option<&'a str>,
+                duration_ms: u64,
+                operations: u64,
+                dropped: u64,
+                child_exit: Option<&'a ChildExitResult>,
+            }
+            render_json(&RecordResultJson {
+                version: 1,
+                recording_id: id,
+                name: result.name.as_deref(),
+                status: match result.status {
+                    RecordingStatus::Completed => "completed",
+                    RecordingStatus::Failed => "failed",
+                    RecordingStatus::Aborted => "aborted",
+                    _ => "in_progress",
+                },
+                shutdown_reason: result.shutdown_reason.map(|reason| match reason {
+                    ShutdownReason::UserInterrupt => "user_interrupt",
+                    ShutdownReason::TerminationSignal => "termination_signal",
+                    ShutdownReason::SourceCompleted => "source_completed",
+                    ShutdownReason::DurationLimit => "duration_limit",
+                    ShutdownReason::WalSizeLimit => "wal_size_limit",
+                    ShutdownReason::CaptureFailure => "capture_failure",
+                    ShutdownReason::WalFailure => "wal_failure",
+                    ShutdownReason::ProcessCrashRecovered => "process_crash_recovered",
+                    ShutdownReason::ForcedTermination => "forced_termination",
+                }),
+                duration_ms: result.duration_ms,
+                operations: result.committed_records,
+                dropped: 0,
+                child_exit: result.child_exit.as_ref(),
+            })
+        }
+    }
 }
 
 async fn run_replay(
@@ -928,13 +1101,23 @@ struct ListRecordingJson {
     duration: Option<u64>,
     sessions: usize,
     operations: usize,
-    status: String,
+    status: chronicle_application::RecordingCatalogStatus,
 }
 
 #[derive(Serialize)]
 struct ListJson {
     version: u8,
     recordings: Vec<ListRecordingJson>,
+}
+
+fn recording_status_human(status: chronicle_application::RecordingCatalogStatus) -> &'static str {
+    match status {
+        chronicle_application::RecordingCatalogStatus::InProgress => "in_progress",
+        chronicle_application::RecordingCatalogStatus::Recoverable => "recoverable",
+        chronicle_application::RecordingCatalogStatus::Published => "published",
+        chronicle_application::RecordingCatalogStatus::Failed => "failed",
+        chronicle_application::RecordingCatalogStatus::Inconsistent => "inconsistent",
+    }
 }
 
 fn format_duration_millis(millis: u64) -> String {
@@ -982,7 +1165,7 @@ fn run_list(
                         duration,
                         row.sessions,
                         row.operations,
-                        serde_json::to_string(&row.status).unwrap_or_else(|_| "unknown".into()),
+                        recording_status_human(row.status),
                     ));
                 }
                 lines.join("\n")
@@ -999,7 +1182,7 @@ fn run_list(
                     duration: row.duration_ms,
                     sessions: row.sessions,
                     operations: row.operations,
-                    status: serde_json::to_string(&row.status).unwrap_or_else(|_| "unknown".into()),
+                    status: row.status,
                 })
                 .collect(),
         })?,
