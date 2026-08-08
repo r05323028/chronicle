@@ -30,7 +30,7 @@ pub use cgroup_selection::{
 };
 pub use command_record::{
     COMMAND_RECORD_ATTACH_DEADLINE, COMMAND_RECORD_SCOPE_PREFIX, ChildStdio, CommandRecordOptions,
-    CommandRecordResult, record_command,
+    CommandRecordResult, record_command, retry_recording,
 };
 pub use continuous_recorder::{ContinuousRecorderError, ContinuousRecorderService};
 pub use data_dir::{DataDirSource, ResolvedDataDir, ensure_private_data_dir, resolve_data_dir};

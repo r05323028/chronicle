@@ -13,9 +13,7 @@
 use crate::{ApplicationError, ChildExitResult, RecordingId, RecordingStatus};
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use crate::{DomainLockGuard, FilesystemSessionStore, RecordingMetadata};
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Hard deadline for capture attachment (bootstrap release).
@@ -325,6 +323,78 @@ pub fn record_command(
             Err(error)
         }
     }
+}
+
+/// `record --retry RECORDING`: reacquire the exact domain lock, then retry
+/// recovery/ETL/publication/catalog completion for one recording id.
+/// Never starts a target or capture and never creates a duplicate session
+/// (publication is idempotent). Only recovery-authoritative `recoverable`
+/// entries may be retried; everything else fails safely.
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+pub fn retry_recording(
+    data_dir: &Path,
+    domain_lock_root: Option<&Path>,
+    reference: &str,
+) -> Result<RecordingId, ApplicationError> {
+    use crate::{
+        RecordingCatalogStatus, acquire_domain_lock, ensure_private_data_dir,
+        process_and_publish_recording_wal, reconcile_catalog, recordings_root, resolve_recording,
+        save_catalog,
+    };
+    use chronicle_common::SessionId;
+
+    ensure_private_data_dir(data_dir)?;
+    let guard = acquire_domain_lock(data_dir, domain_lock_root)?;
+    let recording_id = resolve_recording(data_dir, reference)?;
+    let view = reconcile_catalog(data_dir)?;
+    let entry = view
+        .entries
+        .iter()
+        .find(|entry| entry.recording_id == recording_id)
+        .ok_or_else(|| ApplicationError::RecordingNotFound(reference.to_owned()))?;
+    if entry.status != RecordingCatalogStatus::Recoverable {
+        return Err(ApplicationError::InvalidConfig(format!(
+            "recording {} is not recoverable (status {:?}); only recovery-authoritative recoverable recordings can be retried",
+            recording_id.to_cli_string(),
+            entry.status
+        )));
+    }
+    let wal_dir = recordings_root(data_dir).join(recording_id.to_string());
+    let registry = chronicle_protocol_builtins::registry()?;
+    let published_session = match process_and_publish_recording_wal(&wal_dir, data_dir, &registry) {
+        Ok(published) => published.session_id,
+        Err(error)
+            if matches!(
+                error,
+                ApplicationError::Wal(chronicle_wal::WalError::NoPublishedSegments)
+            ) =>
+        {
+            crate::command_record::publish_empty_session(data_dir, recording_id)?
+        }
+        Err(error) => return Err(error),
+    };
+    let mut view = reconcile_catalog(data_dir)?;
+    for entry in &mut view.entries {
+        if entry.recording_id == recording_id {
+            entry.status = RecordingCatalogStatus::Published;
+            entry.ended_at = Some(time::OffsetDateTime::now_utc());
+            entry.session_id = Some(published_session);
+        }
+    }
+    save_catalog(data_dir, &view)?;
+    let _ = guard;
+    Ok(recording_id)
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+pub fn retry_recording(
+    _data_dir: &Path,
+    _domain_lock_root: Option<&Path>,
+    _reference: &str,
+) -> Result<RecordingId, ApplicationError> {
+    Err(ApplicationError::UnsupportedLivePreflight(
+        "record --retry requires the Linux eBPF build",
+    ))
 }
 
 #[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]

@@ -4,7 +4,7 @@ use chronicle_application::{
     inspect_session, list_recordings, load_recorder_metadata, process_and_publish_recording_wal,
     record_fixture_file, render_inspect_human, render_inspect_json, render_json,
     render_replay_human, replay_session_with_plan, resolve_data_dir, resolve_recording,
-    resolve_session,
+    resolve_session, retry_recording,
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::{
@@ -800,8 +800,23 @@ fn public_record(
         ..
     } = args;
     let _ = (config, format, &name, &duration);
-    if retry.is_some() {
-        return Err(ApplicationError::NotImplemented("record --retry"));
+    if let Some(reference) = retry {
+        let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
+        let recording_id =
+            retry_recording(&data_dir, config.domain_lock_root.as_deref(), &reference)?;
+        let output = match format {
+            Format::Human => format!(
+                "Recording finalized.\n  id: {}\nTry:\n  chronicle inspect {}",
+                recording_id.to_cli_string(),
+                recording_id.to_cli_string()
+            ),
+            Format::Json => render_json(&serde_json::json!({
+                "version": 1,
+                "recording_id": recording_id.to_cli_string(),
+                "status": "published",
+            }))?,
+        };
+        return Ok((output, 0));
     }
     if pid.is_some() || cgroup.is_some() {
         return Err(ApplicationError::NotImplemented("record --pid/--cgroup"));
