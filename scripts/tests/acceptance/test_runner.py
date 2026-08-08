@@ -666,10 +666,12 @@ class AcceptanceRunnerTests(unittest.TestCase):
         inputs = validation.acceptance_fingerprint(ROOT, cfg)["inputs"]
         self.assertTrue(inputs)
         self.assertTrue(all(not item["path"].startswith("docs/") for item in inputs))
-        self.assertIn(
-            "--exclude='./docs'",
-            (ROOT / "scripts/acceptance/lib/multipass.sh").read_text(),
-        )
+        # docs/ is git-tracked; the snapshot must include it so the guest-side
+        # release clean-tree check does not see spurious deletions.
+        snapshot = (ROOT / "scripts/acceptance/lib/multipass.sh").read_text()
+        self.assertNotIn("--exclude='./docs'", snapshot)
+        self.assertIn("--exclude='./target'", snapshot)
+        self.assertIn("--exclude='./graphify-out'", snapshot)
 
     def test_p2_common_coverage_requires_p1_pass(self):
         p1 = report.profile_scenarios(self.definition, "p1")

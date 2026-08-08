@@ -235,7 +235,9 @@ def guest_identity(
         and (
             not release
             or (
-                isinstance(value.get("working_tree_dirty"), bool)
+                # multipass.sh serializes the guest dirty flag as a bash
+                # integer (0/1), so accept both bool and int here.
+                isinstance(value.get("working_tree_dirty"), (bool, int))
                 and not value.get("working_tree_dirty")
                 and known_identity(value.get("commit_sha"))
                 and known_identity(value.get("tree_sha"))
