@@ -45,7 +45,7 @@ Preserve contradictory manifest, checkpoint, or digest artifacts in place; they 
 
 ## Evidence export
 
-Retain machine-readable status, recovery reports, manifests, checkpoints, tombstones, command logs, SHA-256 manifests, acceptance fingerprint, source commit/tree provenance, and kernel/architecture/capability data under runtime-only `target/validation-evidence/acceptance/<profile>/<fingerprint>/<run-id>/`. Redact payloads and credentials. Require exact clean start/end source identity only for release-grade evidence.
+Retain machine-readable status, recovery reports, manifests, checkpoints, tombstones, command logs, SHA-256 manifests, acceptance fingerprint, source commit/tree provenance, and kernel/architecture/capability data under runtime-only `target/validation-evidence/acceptance/<profile>/<fingerprint>/<run-id>/`. Redact payloads and credentials. Require clean, known current source that remains unchanged for release-grade evidence.
 
 ## Upgrade and rollback
 

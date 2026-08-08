@@ -70,7 +70,7 @@ Successful fast/targeted runs retain no artifact by default. Successful gates re
 
 `validation/groups.toml` owns path-to-group selection. Targeted output always lists changed paths, selected groups, skipped groups, and reasons. Acceptance fingerprints include only acceptance-sensitive source/build inputs and validation configuration; environment is compared separately. Unrelated documentation does not invalidate compatible evidence. P2 evidence may satisfy P1 when scenario coverage and environment match; P1 evidence never satisfies P2.
 
-`scripts/acceptance.sh` is the single runner. Normal runs allow dirty source and record commit/tree as provenance. `--release` requires clean stable exact source identity and complete release-eligible evidence. Legacy P1/P2 scripts remain deprecation wrappers only.
+`scripts/acceptance.sh` is the single runner. Normal runs allow dirty source and record commit/tree as provenance. `--release` requires a clean, identifiable current source that remains unchanged, plus complete compatible release-eligible evidence. Legacy P1/P2 scripts remain deprecation wrappers only.
 
 Historical verification measurements (temporary clean snapshot `5b3f49c9…`; not current retained acceptance evidence):
 
