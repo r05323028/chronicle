@@ -8,12 +8,13 @@ import os
 import platform
 import subprocess
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FINGERPRINT_VERSION = 2
-COMPATIBILITY_VERSION = 1
+COMPATIBILITY_VERSION = 2
 
 
 def _known_identity(value: Any) -> bool:
@@ -274,15 +275,19 @@ def normalize_legacy_report(
 
 
 def timeout_records(root: Path) -> list[dict[str, Any]]:
-    """Load bounded timeout evidence without trusting malformed artifacts."""
+    """Load bounded timeout evidence, failing closed on malformed artifacts."""
     records: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*timeout*.json")):
+        evidence_file = str(path.relative_to(root))
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            records.append({"timeout_layer": "invalid", "evidence_file": evidence_file})
             continue
         if isinstance(value, dict) and value.get("timeout_layer"):
-            records.append({**value, "evidence_file": str(path.relative_to(root))})
+            records.append({**value, "evidence_file": evidence_file})
+        else:
+            records.append({"timeout_layer": "invalid", "evidence_file": evidence_file})
     return records
 
 
@@ -341,6 +346,7 @@ def make_report(
         "schema_version": SCHEMA_VERSION,
         "compatibility_version": COMPATIBILITY_VERSION,
         "run_id": run_id,
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "profile": profile,
         "executor": executor,
         "selected_scenarios": selected,
@@ -365,6 +371,88 @@ def make_report(
 def write_report(path: Path, report: dict[str, Any]) -> None:
     path.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def report_is_complete(value: dict[str, Any], required: Iterable[str]) -> bool:
+    selected = value.get("selected_scenarios")
+    completed = value.get("completed_scenarios")
+    phases = value.get("phases")
+    required_set = set(required)
+    return (
+        value.get("schema_version") == SCHEMA_VERSION
+        and value.get("compatibility_version") == COMPATIBILITY_VERSION
+        and isinstance(value.get("run_id"), str)
+        and bool(value.get("run_id"))
+        and isinstance(value.get("created_at"), str)
+        and bool(value.get("created_at"))
+        and value.get("profile") in {"p1", "p2"}
+        and value.get("executor") in {"local", "multipass"}
+        and isinstance(value.get("environment"), dict)
+        and value["environment"].get("executor") == value.get("executor")
+        and value.get("status") == "passed"
+        and value.get("exit_code") == 0
+        and isinstance(value.get("release_requested"), bool)
+        and isinstance(value.get("release_eligible"), bool)
+        and isinstance(value.get("source"), dict)
+        and isinstance(value.get("reuse"), dict)
+        and isinstance(value.get("timeouts"), list)
+        and not value.get("timeouts")
+        and isinstance(selected, list)
+        and all(isinstance(item, str) for item in selected)
+        and isinstance(completed, list)
+        and all(isinstance(item, str) for item in completed)
+        and len(selected) == len(set(selected))
+        and len(completed) == len(set(completed))
+        and set(selected) == set(completed)
+        and required_set.issubset(set(selected))
+        and isinstance(value.get("failed_scenarios"), list)
+        and not value.get("failed_scenarios")
+        and isinstance(value.get("skipped_scenarios"), list)
+        and not value.get("skipped_scenarios")
+        and isinstance(value.get("not_checked_scenarios"), list)
+        and not value.get("not_checked_scenarios")
+        and isinstance(phases, list)
+        and bool(phases)
+        and all(
+            isinstance(phase, dict)
+            and phase.get("name")
+            and phase.get("status") == "passed"
+            for phase in phases
+        )
+        and value.get("artifact_manifest")
+        == {"file": "artifact-manifest.sha256", "complete": True}
+    )
+
+
+def guest_source_is_valid(value: dict[str, Any], fingerprint: str) -> bool:
+    if value.get("executor") != "multipass":
+        return True
+    guest = value.get("guest_source", {})
+    records = guest.get("records") if isinstance(guest, dict) else None
+    return (
+        isinstance(records, list)
+        and bool(records)
+        and all(
+            isinstance(record, dict)
+            and record.get("fingerprint") == fingerprint
+            and _known_identity(record.get("commit_sha"))
+            and _known_identity(record.get("tree_sha"))
+            and isinstance(record.get("working_tree_dirty"), (bool, int))
+            and (
+                value.get("reuse", {}).get("reused")
+                or (
+                    record.get("run_id") == value.get("run_id")
+                    and record.get("commit_sha")
+                    == value.get("source", {}).get("commit_sha")
+                    and record.get("tree_sha")
+                    == value.get("source", {}).get("tree_sha")
+                    and bool(record.get("working_tree_dirty"))
+                    == value.get("source", {}).get("working_tree_dirty")
+                )
+            )
+            for record in records
+        )
     )
 
 
@@ -396,8 +484,19 @@ def verify_reuse_chain(
         )
     except (OSError, json.JSONDecodeError):
         return False
-    return isinstance(origin_report, dict) and verify_reuse_chain(
-        origin_report, max_depth=max_depth - 1, seen=seen
+    fingerprint = value.get("source", {}).get("fingerprint")
+    required = value.get("selected_scenarios", [])
+    return (
+        isinstance(origin_report, dict)
+        and report_is_complete(origin_report, required)
+        and origin_report.get("source", {}).get("fingerprint") == fingerprint
+        and origin_report.get("executor") == value.get("executor")
+        and environments_compatible(
+            origin_report.get("environment", {}), value.get("environment", {})
+        )
+        and guest_source_is_valid(origin_report, fingerprint)
+        and not timeout_records(origin_root)
+        and verify_reuse_chain(origin_report, max_depth=max_depth - 1, seen=seen)
     )
 
 
@@ -411,82 +510,18 @@ def report_is_compatible(
     source: dict[str, Any],
     root: Path,
 ) -> bool:
-    required_set = set(required)
-    if (
-        report.get("schema_version") != SCHEMA_VERSION
-        or report.get("compatibility_version") != COMPATIBILITY_VERSION
-    ):
+    if not report_is_complete(report, required):
         return False
-    if (
-        report.get("status") != "passed"
-        or report.get("timeouts")
-        or report.get("source", {}).get("fingerprint") != fingerprint
-    ):
+    if report.get("source", {}).get("fingerprint") != fingerprint:
         return False
     if not verify_reuse_chain(report):
         return False
-    if not required_set.issubset(set(report.get("completed_scenarios", []))):
-        return False
-    if (
-        report.get("failed_scenarios")
-        or report.get("skipped_scenarios")
-        or report.get("not_checked_scenarios")
-    ):
-        return False
-    phases = report.get("phases")
-    if (
-        not isinstance(phases, list)
-        or not phases
-        or any(
-            not isinstance(phase, dict)
-            or not phase.get("name")
-            or phase.get("status") != "passed"
-            for phase in phases
-        )
-    ):
-        return False
     if not environments_compatible(report.get("environment", {}), environment_value):
         return False
-    if report.get("executor") == "multipass":
-        guest = report.get("guest_source", {})
-        if not isinstance(guest, dict) or not guest.get("records"):
-            return False
-        if any(
-            (
-                not report.get("reuse", {}).get("reused")
-                and record.get("run_id") != report.get("run_id")
-            )
-            or record.get("fingerprint") != fingerprint
-            for record in guest["records"]
-            if isinstance(record, dict)
-        ):
-            return False
-    if release:
-        candidate_source = report.get("source", {})
-        if not report.get("release_eligible"):
-            return False
-        if (
-            not _known_identity(candidate_source.get("commit_sha"))
-            or not _known_identity(candidate_source.get("tree_sha"))
-            or candidate_source.get("commit_sha") != source.get("commit_sha")
-            or candidate_source.get("tree_sha") != source.get("tree_sha")
-        ):
-            return False
-        if (
-            "identity_error" not in candidate_source
-            or candidate_source.get("identity_error")
-            or not isinstance(candidate_source.get("working_tree_dirty"), bool)
-            or candidate_source.get("working_tree_dirty")
-        ):
-            return False
-        guest_records = report.get("guest_source", {}).get("records", [])
-        if any(
-            record.get("commit_sha") != source.get("commit_sha")
-            or record.get("tree_sha") != source.get("tree_sha")
-            or record.get("working_tree_dirty")
-            for record in guest_records
-        ):
-            return False
+    if not guest_source_is_valid(report, fingerprint):
+        return False
+    if timeout_records(root):
+        return False
     return verify_manifest(root)
 
 

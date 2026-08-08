@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import importlib.util
 import json
 import os
@@ -49,6 +50,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             "tree_sha": "tree-a",
             "fingerprint": "fp-a",
             "working_tree_dirty": False,
+            "identity_error": None,
         }
 
     def tearDown(self):
@@ -400,6 +402,57 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertEqual(runner.release_source_errors(dirty), ["working tree is dirty"])
         self.assertEqual(runner.release_source_errors(self.source), [])
 
+    def test_source_mutation_during_release_run_fails(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        args = runner.parser().parse_args(
+            [
+                "--profile",
+                "p1",
+                "--executor",
+                "local",
+                "--release",
+                "--no-reuse",
+                "--evidence-root",
+                str(self.temp / "mutation-evidence"),
+            ]
+        )
+        source_end = {
+            **self.source,
+            "commit_sha": "commit-b",
+            "tree_sha": "tree-b",
+        }
+        with (
+            mock.patch.object(
+                runner,
+                "source_fingerprint",
+                return_value=("fp-a", {"fingerprint": "fp-a"}),
+            ),
+            mock.patch.object(
+                runner, "collect_environment", return_value=self.environment
+            ),
+            mock.patch.object(
+                runner.subprocess, "run", return_value=mock.Mock(returncode=0)
+            ),
+            mock.patch.object(
+                runner.report,
+                "normalize_legacy_report",
+                return_value=("passed", selected, [], []),
+            ),
+            mock.patch.object(
+                runner.report,
+                "source_provenance",
+                side_effect=[self.source, source_end],
+            ),
+        ):
+            self.assertEqual(runner.run_profile(args, "p1", self.definition), 1)
+        report_path = next(
+            (self.temp / "mutation-evidence").glob("p1/fp-a/*/acceptance-report.json")
+        )
+        value = self._read_report(report_path)
+        self.assertEqual(value["status"], "failed")
+        self.assertFalse(value["release_eligible"])
+        self.assertFalse(value["source"]["stable"])
+
     def test_report_completeness_and_release_identity(self):
         selected = report.profile_scenarios(self.definition, "p1")
         value = report.make_report(
@@ -457,8 +510,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             return_code=0,
             source_stable=True,
         )
-        report.write_report(root / "acceptance-report.json", value)
-        report.write_manifest(root)
+        runner.write_evidence(root, value)
         return root
 
     def test_p2_evidence_satisfies_p1_but_p1_does_not_satisfy_p2(self):
@@ -490,6 +542,99 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 root=root,
             )
         )
+
+    def test_release_reuses_equivalent_content_across_commit_sha(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        evidence_source = {**self.source, "working_tree_dirty": True}
+        root = self._write_evidence("p1", selected, selected, source=evidence_source)
+        candidate = self._read_report(root / "acceptance-report.json")
+        self.assertFalse(candidate["release_eligible"])
+        current_source = {
+            **self.source,
+            "commit_sha": "commit-b",
+            "tree_sha": "tree-b",
+        }
+        self.assertTrue(
+            report.report_is_compatible(
+                candidate,
+                fingerprint="fp-a",
+                required=selected,
+                environment_value=self.environment,
+                release=True,
+                source=current_source,
+                root=root,
+            )
+        )
+
+    def test_release_run_reuses_cross_sha_evidence_and_detects_mutation(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        evidence_source = {**self.source, "working_tree_dirty": True}
+        self._write_evidence("p1", selected, selected, source=evidence_source)
+        args = runner.parser().parse_args(
+            [
+                "--profile",
+                "p1",
+                "--executor",
+                "local",
+                "--release",
+                "--evidence-root",
+                str(self.temp / "evidence"),
+            ]
+        )
+        current = {
+            **self.source,
+            "commit_sha": "commit-b",
+            "tree_sha": "tree-b",
+            "working_tree_dirty": True,
+        }
+        with (
+            mock.patch.object(
+                runner,
+                "source_fingerprint",
+                side_effect=[
+                    ("fp-a", {"fingerprint": "fp-a"}),
+                    ("fp-a", {"fingerprint": "fp-a"}),
+                ],
+            ),
+            mock.patch.object(
+                runner, "collect_environment", return_value=self.environment
+            ),
+            mock.patch.object(
+                runner.report, "source_provenance", side_effect=[current, current]
+            ),
+        ):
+            self.assertEqual(runner.run_profile(args, "p1", self.definition), 0)
+        receipt = next(
+            value
+            for path in (self.temp / "evidence").glob(
+                "p1/fp-a/*/acceptance-report.json"
+            )
+            if (value := self._read_report(path))["reuse"]["reused"]
+        )
+        self.assertTrue(receipt["reuse"]["reused"])
+        self.assertTrue(receipt["release_eligible"])
+        self.assertEqual(receipt["source"]["commit_sha"], "commit-b")
+
+        mutated = {**current, "commit_sha": "commit-c", "tree_sha": "tree-c"}
+        with (
+            mock.patch.object(
+                runner,
+                "source_fingerprint",
+                side_effect=[
+                    ("fp-a", {"fingerprint": "fp-a"}),
+                    ("fp-a", {"fingerprint": "fp-a"}),
+                ],
+            ),
+            mock.patch.object(
+                runner, "collect_environment", return_value=self.environment
+            ),
+            mock.patch.object(
+                runner.report,
+                "source_provenance",
+                side_effect=[current, mutated],
+            ),
+        ):
+            self.assertEqual(runner.run_profile(args, "p1", self.definition), 2)
 
     def test_empty_phase_evidence_cannot_pass_or_reuse(self):
         selected = report.profile_scenarios(self.definition, "p1")
@@ -540,8 +685,181 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 root=root,
             )
         )
+        (root / "gate-timeout.json").write_text(
+            json.dumps({"timeout_layer": "acceptance_gate"})
+        )
+        report.write_manifest(root)
+        self.assertFalse(
+            report.report_is_compatible(
+                candidate,
+                fingerprint="fp-a",
+                required=p1,
+                environment_value=self.environment,
+                release=False,
+                source=self.source,
+                root=root,
+            )
+        )
         (root / "acceptance-report.json").write_text("corrupt\n")
         self.assertFalse(report.verify_manifest(root))
+
+    def test_incompatible_or_incomplete_evidence_rejects_reuse(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        base = report.make_report(
+            run_id="invalid",
+            profile="p1",
+            executor="local",
+            selected=selected,
+            completed=selected,
+            failed=[],
+            skipped=[],
+            not_checked=[],
+            phases=[{"name": "run", "status": "passed"}],
+            source=self.source,
+            environment_value=self.environment,
+            return_code=0,
+        )
+        base["artifact_manifest"] = {
+            "file": "artifact-manifest.sha256",
+            "complete": True,
+        }
+        cases = {
+            "schema": lambda value: value.update(schema_version=999),
+            "compatibility": lambda value: value.update(compatibility_version=999),
+            "fingerprint": lambda value: value["source"].update(fingerprint="fp-b"),
+            "executor-environment": lambda value: value["environment"].update(
+                executor="multipass"
+            ),
+            "scenario-set": lambda value: value.update(selected_scenarios=[]),
+            "incomplete": lambda value: value.update(completed_scenarios=[]),
+            "partially-incomplete": lambda value: value.update(
+                selected_scenarios=[*selected, "new-required"]
+            ),
+            "failed": lambda value: value.update(failed_scenarios=[selected[0]]),
+            "not-checked": lambda value: value.update(
+                not_checked_scenarios=[selected[0]]
+            ),
+            "phase": lambda value: value.update(
+                phases=[{"name": "run", "status": "failed"}]
+            ),
+            "timeout": lambda value: value.update(
+                timeouts=[{"timeout_layer": "scenario"}]
+            ),
+            "manifest-incomplete": lambda value: value.update(
+                artifact_manifest={
+                    "file": "artifact-manifest.sha256",
+                    "complete": False,
+                }
+            ),
+            "missing-profile": lambda value: value.pop("profile"),
+            "missing-exit": lambda value: value.pop("exit_code"),
+            "missing-created-at": lambda value: value.pop("created_at"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                value = copy.deepcopy(base)
+                mutate(value)
+                root = self.temp / "invalid" / name
+                root.mkdir(parents=True)
+                report.write_report(root / "acceptance-report.json", value)
+                report.write_manifest(root)
+                self.assertTrue(report.verify_manifest(root))
+                self.assertFalse(
+                    report.report_is_compatible(
+                        value,
+                        fingerprint="fp-a",
+                        required=selected,
+                        environment_value=self.environment,
+                        release=False,
+                        source=self.source,
+                        root=root,
+                    )
+                )
+
+    def test_malformed_timeout_and_guest_evidence_fail_closed(self):
+        runtime = self.temp / "malformed-timeout"
+        runtime.mkdir()
+        (runtime / "scenario-timeout.json").write_text("not-json\n")
+        self.assertEqual(
+            report.timeout_records(runtime),
+            [
+                {
+                    "timeout_layer": "invalid",
+                    "evidence_file": "scenario-timeout.json",
+                }
+            ],
+        )
+
+        selected = report.profile_scenarios(self.definition, "p1")
+        root = self.temp / "malformed-guest"
+        root.mkdir()
+        value = report.make_report(
+            run_id="malformed-guest",
+            profile="p1",
+            executor="multipass",
+            selected=selected,
+            completed=selected,
+            failed=[],
+            skipped=[],
+            not_checked=[],
+            phases=[{"name": "run", "status": "passed"}],
+            source=self.source,
+            environment_value={**self.environment, "executor": "multipass"},
+            return_code=0,
+            guest_source={"records": [None]},
+        )
+        runner.write_evidence(root, value)
+        self.assertFalse(
+            report.report_is_compatible(
+                value,
+                fingerprint="fp-a",
+                required=selected,
+                environment_value={**self.environment, "executor": "multipass"},
+                release=False,
+                source=self.source,
+                root=root,
+            )
+        )
+
+        root = self.temp / "mismatched-guest"
+        root.mkdir()
+        value = report.make_report(
+            run_id="mismatched-guest",
+            profile="p1",
+            executor="multipass",
+            selected=selected,
+            completed=selected,
+            failed=[],
+            skipped=[],
+            not_checked=[],
+            phases=[{"name": "run", "status": "passed"}],
+            source=self.source,
+            environment_value={**self.environment, "executor": "multipass"},
+            return_code=0,
+            guest_source={
+                "records": [
+                    {
+                        "run_id": "mismatched-guest",
+                        "fingerprint": "fp-a",
+                        "commit_sha": "other-commit",
+                        "tree_sha": "other-tree",
+                        "working_tree_dirty": False,
+                    }
+                ]
+            },
+        )
+        runner.write_evidence(root, value)
+        self.assertFalse(
+            report.report_is_compatible(
+                value,
+                fingerprint="fp-a",
+                required=selected,
+                environment_value={**self.environment, "executor": "multipass"},
+                release=False,
+                source=self.source,
+                root=root,
+            )
+        )
 
     def test_reuse_receipt_records_p2_to_p1_source(self):
         selected = report.profile_scenarios(self.definition, "p1")
@@ -571,9 +889,19 @@ class AcceptanceRunnerTests(unittest.TestCase):
             source=self.source,
             environment_value={**self.environment, "executor": "multipass"},
             return_code=0,
-            guest_source={"records": [{"run_id": "source", "fingerprint": "fp-a"}]},
+            guest_source={
+                "records": [
+                    {
+                        "run_id": "source",
+                        "fingerprint": "fp-a",
+                        "commit_sha": "commit-a",
+                        "tree_sha": "tree-a",
+                        "working_tree_dirty": False,
+                    }
+                ]
+            },
         )
-        report.write_report(candidate / "acceptance-report.json", candidate_value)
+        runner.write_evidence(candidate, candidate_value)
         (candidate / "payload.txt").write_text("immutable\n")
         report.write_manifest(candidate)
         receipt_status = runner.write_reuse_receipt(
@@ -618,6 +946,62 @@ class AcceptanceRunnerTests(unittest.TestCase):
             )
         )
 
+    def test_reuse_chain_binds_fingerprint_environment_and_scenarios(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        origin = self.temp / "chain-origin"
+        origin.mkdir()
+        origin_value = report.make_report(
+            run_id="origin",
+            profile="p1",
+            executor="local",
+            selected=selected,
+            completed=selected,
+            failed=[],
+            skipped=[],
+            not_checked=[],
+            phases=[{"name": "run", "status": "passed"}],
+            source={**self.source, "fingerprint": "fp-b"},
+            environment_value={**self.environment, "kernel": "different"},
+            return_code=0,
+        )
+        runner.write_evidence(origin, origin_value)
+
+        receipt_root = self.temp / "chain-receipt"
+        receipt_root.mkdir()
+        receipt_value = report.make_report(
+            run_id="receipt",
+            profile="p1",
+            executor="local",
+            selected=selected,
+            completed=selected,
+            failed=[],
+            skipped=[],
+            not_checked=[],
+            phases=[{"name": "reuse", "status": "passed"}],
+            source=self.source,
+            environment_value=self.environment,
+            return_code=0,
+            reused=True,
+            reused_from=str(origin),
+        )
+        receipt_value["reuse"]["origin"] = {
+            "root": str(origin),
+            "manifest": "artifact-manifest.sha256",
+            "manifest_sha256": report.sha256(origin / "artifact-manifest.sha256"),
+        }
+        runner.write_evidence(receipt_root, receipt_value)
+        self.assertFalse(
+            report.report_is_compatible(
+                receipt_value,
+                fingerprint="fp-a",
+                required=selected,
+                environment_value=self.environment,
+                release=False,
+                source=self.source,
+                root=receipt_root,
+            )
+        )
+
     def test_unknown_source_identity_cannot_be_release_eligible(self):
         source = report.source_provenance(self.temp, "fp-a")
         self.assertTrue(source["identity_error"])
@@ -658,7 +1042,22 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 }
             )
         )
+        _, valid = runner.guest_identity(runtime, "run-a", "fp-a", False)
+        self.assertFalse(valid)
         _, valid = runner.guest_identity(runtime, "run-a", "fp-a", True)
+        self.assertFalse(valid)
+        (runtime / "guest-source.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "run-a",
+                    "fingerprint": "fp-a",
+                    "commit_sha": "other-commit",
+                    "tree_sha": "other-tree",
+                    "working_tree_dirty": False,
+                }
+            )
+        )
+        _, valid = runner.guest_identity(runtime, "run-a", "fp-a", True, self.source)
         self.assertFalse(valid)
 
     def test_snapshot_inputs_exclude_docs(self):
@@ -718,6 +1117,34 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertEqual(
             runner.source_fingerprint("p1", "local")[0],
             runner.source_fingerprint("p2", "multipass")[0],
+        )
+
+    def test_openspec_archive_does_not_change_fingerprint_but_scenarios_do(self):
+        (self.temp / "validation").mkdir()
+        shutil.copy2(
+            ROOT / "validation/groups.toml", self.temp / "validation/groups.toml"
+        )
+        (self.temp / "Cargo.lock").write_text("lock\n")
+        scenario = self.temp / "scripts/acceptance/scenarios.toml"
+        scenario.parent.mkdir(parents=True)
+        scenario.write_text("scenario contract v1\n")
+        cfg = validation.config(self.temp)
+        first = validation.acceptance_fingerprint(self.temp, cfg)["fingerprint"]
+        archive = self.temp / "openspec/changes/archive/change/spec.md"
+        archive.parent.mkdir(parents=True)
+        archive.write_text("archive only\n")
+        cache = self.temp / "scripts/acceptance/__pycache__/runner.pyc"
+        cache.parent.mkdir(parents=True)
+        cache.write_bytes(b"generated cache")
+        (self.temp / "scripts/acceptance/.DS_Store").write_bytes(b"finder cache")
+        self.assertEqual(
+            first,
+            validation.acceptance_fingerprint(self.temp, cfg)["fingerprint"],
+        )
+        scenario.write_text("scenario contract v2\n")
+        self.assertNotEqual(
+            first,
+            validation.acceptance_fingerprint(self.temp, cfg)["fingerprint"],
         )
 
     def test_fingerprint_ignores_docs_but_changes_source(self):

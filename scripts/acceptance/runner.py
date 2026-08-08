@@ -61,7 +61,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--profile", choices=("p1", "p2", "all"), required=True)
     value.add_argument("--executor", choices=("local", "multipass"), default="local")
     value.add_argument(
-        "--release", action="store_true", help="require release-grade source identity"
+        "--release", action="store_true", help="require release-grade complete evidence"
     )
     value.add_argument("--no-reuse", action="store_true", help="force a fresh run")
     value.add_argument(
@@ -217,7 +217,11 @@ def write_evidence(root: Path, value: dict[str, Any]) -> None:
 
 
 def guest_identity(
-    runtime_root: Path, run_id: str, fingerprint: str, release: bool
+    runtime_root: Path,
+    run_id: str,
+    fingerprint: str,
+    release: bool,
+    source: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, bool]:
     records: list[dict[str, Any]] = []
     for path in sorted(runtime_root.rglob("guest-source.json")):
@@ -232,15 +236,18 @@ def guest_identity(
     valid = all(
         value.get("run_id") == run_id
         and value.get("fingerprint") == fingerprint
+        and known_identity(value.get("commit_sha"))
+        and known_identity(value.get("tree_sha"))
+        # multipass.sh serializes dirty as a bash integer (0/1).
+        and isinstance(value.get("working_tree_dirty"), (bool, int))
+        and (not release or not value.get("working_tree_dirty"))
         and (
-            not release
+            source is None
             or (
-                # multipass.sh serializes the guest dirty flag as a bash
-                # integer (0/1), so accept both bool and int here.
-                isinstance(value.get("working_tree_dirty"), (bool, int))
-                and not value.get("working_tree_dirty")
-                and known_identity(value.get("commit_sha"))
-                and known_identity(value.get("tree_sha"))
+                value.get("commit_sha") == source.get("commit_sha")
+                and value.get("tree_sha") == source.get("tree_sha")
+                and bool(value.get("working_tree_dirty"))
+                == source.get("working_tree_dirty")
             )
         )
         for value in records
@@ -257,6 +264,7 @@ def write_reuse_receipt(
     environment_value: dict[str, Any],
     candidate_root: Path,
     candidate_report: dict[str, Any],
+    source_stable: bool = True,
 ) -> int:
     receipt_id = now_run_id()
     receipt_root = args.evidence_root.resolve() / profile / fingerprint / receipt_id
@@ -282,13 +290,15 @@ def write_reuse_receipt(
         reused_from=str(candidate_root),
         legacy={"source_evidence": str(candidate_root)},
         release_requested=args.release,
-        source_stable=True,
+        source_stable=source_stable,
         reuse_requested=True,
         guest_source=candidate_report.get("guest_source"),
-        guest_source_ok=bool(candidate_report.get("guest_source")),
+        guest_source_ok=(
+            args.executor != "multipass" or bool(candidate_report.get("guest_source"))
+        ),
     )
     value["status"] = "passed"
-    value["release_eligible"] = bool(args.release and value["release_eligible"])
+    value["release_eligible"] = bool(args.release and source_stable)
     value["reuse"]["origin"] = {
         "root": str(candidate_root),
         "manifest": origin_manifest.name,
@@ -306,14 +316,6 @@ def run_profile(
     selected = report.profile_scenarios(definition, profile)
     fingerprint, fingerprint_payload = source_fingerprint(profile, args.executor)
     source_start = report.source_provenance(ROOT, fingerprint)
-    if args.release:
-        errors = release_source_errors(source_start)
-        if errors:
-            print(
-                f"release source validation failed: {', '.join(errors)}",
-                file=sys.stderr,
-            )
-            return 2
     try:
         environment_value = collect_environment(args.executor, args.vm)
     except RuntimeError as exc:
@@ -331,16 +333,41 @@ def run_profile(
         )
         if reused:
             path, candidate = reused
+            end_fingerprint, _ = source_fingerprint(profile, args.executor)
+            source_end = report.source_provenance(ROOT, end_fingerprint)
+            source_stable = (
+                fingerprint == end_fingerprint and source_start == source_end
+            )
+            if not source_stable:
+                print(
+                    "source changed while validating reusable evidence", file=sys.stderr
+                )
+                return 2
             return write_reuse_receipt(
                 args,
                 profile,
                 selected,
                 fingerprint,
-                report.source_provenance(ROOT, fingerprint),
+                {
+                    **source_start,
+                    "start": source_start,
+                    "end": source_end,
+                    "stable": source_stable,
+                },
                 environment_value,
                 path,
                 candidate,
+                source_stable,
             )
+
+    if args.release:
+        errors = release_source_errors(source_start)
+        if errors:
+            print(
+                f"release source validation failed: {', '.join(errors)}",
+                file=sys.stderr,
+            )
+            return 2
 
     run_id = now_run_id()
     run_root = evidence_root / profile / fingerprint / run_id
@@ -488,12 +515,18 @@ def run_profile(
         not_checked = []
 
     source_end = report.source_provenance(ROOT, fingerprint)
+    source_stable = source_start == source_end
     source = {
         **source_start,
         "start": source_start,
         "end": source_end,
-        "stable": source_start == source_end,
+        "stable": source_stable,
     }
+    if args.release and not source_stable:
+        status = "failed"
+        failed = list(selected)
+        completed = []
+        not_checked = []
     final_environment = environment_value
     guest_environment_paths = sorted(runtime_root.rglob("guest-environment.json"))
     if guest_environment_paths:
@@ -504,7 +537,7 @@ def run_profile(
         except (OSError, json.JSONDecodeError):
             pass
     guest_source, guest_source_ok = guest_identity(
-        runtime_root, run_id, fingerprint, args.release
+        runtime_root, run_id, fingerprint, args.release, source_start
     )
     if args.executor == "multipass" and not guest_source_ok and status == "passed":
         status = "failed"
@@ -526,7 +559,7 @@ def run_profile(
         return_code=return_code if status != "passed" else 0,
         legacy=({"p1": p1_legacy, "p2": legacy} if profile == "p2" else legacy),
         release_requested=args.release,
-        source_stable=bool(source["stable"]),
+        source_stable=source_stable,
         reuse_requested=not args.no_reuse,
         guest_source=guest_source,
         guest_source_ok=guest_source_ok if args.executor == "multipass" else True,

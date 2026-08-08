@@ -50,6 +50,16 @@ class LayeredValidationTests(unittest.TestCase):
         self.assertEqual(result["selected"], sorted(self.cfg["groups"]))
         self.assertTrue(all(item["selected"] for item in result["decisions"].values()))
 
+    def test_agent_guidance_selects_docs_only(self):
+        result = validation.select(self.temp, ["AGENTS.md"], self.cfg)
+        self.assertEqual(result["unknown_paths"], [])
+        self.assertEqual(result["selected"], ["cli_docs"])
+
+    def test_validation_config_selects_build_tooling(self):
+        result = validation.select(self.temp, ["validation/groups.toml"], self.cfg)
+        self.assertEqual(result["unknown_paths"], [])
+        self.assertEqual(result["selected"], ["build_tooling"])
+
     def test_etl_does_not_select_ebpf(self):
         result = validation.select(
             self.temp, ["crates/chronicle-etl/src/lib.rs"], self.cfg
@@ -201,10 +211,14 @@ class LayeredValidationTests(unittest.TestCase):
         future = self.temp / "crates/chronicle-application/src/future_lifecycle.rs"
         future.parent.mkdir(parents=True, exist_ok=True)
         future.write_text("fn future_lifecycle() {}\n")
-        cfg = {"groups": {name: dict(group) for name, group in self.cfg["groups"].items()}}
+        cfg = {
+            "groups": {name: dict(group) for name, group in self.cfg["groups"].items()}
+        }
         cfg["groups"]["etl"]["paths"] = ["crates/chronicle-etl/**"]
         ownership = validation.source_ownership(self.temp, cfg)
-        self.assertIn("crates/chronicle-application/src/future_lifecycle.rs", ownership["unowned"])
+        self.assertIn(
+            "crates/chronicle-application/src/future_lifecycle.rs", ownership["unowned"]
+        )
 
     def test_recorder_source_selects_p2_validation(self):
         result = validation.select(
@@ -262,9 +276,32 @@ class LayeredValidationTests(unittest.TestCase):
                     gate="p1",
                     fingerprint="fp",
                     commit="new-sha",
+                    release=True,
                 )
             ),
             0,
+        )
+
+        environment_file = self.temp / "incompatible-environment.json"
+        environment_file.write_text('{"kernel": "different"}\n')
+        validation.compact(
+            argparse.Namespace(
+                source=source,
+                dest=evidence / "p2",
+                gate="p2",
+                status="passed",
+                fingerprint="fp",
+                commit="sha",
+                checks="P2",
+                environment=environment_file,
+                artifact_mode="artifact-on-failure",
+            )
+        )
+        self.assertEqual(
+            validation.reuse(
+                argparse.Namespace(evidence_root=evidence, gate="p2", fingerprint="fp")
+            ),
+            1,
         )
 
     def test_failure_artifact_contains_reproducer_inputs_only(self):

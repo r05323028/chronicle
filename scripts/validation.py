@@ -152,11 +152,23 @@ def files_for_patterns(root: Path, patterns: list[str]) -> list[Path]:
                 result.add(path)
     # Git-aware lookup above covers tracked files. Walk the checkout as well so
     # untracked acceptance-sensitive source is fingerprinted exactly as tested.
-    ignored = {".git", "target", "graphify-out", ".venv", "node_modules"}
+    ignored = {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "graphify-out",
+        "node_modules",
+        "target",
+    }
     for directory, directories, names in os.walk(root):
         directories[:] = [name for name in directories if name not in ignored]
         base = Path(directory)
         for name in names:
+            if name == ".DS_Store" or name.endswith((".pyc", ".pyo")):
+                continue
             path = base / name
             relative = str(path.relative_to(root))
             if any(matches(relative, pattern) for pattern in patterns):
@@ -466,31 +478,39 @@ def reuse(args: argparse.Namespace) -> int:
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (
-            manifest.get("status") != "passed"
+            manifest.get("version") != 1
+            or manifest.get("gate") != args.gate
+            or manifest.get("status") != "passed"
             or not isinstance(manifest.get("executed"), bool)
             or not manifest.get("executed")
             or manifest.get("fingerprint") != args.fingerprint
-            or (
-                getattr(args, "release", False)
-                and getattr(args, "commit", None)
-                and manifest.get("original_commit") != args.commit
-            )
+            or manifest.get("environment") != environment(Path.cwd())
         ):
             return 1
         required_checks = {
             check for check in getattr(args, "checks", "").split(",") if check
         }
-        covered_checks = set(manifest.get("covered_checks", []))
+        covered = manifest.get("covered_checks")
+        if not isinstance(covered, list) or not all(
+            isinstance(check, str) for check in covered
+        ):
+            return 1
+        covered_checks = set(covered)
         if not required_checks.issubset(covered_checks):
             return 1
         checksums = manifest_path.parent / "checksums.txt"
         if not checksums.is_file():
             return 1
         root = manifest_path.parent.resolve()
+        listed: set[Path] = set()
         for line in checksums.read_text(encoding="utf-8").splitlines():
             expected, relative = line.split("  ", 1)
             candidate = Path(relative)
-            if candidate.is_absolute() or ".." in candidate.parts:
+            if (
+                candidate.is_absolute()
+                or ".." in candidate.parts
+                or candidate in listed
+            ):
                 return 1
             path = (root / candidate).resolve()
             try:
@@ -499,6 +519,16 @@ def reuse(args: argparse.Namespace) -> int:
                 return 1
             if not path.is_file() or digest(path) != expected:
                 return 1
+            listed.add(candidate)
+        actual = {
+            path.relative_to(root)
+            for path in root.rglob("*")
+            if path.is_file() and path.name != "checksums.txt"
+        }
+        if listed != actual or set(manifest.get("files", [])) != {
+            str(path) for path in actual
+        }:
+            return 1
     except (OSError, ValueError, json.JSONDecodeError):
         return 1
     print(

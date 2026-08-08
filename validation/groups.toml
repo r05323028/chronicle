@@ -67,6 +67,7 @@ paths = [
   "docs/**",
   "README.md",
   "CONTRIBUTING.md",
+  "AGENTS.md",
   "openspec/**",
 ]
 commands = ["cli_docs"]
@@ -85,7 +86,7 @@ gates = ["p1", "p2"]
 
 [groups.build_tooling]
 description = "validation and CI tooling"
-paths = ["scripts/**", ".github/**", "deny.toml"]
+paths = ["scripts/**", "validation/**", ".github/**", "deny.toml"]
 commands = ["build_tooling"]
 gates = ["p1", "p2"]
 
