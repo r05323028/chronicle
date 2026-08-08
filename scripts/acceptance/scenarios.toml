@@ -42,12 +42,14 @@ execution_order = [
 ]
 
 [scenarios.capture-basic]
+timeout_seconds = 900
 capabilities = ["privileged", "ebpf"]
 phases = ["environment", "capture"]
 legacy_p1_checks = ["privileged_acceptance"]
 legacy_p2_checks = ["systemd_type_simple", "three_epochs"]
 
 [scenarios.wal-recovery]
+timeout_seconds = 300
 capabilities = ["privileged", "wal"]
 phases = ["capture", "recovery"]
 legacy_p1_checks = ["wal_fault_matrix", "ingest_limit_matrix"]
@@ -57,12 +59,14 @@ legacy_p2_checks = [
 ]
 
 [scenarios.replay]
+timeout_seconds = 300
 capabilities = ["privileged", "replay"]
 phases = ["replay"]
 legacy_p1_checks = ["replay_matrix"]
 legacy_p2_checks = ["inspect_replay", "one_shot_equivalence"]
 
 [scenarios.resource-cleanup]
+timeout_seconds = 900
 capabilities = ["privileged", "cleanup"]
 phases = ["cleanup"]
 legacy_p1_checks = [
@@ -74,11 +78,13 @@ legacy_p1_checks = [
 legacy_p2_checks = ["resource_cleanup", "signal_shutdown"]
 
 [scenarios.recorder-readiness]
+timeout_seconds = 300
 capabilities = ["privileged", "systemd", "cgroup-v2", "btf"]
 phases = ["readiness"]
 legacy_p2_checks = ["incremental_worker", "process_restart_readiness"]
 
 [scenarios.incremental-etl]
+timeout_seconds = 300
 capabilities = ["privileged", "etl"]
 phases = ["incremental", "finalization"]
 legacy_p2_checks = [
@@ -88,6 +94,7 @@ legacy_p2_checks = [
 ]
 
 [scenarios.checkpoint-kill-restart]
+timeout_seconds = 300
 capabilities = ["privileged", "crash-recovery"]
 phases = ["checkpoint_crash_matrix"]
 legacy_p2_checks = [
@@ -96,6 +103,7 @@ legacy_p2_checks = [
 ]
 
 [scenarios.quota-pressure]
+timeout_seconds = 600
 capabilities = ["privileged", "quota"]
 phases = ["quota_pressure"]
 legacy_p2_checks = [
@@ -107,6 +115,7 @@ legacy_p2_checks = [
 ]
 
 [scenarios.retention-interruption]
+timeout_seconds = 600
 capabilities = ["privileged", "retention", "crash-recovery"]
 phases = ["cleanup_recovery"]
 legacy_p2_checks = [
@@ -116,6 +125,7 @@ legacy_p2_checks = [
 ]
 
 [scenarios.corruption-quarantine]
+timeout_seconds = 300
 capabilities = ["privileged", "corruption"]
 phases = ["corruption"]
 legacy_p2_checks = [
@@ -124,6 +134,7 @@ legacy_p2_checks = [
 ]
 
 [scenarios.reboot-recovery]
+timeout_seconds = 300
 capabilities = ["privileged", "reboot", "persistent-state"]
 phases = ["pre_reboot", "post_reboot"]
 legacy_p2_checks = ["pre_reboot_persistence", "host_reboot_recovery"]

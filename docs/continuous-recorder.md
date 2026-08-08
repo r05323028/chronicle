@@ -29,6 +29,8 @@ One mutating recorder per filesystem domain. Standalone ETL, cleanup, or store m
 
 `liveness` means process exists. `capture_readiness` becomes ready only after durable WAL appendability and capture attachment. `processing_readiness` is independent and can be unknown/degraded while capture remains ready. Stale ownership reports failed health with crash-recovery remediation.
 
+Acceptance polls machine-readable status for at most `CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS` (default 180), while each status command defaults to 10s. Ordinary scenarios use 300s; quota/retention use 600s; cargo-heavy scenarios use 900s. Scenario cleanup gets an independent 180s grace before forced kill. Validation runs acceptance profile at 3300s beneath 3600s gate. Timeout retains readiness transitions, recorder status/journal, process, disk, WAL, and checkpoint diagnostics before bounded cleanup.
+
 ## Retention and quota
 
 Retention transitions require sealed, processed, checkpointed, and verified finalized-session evidence. Cleanup writes deleting intent, renames to same-filesystem trash, syncs, writes a tombstone, unlinks, and syncs again. Digest mismatch, missing intent, incomplete cleanup, and protected lineage fail closed.

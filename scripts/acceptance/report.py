@@ -34,6 +34,11 @@ def load_scenarios(path: Path) -> dict[str, Any]:
     if not p1.issubset(p2):
         raise ValueError("p2 profile must include every p1 scenario")
     scenario_definitions = value.get("scenarios", {})
+    if any(
+        not isinstance(item.get("timeout_seconds"), int) or item["timeout_seconds"] <= 0
+        for item in scenario_definitions.values()
+    ):
+        raise ValueError("every scenario timeout_seconds must be a positive integer")
     for profile in ("p1", "p2"):
         selected = list(profiles.get(profile, {}).get("scenarios", []))
         if any(scenario not in scenario_definitions for scenario in selected):
@@ -77,9 +82,12 @@ def dispatch_scenarios(definition: dict[str, Any], profile: str) -> list[str]:
 def _git_value(root: Path, *args: str) -> tuple[str | None, bool]:
     try:
         value = subprocess.check_output(
-            ["git", "-C", str(root), *args], text=True, stderr=subprocess.DEVNULL
+            ["git", "-C", str(root), *args],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
         ).strip()
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
         return None, True
     return value or None, False
 
@@ -126,9 +134,13 @@ def environment(root: Path) -> dict[str, Any]:
                 capabilities[key] = value.strip()
     try:
         rustc = subprocess.check_output(
-            ["rustc", "-Vv"], cwd=root, text=True, stderr=subprocess.DEVNULL
+            ["rustc", "-Vv"],
+            cwd=root,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
         ).strip()
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
         rustc = "not_checked"
     return {
         "os": platform.system(),
@@ -261,6 +273,19 @@ def normalize_legacy_report(
     return result, completed, failed, not_checked
 
 
+def timeout_records(root: Path) -> list[dict[str, Any]]:
+    """Load bounded timeout evidence without trusting malformed artifacts."""
+    records: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*timeout*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and value.get("timeout_layer"):
+            records.append({**value, "evidence_file": str(path.relative_to(root))})
+    return records
+
+
 def make_report(
     *,
     run_id: str,
@@ -283,13 +308,15 @@ def make_report(
     reuse_requested: bool = True,
     guest_source: dict[str, Any] | None = None,
     guest_source_ok: bool = True,
+    timeouts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    timeouts = [] if timeouts is None else timeouts
     status = (
         "passed"
         if not failed and not not_checked and set(selected) <= set(completed)
         else "not_checked"
     )
-    if failed or return_code not in {0, 77}:
+    if failed or return_code not in {0, 77} or timeouts:
         status = "failed"
     release_eligible = (
         status == "passed"
@@ -330,6 +357,7 @@ def make_report(
         "release_eligible": release_eligible,
         "status": status,
         "exit_code": return_code,
+        "timeouts": timeouts,
         "legacy_report": legacy,
     }
 
@@ -391,6 +419,7 @@ def report_is_compatible(
         return False
     if (
         report.get("status") != "passed"
+        or report.get("timeouts")
         or report.get("source", {}).get("fingerprint") != fingerprint
     ):
         return False

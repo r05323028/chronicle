@@ -32,6 +32,30 @@ def now_run_id() -> str:
     return f"{stamp}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
+def positive_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("timeout must be a positive integer") from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("timeout must be a positive integer")
+    return seconds
+
+
+def bounded_profile_command(command: list[str], timeout: int) -> list[str]:
+    cleanup_grace = os.environ.get("CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS", "180")
+    command_grace = os.environ.get("CHRONICLE_TIMEOUT_GRACE_SECONDS", "5")
+    return [
+        "env",
+        f"CHRONICLE_TIMEOUT_GRACE_SECONDS={cleanup_grace}",
+        str(ROOT / "scripts/run-with-timeout.sh"),
+        str(timeout),
+        "env",
+        f"CHRONICLE_TIMEOUT_GRACE_SECONDS={command_grace}",
+        *command,
+    ]
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Run Chronicle acceptance scenarios")
     value.add_argument("--profile", choices=("p1", "p2", "all"), required=True)
@@ -50,6 +74,14 @@ def parser() -> argparse.ArgumentParser:
         "--evidence-root",
         type=Path,
         default=ROOT / "target/validation-evidence/acceptance",
+    )
+    value.add_argument(
+        "--gate-timeout-seconds",
+        type=positive_seconds,
+        default=positive_seconds(
+            os.environ.get("CHRONICLE_ACCEPTANCE_GATE_TIMEOUT_SECONDS", "3600")
+        ),
+        help="hard deadline for one complete acceptance profile",
     )
     return value
 
@@ -341,6 +373,22 @@ def run_profile(
             "CHRONICLE_ACCEPTANCE_P1_SCENARIOS": ",".join(
                 report.dispatch_scenarios(definition, "p1")
             ),
+            "CHRONICLE_TIMEOUT_EVIDENCE_FILE": str(runtime_root / "gate-timeout.json"),
+            "CHRONICLE_TIMEOUT_PHASE_FILE": str(assertions_root / "current-phase.txt"),
+            "CHRONICLE_TIMEOUT_DIAGNOSTICS": ":".join(
+                str(Path("assertions") / name)
+                for name in (
+                    "recorder-service-status.txt",
+                    "recorder-journal.log",
+                    "process-list.txt",
+                    "disk-space.txt",
+                    "readiness-transitions.log",
+                )
+            ),
+            "CHRONICLE_TIMEOUT_LAYER": "acceptance_gate",
+            "CHRONICLE_ACCEPTANCE_GATE_TIMEOUT_SECONDS": str(args.gate_timeout_seconds),
+            "CHRONICLE_TIMEOUT_NAME": profile,
+            "CHRONICLE_ACCEPTANCE_GATE_WRAPPED": "1",
         }
     )
     print(
@@ -357,7 +405,9 @@ def run_profile(
             str(runtime_root),
             "1" if args.release else "0",
         ]
-    completed_process = subprocess.run(command, cwd=ROOT, env=env)
+    completed_process = subprocess.run(
+        bounded_profile_command(command, args.gate_timeout_seconds), cwd=ROOT, env=env
+    )
     return_code = completed_process.returncode
     if (
         args.executor == "local"
@@ -398,9 +448,10 @@ def run_profile(
                     failed.append(scenario)
             elif scenario not in not_checked:
                 not_checked.append(scenario)
+    timeouts = report.timeout_records(runtime_root)
     if return_code == 77 and not failed:
         status = "not_checked"
-    if return_code not in {0, 77}:
+    if return_code not in {0, 77} or timeouts:
         status = "failed"
         if not failed:
             failed = list(selected)
@@ -477,6 +528,7 @@ def run_profile(
         reuse_requested=not args.no_reuse,
         guest_source=guest_source,
         guest_source_ok=guest_source_ok if args.executor == "multipass" else True,
+        timeouts=timeouts,
     )
     # Normalize status from legacy report into the central result.
     final_report["status"] = status
@@ -491,6 +543,7 @@ def run_profile(
                 "environment.json",
                 "guest-environment.json",
                 "phases.json",
+                "reboot-boot-ids.json",
             }:
                 try:
                     if child.is_dir():
@@ -503,6 +556,8 @@ def run_profile(
     print(f"Evidence: {run_root}")
     if status == "passed":
         return 0
+    if timeouts:
+        return 124
     return 77 if status == "not_checked" else 1
 
 

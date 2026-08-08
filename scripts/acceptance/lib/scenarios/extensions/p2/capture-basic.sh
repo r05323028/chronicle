@@ -60,10 +60,8 @@ EOF
 	phase workload 'start loopback HTTP workload'
 	python3 "$DRIVER" serve --port-file "$ARTIFACT_ROOT/upstream.port" --requests "$ARTIFACT_ROOT/upstream-requests.jsonl" >"$ARTIFACT_ROOT/upstream.log" 2>&1 &
 	UPSTREAM_PID=$!
-	for _ in $(seq 1 100); do
-		[[ -s "$ARTIFACT_ROOT/upstream.port" ]] && break
-		sleep 0.1
-	done
+	wait_for_path "$ARTIFACT_ROOT/upstream.port" 10
+	[[ -s "$ARTIFACT_ROOT/upstream.port" ]]
 	PORT=$(cat "$ARTIFACT_ROOT/upstream.port")
 
 	phase start 'start foreground recorder under systemd Type=simple'
@@ -73,13 +71,7 @@ EOF
 		--property=Restart=on-failure --property=RestartSec=1s \
 		--property=NoNewPrivileges=no \
 		"$CHRONICLE" --format json recorder --config "$CONFIG"
-	for _ in $(seq 1 30); do
-		if systemctl is-active --quiet "$UNIT"; then
-			break
-		fi
-		sleep 1
-	done
-	if ! systemctl is-active --quiet "$UNIT"; then
+	if ! wait_for_unit_active "$UNIT" 30; then
 		collect_recorder_readiness_diagnostics
 		exit 1
 	fi

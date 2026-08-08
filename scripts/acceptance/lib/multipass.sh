@@ -13,6 +13,30 @@ VM_SOURCE_ROOT="/home/ubuntu/chronicle-acceptance-sources/$RUN_ID"
 VM_RUN_ROOT="/home/ubuntu/chronicle-acceptance-runs/$RUN_ID"
 VM_ARTIFACTS="$VM_RUN_ROOT/artifacts"
 REMOTE_STATUS=0
+TIMEOUT_WRAPPER="$ROOT/scripts/run-with-timeout.sh"
+HOST_PROFILE_TIMEOUT=${CHRONICLE_ACCEPTANCE_GATE_TIMEOUT_SECONDS:-3600}
+ACCEPTANCE_CLEANUP_GRACE=${CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS:-180}
+((HOST_PROFILE_TIMEOUT > ACCEPTANCE_CLEANUP_GRACE + 420)) || {
+	printf '%s\n' 'acceptance gate timeout must leave guest cleanup and host finalization margin' >&2
+	exit 2
+}
+GUEST_GATE_TIMEOUT=${CHRONICLE_ACCEPTANCE_GUEST_TIMEOUT_SECONDS:-$((HOST_PROFILE_TIMEOUT - ACCEPTANCE_CLEANUP_GRACE - 120))}
+MULTIPASS_STATUS_TIMEOUT=${CHRONICLE_MULTIPASS_STATUS_TIMEOUT_SECONDS:-120}
+MULTIPASS_TRANSFER_TIMEOUT=${CHRONICLE_MULTIPASS_TRANSFER_TIMEOUT_SECONDS:-300}
+MULTIPASS_BOOTSTRAP_TIMEOUT=${CHRONICLE_MULTIPASS_BOOTSTRAP_TIMEOUT_SECONDS:-900}
+MULTIPASS_REMOTE_TIMEOUT=${CHRONICLE_MULTIPASS_REMOTE_TIMEOUT_SECONDS:-$((GUEST_GATE_TIMEOUT + ACCEPTANCE_CLEANUP_GRACE + 30))}
+MULTIPASS_VM_READINESS_TIMEOUT=${CHRONICLE_MULTIPASS_VM_READINESS_TIMEOUT_SECONDS:-120}
+for value in "$ACCEPTANCE_CLEANUP_GRACE" "$GUEST_GATE_TIMEOUT" "$MULTIPASS_STATUS_TIMEOUT" "$MULTIPASS_TRANSFER_TIMEOUT" "$MULTIPASS_BOOTSTRAP_TIMEOUT" "$MULTIPASS_REMOTE_TIMEOUT" "$MULTIPASS_VM_READINESS_TIMEOUT"; do
+	[[ $value =~ ^[1-9][0-9]*$ ]] || {
+		printf 'Multipass timeouts must be positive integers, got %q\n' "$value" >&2
+		exit 2
+	}
+done
+((GUEST_GATE_TIMEOUT + ACCEPTANCE_CLEANUP_GRACE < MULTIPASS_REMOTE_TIMEOUT && MULTIPASS_REMOTE_TIMEOUT < HOST_PROFILE_TIMEOUT)) || {
+	printf '%s\n' 'remote timeout must exceed guest timeout plus cleanup grace and remain shorter than host profile timeout' >&2
+	exit 2
+}
+multipass() { "$TIMEOUT_WRAPPER" "${MULTIPASS_TIMEOUT:-$MULTIPASS_STATUS_TIMEOUT}" multipass "$@"; }
 
 cleanup() {
 	if [[ "${CHRONICLE_ACCEPTANCE_KEEP_SNAPSHOT:-0}" != 1 ]]; then
@@ -32,7 +56,7 @@ make_snapshot() {
 }
 
 ensure_vm() {
-	command -v multipass >/dev/null 2>&1 || {
+	type -P multipass >/dev/null 2>&1 || {
 		printf '%s\n' 'multipass is required for multipass acceptance' >&2
 		return 1
 	}
@@ -44,7 +68,7 @@ ensure_vm() {
 }
 
 bootstrap_vm() {
-	multipass exec "$VM" -- bash -lc '
+	MULTIPASS_TIMEOUT=$MULTIPASS_BOOTSTRAP_TIMEOUT multipass exec "$VM" -- bash -lc '
 		set -euo pipefail
 		if ! command -v clang >/dev/null || ! command -v zstd >/dev/null; then
 			sudo apt-get update -qq
@@ -63,7 +87,7 @@ transfer_source() {
 	# Refresh source after reboot without deleting persistent recorder state.
 	multipass exec "$VM" -- sudo rm -rf "$VM_SOURCE_ROOT"
 	multipass exec "$VM" -- sudo mkdir -p "$(dirname "$VM_SOURCE_ROOT")" && multipass exec "$VM" -- sudo chown -R ubuntu:ubuntu "$(dirname "$VM_SOURCE_ROOT")"
-	multipass transfer --recursive "$SNAPSHOT" "$VM:/home/ubuntu/chronicle-acceptance-sources/"
+	MULTIPASS_TIMEOUT=$MULTIPASS_TRANSFER_TIMEOUT multipass transfer --recursive "$SNAPSHOT" "$VM:/home/ubuntu/chronicle-acceptance-sources/"
 	multipass exec "$VM" -- sudo chown -R ubuntu:ubuntu "$VM_SOURCE_ROOT"
 }
 
@@ -73,7 +97,7 @@ run_remote() {
 	if [[ "$profile" == p1 ]]; then
 		scenarios=${CHRONICLE_ACCEPTANCE_P1_SCENARIOS:-$scenarios}
 	fi
-	multipass exec "$VM" -- bash -lc "
+	MULTIPASS_TIMEOUT=$MULTIPASS_REMOTE_TIMEOUT multipass exec "$VM" -- bash -lc "
 		set +e
 		cd '$VM_SOURCE_ROOT'
 		sudo -E env HOME=/home/ubuntu PATH=\"\$PATH\" \\
@@ -85,11 +109,27 @@ run_remote() {
 			CHRONICLE_ACCEPTANCE_EXPECTED_SHA='${CHRONICLE_ACCEPTANCE_EXPECTED_SHA:-}' \\
 			CHRONICLE_ACCEPTANCE_MODE=full \\
 			CHRONICLE_ACCEPTANCE_SCENARIOS='$scenarios' \\
+			CHRONICLE_ACCEPTANCE_GATE_WRAPPED=1 \\
+			CHRONICLE_ACCEPTANCE_GATE_TIMEOUT_SECONDS='$GUEST_GATE_TIMEOUT' \\
+			CHRONICLE_ACCEPTANCE_SCENARIO_TIMEOUT_SECONDS='${CHRONICLE_ACCEPTANCE_SCENARIO_TIMEOUT_SECONDS:-}' \\
+			CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS='${CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS:-180}' \\
+			CHRONICLE_ACCEPTANCE_READINESS_COMMAND_TIMEOUT_SECONDS='${CHRONICLE_ACCEPTANCE_READINESS_COMMAND_TIMEOUT_SECONDS:-10}' \\
+			CHRONICLE_ACCEPTANCE_SERVICE_COMMAND_TIMEOUT_SECONDS='${CHRONICLE_ACCEPTANCE_SERVICE_COMMAND_TIMEOUT_SECONDS:-30}' \\
+			CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS='$ACCEPTANCE_CLEANUP_GRACE' \\
+			CHRONICLE_TIMEOUT_GRACE_SECONDS='${CHRONICLE_TIMEOUT_GRACE_SECONDS:-5}' \\
+			CHRONICLE_TIMEOUT_EVIDENCE_FILE='$artifact_root/gate-timeout.json' \\
+			CHRONICLE_TIMEOUT_PHASE_FILE='$artifact_root/current-phase.txt' \\
+			CHRONICLE_TIMEOUT_DIAGNOSTICS='recorder-service-status.txt:recorder-journal.log:process-list.txt:disk-space.txt:readiness-transitions.log' \\
+			CHRONICLE_TIMEOUT_LAYER=acceptance_gate \\
+			CHRONICLE_TIMEOUT_NAME='guest-$profile' \\
 			CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT='$artifact_root' \\
 			CARGO_TARGET_DIR=/home/ubuntu/chronicle-target \\
 			CHRONICLE_EBPF_TARGET_DIR=/home/ubuntu/chronicle-ebpf-target \\
 			$extra \\
-			'$VM_SOURCE_ROOT/scripts/acceptance/lib/profile-$profile.sh'
+			env CHRONICLE_TIMEOUT_GRACE_SECONDS='$ACCEPTANCE_CLEANUP_GRACE' \\
+			'$VM_SOURCE_ROOT/scripts/run-with-timeout.sh' '$GUEST_GATE_TIMEOUT' \\
+			env CHRONICLE_TIMEOUT_GRACE_SECONDS='${CHRONICLE_TIMEOUT_GRACE_SECONDS:-5}' \\
+			bash '$VM_SOURCE_ROOT/scripts/acceptance/lib/profile-$profile.sh'
 		status=\$?
 		sudo -E env HOME=/home/ubuntu PATH=\"\$PATH\" python3 '$VM_SOURCE_ROOT/scripts/validation.py' environment --root '$VM_SOURCE_ROOT' | sudo tee '$artifact_root/guest-environment.json' >/dev/null || true
 		guest_commit=\$(git -C '$VM_SOURCE_ROOT' rev-parse HEAD 2>/dev/null || printf not_checked)
@@ -106,7 +146,7 @@ transfer_artifacts() {
 	local transfer_root="$DEST/.transfer"
 	rm -rf -- "$transfer_root" "$DEST/assertions"
 	mkdir -p -- "$transfer_root"
-	multipass transfer --recursive "$VM:$VM_ARTIFACTS" "$transfer_root/"
+	MULTIPASS_TIMEOUT=$MULTIPASS_TRANSFER_TIMEOUT multipass transfer --recursive "$VM:$VM_ARTIFACTS" "$transfer_root/"
 	mv "$transfer_root/$(basename "$VM_ARTIFACTS")" "$DEST/assertions"
 	rm -rf -- "$transfer_root"
 	if [[ -f "$DEST/assertions/guest-environment.json" ]]; then
@@ -115,12 +155,16 @@ transfer_artifacts() {
 }
 
 wait_for_vm() {
-	for _ in $(seq 1 60); do
-		if [[ "$(multipass info "$VM" | awk '/State:/ {print $2; exit}')" == Running ]] && multipass exec "$VM" -- true >/dev/null 2>&1; then
+	local timeout=$MULTIPASS_VM_READINESS_TIMEOUT
+	local deadline=$((SECONDS + timeout)) state=unknown
+	while ((SECONDS < deadline)); do
+		state=$(MULTIPASS_TIMEOUT=10 multipass info "$VM" 2>/dev/null | awk '/State:/ {print $2; exit}')
+		if [[ $state == Running ]] && MULTIPASS_TIMEOUT=10 multipass exec "$VM" -- true >/dev/null 2>&1; then
 			return 0
 		fi
 		sleep 2
 	done
+	printf 'VM %s did not become ready after %ss; last state=%s\n' "$VM" "$timeout" "$state" >&2
 	return 1
 }
 
@@ -164,11 +208,24 @@ else
 		REMOTE_STATUS=$PRE_STATUS
 	fi
 	if [[ "$PRE_STATUS" -eq 0 || "$PRE_STATUS" -eq 77 ]]; then
-		# The restart command can error on the ssh drop mid-reboot while the
-		# VM still reboots cleanly; verify via wait_for_vm instead of aborting.
-		multipass restart "$VM" 2>/dev/null || multipass stop "$VM" >/dev/null 2>&1 || true
-		multipass start "$VM" >/dev/null 2>&1 || true
+		BOOT_ID_BEFORE=$(MULTIPASS_TIMEOUT=10 multipass exec "$VM" -- cat /proc/sys/kernel/random/boot_id)
+		if ! MULTIPASS_TIMEOUT=$MULTIPASS_STATUS_TIMEOUT multipass restart "$VM" 2>/dev/null; then
+			MULTIPASS_TIMEOUT=$MULTIPASS_STATUS_TIMEOUT multipass stop "$VM" >/dev/null
+			MULTIPASS_TIMEOUT=$MULTIPASS_STATUS_TIMEOUT multipass start "$VM" >/dev/null
+		fi
 		wait_for_vm
+		BOOT_ID_AFTER=$(MULTIPASS_TIMEOUT=10 multipass exec "$VM" -- cat /proc/sys/kernel/random/boot_id)
+		[[ -n $BOOT_ID_BEFORE && -n $BOOT_ID_AFTER && $BOOT_ID_BEFORE != "$BOOT_ID_AFTER" ]] || {
+			printf 'VM reboot was not proven: before=%s after=%s\n' "$BOOT_ID_BEFORE" "$BOOT_ID_AFTER" >&2
+			exit 1
+		}
+		python3 - "$DEST/reboot-boot-ids.json" "$BOOT_ID_BEFORE" "$BOOT_ID_AFTER" <<'PY'
+import json, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({
+    "before": sys.argv[2], "after": sys.argv[3], "changed": sys.argv[2] != sys.argv[3]
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
 		transfer_source
 		set +e
 		run_remote p2 "$POST_ROOT" "CHRONICLE_ACCEPTANCE_REBOOT_RESUME=1 CHRONICLE_ACCEPTANCE_CRASH_MODE=1 CHRONICLE_ACCEPTANCE_DOMAIN_ROOT='$DOMAIN_ROOT' CHRONICLE_ACCEPTANCE_STATE_ROOT='$DOMAIN_ROOT/state' CHRONICLE_ACCEPTANCE_STORE_ROOT='$DOMAIN_ROOT/store'"

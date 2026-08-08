@@ -2,6 +2,38 @@
 # Shared machine-readable recorder readiness polling and bounded diagnostics.
 set -euo pipefail
 
+TIMEOUT_WRAPPER=${TIMEOUT_WRAPPER:-"$ROOT/scripts/run-with-timeout.sh"}
+READINESS_COMMAND_TIMEOUT=${CHRONICLE_ACCEPTANCE_READINESS_COMMAND_TIMEOUT_SECONDS:-10}
+[[ $READINESS_COMMAND_TIMEOUT =~ ^[1-9][0-9]*$ ]] || {
+	printf '%s\n' 'CHRONICLE_ACCEPTANCE_READINESS_COMMAND_TIMEOUT_SECONDS must be a positive integer' >&2
+	return 2 2>/dev/null || exit 2
+}
+
+bounded_readiness_command() {
+	local timeout=$1
+	shift
+	"$TIMEOUT_WRAPPER" "$timeout" "$@"
+}
+
+systemd_active_epoch() {
+	local timeout=$1 unit=$2 value
+	value=$(bounded_readiness_command "$timeout" systemctl --timestamp=unix show "$unit" -p ActiveEnterTimestamp --value 2>/dev/null || printf '')
+	value=${value#@}
+	value=${value%%.*}
+	[[ $value =~ ^[0-9]+$ ]] && printf '%s\n' "$value" || printf '0\n'
+}
+
+recorder_metadata_epoch() {
+	python3 - "$1" <<'PY'
+import json, os, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(int(value.get("updated_at_unix_seconds") or os.stat(sys.argv[1]).st_mtime))
+except (OSError, ValueError, TypeError):
+    print(0)
+PY
+}
+
 recorder_status_state() {
 	python3 - "$1" <<'PY'
 import json
@@ -11,7 +43,7 @@ from pathlib import Path
 try:
     value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 except (OSError, ValueError):
-    print("unavailable|unknown|unknown|unknown|unknown")
+    print("unavailable|unknown|unknown|unknown|unknown|false")
     raise SystemExit
 state = value.get("state")
 if state not in {"starting", "recovering", "loading_ebpf", "ready", "degraded", "failed"}:
@@ -79,18 +111,18 @@ PY
 		cat "$CGROUP/cgroup.procs" 2>/dev/null || true
 	} >"$root/cgroup-information.txt"
 	if command -v bpftool >/dev/null 2>&1; then
-		bpftool prog show 2>&1 | head -n 200 >"$root/bpftool-programs.txt" || true
-		bpftool link show 2>&1 | head -n 200 >"$root/bpftool-links.txt" || true
+		bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" bpftool prog show 2>&1 | head -n 200 >"$root/bpftool-programs.txt" || true
+		bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" bpftool link show 2>&1 | head -n 200 >"$root/bpftool-links.txt" || true
 	else
 		printf '%s\n' 'bpftool unavailable' >"$root/bpftool-programs.txt"
 		printf '%s\n' 'bpftool unavailable' >"$root/bpftool-links.txt"
 	fi
-	systemctl status "$UNIT" --no-pager >"$root/recorder-service-status.txt" 2>&1 || true
-	journalctl --no-pager -n 200 -u "$UNIT" >"$root/recorder-journal.log" 2>&1 || true
-	ps -eo pid,ppid,stat,etimes,cmd --forest 2>&1 | head -n 200 >"$root/process-list.txt" || true
-	df -P "$state_root" "$root" >"$root/disk-space.txt" 2>&1 || true
-	find "$state_root/wal" -maxdepth 3 -type f -printf '%p %s bytes\n' 2>/dev/null | head -n 200 | sort >"$root/wal-directory-listing.txt" || true
-	python3 - "$state_root/wal/incremental-etl-checkpoint.json" "$root/checkpoint-metadata.json" <<'PY'
+	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" systemctl status "$UNIT" --no-pager >"$root/recorder-service-status.txt" 2>&1 || true
+	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" journalctl --no-pager -n 200 -u "$UNIT" >"$root/recorder-journal.log" 2>&1 || true
+	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" ps -eo pid,ppid,stat,etimes,cmd --forest 2>&1 | head -n 200 >"$root/process-list.txt" || true
+	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" df -P "$state_root" "$root" >"$root/disk-space.txt" 2>&1 || true
+	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" find "$state_root/wal" -maxdepth 3 -type f -printf '%p %s bytes\n' 2>/dev/null | head -n 200 | sort >"$root/wal-directory-listing.txt" || true
+	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" python3 - "$state_root/wal/incremental-etl-checkpoint.json" "$root/checkpoint-metadata.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -132,16 +164,36 @@ wait_for_recorder_ready() {
 			;;
 		esac
 	done
-	local deadline=$((SECONDS + timeout)) state last_state=none tmp="$RECORDER_STATUS.tmp"
+	[[ $timeout =~ ^[1-9][0-9]*$ ]] || {
+		printf 'readiness timeout must be a positive integer, got %q\n' "$timeout" >&2
+		return 2
+	}
+	[[ $interval =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+		printf 'readiness interval must be a non-negative number, got %q\n' "$interval" >&2
+		return 2
+	}
+	local deadline=$((SECONDS + timeout)) state unit_state last_state=none tmp="$RECORDER_STATUS.tmp"
+	local remaining command_timeout
 	: >"$ARTIFACT_ROOT/readiness-transitions.log"
 	rm -f "$RECORDER_STATUS" "$tmp"
 	while ((SECONDS < deadline)); do
-		if "$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$tmp" 2>"$ARTIFACT_ROOT/recorder-status.stderr"; then
+		remaining=$((deadline - SECONDS))
+		command_timeout=$READINESS_COMMAND_TIMEOUT
+		((command_timeout <= remaining)) || command_timeout=$remaining
+		if bounded_readiness_command "$command_timeout" "$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$tmp" 2>"$ARTIFACT_ROOT/recorder-status.stderr"; then
 			mv -f "$tmp" "$RECORDER_STATUS"
-			state=$(recorder_status_state "$RECORDER_STATUS" || printf 'unavailable|unknown|unknown|unknown|unknown')
+			state=$(recorder_status_state "$RECORDER_STATUS" || printf 'unavailable|unknown|unknown|unknown|unknown|false')
 		else
-			state='unavailable|unknown|unknown|unknown|unknown'
+			state='unavailable|unknown|unknown|unknown|unknown|false'
 			rm -f "$tmp"
+			if [[ -n ${UNIT:-} ]]; then
+				unit_state=$(bounded_readiness_command "$command_timeout" systemctl is-active "$UNIT" 2>/dev/null || true)
+				if [[ $unit_state == failed ]]; then
+					printf 'recorder unit entered terminal failed state while status unavailable\n' >&2
+					collect_recorder_readiness_diagnostics
+					return 1
+				fi
+			fi
 		fi
 		if [[ $state != "$last_state" ]]; then
 			printf '[%s] recorder-state=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$state" | tee -a "$ARTIFACT_ROOT/readiness-transitions.log"
@@ -153,14 +205,10 @@ wait_for_recorder_ready() {
 			# recorder's state file must be newer than the unit's latest start,
 			# otherwise the recorder is still mid-startup.
 			if [[ -n "${UNIT:-}" ]]; then
-				local started
-				started=$(systemctl show "$UNIT" -p ActiveEnterTimestamp --value 2>/dev/null || printf '')
-				local start_epoch=0 status_mtime=0
-				if [[ -n "$started" ]] && command -v date >/dev/null 2>&1; then
-					start_epoch=$(date -d "$started" +%s 2>/dev/null || printf '0')
-				fi
-				status_mtime=$(stat -c %Y "$STATE_ROOT/recorder.json" 2>/dev/null || printf '0')
-				if ((start_epoch != 0)) && ((status_mtime < start_epoch)); then
+				local start_epoch=0 status_epoch=0
+				start_epoch=$(systemd_active_epoch "$command_timeout" "$UNIT")
+				status_epoch=$(recorder_metadata_epoch "$STATE_ROOT/recorder.json")
+				if ((start_epoch != 0)) && ((status_epoch < start_epoch)); then
 					sleep "$interval"
 					continue
 				fi

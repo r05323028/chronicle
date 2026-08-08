@@ -4,6 +4,28 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+if [[ ${CHRONICLE_ACCEPTANCE_GATE_WRAPPED:-0} != 1 ]]; then
+	gate_timeout=${CHRONICLE_ACCEPTANCE_GATE_TIMEOUT_SECONDS:-3600}
+	[[ $gate_timeout =~ ^[1-9][0-9]*$ ]] || {
+		printf '%s\n' 'CHRONICLE_ACCEPTANCE_GATE_TIMEOUT_SECONDS must be a positive integer' >&2
+		exit 2
+	}
+	cleanup_grace=${CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS:-180}
+	command_grace=${CHRONICLE_TIMEOUT_GRACE_SECONDS:-5}
+	[[ $cleanup_grace =~ ^[1-9][0-9]*$ ]] || {
+		printf '%s\n' 'CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS must be a positive integer' >&2
+		exit 2
+	}
+	timeout_env=(CHRONICLE_ACCEPTANCE_GATE_WRAPPED=1 CHRONICLE_TIMEOUT_LAYER=acceptance_gate CHRONICLE_TIMEOUT_NAME=p2 CHRONICLE_TIMEOUT_GRACE_SECONDS="$cleanup_grace")
+	if [[ -n ${CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT:-} ]]; then
+		timeout_env+=(
+			CHRONICLE_TIMEOUT_EVIDENCE_FILE="$CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT/gate-timeout.json"
+			CHRONICLE_TIMEOUT_PHASE_FILE="$CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT/current-phase.txt"
+			CHRONICLE_TIMEOUT_DIAGNOSTICS="recorder-service-status.txt:recorder-journal.log:process-list.txt:disk-space.txt:readiness-transitions.log"
+		)
+	fi
+	exec env "${timeout_env[@]}" "$ROOT/scripts/run-with-timeout.sh" "$gate_timeout" env CHRONICLE_TIMEOUT_GRACE_SECONDS="$command_grace" bash "$0" "$@"
+fi
 MODE=${CHRONICLE_ACCEPTANCE_MODE:-full}
 RELEASE_MODE=${CHRONICLE_ACCEPTANCE_RELEASE:-0}
 EXPECTED_SHA=${CHRONICLE_ACCEPTANCE_EXPECTED_SHA:-}
@@ -29,18 +51,36 @@ CHECKS_JSON="$ARTIFACT_ROOT/checks.json"
 CHECKPOINT_PAUSE_FILE="$STATE_ROOT/wal/checkpoint-pause.control"
 CHECKPOINT_READY_FILE="${CHECKPOINT_PAUSE_FILE%.*}.ready"
 UPSTREAM_PID=""
+QUOTA_UNIT=""
+QUOTA_CGROUP=""
+QUOTA_MOUNT=""
+QUOTA_IMAGE=""
 CURRENT_PHASE="initializing"
 READINESS_TIMEOUT=${CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS:-180}
 READINESS_INTERVAL=${CHRONICLE_ACCEPTANCE_READINESS_INTERVAL_SECONDS:-1}
+SERVICE_COMMAND_TIMEOUT=${CHRONICLE_ACCEPTANCE_SERVICE_COMMAND_TIMEOUT_SECONDS:-30}
+TIMEOUT_WRAPPER="$ROOT/scripts/run-with-timeout.sh"
+[[ $SERVICE_COMMAND_TIMEOUT =~ ^[1-9][0-9]*$ ]] || {
+	printf '%s\n' 'CHRONICLE_ACCEPTANCE_SERVICE_COMMAND_TIMEOUT_SECONDS must be a positive integer' >&2
+	exit 2
+}
+systemctl() { "$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" systemctl "$@"; }
+systemd-run() { "$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" systemd-run "$@"; }
+journalctl() { "$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" journalctl "$@"; }
+# shellcheck source=scripts/lib/common.sh
+source "$ROOT/scripts/lib/common.sh"
 source "$ROOT/scripts/acceptance/recorder-readiness.sh"
 
 mkdir -p "$ARTIFACT_ROOT"
 rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
 printf '%s\n' 'chronicle-p2-acceptance-root-v1' >"$ARTIFACT_ROOT/.chronicle-acceptance-root"
+printf '%s\n' "$UNIT" >"$ARTIFACT_ROOT/active-units.txt"
+printf '%s\n' "$CURRENT_PHASE" >"$ARTIFACT_ROOT/current-phase.txt"
 exec > >(tee -a "$COMMAND_LOG") 2>&1
 
 phase() {
 	CURRENT_PHASE="$1"
+	printf '%s\n' "$CURRENT_PHASE" >"$ARTIFACT_ROOT/current-phase.txt"
 	printf '[%s] %s\n' "$1" "$2"
 }
 
@@ -52,11 +92,16 @@ phase() {
 wait_for_unit_stable() {
 	local unit=${1:?unit required}
 	local status_root=${2:-$STATE_ROOT}
-	local attempts=${3:-90}
-	local restarts_before restarts_after stable=0
+	local timeout=${3:-90}
+	local deadline=$((SECONDS + timeout)) restarts_before restarts_after stable=0 state=unknown
 	restarts_before=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || printf '0')
-	for _ in $(seq 1 "$attempts"); do
-		if systemctl is-active --quiet "$unit"; then
+	while ((SECONDS < deadline)); do
+		state=$(systemctl is-active "$unit" 2>/dev/null || true)
+		[[ $state != failed ]] || {
+			printf 'unit %s entered terminal failed state; restarts=%s\n' "$unit" "$restarts_before" >&2
+			return 1
+		}
+		if [[ $state == active ]]; then
 			restarts_after=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || printf '0')
 			if [[ "$restarts_after" == "$restarts_before" ]]; then
 				stable=$((stable + 1))
@@ -65,20 +110,77 @@ wait_for_unit_stable() {
 				restarts_before=$restarts_after
 			fi
 			if ((stable >= 2)); then
-				local started
-				started=$(systemctl show "$unit" -p ActiveEnterTimestamp --value 2>/dev/null || printf '')
-				local start_epoch=0 status_mtime=0
-				if [[ -n "$started" ]] && command -v date >/dev/null 2>&1; then
-					start_epoch=$(date -d "$started" +%s 2>/dev/null || printf '0')
-				fi
-				status_mtime=$(stat -c %Y "$status_root/recorder.json" 2>/dev/null || printf '0')
-				if ((start_epoch == 0)) || ((status_mtime >= start_epoch)); then
+				local start_epoch=0 status_epoch=0
+				start_epoch=$(systemd_active_epoch "$SERVICE_COMMAND_TIMEOUT" "$unit")
+				status_epoch=$(recorder_metadata_epoch "$status_root/recorder.json")
+				if ((start_epoch == 0)) || ((status_epoch >= start_epoch)); then
 					return 0
 				fi
 			fi
 		fi
 		sleep 1
 	done
+	printf 'unit %s did not stabilize after %ss; last state=%s restarts=%s\n' "$unit" "$timeout" "$state" "$restarts_before" >&2
+	return 1
+}
+
+wait_for_unit_inactive() {
+	local unit=${1:?unit required} timeout=${2:-30}
+	local deadline=$((SECONDS + timeout)) state=unknown
+	while ((SECONDS < deadline)); do
+		state=$(systemctl is-active "$unit" 2>/dev/null || true)
+		[[ $state == inactive ]] && return 0
+		[[ $state != failed ]] || break
+		sleep 0.1
+	done
+	printf 'unit %s did not become cleanly inactive after %ss; last state=%s\n' "$unit" "$timeout" "$state" >&2
+	return 1
+}
+
+wait_for_unit_stopped() {
+	local unit=${1:?unit required} timeout=${2:-30}
+	local deadline=$((SECONDS + timeout)) state=unknown
+	while ((SECONDS < deadline)); do
+		state=$(systemctl is-active "$unit" 2>/dev/null || true)
+		case $state in inactive | failed | unknown) return 0 ;; esac
+		sleep 0.1
+	done
+	printf 'unit %s did not stop after %ss; last state=%s\n' "$unit" "$timeout" "$state" >&2
+	return 1
+}
+
+stop_managed_unit() {
+	local unit=${1:-}
+	[[ -n $unit ]] || return 0
+	systemctl stop --no-block "$unit" 2>/dev/null || true
+	if ! wait_for_unit_stopped "$unit" 35; then
+		systemctl kill --kill-who=all --signal=SIGKILL "$unit" 2>/dev/null || true
+		wait_for_unit_stopped "$unit" 5 || return 1
+	fi
+	systemctl reset-failed "$unit" 2>/dev/null || true
+}
+
+wait_for_unit_active() {
+	local unit=${1:?unit required} timeout=${2:-30}
+	local deadline=$((SECONDS + timeout)) state=unknown
+	while ((SECONDS < deadline)); do
+		state=$(systemctl is-active "$unit" 2>/dev/null || true)
+		[[ $state == active ]] && return 0
+		[[ $state == failed ]] && break
+		sleep 0.1
+	done
+	printf 'unit %s did not become active after %ss; last state=%s\n' "$unit" "$timeout" "$state" >&2
+	return 1
+}
+
+wait_for_path() {
+	local path=${1:?path required} timeout=${2:?timeout required}
+	local deadline=$((SECONDS + timeout))
+	while ((SECONDS < deadline)); do
+		[[ -e $path ]] && return 0
+		sleep 0.1
+	done
+	printf 'path did not appear after %ss: %s\n' "$timeout" "$path" >&2
 	return 1
 }
 
@@ -180,25 +282,50 @@ PY
 
 cleanup() {
 	set +e
+	local failed=0 loop loops quota_mounted=false
 	rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
-	if [[ "$PRE_REBOOT" != 1 ]]; then
-		[[ -z "$UPSTREAM_PID" ]] || kill "$UPSTREAM_PID" 2>/dev/null || true
-		if command -v systemctl >/dev/null 2>&1; then
-			systemctl stop "$UNIT" 2>/dev/null || true
-			for _ in $(seq 1 50); do
-				systemctl is-active --quiet "$UNIT" || break
-				sleep 0.1
-			done
+	stop_process "$UPSTREAM_PID"
+	UPSTREAM_PID=""
+	if type -P systemctl >/dev/null 2>&1; then
+		stop_managed_unit "$QUOTA_UNIT" || failed=1
+		stop_managed_unit "$UNIT" || failed=1
+	fi
+	printf '%s\n' "$$" >/sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+	if [[ -n $QUOTA_CGROUP && -d $QUOTA_CGROUP ]]; then
+		rmdir "$QUOTA_CGROUP" 2>/dev/null || failed=1
+	fi
+	if [[ -d $CGROUP ]]; then
+		rmdir "$CGROUP" 2>/dev/null || failed=1
+	fi
+	if [[ -n $QUOTA_MOUNT ]] && "$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" mountpoint -q "$QUOTA_MOUNT" 2>/dev/null; then
+		if ! "$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" umount "$QUOTA_MOUNT" 2>/dev/null; then
+			failed=1
+			quota_mounted=true
 		fi
-		[[ -d "$CGROUP" ]] && rmdir "$CGROUP" 2>/dev/null || true
+	fi
+	if [[ $quota_mounted == false && -n $QUOTA_IMAGE ]] && type -P losetup >/dev/null 2>&1; then
+		loops=$("$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" losetup -j "$QUOTA_IMAGE" 2>/dev/null | cut -d: -f1) || failed=1
+		while read -r loop; do
+			[[ -z $loop ]] || "$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" losetup -d "$loop" 2>/dev/null || failed=1
+		done <<<"$loops"
+	fi
+	if [[ $quota_mounted == false ]]; then
+		[[ -z $QUOTA_MOUNT ]] || rm -rf -- "$QUOTA_MOUNT"
+		[[ -z $QUOTA_IMAGE ]] || rm -f -- "$QUOTA_IMAGE"
 	fi
 	# Atomic metadata writers may leave transient files while systemd drains;
 	# never include disappearing temporary files in retained evidence.
 	find "$ARTIFACT_ROOT" -type f -name '.tmp-*' -delete 2>/dev/null || true
+	return "$failed"
 }
 on_exit() {
-	local rc=$?
-	cleanup
+	local rc=$? cleanup_status=0
+	declare -F stop_scenario_watchdog >/dev/null && stop_scenario_watchdog
+	cleanup || cleanup_status=$?
+	if [[ $rc -eq 0 && $cleanup_status -ne 0 ]]; then
+		rc=1
+		CURRENT_PHASE="cleanup_failed"
+	fi
 	local end_sha
 	end_sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf 'unavailable')
 	if [[ "$rc" == 0 && "$RELEASE_MODE" == 1 ]] && { [[ "$end_sha" != "$SHA" ]] || [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=all)" ]]; }; then
@@ -210,6 +337,7 @@ on_exit() {
 		find "$ARTIFACT_ROOT" -type f ! -name artifact-manifest.sha256 ! -name '.tmp-*' -print0 |
 			sort -z | xargs -0r sha256sum >"$ARTIFACT_ROOT/artifact-manifest.sha256"
 	fi
+	declare -F stop_scenario_watchdog >/dev/null && stop_scenario_watchdog true
 	exit "$rc"
 }
 trap on_exit EXIT
@@ -222,7 +350,7 @@ skip() {
 [[ "$MODE" == full ]] || skip 'P2 privileged acceptance requires full mode'
 [[ "$(uname -s)" == Linux ]] || skip 'requires Linux'
 [[ "$(id -u)" == 0 ]] || skip 'requires root'
-command -v systemctl >/dev/null || skip 'requires systemd'
+type -P systemctl >/dev/null || skip 'requires systemd'
 [[ -r /sys/fs/cgroup/cgroup.controllers ]] || skip 'requires cgroup v2'
 [[ -r /sys/kernel/btf/vmlinux ]] || skip 'requires BTF'
 if [[ "$RELEASE_MODE" == 1 ]]; then

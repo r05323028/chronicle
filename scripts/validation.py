@@ -27,9 +27,9 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback is docume
 def run(root: Path, *args: str) -> str:
     try:
         return subprocess.check_output(
-            args, cwd=root, text=True, stderr=subprocess.DEVNULL
+            args, cwd=root, text=True, stderr=subprocess.DEVNULL, timeout=30
         ).strip()
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
         return "not_checked"
 
 
@@ -135,7 +135,11 @@ def source_ownership(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
             owners[name] = sorted(matches_for_file)
         else:
             unowned.append(name)
-    return {"files": len(owners) + len(unowned), "owners": owners, "unowned": sorted(unowned)}
+    return {
+        "files": len(owners) + len(unowned),
+        "owners": owners,
+        "unowned": sorted(unowned),
+    }
 
 
 def files_for_patterns(root: Path, patterns: list[str]) -> list[Path]:
@@ -245,8 +249,12 @@ def fingerprint(
         "validation_config_sha256": digest(root / "validation/groups.toml"),
         "checks": gate_cfg.get("checks", []),
     }
-    fingerprint_payload = {key: value for key, value in payload.items() if key != "environment"}
-    encoded = json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
+    fingerprint_payload = {
+        key: value for key, value in payload.items() if key != "environment"
+    }
+    encoded = json.dumps(
+        fingerprint_payload, sort_keys=True, separators=(",", ":")
+    ).encode()
     return {"fingerprint": hashlib.sha256(encoded).hexdigest(), **payload}
 
 
@@ -278,8 +286,7 @@ def acceptance_fingerprint(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     )
     paths = files_for_patterns(root, sorted(set(patterns)))
     inputs = [
-        {"path": str(path.relative_to(root)), "sha256": digest(path)}
-        for path in paths
+        {"path": str(path.relative_to(root)), "sha256": digest(path)} for path in paths
     ]
     payload = {
         "fingerprint_version": 2,

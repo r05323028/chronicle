@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: reboot-recovery.
 scenario_p2_reboot_recovery() {
-if [[ "$PRE_REBOOT" == 1 ]]; then
+	if [[ "$PRE_REBOOT" == 1 ]]; then
 		phase pre_reboot 'retain live recorder state for VM reboot'
 		"$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$ARTIFACT_ROOT/pre-reboot-status.json"
 		test -f "$STATE_ROOT/wal/recording.json"
 		# Drain the recorder before the VM reboot so the reboot never lands in a
 		# partial publication window; restart continuity is then deterministic.
-		systemctl stop "$UNIT" 2>/dev/null || true
-		for _ in $(seq 1 60); do
-				systemctl is-active --quiet "$UNIT" || break
-				sleep 0.25
-		done
-		! systemctl is-active --quiet "$UNIT"
+		systemctl stop --no-block "$UNIT" 2>/dev/null || true
+		wait_for_unit_inactive "$UNIT" 45
+		printf '%s\n' complete >"$ARTIFACT_ROOT/pre-reboot-handoff.txt"
 		exit 0
-fi
+	fi
 
 	phase reboot_recovery 'prove WAL, checkpoint, catalog, and counter continuity after reboot'
 	PRE_STATUS="$ARTIFACT_ROOT/../pre-reboot/pre-reboot-status.json"

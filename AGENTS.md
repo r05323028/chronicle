@@ -45,11 +45,15 @@ Suggested ranges:
 - Full workspace validation: 15-30 minutes
 - VM bootstrap and privileged acceptance: 30-60 minutes
 
-Prefer the repository timeout wrapper when available:
+Prefer repository timeout wrapper:
 
 ```bash
 ./scripts/run-with-timeout.sh <duration> <command> [arguments...]
 ```
+
+Wrapper preserves command status/output; deadline returns 124 after process-tree TERM and `CHRONICLE_TIMEOUT_GRACE_SECONDS` (default 5), then KILL. Hierarchy defaults: command 900s, readiness command/readiness 10s/180s, service command 30s, scenario 300s (600s quota/retention, 900s cargo-heavy), acceptance cleanup 180s, acceptance profile 3300s under `validate.sh`, gate 3600s. Override with `CHRONICLE_VALIDATION_COMMAND_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_READINESS_COMMAND_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_SERVICE_COMMAND_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_SCENARIO_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS`, `CHRONICLE_ACCEPTANCE_PROFILE_TIMEOUT_SECONDS`, and gate timeout variables. Multipass knobs: `CHRONICLE_ACCEPTANCE_GUEST_TIMEOUT_SECONDS`, `CHRONICLE_MULTIPASS_STATUS_TIMEOUT_SECONDS`, `CHRONICLE_MULTIPASS_VM_READINESS_TIMEOUT_SECONDS`, `CHRONICLE_MULTIPASS_TRANSFER_TIMEOUT_SECONDS`, `CHRONICLE_MULTIPASS_BOOTSTRAP_TIMEOUT_SECONDS`, `CHRONICLE_MULTIPASS_REMOTE_TIMEOUT_SECONDS`; guest and remote deadlines must remain shorter than host profile deadline.
+
+Agent recorder workflow: run `validate.sh fast`, then targeted changed-path/recorder tooling, then bounded scenario or lifecycle validation. Run complete P1/P2 gate only when required. Never start foreground daemon without wrapper and deterministic cleanup.
 
 ## Linux-only validation on macOS
 

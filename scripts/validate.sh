@@ -6,6 +6,27 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HELPER="$ROOT/scripts/validation.py"
 CONFIG="$ROOT/validation/groups.toml"
 MODE=${1:-}
+COMMAND_TIMEOUT=${CHRONICLE_VALIDATION_COMMAND_TIMEOUT_SECONDS:-900}
+GATE_TIMEOUT=${CHRONICLE_VALIDATION_GATE_TIMEOUT_SECONDS:-3600}
+ACCEPTANCE_PROFILE_TIMEOUT=${CHRONICLE_ACCEPTANCE_PROFILE_TIMEOUT_SECONDS:-3300}
+[[ $COMMAND_TIMEOUT =~ ^[1-9][0-9]*$ ]] || {
+	printf '%s\n' 'CHRONICLE_VALIDATION_COMMAND_TIMEOUT_SECONDS must be a positive integer' >&2
+	exit 2
+}
+[[ $GATE_TIMEOUT =~ ^[1-9][0-9]*$ ]] || {
+	printf '%s\n' 'CHRONICLE_VALIDATION_GATE_TIMEOUT_SECONDS must be a positive integer' >&2
+	exit 2
+}
+[[ $ACCEPTANCE_PROFILE_TIMEOUT =~ ^[1-9][0-9]*$ && $ACCEPTANCE_PROFILE_TIMEOUT -lt $GATE_TIMEOUT ]] || {
+	printf '%s\n' 'CHRONICLE_ACCEPTANCE_PROFILE_TIMEOUT_SECONDS must be positive and shorter than validation gate timeout' >&2
+	exit 2
+}
+if [[ $MODE =~ ^(fast|targeted|gate|release)$ && ${CHRONICLE_VALIDATION_GATE_WRAPPED:-0} != 1 ]]; then
+	mkdir -p "$ROOT/target/validation-work"
+	exec env CHRONICLE_VALIDATION_GATE_WRAPPED=1 CHRONICLE_TIMEOUT_LAYER=validation_gate CHRONICLE_TIMEOUT_NAME="$MODE" CHRONICLE_TIMEOUT_PHASE="$MODE" \
+		CHRONICLE_TIMEOUT_EVIDENCE_FILE="$ROOT/target/validation-work/$MODE-gate-timeout-$$.json" \
+		"$ROOT/scripts/run-with-timeout.sh" "$GATE_TIMEOUT" "$0" "$@"
+fi
 shift || true
 VM=${CHRONICLE_MULTIPASS_VM:-chronicle-ubuntu}
 CHANGED_SINCE=
@@ -28,6 +49,7 @@ Usage:
 
 Options: --changed-since REF --reuse-evidence --force --no-artifact --artifact-on-failure --keep-workdir
 Set CHRONICLE_VALIDATE_DRY_RUN=1 to inspect selection without running commands.
+Timeouts: command=900s, acceptance profile=3300s, validation gate=3600s.
 EOF
 }
 
@@ -117,6 +139,11 @@ trap cleanup EXIT
 run_step() {
 	local name=$1
 	shift
+	local timeout=$COMMAND_TIMEOUT layer=command status
+	if [[ $name == acceptance-* ]]; then
+		timeout=$GATE_TIMEOUT
+		layer=acceptance_gate
+	fi
 	local log="$WORKDIR/$name.log"
 	printf '\n== %s ==\n' "$name"
 	printf '+ %q' "$@"
@@ -125,37 +152,41 @@ run_step() {
 		printf 'DRY RUN\n'
 		return 0
 	fi
-	if "$@" >"$log" 2>&1; then
+	if CHRONICLE_TIMEOUT_EVIDENCE_FILE="$WORKDIR/$name-timeout.json" CHRONICLE_TIMEOUT_LAYER="$layer" CHRONICLE_TIMEOUT_NAME="$name" CHRONICLE_TIMEOUT_PHASE="$name" \
+		"$ROOT/scripts/run-with-timeout.sh" "$timeout" "$@" >"$log" 2>&1; then
 		cat "$log"
 	else
+		status=$?
 		cat "$log"
 		cp "$log" "$WORKDIR/failed-test.log"
-		printf 'FAILED: %s\n' "$name" >&2
-		return 1
+		printf 'FAILED: %s (exit %s)\n' "$name" "$status" >&2
+		return "$status"
 	fi
 }
 
 run_shell() {
-	local name=$1 command=$2
+	local name=$1 command=$2 status
 	local log="$WORKDIR/$name.log"
 	printf '\n== %s ==\n+ %s\n' "$name" "$command"
 	if [[ $DRY_RUN == true || $DRY_RUN == 1 ]]; then
 		printf 'DRY RUN\n'
 		return 0
 	fi
-	if bash -lc "cd '$ROOT' && $command" >"$log" 2>&1; then
+	if CHRONICLE_TIMEOUT_EVIDENCE_FILE="$WORKDIR/$name-timeout.json" CHRONICLE_TIMEOUT_LAYER=command CHRONICLE_TIMEOUT_NAME="$name" CHRONICLE_TIMEOUT_PHASE="$name" \
+		"$ROOT/scripts/run-with-timeout.sh" "$COMMAND_TIMEOUT" bash -lc "cd '$ROOT' && $command" >"$log" 2>&1; then
 		cat "$log"
 	else
+		status=$?
 		cat "$log"
 		cp "$log" "$WORKDIR/failed-test.log"
-		printf 'FAILED: %s\n' "$name" >&2
-		return 1
+		printf 'FAILED: %s (exit %s)\n' "$name" "$status" >&2
+		return "$status"
 	fi
 }
 
 run_gate() {
 	local gate=$1 status=0
-	local -a command=("$ROOT/scripts/acceptance.sh" --profile "$gate" --executor multipass --vm "$VM" --evidence-root "$EVIDENCE_ROOT/acceptance")
+	local -a command=("$ROOT/scripts/acceptance.sh" --profile "$gate" --executor multipass --vm "$VM" --evidence-root "$EVIDENCE_ROOT/acceptance" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT")
 	if [[ $MODE == release ]]; then
 		command+=(--release)
 	fi
@@ -238,11 +269,11 @@ PY
 			printf 'eBPF source changed: minimal privileged smoke selects P1 smoke path.\n'
 			if [[ ${CHRONICLE_SKIP_PRIVILEGED_SMOKE:-false} != true ]]; then
 				if [[ $DRY_RUN == true || $DRY_RUN == 1 ]]; then
-					printf 'WOULD RUN privileged P1 smoke: %q ' "$ROOT/scripts/acceptance.sh" --profile p1 --executor multipass --vm "$VM" --evidence-root "$WORKDIR/p1-smoke-source" --no-reuse --compact
+					printf 'WOULD RUN privileged P1 smoke: %q ' "$ROOT/scripts/acceptance.sh" --profile p1 --executor multipass --vm "$VM" --evidence-root "$WORKDIR/p1-smoke-source" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT" --no-reuse --compact
 					printf '\n'
 				else
 					"$ROOT/scripts/acceptance.sh" --profile p1 --executor multipass --vm "$VM" \
-						--evidence-root "$WORKDIR/p1-smoke-source" --no-reuse --compact
+						--evidence-root "$WORKDIR/p1-smoke-source" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT" --no-reuse --compact
 				fi
 			fi
 			;;
@@ -281,7 +312,7 @@ release)
 	run_shell release-tests "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo test --workspace --all-features --locked"
 	run_shell release-openspec 'openspec validate --all --strict --no-interactive'
 	run_shell release-source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'"
-	release_command=("$ROOT/scripts/acceptance.sh" --profile all --executor multipass --vm "$VM" --evidence-root "$EVIDENCE_ROOT/acceptance" --release)
+	release_command=("$ROOT/scripts/acceptance.sh" --profile all --executor multipass --vm "$VM" --evidence-root "$EVIDENCE_ROOT/acceptance" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT" --release)
 	if [[ $REUSE_EVIDENCE != true ]]; then release_command+=(--no-reuse); fi
 	run_step acceptance-release "${release_command[@]}"
 	;;

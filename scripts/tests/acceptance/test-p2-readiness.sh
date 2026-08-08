@@ -16,6 +16,7 @@ count=$(cat "$FAKE_COUNT" 2>/dev/null || printf 0)
 count=$((count + 1))
 printf '%s\n' "$count" >"$FAKE_COUNT"
 case "$FAKE_MODE:$count" in
+  hang:*) sleep 30; exit 1 ;;
   unavailable:1|timeout:*) exit 1 ;;
   failed:1|stale:1|restart:1) printf '%s\n' '{"state":"failed","lifecycle":"failed","capture_readiness":"not_ready","processing_readiness":"not_ready","health":"failed","stale_owner":true}' ;;
   legacy:1) printf '%s\n' '{"lifecycle":"running","capture_readiness":"ready","processing_readiness":"ready","health":"healthy","stale_owner":false}' ;;
@@ -77,6 +78,28 @@ for mode in failed stale; do
 	[[ $(cat "$CASE_DIR/count") == 1 ]]
 done
 
+# Status unavailability plus terminal unit state fails immediately.
+new_case
+export FAKE_MODE=timeout
+cat >"$CASE_DIR/systemctl" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+*' is-active '*) printf '%s\n' failed ;;
+*) exit 1 ;;
+esac
+EOF
+chmod +x "$CASE_DIR/systemctl"
+old_path=$PATH
+PATH="$CASE_DIR:$PATH"
+export PATH
+source "$LIB"
+started=$SECONDS
+if wait_for_recorder_ready --timeout 5 --interval 0; then exit 1; fi
+((SECONDS - started < 3))
+[[ $(cat "$CASE_DIR/count") == 1 ]]
+PATH=$old_path
+export PATH
+
 # 5: timeout produces bounded diagnostics, not build/cache data.
 new_case
 export FAKE_MODE=timeout
@@ -86,6 +109,15 @@ for file in recorder-status.json recorder-service-status.txt recorder-journal.lo
 	[[ -f "$CASE_DIR/$file" ]]
 done
 [[ ! -e "$CASE_DIR/target" ]]
+
+# A blocked recorder-status subprocess cannot defeat readiness deadline.
+new_case
+export FAKE_MODE=hang
+source "$LIB"
+started=$SECONDS
+if wait_for_recorder_ready --timeout 1 --interval 0; then exit 1; fi
+((SECONDS - started < 5))
+[[ $(cat "$CASE_DIR/count") == 1 ]]
 
 # 6: recorder restart follows same contract.
 new_case
@@ -115,4 +147,29 @@ source "$LIB"
 wait_for_recorder_ready --timeout 5 --interval 0
 [[ ! -e "$CASE_DIR/recorder-journal.log" ]]
 [[ $(du -sk "$CASE_DIR" | awk '{print $1}') -lt 128 ]]
+
+# Ready metadata from before latest unit start is rejected as stale.
+new_case
+export FAKE_MODE=ready
+printf '{}\n' >"$CASE_DIR/state/recorder.json"
+touch -t 200001010000 "$CASE_DIR/state/recorder.json"
+cat >"$CASE_DIR/systemctl" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+*' ActiveEnterTimestamp '*) printf '%s\n' '@4070908800' ;;
+*' is-active '*) printf '%s\n' active ;;
+*' status '*) exit 1 ;;
+esac
+EOF
+chmod +x "$CASE_DIR/systemctl"
+old_path=$PATH
+PATH="$CASE_DIR:$PATH"
+export PATH
+source "$LIB"
+if wait_for_recorder_ready --timeout 1 --interval 0; then
+	echo 'stale predecessor status unexpectedly accepted' >&2
+	exit 1
+fi
+PATH=$old_path
+export PATH
 printf '%s\n' 'p2 readiness contract tests passed'

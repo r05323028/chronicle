@@ -62,7 +62,29 @@ set_check three_epochs passed
 # the isolated loopback pressure run above.
 
 phase etl 'publish final canonical session'
-"$CHRONICLE" --format json etl --wal-dir "$STATE_ROOT/wal" --output "$STORE_ROOT" >"$ARTIFACT_ROOT/etl.json" 2>"$ARTIFACT_ROOT/etl.log"
+# With one-second epochs the catalog's Active entry may be a fresh empty
+# successor (the final-workload pass committed to the preceding recording),
+# so publish the last recording that actually published committed segments.
+ETL_WAL_DIR="$STATE_ROOT/wal"
+if [[ -f "$STATE_ROOT/wal/epochs.json" ]]; then
+	ETL_REL=$(
+		python3 - "$STATE_ROOT/wal/epochs.json" "$STATE_ROOT/wal" <<'PY'
+import json, sys
+from pathlib import Path
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+root = Path(sys.argv[2])
+chosen = None
+for entry in value["epochs"]:
+    if entry.get("state") in ("Active", "Finalized") and any(
+        (root / entry["path"] / "segments").glob("*.chwal")
+    ):
+        chosen = entry
+print(chosen["path"] if chosen else ".")
+PY
+	)
+	ETL_WAL_DIR="$STATE_ROOT/wal/$ETL_REL"
+fi
+"$CHRONICLE" --format json etl --wal-dir "$ETL_WAL_DIR" --output "$STORE_ROOT" >"$ARTIFACT_ROOT/etl.json" 2>"$ARTIFACT_ROOT/etl.log"
 SESSION_ID=$(
 	python3 - "$ARTIFACT_ROOT/etl.json" <<'PY'
 import json, sys
@@ -77,7 +99,7 @@ test -d "$STORE_ROOT/sessions/$SESSION_ID"
 phase equivalence 'compare one-shot ETL output with incremental checkpoint output'
 "$CHRONICLE" --format json inspect "$SESSION_ID" --root "$STORE_ROOT" >"$ARTIFACT_ROOT/inspect.json"
 ONE_SHOT_STORE="$ARTIFACT_ROOT/one-shot-store"
-"$CHRONICLE" --format json etl --wal-dir "$STATE_ROOT/wal" --output "$ONE_SHOT_STORE" >"$ARTIFACT_ROOT/one-shot-etl.json" 2>"$ARTIFACT_ROOT/one-shot-etl.log"
+"$CHRONICLE" --format json etl --wal-dir "$ETL_WAL_DIR" --output "$ONE_SHOT_STORE" >"$ARTIFACT_ROOT/one-shot-etl.json" 2>"$ARTIFACT_ROOT/one-shot-etl.log"
 ONE_SHOT_SESSION=$(
 	python3 - "$ARTIFACT_ROOT/one-shot-etl.json" <<'PY'
 import json, sys

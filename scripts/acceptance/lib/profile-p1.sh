@@ -4,6 +4,27 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+if [[ ${CHRONICLE_ACCEPTANCE_GATE_WRAPPED:-0} != 1 ]]; then
+	gate_timeout=${CHRONICLE_ACCEPTANCE_GATE_TIMEOUT_SECONDS:-3600}
+	[[ $gate_timeout =~ ^[1-9][0-9]*$ ]] || {
+		printf '%s\n' 'CHRONICLE_ACCEPTANCE_GATE_TIMEOUT_SECONDS must be a positive integer' >&2
+		exit 2
+	}
+	cleanup_grace=${CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS:-180}
+	command_grace=${CHRONICLE_TIMEOUT_GRACE_SECONDS:-5}
+	[[ $cleanup_grace =~ ^[1-9][0-9]*$ ]] || {
+		printf '%s\n' 'CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS must be a positive integer' >&2
+		exit 2
+	}
+	timeout_env=(CHRONICLE_ACCEPTANCE_GATE_WRAPPED=1 CHRONICLE_TIMEOUT_LAYER=acceptance_gate CHRONICLE_TIMEOUT_NAME=p1 CHRONICLE_TIMEOUT_GRACE_SECONDS="$cleanup_grace")
+	if [[ -n ${CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT:-} ]]; then
+		timeout_env+=(
+			CHRONICLE_TIMEOUT_EVIDENCE_FILE="$CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT/gate-timeout.json"
+			CHRONICLE_TIMEOUT_PHASE_FILE="$CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT/current-phase.txt"
+		)
+	fi
+	exec env "${timeout_env[@]}" "$ROOT/scripts/run-with-timeout.sh" "$gate_timeout" env CHRONICLE_TIMEOUT_GRACE_SECONDS="$command_grace" bash "$0" "$@"
+fi
 # shellcheck source=scripts/lib/common.sh
 source "$ROOT/scripts/lib/common.sh"
 # shellcheck source=scripts/lib/env.sh
@@ -118,6 +139,7 @@ skip() {
 
 phase() {
 	CURRENT_PHASE="$1/$TOTAL_PHASES"
+	printf '%s\n' "$CURRENT_PHASE" >"$ARTIFACT_ROOT/current-phase.txt"
 	log "[$1/$TOTAL_PHASES] $2"
 }
 
@@ -283,6 +305,7 @@ cleanup_resources() {
 on_exit() {
 	local status=$?
 	set +e
+	declare -F stop_scenario_watchdog >/dev/null && stop_scenario_watchdog
 	local cleanup_status=0
 	cleanup_resources || cleanup_status=$?
 	END_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf '%s' 'not_checked')
@@ -299,6 +322,7 @@ on_exit() {
 		fi
 	fi
 	write_summary "$status"
+	declare -F stop_scenario_watchdog >/dev/null && stop_scenario_watchdog true
 	exit "$status"
 }
 trap on_exit EXIT
@@ -319,6 +343,7 @@ SESSION_ROOT="$ARTIFACT_ROOT/sessions"
 SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
 COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
 : >"$COMMAND_LOG"
+printf '%s\n' "$CURRENT_PHASE" >"$ARTIFACT_ROOT/current-phase.txt"
 trap 'printf "%s\\n" "$BASH_COMMAND" >>"$COMMAND_LOG"' DEBUG
 TMP_DIR=$(mktemp -d)
 

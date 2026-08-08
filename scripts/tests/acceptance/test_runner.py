@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -86,7 +88,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             "CHRONICLE_ACCEPTANCE_SCENARIOS='replay,capture-basic,wal-recovery,resource-cleanup'\n"
             "run_scenario_plan p1\n"
         )
-        output = subprocess.check_output(["bash", str(command)], text=True)
+        output = subprocess.check_output(["bash", str(command)], text=True, timeout=10)
         actual = [
             line for line in output.splitlines() if not line.startswith("[scenario]")
         ]
@@ -100,10 +102,99 @@ class AcceptanceRunnerTests(unittest.TestCase):
             )
         )
         self.assertNotEqual(
-            subprocess.run(["bash", str(command)], check=False).returncode, 0
+            subprocess.run(["bash", str(command)], check=False, timeout=10).returncode,
+            0,
         )
 
+    def test_dispatcher_bounds_scenarios_and_runs_cleanup(self):
+        sandbox = self.temp / "scenario-timeout"
+        scenario_root = sandbox / "scripts/acceptance/lib/scenarios/p1"
+        scenario_root.mkdir(parents=True)
+        shutil.copy2(
+            ROOT / "scripts/acceptance/lib/scenario-dispatch.sh",
+            sandbox / "dispatcher.sh",
+        )
+        (scenario_root / "hang.sh").write_text(
+            "scenario_p1_hang() { case $SCENARIO_TEST_MODE in "
+            "pass) return 0 ;; fail) return 9 ;; "
+            'hang) sh -c \'trap "" TERM; echo $$ >"$1"; '
+            'while :; do sleep 1; done\' sh "$ARTIFACT_ROOT/child.pid" ;; '
+            "esac; }\n"
+        )
+        command = sandbox / "run.sh"
+        artifact = sandbox / "artifacts"
+        command.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"ROOT={sandbox}\n"
+            f"TIMEOUT={ROOT / 'scripts/run-with-timeout.sh'}\n"
+            f"ARTIFACT_ROOT={artifact}\n"
+            'mkdir -p "$ARTIFACT_ROOT"\n'
+            "cleanup() { if [[ -f \"$ARTIFACT_ROOT/scenario-timeout.json\" ]]; then sleep 2; fi; "
+            "printf cleaned >\"$ARTIFACT_ROOT/cleanup.txt\"; "
+            "printf report >\"$ARTIFACT_ROOT/cleanup-report.txt\"; }\n"
+            "trap cleanup EXIT\n"
+            f"source {sandbox}/dispatcher.sh\n"
+            "die() { exit 1; }\n"
+            "CHRONICLE_ACCEPTANCE_SCENARIOS=hang\n"
+            "run_scenario_plan p1\n"
+        )
+        wrapper = ROOT / "scripts/run-with-timeout.sh"
+        for mode, expected in (("pass", 0), ("fail", 9)):
+            shutil.rmtree(artifact, ignore_errors=True)
+            env = {**os.environ, "SCENARIO_TEST_MODE": mode}
+            result = subprocess.run(
+                [str(wrapper), "10", "bash", str(command)],
+                env=env,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(result.returncode, expected)
+            self.assertTrue((artifact / "cleanup.txt").is_file())
+        shutil.rmtree(artifact, ignore_errors=True)
+        env = {
+            **os.environ,
+            "SCENARIO_TEST_MODE": "hang",
+            "CHRONICLE_ACCEPTANCE_SCENARIO_TIMEOUT_SECONDS": "1",
+            "CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS": "6",
+            "CHRONICLE_TIMEOUT_GRACE_SECONDS": "1",
+        }
+        started = time.monotonic()
+        result = subprocess.run(
+            [str(wrapper), "10", "bash", str(command)],
+            env=env,
+            check=False,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 124)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertTrue((artifact / "cleanup.txt").is_file())
+        self.assertTrue((artifact / "cleanup-report.txt").is_file())
+        timeout = self._read_report(artifact / "scenario-timeout.json")
+        self.assertEqual(timeout["scenario"], "hang")
+        self.assertEqual(timeout["timeout_layer"], "scenario")
+        self.assertEqual(timeout["phase"], "scenario:p1/hang")
+        child = int((artifact / "child.pid").read_text())
+        for _ in range(30):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f"scenario child {child} survived TERM/KILL escalation")
+
     def test_dispatch_order_and_implementations_are_complete(self):
+        self.assertEqual(
+            self.definition["scenarios"]["capture-basic"]["timeout_seconds"], 900
+        )
+        self.assertEqual(
+            self.definition["scenarios"]["quota-pressure"]["timeout_seconds"], 600
+        )
+        self.assertEqual(
+            self.definition["scenarios"]["checkpoint-kill-restart"]["timeout_seconds"],
+            300,
+        )
         for profile in ("p1", "p2"):
             selected = report.profile_scenarios(self.definition, profile)
             ordered = report.dispatch_scenarios(self.definition, profile)
@@ -133,9 +224,38 @@ class AcceptanceRunnerTests(unittest.TestCase):
         multipass = (ROOT / "scripts/acceptance/lib/multipass.sh").read_text()
         self.assertNotIn("run_remote p1", multipass.split("else", 1)[1])
         self.assertIn('status = value.get("status", "not_checked")', multipass)
+        self.assertIn("GUEST_GATE_TIMEOUT", multipass)
+        self.assertIn("MULTIPASS_REMOTE_TIMEOUT < HOST_PROFILE_TIMEOUT", multipass)
+        self.assertIn("scripts/run-with-timeout.sh", multipass)
+        self.assertIn("gate-timeout.json", multipass)
+        self.assertIn("/proc/sys/kernel/random/boot_id", multipass)
+        self.assertIn("reboot-boot-ids.json", multipass)
+        self.assertIn("GUEST_GATE_TIMEOUT + ACCEPTANCE_CLEANUP_GRACE", multipass)
         self.assertNotIn(
             "p1_artifact_root", (ROOT / "scripts/acceptance/runner.py").read_text()
         )
+
+    def test_p2_profile_owns_failure_cleanup_resources(self):
+        profile = (ROOT / "scripts/acceptance/lib/profile-p2.sh").read_text()
+        for contract in (
+            'QUOTA_UNIT=""',
+            'QUOTA_CGROUP=""',
+            'QUOTA_MOUNT=""',
+            'stop_managed_unit "$QUOTA_UNIT"',
+            'stop_managed_unit "$UNIT"',
+            "--kill-who=all",
+            'stop_process "$UPSTREAM_PID"',
+            'mountpoint -q "$QUOTA_MOUNT"',
+            'losetup -j "$QUOTA_IMAGE"',
+            'CURRENT_PHASE="cleanup_failed"',
+            "active-units.txt",
+        ):
+            self.assertIn(contract, profile)
+        reboot = (
+            ROOT / "scripts/acceptance/lib/scenarios/p2/reboot-recovery.sh"
+        ).read_text()
+        self.assertIn("pre-reboot-handoff.txt", reboot)
+        self.assertIn('wait_for_unit_inactive "$UNIT"', reboot)
 
     def test_all_deduplicates_to_p2_superset(self):
         with mock.patch.object(runner, "run_profile", return_value=0) as run:
@@ -149,6 +269,120 @@ class AcceptanceRunnerTests(unittest.TestCase):
         )
         self.assertEqual(args.executor, "multipass")
         self.assertTrue(args.no_reuse)
+        self.assertEqual(args.gate_timeout_seconds, 3600)
+        with self.assertRaises(SystemExit):
+            runner.parser().parse_args(
+                ["--profile", "p1", "--gate-timeout-seconds", "0"]
+            )
+
+    def test_gate_command_has_outer_timeout_and_evidence(self):
+        evidence = self.temp / "gate-timeout.json"
+        phase = self.temp / "current-phase.txt"
+        phase.write_text("checkpoint_crash_matrix\n")
+        diagnostic = self.temp / "process-list.txt"
+        diagnostic.write_text("pid state\n")
+        env = {
+            **os.environ,
+            "CHRONICLE_TIMEOUT_EVIDENCE_FILE": str(evidence),
+            "CHRONICLE_TIMEOUT_PHASE_FILE": str(phase),
+            "CHRONICLE_TIMEOUT_DIAGNOSTICS": "process-list.txt:missing.log",
+            "CHRONICLE_TIMEOUT_LAYER": "acceptance_gate",
+            "CHRONICLE_TIMEOUT_NAME": "p2",
+        }
+        command = runner.bounded_profile_command(["sh", "-c", "sleep 30"], 1)
+        result = subprocess.run(command, env=env, check=False, timeout=5)
+        self.assertEqual(result.returncode, 124)
+        value = self._read_report(evidence)
+        self.assertEqual(value["timeout_layer"], "acceptance_gate")
+        self.assertEqual(value["configured_timeout_seconds"], 1)
+        self.assertEqual(value["phase"], "checkpoint_crash_matrix")
+        self.assertEqual(value["diagnostics"], ["process-list.txt"])
+
+    def test_runner_timeout_finishes_central_report_and_manifest(self):
+        sandbox = self.temp / "runner-timeout"
+        profile = sandbox / "scripts/acceptance/lib/profile-p1.sh"
+        profile.parent.mkdir(parents=True)
+        profile.write_text("#!/usr/bin/env bash\nexec sleep 30\n")
+        wrapper = sandbox / "scripts/run-with-timeout.sh"
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / "scripts/run-with-timeout.sh", wrapper)
+        args = runner.parser().parse_args(
+            [
+                "--profile",
+                "p1",
+                "--executor",
+                "local",
+                "--no-reuse",
+                "--gate-timeout-seconds",
+                "1",
+                "--evidence-root",
+                str(self.temp / "timeout-evidence"),
+            ]
+        )
+        with (
+            mock.patch.object(runner, "ROOT", sandbox),
+            mock.patch.object(
+                runner,
+                "source_fingerprint",
+                return_value=("fp-a", {"fingerprint": "fp-a"}),
+            ),
+            mock.patch.object(
+                runner, "collect_environment", return_value=self.environment
+            ),
+            mock.patch.object(report, "source_provenance", return_value=self.source),
+        ):
+            self.assertEqual(runner.run_profile(args, "p1", self.definition), 124)
+        report_path = next(
+            (self.temp / "timeout-evidence").glob("p1/fp-a/*/acceptance-report.json")
+        )
+        value = self._read_report(report_path)
+        self.assertEqual(value["status"], "failed")
+        self.assertEqual(value["timeouts"][0]["timeout_layer"], "acceptance_gate")
+        self.assertTrue((report_path.parent / "artifact-manifest.sha256").is_file())
+        self.assertTrue(report.verify_manifest(report_path.parent))
+        entrypoint = (ROOT / "scripts/acceptance.sh").read_text()
+        self.assertNotIn("run-with-timeout.sh", entrypoint)
+        self.assertIn("acceptance/runner.py", entrypoint)
+
+    def test_timeout_records_fail_report_and_reuse(self):
+        runtime = self.temp / "runtime"
+        runtime.mkdir()
+        (runtime / "scenario-timeout.json").write_text(
+            json.dumps({"timeout_layer": "scenario", "scenario": "hang"})
+        )
+        timeouts = report.timeout_records(runtime)
+        self.assertEqual(timeouts[0]["scenario"], "hang")
+        value = report.make_report(
+            run_id="timeout",
+            profile="p1",
+            executor="local",
+            selected=["hang"],
+            completed=["hang"],
+            failed=[],
+            skipped=[],
+            not_checked=[],
+            phases=[{"name": "run", "status": "passed"}],
+            source=self.source,
+            environment_value=self.environment,
+            return_code=124,
+            timeouts=timeouts,
+        )
+        self.assertEqual(value["status"], "failed")
+        root = self.temp / "timeout-evidence"
+        root.mkdir()
+        report.write_report(root / "acceptance-report.json", value)
+        report.write_manifest(root)
+        self.assertFalse(
+            report.report_is_compatible(
+                value,
+                fingerprint="fp-a",
+                required=["hang"],
+                environment_value=self.environment,
+                release=False,
+                source=self.source,
+                root=root,
+            )
+        )
 
     def test_multipass_environment_timeout_does_not_fallback_to_host(self):
         with mock.patch.object(
@@ -493,6 +727,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         for name in (
             "scripts/acceptance.sh",
             "scripts/acceptance/runner.py",
+            "scripts/run-with-timeout.sh",
             "crates/chronicle-etl/src/lib.rs",
         ):
             path = self.temp / name
@@ -510,7 +745,9 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 self.temp, "p1", cfg, profile="p1", executor="local"
             )["fingerprint"],
         )
-        (self.temp / "scripts/acceptance/runner.py").write_text("source changed\n")
+        (self.temp / "scripts/run-with-timeout.sh").write_text(
+            "timeout contract changed\n"
+        )
         self.assertNotEqual(
             first,
             validation.fingerprint(

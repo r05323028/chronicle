@@ -9,10 +9,7 @@ scenario_p2_retention_interruption() {
 	CLEANUP_READY_FILE="${CLEANUP_PAUSE_FILE%.*}.ready"
 	rm -f "$CLEANUP_PAUSE_FILE" "$CLEANUP_READY_FILE"
 	systemctl stop "$UNIT" 2>/dev/null || true
-	for _ in $(seq 1 50); do
-		systemctl is-active --quiet "$UNIT" || break
-		sleep 0.1
-	done
+	wait_for_unit_inactive "$UNIT" 5
 	systemctl reset-failed "$UNIT" 2>/dev/null || true
 	cat >"$CONFIG" <<EOF
 version = 1
@@ -113,10 +110,7 @@ PY
 	# Graceful systemd stop runs the production shutdown path; cleanup pauses
 	# at the first proof-eligible segment and signals readiness.
 	systemctl stop --no-block "$UNIT"
-	for _ in $(seq 1 200); do
-		[[ -f "$CLEANUP_READY_FILE" ]] && break
-		sleep 0.25
-	done
+	wait_for_path "$CLEANUP_READY_FILE" 50 || true
 	CLEANUP_PID=$(systemctl show "$UNIT" -p ExecMainPID --value)
 	{
 		echo "cleanup_interrupt state: ready=$([[ -f "$CLEANUP_READY_FILE" ]] && echo yes || echo no)"
@@ -213,11 +207,7 @@ PY
 
 	phase cleanup_restart 'stop cleanly and prove restart consistency'
 	systemctl stop "$UNIT" 2>/dev/null || true
-	for _ in $(seq 1 120); do
-		systemctl is-active --quiet "$UNIT" || break
-		sleep 0.1
-	done
-	if systemctl is-active --quiet "$UNIT"; then
+	if ! wait_for_unit_stopped "$UNIT" 12; then
 		echo 'recorder did not stop for clean cleanup' >&2
 		exit 1
 	fi
