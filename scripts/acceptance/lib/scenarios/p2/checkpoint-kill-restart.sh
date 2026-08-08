@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: checkpoint-kill-restart.
 scenario_p2_checkpoint_kill_restart() {
-phase checkpoint_crash_matrix 'exercise production publication crash boundaries'
-rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
-: >"$CHECKPOINT_PAUSE_FILE"
-# The workload must run inside the recorder's capture cgroup so the
-# checkpoint publication pauses deterministically; uncaptured traffic
-# leaves the worker with no new committed data to publish.
-printf '%s\n' "$$" >"$CGROUP/cgroup.procs" 2>/dev/null || true
-# A body >= GROUP_COMMIT_BYTES forces the WAL group commit inside the
-# append path, so the checkpoint publish pauses deterministically;
-# tiny traffic would sit uncommitted until the next age-expired append
-# and the pause would never fire.
-python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" --body-bytes 4194304 >"$ARTIFACT_ROOT/checkpoint-crash-workload.json"
-# Leave the capture cgroup: the restart's cgroup sweep would otherwise
-# signal this scenario shell while the recorder converges.
-printf '%s\n' "$$" >/sys/fs/cgroup/cgroup.procs 2>/dev/null || true
-wait_for_path "$CHECKPOINT_READY_FILE" 30
+	phase checkpoint_crash_matrix 'exercise production publication crash boundaries'
+	rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
+	: >"$CHECKPOINT_PAUSE_FILE"
+	# The workload must run inside the recorder's capture cgroup so the
+	# checkpoint publication pauses deterministically; uncaptured traffic
+	# leaves the worker with no new committed data to publish.
+	printf '%s\n' "$$" >"$CGROUP/cgroup.procs" 2>/dev/null || true
+	# A body >= GROUP_COMMIT_BYTES forces the WAL group commit inside the
+	# append path, so the checkpoint publish pauses deterministically;
+	# tiny traffic would sit uncommitted until the next age-expired append
+	# and the pause would never fire.
+	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" --body-bytes 4194304 >"$ARTIFACT_ROOT/checkpoint-crash-workload.json"
+	# Leave the capture cgroup: the restart's cgroup sweep would otherwise
+	# signal this scenario shell while the recorder converges.
+	printf '%s\n' "$$" >/sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+	wait_for_path "$CHECKPOINT_READY_FILE" 30
 	PENDING_FILES=()
 	while IFS= read -r -d '' pending; do
 		PENDING_FILES+=("$pending")
