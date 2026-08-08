@@ -1,5 +1,7 @@
 //! Application services and configuration. CLI remains an outer adapter.
 
+#[allow(unsafe_code)] // bootstrap credential hardening uses raw descriptor and sigaction syscalls
+mod bootstrap;
 mod cgroup_selection;
 mod continuous_recorder;
 mod data_dir;
@@ -19,6 +21,7 @@ mod recording_catalog;
 mod rollover_transition;
 mod supervised_scope;
 
+pub use bootstrap::{BOOTSTRAP_FAILURE_EXIT, run_bootstrap};
 pub use cgroup_selection::{
     CgroupSelection, CgroupSelectionError, CgroupSelector, PidCgroupSelection,
     preflight_cgroup_selection, preflight_pid_cgroup_selection,

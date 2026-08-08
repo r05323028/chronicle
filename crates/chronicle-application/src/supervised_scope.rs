@@ -460,7 +460,6 @@ pub fn open_scope(path: &Path) -> Result<SupervisedScope, ScopeError> {
 /// [`preflight_scope_access`].
 #[cfg(target_os = "linux")]
 pub fn discover_delegated_root(uid: u32) -> Result<(PathBuf, PathBuf), ScopeError> {
-    use std::os::unix::fs::MetadataExt;
     let hierarchy = PathBuf::from("/sys/fs/cgroup");
     if !hierarchy.is_dir() {
         return Err(ScopeError::NotV2);

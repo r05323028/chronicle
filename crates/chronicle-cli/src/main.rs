@@ -97,6 +97,16 @@ enum InternalCommand {
         #[arg(long)]
         root: PathBuf,
     },
+    /// Hidden bootstrap for command-mode record/replay: blocks on the
+    /// readiness pipe (fd 3), hardens credentials, and execs the target.
+    Bootstrap {
+        #[arg(long, hide = true)]
+        uid: u32,
+        #[arg(long, hide = true)]
+        gid: u32,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -267,8 +277,60 @@ impl From<Timing> for TimingMode {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Entry point. The hidden bootstrap runs synchronously before the tokio
+/// runtime is initialized so that no runtime descriptor can collide with the
+/// readiness pipe on fixed fd 3.
+fn main() {
+    if is_bootstrap_invocation() {
+        let code = run_bootstrap_from_args();
+        std::process::exit(code);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(async_main());
+}
+
+fn is_bootstrap_invocation() -> bool {
+    std::env::args().nth(1).as_deref() == Some("internal")
+        && std::env::args().nth(2).as_deref() == Some("bootstrap")
+}
+
+fn run_bootstrap_from_args() -> i32 {
+    let args: Vec<String> = std::env::args().skip(3).collect();
+    let mut uid = None;
+    let mut gid = None;
+    let mut command = Vec::new();
+    let mut after_dashdash = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if !after_dashdash && argument == "--" {
+            after_dashdash = true;
+        } else if !after_dashdash && argument == "--uid" {
+            uid = args
+                .get(index + 1)
+                .and_then(|value| value.parse::<u32>().ok());
+            index += 1;
+        } else if !after_dashdash && argument == "--gid" {
+            gid = args
+                .get(index + 1)
+                .and_then(|value| value.parse::<u32>().ok());
+            index += 1;
+        } else {
+            command.push(argument.clone());
+        }
+        index += 1;
+    }
+    let (Some(uid), Some(gid)) = (uid, gid) else {
+        eprintln!("chronicle bootstrap: --uid and --gid are required");
+        return chronicle_application::BOOTSTRAP_FAILURE_EXIT;
+    };
+    chronicle_application::run_bootstrap(uid, gid, &command)
+}
+
+async fn async_main() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
@@ -549,6 +611,9 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
                 })?,
             };
             Ok((output, 0))
+        }
+        Command::Internal(InternalCommand::Bootstrap { .. }) => {
+            unreachable!("bootstrap is handled synchronously before the runtime")
         }
         Command::Record(args) => run_record(args, cli_data_dir.as_deref(), &config, format),
         Command::Replay(args) => run_replay(args, cli_data_dir.as_deref(), &config, format).await,

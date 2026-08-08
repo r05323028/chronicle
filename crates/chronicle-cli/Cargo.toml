@@ -31,6 +31,7 @@ uuid.workspace = true
 [dev-dependencies]
 chronicle-capture = { path = "../chronicle-capture" }
 chronicle-wal = { path = "../chronicle-wal" }
+rustix.workspace = true
 
 [lints]
 workspace = true

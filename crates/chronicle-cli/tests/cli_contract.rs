@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // pre_exec dup2 of the readiness pipe onto fd 3
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -609,4 +610,149 @@ fn new_surface_list_inspect_json_and_empty_state_contract() {
     std::fs::remove_dir_all(&empty_dir).ok();
     std::fs::remove_dir_all(&data_dir).ok();
     let _ = PathBuf::new();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bootstrap_blocks_until_ready_then_hardens_and_execs_target() {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
+
+    // A pipe becomes the readiness channel: read end is dup2'd onto fd 3 in
+    // the child; the parent writes the go byte after "attachment".
+    let mut pipe = os_pipe().expect("pipe");
+    let read_end = pipe.0;
+    let write_end = pipe.1;
+
+    let uid = std::fs::metadata("/proc/self").unwrap().uid();
+    let gid = std::fs::metadata("/proc/self").unwrap().gid();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chronicle"));
+    command.args([
+        "internal",
+        "bootstrap",
+        "--uid",
+        &uid.to_string(),
+        "--gid",
+        &gid.to_string(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "exit 42",
+    ]);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            // Place the readiness pipe read end on fixed fd 3 in the child.
+            // When it already IS fd 3, only clear CLOEXEC so it survives the
+            // bootstrap's exec of the chronicle binary. Both wrappers are
+            // forgotten on every path so no descriptor drops in the child.
+            use std::os::fd::FromRawFd;
+            let source = std::fs::File::from_raw_fd(read_end);
+            let mut target = std::os::fd::OwnedFd::from_raw_fd(3);
+            let result = if read_end == 3 {
+                rustix::io::fcntl_setfd(&target, rustix::io::FdFlags::empty())
+            } else {
+                rustix::io::dup2(&source, &mut target)
+            };
+            std::mem::forget(source);
+            std::mem::forget(target);
+            result.map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        });
+    }
+    let mut child = command.spawn().expect("spawn bootstrap");
+    // The bootstrap must be blocked: give it a moment, then confirm it has
+    // not exec'd (no exit yet) before releasing.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    if let Some(status) = child.try_wait().unwrap() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        panic!("bootstrap must block before readiness; exited {status:?} stderr: {stderr}");
+    }
+    // Release: capture attached, WAL durable.
+    use std::io::Write;
+    let mut write_end = unsafe { std::fs::File::from_raw_fd(write_end) };
+    write_end.write_all(b"G").expect("write go byte");
+    drop(write_end);
+    let status = child.wait().expect("wait bootstrap");
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    #[cfg(not(unix))]
+    let signal = None;
+    // The target (sh -c 'exit 42') exit code 42 is reported factually.
+    assert_eq!(
+        status.code(),
+        Some(42),
+        "target exit code must be reported; signal={signal:?} stderr={stderr:?}"
+    );
+
+    // Failure path: without the go byte, EOF aborts the bootstrap with the
+    // typed Chronicle failure code (never a synthesized 127).
+    let mut pipe = os_pipe().expect("pipe");
+    let read_end = pipe.0;
+    let write_end = pipe.1;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chronicle"));
+    command.args([
+        "internal",
+        "bootstrap",
+        "--uid",
+        &uid.to_string(),
+        "--gid",
+        &gid.to_string(),
+        "--",
+        "/bin/true",
+    ]);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            use std::os::fd::FromRawFd;
+            let source = std::fs::File::from_raw_fd(read_end);
+            let mut target = std::os::fd::OwnedFd::from_raw_fd(3);
+            let result = if read_end == 3 {
+                rustix::io::fcntl_setfd(&target, rustix::io::FdFlags::empty())
+            } else {
+                rustix::io::dup2(&source, &mut target)
+            };
+            std::mem::forget(source);
+            std::mem::forget(target);
+            result.map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        });
+    }
+    let mut child = command.spawn().expect("spawn bootstrap");
+    // Close the write end without sending a go byte: EOF must abort. The raw
+    // fd must be wrapped so dropping it actually closes the pipe.
+    let write_end = unsafe { std::fs::File::from_raw_fd(write_end) };
+    drop(write_end);
+    let status = child.wait().expect("wait bootstrap");
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "EOF before readiness is a typed failure"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn os_pipe() -> Option<(std::os::fd::RawFd, std::os::fd::RawFd)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // CLOEXEC so the child's exec of the bootstrap closes every inherited end
+    // except the dup2'd fd 3; otherwise the child would keep a write end open
+    // and the EOF-abort path could never fire.
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
+    // Leak the OwnedFds so the raw fds stay open for the child.
+    let read = std::mem::ManuallyDrop::new(read).as_raw_fd();
+    let write = std::mem::ManuallyDrop::new(write).as_raw_fd();
+    Some((read, write))
 }
