@@ -406,6 +406,98 @@ pub fn record_command(
     ))
 }
 
+/// `record --pid PID` / `record --cgroup PATH`: record an already-running
+/// workload through the existing `record_live_ebpf` path, then run the same
+/// internal WAL -> ETL -> publish -> catalog workflow as command mode while
+/// holding the exact data-domain lock for the whole transaction. The workload
+/// is never terminated.
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+pub fn record_selector(
+    selector: crate::CgroupSelector,
+    allow_shared_cgroup: bool,
+    options: CommandRecordOptions,
+) -> Result<CommandRecordResult, ApplicationError> {
+    use crate::recording_catalog::RecordingIntentV1;
+    use crate::{
+        ProductionRecordingBounds, RecordingMetadata, acquire_domain_lock, claim_recording_name,
+        ensure_private_data_dir, reconcile_catalog, record_live_ebpf, recordings_root,
+        save_catalog, write_recording_intent,
+    };
+    use time::OffsetDateTime;
+
+    ensure_private_data_dir(&options.data_dir)?;
+    let guard = acquire_domain_lock(&options.data_dir, options.domain_lock_root.as_deref())?;
+    let recording_id = RecordingId::new();
+    if let Some(name) = &options.name {
+        claim_recording_name(&guard, &options.data_dir, name)?;
+    }
+    let intent = RecordingIntentV1 {
+        version: 1,
+        recording_id,
+        name: options.name.clone(),
+        created_at: OffsetDateTime::now_utc(),
+    };
+    write_recording_intent(&guard, &options.data_dir, &intent)?;
+    {
+        let view = reconcile_catalog(&options.data_dir)?;
+        save_catalog(&options.data_dir, &view)?;
+    }
+    let wal_dir = recordings_root(&options.data_dir).join(recording_id.to_string());
+    let bounds = ProductionRecordingBounds {
+        duration_seconds: options.duration_seconds,
+        segment_bytes: crate::DEFAULT_SEGMENT_BYTES,
+        max_wal_bytes: 4 * 1024 * 1024 * 1024,
+    };
+    let result = record_live_ebpf(
+        selector,
+        allow_shared_cgroup,
+        &wal_dir,
+        bounds,
+        &options.stop,
+        recording_id,
+    )?;
+    finalize_and_publish(
+        &guard,
+        &options,
+        recording_id,
+        &RecordingMetadata {
+            version: crate::RECORDING_METADATA_SCHEMA_VERSION,
+            recording_id,
+            selector: None,
+            status: RecordingStatus::Completed,
+            shutdown_reason: None,
+            last_valid_commit: None,
+            counters: Default::default(),
+            terminal_wal_loss: None,
+            capture: None,
+        },
+        &None,
+        &crate::CleanupOutcome::Clean,
+    )?;
+    let _ = ();
+    Ok(CommandRecordResult {
+        recording_id,
+        name: options.name.clone(),
+        status: result.status,
+        shutdown_reason: Some(result.shutdown_reason),
+        child_exit: None,
+        cleanup: crate::CleanupOutcome::Clean,
+        duration_ms: 0,
+        committed_records: result.counters.committed.records,
+    })
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+pub fn record_selector(
+    _selector: crate::CgroupSelector,
+    _allow_shared_cgroup: bool,
+    _options: CommandRecordOptions,
+) -> Result<CommandRecordResult, ApplicationError> {
+    Err(ApplicationError::UnsupportedLivePreflight(
+        "record --pid/--cgroup requires the Linux eBPF build",
+    ))
+}
+
 /// Reap the bootstrap child (which exec'd the target): its exit status is the
 /// target's factual exit, reported but never forwarded.
 #[cfg_attr(

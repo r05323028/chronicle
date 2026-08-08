@@ -30,7 +30,7 @@ pub use cgroup_selection::{
 };
 pub use command_record::{
     COMMAND_RECORD_ATTACH_DEADLINE, COMMAND_RECORD_SCOPE_PREFIX, ChildStdio, CommandRecordOptions,
-    CommandRecordResult, record_command, retry_recording,
+    CommandRecordResult, record_command, record_selector, retry_recording,
 };
 pub use continuous_recorder::{ContinuousRecorderError, ContinuousRecorderService};
 pub use data_dir::{DataDirSource, ResolvedDataDir, ensure_private_data_dir, resolve_data_dir};
@@ -729,9 +729,15 @@ pub fn preflight_wal_destination(
 ) -> Result<ProductionWalPreflight, ApplicationError> {
     validate_production_recording_bounds(bounds)?;
     if wal_directory.exists() {
-        return Err(ApplicationError::ProductionPreflight(
-            "WAL destination already exists",
-        ));
+        // The caller may have created the directory for the private intent
+        // sidecar; only an existing WAL (metadata or segments) is a conflict.
+        let has_wal = wal_directory.join("recording.json").exists()
+            || wal_directory.join("segments").exists();
+        if has_wal {
+            return Err(ApplicationError::ProductionPreflight(
+                "WAL destination already exists",
+            ));
+        }
     }
     let parent = wal_directory
         .parent()
@@ -782,6 +788,8 @@ pub(crate) fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
 }
 
 /// Runs live eBPF recording. Signal adapters request stop through `stop`.
+/// `recording_id` is caller-allocated so orchestration can persist intent and
+/// catalog linkage before capture.
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 pub fn record_live_ebpf(
     selector: CgroupSelector,
@@ -789,6 +797,7 @@ pub fn record_live_ebpf(
     wal_directory: impl AsRef<Path>,
     bounds: ProductionRecordingBounds,
     stop: &ProductionSignalStop,
+    recording_id: RecordingId,
 ) -> Result<ProductionRecordingResult, ApplicationError> {
     preflight_wal_destination(wal_directory.as_ref(), bounds)?;
     preflight_embedded_ebpf()?;
@@ -813,7 +822,7 @@ pub fn record_live_ebpf(
     let capture_metadata = live_capture_metadata(&selection, bounds)?;
     let mut metadata = RecordingMetadata {
         version: RECORDING_METADATA_SCHEMA_VERSION,
-        recording_id: RecordingId::new(),
+        recording_id,
         selector: Some(RecordingSelectorIdentity {
             canonical_cgroup_path: selection.canonical_path.display().to_string(),
             cgroup_id: selection.cgroup_id,
@@ -7165,7 +7174,12 @@ mod tests {
             preflight_wal_destination(&wal, ProductionRecordingBounds::default()).unwrap();
         assert!(preflight.available_bytes > 0);
         assert!(!wal.exists());
+        // An existing dir without WAL artifacts (e.g. only the private intent
+        // sidecar) is not a conflict.
         std::fs::create_dir(&wal).unwrap();
+        assert!(preflight_wal_destination(&wal, ProductionRecordingBounds::default()).is_ok());
+        // An existing WAL (metadata or segments) is a conflict.
+        std::fs::write(wal.join("recording.json"), b"{}").unwrap();
         assert!(matches!(
             preflight_wal_destination(&wal, ProductionRecordingBounds::default()),
             Err(ApplicationError::ProductionPreflight(_))

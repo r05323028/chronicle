@@ -1,3 +1,5 @@
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+use chronicle_application::record_selector;
 use chronicle_application::{
     AppConfig, ApplicationError, REPLAY_REPORT_VERSION, RecorderConfigV1, RecorderLease,
     RecorderStatusV1, RecordingCounters, RecordingEtlCheckpoint, RecordingStatus, ShutdownReason,
@@ -722,7 +724,14 @@ fn record_ebpf_legacy(
     };
     let stop = ProductionSignalStop::default();
     spawn_signal_watcher(stop.clone(), wal_dir.clone());
-    let result = record_live_ebpf(selector, args.allow_shared_cgroup, &wal_dir, bounds, &stop)?;
+    let result = record_live_ebpf(
+        selector,
+        args.allow_shared_cgroup,
+        &wal_dir,
+        bounds,
+        &stop,
+        chronicle_common::RecordingId::new(),
+    )?;
     let metadata =
         load_recording_metadata(&wal_dir)?.ok_or(ApplicationError::RecordingMetadataValidation(
             "recording metadata missing after finalization".into(),
@@ -797,6 +806,7 @@ fn public_record(
         retry,
         pid,
         cgroup,
+        allow_shared_cgroup,
         ..
     } = args;
     let _ = (config, format, &name, &duration);
@@ -819,7 +829,14 @@ fn public_record(
         return Ok((output, 0));
     }
     if pid.is_some() || cgroup.is_some() {
-        return Err(ApplicationError::NotImplemented("record --pid/--cgroup"));
+        return record_selector_mode(
+            pid,
+            cgroup,
+            allow_shared_cgroup,
+            cli_data_dir,
+            config,
+            format,
+        );
     }
     if !command.is_empty() {
         return record_command_mode(command, name, duration, cli_data_dir, config, format);
@@ -874,6 +891,68 @@ fn record_command_mode(
     };
     let output = render_command_record(&result, format)?;
     Ok((output, code))
+}
+
+/// Selector mode: record an already-running workload by PID or cgroup path.
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn record_selector_mode(
+    pid: Option<u32>,
+    cgroup: Option<std::path::PathBuf>,
+    allow_shared_cgroup: bool,
+    cli_data_dir: Option<&Path>,
+    config: &AppConfig,
+    format: Format,
+) -> Result<(String, i32), ApplicationError> {
+    use rustix::process::{getegid, geteuid};
+    let selector = match (pid, cgroup) {
+        (Some(pid), None) => CgroupSelector::Pid(pid),
+        (None, Some(cgroup)) => CgroupSelector::Explicit(cgroup),
+        _ => {
+            return Err(ApplicationError::ProductionPreflight(
+                "select exactly one of --pid or --cgroup",
+            ));
+        }
+    };
+    let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
+    let stop = ProductionSignalStop::default();
+    spawn_command_signal_watcher(stop.clone());
+    let result = record_selector(
+        selector,
+        allow_shared_cgroup,
+        CommandRecordOptions {
+            command: vec!["selector".into()],
+            name: None,
+            duration_seconds: 600,
+            data_dir,
+            domain_lock_root: config.domain_lock_root.clone(),
+            child_stdout: ChildStdio::Null,
+            child_stderr: ChildStdio::Null,
+            invoking_uid: geteuid().as_raw(),
+            invoking_gid: getegid().as_raw(),
+            stop,
+        },
+    )?;
+    let code = if matches!(result.status, RecordingStatus::Completed) {
+        0
+    } else {
+        3
+    };
+    let output = render_command_record(&result, format)?;
+    Ok((output, code))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+fn record_selector_mode(
+    _pid: Option<u32>,
+    _cgroup: Option<std::path::PathBuf>,
+    _allow_shared_cgroup: bool,
+    _cli_data_dir: Option<&Path>,
+    _config: &AppConfig,
+    _format: Format,
+) -> Result<(String, i32), ApplicationError> {
+    Err(ApplicationError::UnsupportedLivePreflight(
+        "record --pid/--cgroup requires the Linux eBPF build",
+    ))
 }
 
 #[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
