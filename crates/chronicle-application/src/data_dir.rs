@@ -229,13 +229,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_default_falls_back_to_local_share() {
+        let root = temp_root();
         let mut with_home = FakeEnv::new();
-        with_home.home = Some(temp_root().join("home"));
+        with_home.home = Some(root.join("home"));
         let resolved = resolve_with(&with_home, None, None).expect("resolves default from home");
-        assert_eq!(
-            resolved.path,
-            temp_root().join("home/.local/share/chronicle")
-        );
+        assert_eq!(resolved.path, root.join("home/.local/share/chronicle"));
         // No home and no XDG: no default candidate exists, so resolution is
         // a typed unsupported error rather than a guess.
         let env = FakeEnv::new();

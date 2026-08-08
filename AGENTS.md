@@ -1,3 +1,19 @@
+## Chronicle philosophy
+
+Chronicle turns production behavior into reliable, replayable regression tests with minimal production cost.
+
+When making design decisions, prefer:
+
+1. **Low production overhead** — avoid unnecessary capture, processing, storage, and dependencies.
+2. **Stable tests over exact recordings** — normalize dynamic values, preserve causal behavior, and minimize flaky replay.
+3. **Simple replay** — users operate on applications and recordings, not WALs, ETL stages, cgroups, or storage internals.
+4. **Behavior over traffic volume** — retain representative behaviors instead of turning every production interaction into a test.
+5. **Reliability first** — WAL durability, recovery, loss accounting, deterministic behavior, and explicit safety boundaries must not be weakened for convenience.
+6. **Portable artifacts** — canonical tests should avoid unnecessary dependence on production hosts, ports, timing, and infrastructure.
+7. **Deterministic core** — heuristics or LLMs may assist classification or suggestions, but correctness must not depend on them.
+
+Prefer the smallest design that preserves these properties.
+
 <!-- CODEGRAPH_START -->
 ## CodeGraph
 

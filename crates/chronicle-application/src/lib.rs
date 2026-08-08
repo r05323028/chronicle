@@ -17,6 +17,7 @@ mod recorder_startup;
 mod recorder_status;
 mod recording_catalog;
 mod rollover_transition;
+mod supervised_scope;
 
 pub use cgroup_selection::{
     CgroupSelection, CgroupSelectionError, CgroupSelector, PidCgroupSelection,
@@ -84,6 +85,11 @@ pub use rollover_transition::{
     ROLLOVER_TRANSITION_FILE, ROLLOVER_TRANSITION_SCHEMA_VERSION, RolloverTransitionError,
     RolloverTransitionPhase, RolloverTransitionV1, load_transition, remove_transition,
     write_transition_atomic,
+};
+pub use supervised_scope::{
+    CleanupOutcome, RealClock, SCOPE_CLEANUP_ABSOLUTE, SCOPE_KILL_WAIT, SCOPE_POLL_INTERVAL,
+    SCOPE_TERM_GRACE, ScopeClock, ScopeError, ScopeIdentity, SupervisedScope,
+    create_supervised_scope, discover_delegated_root, open_scope, preflight_scope_access,
 };
 
 use chronicle_canonical::{
@@ -818,6 +824,7 @@ pub fn record_live_ebpf(
         || load_production_ebpf_source(&selection, pid_baseline.as_ref()),
         monotonic_millis,
         || stop.shutdown_reason(),
+        || Ok(()),
     )
 }
 
@@ -2955,6 +2962,8 @@ pub enum ApplicationError {
     UnsupportedDomainLock,
     #[error("domain lock path is unsafe")]
     DomainLockUnsafePath,
+    #[error("unsupported live supervised scope: {0}")]
+    UnsupportedLivePreflight(&'static str),
     #[error(
         "incompatible domain lock mapping: data directory {data_dir} and lock root {lock_root} resolve different lock paths on the same filesystem; multiple differently locked Chronicle domains on one filesystem are unsupported"
     )]
@@ -3028,8 +3037,10 @@ impl RecordingIngestResult {
 
 /// Drives one already-preflighted production source through bounded WAL persistence.
 /// `requested_stop` supplies source completion or future signal handling; duration is enforced here.
+/// `on_ready` fires once capture is attached and the WAL writer is durable, before the
+/// poll loop: command-mode orchestration releases the bootstrap child there.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub fn record_production<S, Build, Now, Stop>(
+pub fn record_production<S, Build, Now, Stop, Ready>(
     wal_directory: impl AsRef<Path>,
     metadata: &mut RecordingMetadata,
     capture_metadata: RecordingCaptureMetadata,
@@ -3037,12 +3048,14 @@ pub fn record_production<S, Build, Now, Stop>(
     build_source: Build,
     mut now_millis: Now,
     mut requested_stop: Stop,
+    on_ready: Ready,
 ) -> Result<ProductionRecordingResult, ApplicationError>
 where
     S: CaptureSource,
     Build: FnOnce() -> Result<S, ApplicationError>,
     Now: FnMut() -> u64,
     Stop: FnMut() -> Option<ShutdownReason>,
+    Ready: FnOnce() -> Result<(), ApplicationError>,
 {
     validate_production_recording_bounds(bounds)?;
     if metadata.status != RecordingStatus::Starting || metadata.shutdown_reason.is_some() {
@@ -3099,6 +3112,19 @@ where
         }
     };
     let mut ingest = RecordingIngest::new(writer);
+    // Capture is attached and the WAL writer is durable: release the
+    // bootstrap/target now. A failure here (e.g. the readiness pipe died) is a
+    // Chronicle launch failure, not a child exit.
+    if let Err(error) = on_ready() {
+        let _ = shutdown_source_without_wal(&mut source);
+        return persist_live_failure(
+            wal_directory,
+            metadata,
+            RecordingCaptureErrorCode::Attach,
+            ShutdownReason::CaptureFailure,
+            error,
+        );
+    }
     let mut capture_failed = false;
     let mut wal_failed = false;
     let mut requested_reason = loop {
@@ -6555,6 +6581,7 @@ mod tests {
                 stop_checks.set(checks + 1);
                 (checks == 1).then_some(ShutdownReason::SourceCompleted)
             },
+            || Ok(()),
         )
         .unwrap();
 
@@ -6597,6 +6624,7 @@ mod tests {
                 stop_checks.set(checks + 1);
                 (checks == 1).then_some(ShutdownReason::SourceCompleted)
             },
+            || Ok(()),
         )
         .unwrap();
         let suffix = chronicle_wal::WalRecordEnvelope::unplaced(
@@ -6861,6 +6889,7 @@ mod tests {
                 checks.set(count + 1);
                 (count == 1).then_some(ShutdownReason::SourceCompleted)
             },
+            || Ok(()),
         )
         .unwrap();
 
@@ -6942,6 +6971,7 @@ mod tests {
             },
             || 1,
             || None,
+            || Ok(()),
         )
         .unwrap();
 
@@ -6993,6 +7023,83 @@ mod tests {
             invalid.transition_to_recording(capture),
             Err(ApplicationError::RecordingMetadataValidation(_))
         ));
+    }
+
+    #[test]
+    fn record_production_on_ready_fires_once_after_writer_ready() {
+        use chronicle_capture::InMemoryCaptureSource;
+        use std::cell::Cell;
+
+        let directory = ingest_directory("production-on-ready");
+        let mut metadata = recording_metadata(RecordingStatus::Starting);
+        let events = test_capture_events(b"ready".to_vec());
+        let ready_checks = Cell::new(0_u8);
+        let recorded = record_production(
+            &directory,
+            &mut metadata,
+            capture_metadata(),
+            ProductionRecordingBounds {
+                duration_seconds: 60,
+                segment_bytes: MIN_SEGMENT_BYTES,
+                max_wal_bytes: MIN_SEGMENT_BYTES,
+            },
+            || Ok(InMemoryCaptureSource::new(events)),
+            || 1,
+            || Some(ShutdownReason::SourceCompleted),
+            || {
+                // The WAL writer must already be durable when the hook fires:
+                // the metadata must have transitioned to recording and a
+                // recording.json must exist.
+                let persisted = load_recording_metadata(&directory).unwrap().unwrap();
+                assert_eq!(persisted.status, RecordingStatus::Recording);
+                let checks = ready_checks.get();
+                ready_checks.set(checks + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(ready_checks.get(), 1);
+        assert_eq!(recorded.status, RecordingStatus::Completed);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn record_production_on_ready_failure_aborts_as_chronicle_failure() {
+        use chronicle_capture::InMemoryCaptureSource;
+        use std::cell::Cell;
+
+        let directory = ingest_directory("production-on-ready-failure");
+        let mut metadata = recording_metadata(RecordingStatus::Starting);
+        let events = test_capture_events(b"never-run".to_vec());
+        let ready_checks = Cell::new(0_u8);
+        let err = record_production(
+            &directory,
+            &mut metadata,
+            capture_metadata(),
+            ProductionRecordingBounds {
+                duration_seconds: 60,
+                segment_bytes: MIN_SEGMENT_BYTES,
+                max_wal_bytes: MIN_SEGMENT_BYTES,
+            },
+            || Ok(InMemoryCaptureSource::new(events)),
+            || 1,
+            || Some(ShutdownReason::SourceCompleted),
+            || {
+                ready_checks.set(ready_checks.get() + 1);
+                Err(ApplicationError::ProductionPreflight("readiness pipe died"))
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("readiness pipe died"));
+        assert_eq!(ready_checks.get(), 1);
+        // The recording is finalized as failed, never Completed.
+        let persisted = load_recording_metadata(&directory).unwrap().unwrap();
+        assert_eq!(persisted.status, RecordingStatus::Failed);
+        assert_eq!(
+            persisted.shutdown_reason,
+            Some(ShutdownReason::CaptureFailure)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

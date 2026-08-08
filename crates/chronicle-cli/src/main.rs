@@ -1042,7 +1042,8 @@ fn replay_exit_code(result: &chronicle_application::ReplaySessionResult) -> i32 
 fn error_code(error: &ApplicationError) -> i32 {
     match error {
         ApplicationError::InvalidRecordingName(_, _) => 2,
-        ApplicationError::ReplayTarget(_)
+        ApplicationError::UnsupportedLivePreflight(_)
+        | ApplicationError::ReplayTarget(_)
         | ApplicationError::Replay(ReplayError::PreflightDenied) => 4,
         ApplicationError::Protocol(ProtocolError::Transport { .. })
         | ApplicationError::Replay(ReplayError::Protocol(ProtocolError::Transport {
