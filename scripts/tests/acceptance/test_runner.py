@@ -453,6 +453,57 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertFalse(value["release_eligible"])
         self.assertFalse(value["source"]["stable"])
 
+    def test_fingerprint_mutation_during_fresh_release_run_fails(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        args = runner.parser().parse_args(
+            [
+                "--profile",
+                "p1",
+                "--executor",
+                "local",
+                "--release",
+                "--no-reuse",
+                "--evidence-root",
+                str(self.temp / "fingerprint-mutation-evidence"),
+            ]
+        )
+        with (
+            mock.patch.object(
+                runner,
+                "source_fingerprint",
+                side_effect=[
+                    ("fp-a", {"fingerprint": "fp-a"}),
+                    ("fp-b", {"fingerprint": "fp-b"}),
+                ],
+            ),
+            mock.patch.object(
+                runner, "collect_environment", return_value=self.environment
+            ),
+            mock.patch.object(
+                runner.subprocess, "run", return_value=mock.Mock(returncode=0)
+            ),
+            mock.patch.object(
+                runner.report,
+                "normalize_legacy_report",
+                return_value=("passed", selected, [], []),
+            ),
+            mock.patch.object(
+                runner.report,
+                "source_provenance",
+                side_effect=[self.source, self.source],
+            ),
+        ):
+            self.assertEqual(runner.run_profile(args, "p1", self.definition), 1)
+        report_path = next(
+            (self.temp / "fingerprint-mutation-evidence").glob(
+                "p1/fp-a/*/acceptance-report.json"
+            )
+        )
+        value = self._read_report(report_path)
+        self.assertEqual(value["status"], "failed")
+        self.assertFalse(value["release_eligible"])
+        self.assertFalse(value["source"]["stable"])
+
     def test_report_completeness_and_release_identity(self):
         selected = report.profile_scenarios(self.definition, "p1")
         value = report.make_report(
@@ -543,7 +594,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             )
         )
 
-    def test_release_reuses_equivalent_content_across_commit_sha(self):
+    def test_dirty_historical_evidence_reuses_across_commit_sha(self):
         selected = report.profile_scenarios(self.definition, "p1")
         evidence_source = {**self.source, "working_tree_dirty": True}
         root = self._write_evidence("p1", selected, selected, source=evidence_source)
@@ -562,6 +613,17 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 environment_value=self.environment,
                 release=True,
                 source=current_source,
+                root=root,
+            )
+        )
+        self.assertTrue(
+            report.report_is_compatible(
+                candidate,
+                fingerprint="fp-a",
+                required=selected,
+                environment_value=self.environment,
+                release=False,
+                source={**current_source, "working_tree_dirty": True},
                 root=root,
             )
         )
@@ -585,7 +647,6 @@ class AcceptanceRunnerTests(unittest.TestCase):
             **self.source,
             "commit_sha": "commit-b",
             "tree_sha": "tree-b",
-            "working_tree_dirty": True,
         }
         with (
             mock.patch.object(
@@ -614,6 +675,12 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertTrue(receipt["reuse"]["reused"])
         self.assertTrue(receipt["release_eligible"])
         self.assertEqual(receipt["source"]["commit_sha"], "commit-b")
+        self.assertEqual(receipt["source"]["tree_sha"], "tree-b")
+        self.assertEqual(
+            receipt["reuse"]["from"],
+            str((self.temp / "evidence" / "p1" / "fp-a" / "run-a").resolve()),
+        )
+        self.assertTrue(receipt["reuse"]["origin"]["manifest_sha256"])
 
         mutated = {**current, "commit_sha": "commit-c", "tree_sha": "tree-c"}
         with (
@@ -635,6 +702,70 @@ class AcceptanceRunnerTests(unittest.TestCase):
             ),
         ):
             self.assertEqual(runner.run_profile(args, "p1", self.definition), 2)
+
+        with (
+            mock.patch.object(
+                runner,
+                "source_fingerprint",
+                side_effect=[
+                    ("fp-a", {"fingerprint": "fp-a"}),
+                    ("fp-b", {"fingerprint": "fp-b"}),
+                ],
+            ),
+            mock.patch.object(
+                runner, "collect_environment", return_value=self.environment
+            ),
+            mock.patch.object(
+                runner.report,
+                "source_provenance",
+                side_effect=[current, current],
+            ),
+        ):
+            self.assertEqual(runner.run_profile(args, "p1", self.definition), 2)
+
+    def test_release_run_rejects_dirty_current_source_before_reuse(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        self._write_evidence("p1", selected, selected)
+        args = runner.parser().parse_args(
+            [
+                "--profile",
+                "p1",
+                "--executor",
+                "local",
+                "--release",
+                "--evidence-root",
+                str(self.temp / "evidence"),
+            ]
+        )
+        dirty_current = {
+            **self.source,
+            "commit_sha": "commit-b",
+            "tree_sha": "tree-b",
+            "working_tree_dirty": True,
+        }
+        with (
+            mock.patch.object(
+                runner,
+                "source_fingerprint",
+                return_value=("fp-a", {"fingerprint": "fp-a"}),
+            ),
+            mock.patch.object(
+                runner, "collect_environment", return_value=self.environment
+            ) as collect_environment,
+            mock.patch.object(
+                runner.report, "source_provenance", return_value=dirty_current
+            ),
+        ):
+            self.assertEqual(runner.run_profile(args, "p1", self.definition), 2)
+        collect_environment.assert_not_called()
+        reports = [
+            self._read_report(path)
+            for path in (self.temp / "evidence").glob(
+                "p1/fp-a/*/acceptance-report.json"
+            )
+        ]
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(any(value["reuse"]["reused"] for value in reports))
 
     def test_empty_phase_evidence_cannot_pass_or_reuse(self):
         selected = report.profile_scenarios(self.definition, "p1")

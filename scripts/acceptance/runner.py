@@ -316,6 +316,14 @@ def run_profile(
     selected = report.profile_scenarios(definition, profile)
     fingerprint, fingerprint_payload = source_fingerprint(profile, args.executor)
     source_start = report.source_provenance(ROOT, fingerprint)
+    if args.release:
+        errors = release_source_errors(source_start)
+        if errors:
+            print(
+                f"release source validation failed: {', '.join(errors)}",
+                file=sys.stderr,
+            )
+            return 2
     try:
         environment_value = collect_environment(args.executor, args.vm)
     except RuntimeError as exc:
@@ -359,15 +367,6 @@ def run_profile(
                 candidate,
                 source_stable,
             )
-
-    if args.release:
-        errors = release_source_errors(source_start)
-        if errors:
-            print(
-                f"release source validation failed: {', '.join(errors)}",
-                file=sys.stderr,
-            )
-            return 2
 
     run_id = now_run_id()
     run_root = evidence_root / profile / fingerprint / run_id
@@ -514,8 +513,9 @@ def run_profile(
         completed = []
         not_checked = []
 
-    source_end = report.source_provenance(ROOT, fingerprint)
-    source_stable = source_start == source_end
+    end_fingerprint, _ = source_fingerprint(profile, args.executor)
+    source_end = report.source_provenance(ROOT, end_fingerprint)
+    source_stable = fingerprint == end_fingerprint and source_start == source_end
     source = {
         **source_start,
         "start": source_start,

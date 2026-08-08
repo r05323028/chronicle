@@ -14,7 +14,7 @@ Privileged evidence already has a deterministic source fingerprint, profile scen
 **Non-Goals:**
 
 - Remove Git provenance fields.
-- Permit dirty or mutated source to pass a newly executed release run.
+- Permit a dirty, unidentifiable, or mutated current checkout to pass any release request, whether evidence is reused or freshly executed.
 - Broaden supported privileged environments.
 - Run privileged gates when compatible retained evidence already proves them.
 
@@ -22,13 +22,13 @@ Privileged evidence already has a deterministic source fingerprint, profile scen
 
 1. **Commit SHA is metadata, not compatibility input.** Reuse and release eligibility use fingerprint, schema, required scenario set, environment compatibility, manifest integrity, required-check completion, and successful status. Alternative—accept equivalent Git tree SHA—still makes unrelated tracked content part of identity and duplicates fingerprint semantics.
 
-2. **Same-run integrity remains separate.** Fresh release execution captures start/end commit/tree/dirty state and fails when source changes during that run. Historical evidence may have another commit SHA. Alternative—drop all identity checks—would hide mutation during execution.
+2. **Current release candidate integrity remains separate.** Every release request validates a clean, known current commit/tree before reuse or execution, captures start/end identity, and fails when current source changes during the command. Historical evidence may have another commit or tree SHA and may record dirty origin provenance. Alternative—validate only fresh execution—would let a dirty checkout become release-eligible through reuse; alternative—compare historical identity—would restore commit-addressed semantics.
 
 3. **Reuse validation stays centralized.** Shared report/runner compatibility logic decides candidate validity; wrappers pass provenance but do not impose historical SHA equality. Alternative—special release checks in each shell profile—would recreate divergent rules.
 
 4. **Fingerprint contract is strengthened narrowly.** Fingerprint includes gate-owned Rust/eBPF source and build inputs, acceptance runner/scripts/scenario definitions, evidence schema/version behavior, Cargo/toolchain inputs, and validation configuration. Environment remains separately compared because compatible machines may differ in non-source metadata.
 
-5. **Release receipts reference origin evidence.** Reuse writes current-request receipt plus original evidence provenance and manifest digest. `release_eligible` means compatibility/completeness passed, not SHA equality.
+5. **Release receipts reference origin evidence.** Reuse writes current release candidate provenance plus original evidence location and manifest digest. `release_eligible` means current checkout integrity and historical compatibility/completeness passed, not SHA equality.
 
 ## Risks / Trade-offs
 

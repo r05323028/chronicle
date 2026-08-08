@@ -5,7 +5,7 @@ Chronicle currently retains fingerprinted privileged evidence but still uses exa
 ## What Changes
 
 - Make privileged evidence reuse and release eligibility depend on validation fingerprint, scenario contract, evidence schema, compatible environment, complete artifact manifest, and passed required checks.
-- Retain Git commit/tree, dirty state, and start/end identity as provenance and same-run integrity metadata without using historical commit equality as reuse identity.
+- Retain Git commit/tree, dirty state, and start/end identity as provenance and same-run integrity metadata without using historical commit equality as reuse identity; require every release request to start from a clean, identifiable current checkout and remain stable through validation.
 - Strengthen acceptance fingerprint inputs where needed so acceptance behavior, scenarios, schema, source/build inputs, and validation configuration remain content-addressed.
 - Add regression coverage for reuse across different/equivalent commits and rejection on material content, scenario, environment, schema, manifest, timeout, incomplete, failed, or `not_checked` changes.
 - Update agent guidance so SHA-only changes do not trigger privileged reruns.

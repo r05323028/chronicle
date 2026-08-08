@@ -27,7 +27,7 @@ Each P1/P2 acceptance profile SHALL compute a deterministic acceptance-sensitive
 
 ### Requirement: VM-local caches
 
-Privileged validation SHALL reuse an existing Multipass Ubuntu instance when available, transfer an immutable snapshot of the acceptance-sensitive checkout (including dirty development changes), use VM-local `/home/ubuntu/chronicle-target` for `CARGO_TARGET_DIR` and `/home/ubuntu/.cargo` for Cargo cache, and bootstrap missing dependencies without reinstalling an existing toolchain on every run. Build outputs SHALL be treated as caches and SHALL never be uploaded as evidence. A freshly executed release run SHALL additionally require clean known start identity and unchanged end commit/tree/dirty identity so source mutation during that run fails. Historical evidence reuse SHALL instead use content and compatibility identity and SHALL NOT require evidence commit SHA to equal current `HEAD`.
+Privileged validation SHALL reuse an existing Multipass Ubuntu instance when available, transfer an immutable snapshot of the acceptance-sensitive checkout (including dirty development changes), use VM-local `/home/ubuntu/chronicle-target` for `CARGO_TARGET_DIR` and `/home/ubuntu/.cargo` for Cargo cache, and bootstrap missing dependencies without reinstalling an existing toolchain on every run. Build outputs SHALL be treated as caches and SHALL never be uploaded as evidence. Every release request SHALL require a clean, identifiable current source checkout with known commit and tree before evidence lookup and SHALL require unchanged end fingerprint, commit, tree, dirty state, and identity status through the release command. Historical evidence reuse SHALL use content and compatibility identity and SHALL NOT require evidence commit or tree SHA to equal the current release candidate.
 
 #### Scenario: Cache reuse
 
@@ -39,7 +39,17 @@ Privileged validation SHALL reuse an existing Multipass Ubuntu instance when ava
 - **WHEN** required VM dependency is absent
 - **THEN** bootstrap installs it once and later runs skip reinstall
 
-#### Scenario: Source mutation during release run
+#### Scenario: Clean cross-identity release reuse
 
-- **WHEN** source commit, tree, or dirty state changes after a fresh release acceptance run starts
-- **THEN** current run fails integrity validation independently from historical evidence reuse
+- **WHEN** a release request starts from a clean, identifiable current checkout and compatible historical evidence has another commit or tree SHA
+- **THEN** evidence may be reused and release eligibility depends on current checkout stability plus evidence compatibility and completeness
+
+#### Scenario: Dirty current release checkout
+
+- **WHEN** a release request starts from a dirty current checkout, including when compatible historical evidence exists
+- **THEN** release source validation fails before historical evidence is accepted
+
+#### Scenario: Source mutation during release command
+
+- **WHEN** current fingerprint, commit, tree, dirty state, or identity status changes after any release request starts
+- **THEN** release fails independently from historical evidence origin identity

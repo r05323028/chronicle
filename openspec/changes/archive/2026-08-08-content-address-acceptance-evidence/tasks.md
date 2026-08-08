@@ -20,3 +20,4 @@
 - [x] 4.2 Add rejection tests for fingerprint/scenario/environment/schema/manifest/check/timeout/incomplete incompatibility and same-run source mutation.
 - [x] 4.3 Run focused acceptance/validation tests, strict OpenSpec validation, bounded `./scripts/validate.sh fast`, and graphify update.
 - [x] 4.4 Inspect retained P1/P2 evidence under final compatibility rules and report whether reuse remains valid.
+- [x] 4.5 Validate every release checkout before evidence lookup, cover clean cross-SHA reuse, dirty-current rejection, historical dirty provenance, development reuse, and same-run mutation, then sync and archive final semantics.

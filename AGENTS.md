@@ -55,7 +55,7 @@ Wrapper preserves command status/output; deadline returns 124 after process-tree
 
 Agent recorder workflow: run `validate.sh fast`, then targeted changed-path/recorder tooling, then bounded scenario or lifecycle validation. Run complete P1/P2 gate only when required. Never start foreground daemon without wrapper and deterministic cleanup.
 
-Acceptance evidence is content-addressed, not commit-addressed. Acceptance-sensitive content, fingerprint, or compatibility changes invalidate evidence; commit SHA changes alone do not. Retain commit SHA as provenance and preserve same-run source-mutation checks, but reuse compatible P1/P2 evidence across rebases, equivalent recommits, OpenSpec archives, documentation-only commits, and unrelated changes outside validation fingerprint.
+Acceptance evidence is content-addressed, not commit-addressed. Acceptance-sensitive content, fingerprint, or compatibility changes invalidate evidence; commit SHA changes alone do not. Retain commit/tree SHA as provenance and preserve same-run source-mutation checks, but reuse compatible P1/P2 evidence across rebases, equivalent recommits, OpenSpec archives, documentation-only commits, and unrelated changes outside validation fingerprint. Every release request still requires a clean, identifiable current checkout that remains unchanged through validation; never compare current commit/tree with historical evidence identity.
 
 ## Linux-only validation on macOS
 

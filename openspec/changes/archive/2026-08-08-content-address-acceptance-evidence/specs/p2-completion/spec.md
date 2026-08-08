@@ -12,15 +12,16 @@ Privileged acceptance SHALL execute or compatibly reuse evidence for real proces
 
 #### Scenario: Release-grade content identity
 
-- **WHEN** `scripts/acceptance.sh --profile p2 --executor multipass --release` executes or reuses evidence
-- **THEN** report is `release_eligible` only when fingerprint, validation contract, compatible schema and environment, manifest, required scenario coverage, and every required check are complete and passed
-- **AND THEN** evidence commit SHA may differ from current `HEAD`
+- **WHEN** `scripts/acceptance.sh --profile p2 --executor multipass --release` executes or reuses evidence from a clean, identifiable current checkout
+- **THEN** report is `release_eligible` only when current source remains unchanged and fingerprint, validation contract, compatible schema and environment, manifest, required scenario coverage, and every required check are complete and passed
+- **AND THEN** historical evidence commit and tree SHA may differ from the current checkout
 
-#### Scenario: Fresh release run integrity
+#### Scenario: Release request integrity
 
-- **WHEN** a fresh release acceptance run starts from clean known source
-- **THEN** start/end commit, tree, and dirty identity are recorded and source mutation during that run fails
-- **AND THEN** same-run integrity does not impose current-HEAD equality on historical evidence reuse
+- **WHEN** any release request starts
+- **THEN** current commit and tree SHALL be known, current working tree SHALL be clean, and start/end fingerprint, commit, tree, dirty state, and identity status SHALL remain unchanged through validation
+- **AND THEN** release fails before reused evidence is accepted when current source is dirty or unidentifiable, and fails if current source changes during validation
+- **AND THEN** current-checkout integrity does not impose commit or tree equality on historical evidence provenance
 
 #### Scenario: Crash and cleanup evidence
 
