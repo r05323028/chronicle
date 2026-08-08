@@ -48,10 +48,12 @@ trap cleanup EXIT
 make_snapshot() {
 	rm -rf -- "$SNAPSHOT"
 	mkdir -p -- "$SNAPSHOT"
-	# Snapshot actual checkout, including dirty source, but not build/cache/docs noise.
+	# Snapshot actual checkout, including dirty source, but not build/cache
+	# noise. docs/ stays included: it is git-tracked, so excluding it makes
+	# the guest-side release clean-tree check see spurious deletions.
 	(
 		cd "$ROOT"
-		tar --exclude='./target' --exclude='./graphify-out' --exclude='./docs' -cf - .
+		tar --exclude='./target' --exclude='./graphify-out' -cf - .
 	) | (cd "$SNAPSHOT" && tar -xf -)
 }
 
