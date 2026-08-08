@@ -1,17 +1,18 @@
 //! OS-released recorder ownership leases.
 //!
 //! Domain ownership is acquired before state recovery or WAL mutation. The
-//! subordinate state lease is intentionally separate from the WAL `record.lock`.
+//! subordinate state lease is intentionally separate from the WAL `record.lock`
+//! and from the exact Chronicle data-domain lock (`domain_lock`);
+//! `state_is_owned` is never evidence of domain-lock equivalence.
 
 use crate::NormalizedRecorderConfig;
-use std::fs::{self, File, OpenOptions};
+use crate::domain_lock::{DomainLockError, lock_is_held, open_lock};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
-use rustix::fs::{FlockOperation, flock};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 const STATE_LOCK_FILE: &str = ".chronicle-recorder.lock";
 
@@ -41,7 +42,8 @@ pub struct RecorderLease {
 impl RecorderLease {
     pub fn acquire(config: &NormalizedRecorderConfig) -> Result<Self, RecorderLeaseError> {
         let domain_path = &config.domain_lock_path;
-        let domain_file = open_lock(domain_path, RecorderLeaseError::DomainOwned)?;
+        let domain_file = open_lock(domain_path)
+            .map_err(|error| map_domain_error(error, RecorderLeaseError::DomainOwned))?;
 
         if fs::create_dir_all(&config.state_root).is_err() {
             return Err(RecorderLeaseError::Io(std::io::Error::other(
@@ -52,7 +54,8 @@ impl RecorderLease {
         fs::set_permissions(&config.state_root, fs::Permissions::from_mode(0o700))
             .map_err(RecorderLeaseError::Io)?;
         let state_path = config.state_root.join(STATE_LOCK_FILE);
-        let state_file = open_lock(&state_path, RecorderLeaseError::StateOwned)?;
+        let state_file = open_lock(&state_path)
+            .map_err(|error| map_domain_error(error, RecorderLeaseError::StateOwned))?;
 
         Ok(Self {
             domain_file,
@@ -63,7 +66,7 @@ impl RecorderLease {
     }
 
     pub fn domain_is_owned(config: &NormalizedRecorderConfig) -> Result<bool, RecorderLeaseError> {
-        lock_is_held(&config.domain_lock_path)
+        lock_is_held(&config.domain_lock_path).map_err(map_domain_error_owned)
     }
 
     pub fn state_lock_name() -> &'static str {
@@ -71,7 +74,7 @@ impl RecorderLease {
     }
 
     pub fn state_is_owned(state_root: impl AsRef<Path>) -> Result<bool, RecorderLeaseError> {
-        lock_is_held(&state_root.as_ref().join(STATE_LOCK_FILE))
+        lock_is_held(&state_root.as_ref().join(STATE_LOCK_FILE)).map_err(map_domain_error_owned)
     }
 
     pub fn domain_file(&self) -> &File {
@@ -83,67 +86,16 @@ impl RecorderLease {
     }
 }
 
-fn open_lock(path: &Path, held: RecorderLeaseError) -> Result<File, RecorderLeaseError> {
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    {
-        let _ = (path, held);
-        return Err(RecorderLeaseError::UnsupportedPlatform);
-    }
-
-    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    {
-        if path
-            .symlink_metadata()
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(RecorderLeaseError::UnsafePath);
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options.open(path).map_err(RecorderLeaseError::Io)?;
-        #[cfg(unix)]
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(RecorderLeaseError::Io)?;
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(file),
-            Err(error) if error == rustix::io::Errno::WOULDBLOCK => Err(held),
-            Err(error) => Err(RecorderLeaseError::Io(std::io::Error::from_raw_os_error(
-                error.raw_os_error(),
-            ))),
-        }
-    }
+fn map_domain_error_owned(error: DomainLockError) -> RecorderLeaseError {
+    map_domain_error(error, RecorderLeaseError::DomainOwned)
 }
 
-fn lock_is_held(path: &Path) -> Result<bool, RecorderLeaseError> {
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    {
-        let _ = path;
-        return Err(RecorderLeaseError::UnsupportedPlatform);
-    }
-
-    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    {
-        if !path.exists() {
-            return Ok(false);
-        }
-        if path
-            .symlink_metadata()
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(RecorderLeaseError::UnsafePath);
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        let file = options.open(path).map_err(RecorderLeaseError::Io)?;
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(false),
-            Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(true),
-            Err(error) => Err(RecorderLeaseError::Io(std::io::Error::from_raw_os_error(
-                error.raw_os_error(),
-            ))),
-        }
+fn map_domain_error(error: DomainLockError, held: RecorderLeaseError) -> RecorderLeaseError {
+    match error {
+        DomainLockError::DomainOwned => held,
+        DomainLockError::UnsupportedPlatform => RecorderLeaseError::UnsupportedPlatform,
+        DomainLockError::UnsafePath => RecorderLeaseError::UnsafePath,
+        DomainLockError::Io(error) => RecorderLeaseError::Io(error),
     }
 }
 

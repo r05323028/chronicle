@@ -2,6 +2,8 @@
 
 mod cgroup_selection;
 mod continuous_recorder;
+mod data_dir;
+mod domain_lock;
 mod epoch_catalog;
 mod epoch_rollover;
 mod incremental_worker;
@@ -13,6 +15,7 @@ mod recorder_orchestration;
 mod recorder_quota;
 mod recorder_startup;
 mod recorder_status;
+mod recording_catalog;
 mod rollover_transition;
 
 pub use cgroup_selection::{
@@ -20,6 +23,11 @@ pub use cgroup_selection::{
     preflight_cgroup_selection, preflight_pid_cgroup_selection,
 };
 pub use continuous_recorder::{ContinuousRecorderError, ContinuousRecorderService};
+pub use data_dir::{DataDirSource, ResolvedDataDir, ensure_private_data_dir, resolve_data_dir};
+pub use domain_lock::{
+    DOMAIN_LOCK_FILE, DomainLockError, DomainLockGuard, acquire_domain_lock, domain_lock_held,
+    resolve_domain_lock_path,
+};
 pub use epoch_catalog::{
     EPOCH_CATALOG_FILE, EpochCatalogEntry, EpochCatalogError, EpochCatalogState, EpochCatalogV1,
 };
@@ -61,6 +69,16 @@ pub use recorder_startup::{RecorderStartup, RecorderStartupError};
 pub use recorder_status::{
     RECORDER_STATUS_SCHEMA_VERSION, RecorderStatusError, RecorderStatusState, RecorderStatusV1,
     SegmentCounts, StatusRemediation,
+};
+pub use recording_catalog::ListedRecording;
+pub use recording_catalog::{
+    CATALOG_FILE, CATALOG_MAX_BYTES, CATALOG_MAX_ENTRIES, CatalogEntryV1, CatalogV1,
+    ChildExitResult, RECORDING_INTENT_FILE, RECORDING_INTENT_MAX_BYTES, RECORDINGS_SUBDIR,
+    RecordingCatalogStatus, RecordingIntentV1, catalog_path, claim_recording_name,
+    list_recording_ids, list_recordings, load_catalog, load_recording_intent,
+    persist_reconciled_catalog, reconcile_catalog, reconcile_entry_status, recording_intent_path,
+    recordings_root, resolve_recording, save_catalog, validate_catalog, validate_recording_name,
+    write_recording_intent,
 };
 pub use rollover_transition::{
     ROLLOVER_TRANSITION_FILE, ROLLOVER_TRANSITION_SCHEMA_VERSION, RolloverTransitionError,
@@ -2747,6 +2765,10 @@ pub struct AppConfig {
     pub protocol_overrides: Vec<ProtocolOverride>,
     pub redaction: RedactionConfig,
     pub replay: ReplayConfig,
+    /// Public data directory; overridden by `--data-dir` and `CHRONICLE_DATA_DIR`.
+    pub data_dir: Option<PathBuf>,
+    /// Optional explicit root for the shared exact `.chronicle-domain.lock` path.
+    pub domain_lock_root: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -2907,6 +2929,39 @@ pub enum ApplicationError {
     CheckpointContradiction,
     #[error("production recording preflight failed: {0}")]
     ProductionPreflight(&'static str),
+    #[error(
+        "unsafe data directory path '{0}': must be absolute with no symlink or non-directory components"
+    )]
+    UnsafeDataDir(PathBuf),
+    #[error(
+        "data directory resolution is unsupported on this platform; pass --data-dir or set CHRONICLE_DATA_DIR"
+    )]
+    UnsupportedDataDirResolution,
+    #[error("recording catalog invalid: {0}")]
+    CatalogInvalid(String),
+    #[error("recording catalog has {count} entries; limit is {limit}")]
+    CatalogEntryLimit { count: usize, limit: usize },
+    #[error("recording catalog path is unsafe: {0}")]
+    CatalogUnsafePath(PathBuf),
+    #[error("invalid recording name '{0}': {1}")]
+    InvalidRecordingName(String, String),
+    #[error("recording '{0}' was not found")]
+    RecordingNotFound(String),
+    #[error("recording name '{0}' is already in use")]
+    RecordingNameCollision(String),
+    #[error("chronicle data domain is already owned by another process")]
+    DomainOwned,
+    #[error("domain lock is unsupported on this platform")]
+    UnsupportedDomainLock,
+    #[error("domain lock path is unsafe")]
+    DomainLockUnsafePath,
+    #[error(
+        "incompatible domain lock mapping: data directory {data_dir} and lock root {lock_root} resolve different lock paths on the same filesystem; multiple differently locked Chronicle domains on one filesystem are unsupported"
+    )]
+    IncompatibleDomainLockMapping {
+        data_dir: PathBuf,
+        lock_root: PathBuf,
+    },
     #[error("{0} command is not implemented in current scaffold")]
     NotImplemented(&'static str),
 }
@@ -3426,7 +3481,7 @@ fn write_recording_metadata_inner(
     write_private_atomic_json(wal_directory, "recording.json", metadata, fault)
 }
 
-fn write_private_atomic_json<T: Serialize + ?Sized>(
+pub(crate) fn write_private_atomic_json<T: Serialize + ?Sized>(
     directory: &Path,
     file_name: &str,
     value: &T,

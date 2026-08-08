@@ -5,7 +5,7 @@
 use chronicle_canonical::{
     CanonicalSession, CanonicalValidationError, Completeness, PayloadRef, SourceProvenance,
 };
-use chronicle_common::SessionId;
+use chronicle_common::{SessionId, Timestamp};
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use sha2::{Digest, Sha256};
@@ -195,6 +195,21 @@ fn decode_manifest(bytes: &[u8]) -> Result<SessionManifest, StorageError> {
     }
     Ok(manifest)
 }
+
+/// Read-only session summary for bounded catalog reconciliation and `list`.
+/// Timestamps/operation counts come from the canonical session; payloads are
+/// never hydrated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub started_at: Timestamp,
+    pub ended_at: Option<Timestamp>,
+    pub operation_count: usize,
+    pub payload_count: usize,
+}
+
+/// Hard cap for `list_summaries` scans.
+pub const SESSION_SUMMARY_LIMIT: usize = 10_000;
 
 pub struct FilesystemSessionStore {
     root: PathBuf,
@@ -462,6 +477,59 @@ impl FilesystemSessionStore {
             }
         }
         Ok(session)
+    }
+
+    /// Read-only bounded summary of published sessions, newest-first order is
+    /// applied by callers; this returns deterministic id-sorted summaries.
+    ///
+    /// Scans immediate children of `<root>/sessions/` only: every entry must be
+    /// a real directory named as a bare UUID matching its manifest; symlinks,
+    /// non-directories, and mismatched IDs fail safely. Canonical session and
+    /// manifest files are read for timestamps/counts; `payloads/` is never
+    /// hydrated and nothing is mutated. `limit` is clamped to
+    /// [`SESSION_SUMMARY_LIMIT`].
+    pub fn list_summaries(&self, limit: usize) -> Result<Vec<SessionSummary>, StorageError> {
+        let limit = limit.min(SESSION_SUMMARY_LIMIT);
+        let sessions = self.root.join("sessions");
+        let entries = match std::fs::read_dir(&sessions) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(StorageError::Backend(error.to_string())),
+            Ok(entries) => entries,
+        };
+        let mut summaries = Vec::new();
+        for entry in entries {
+            if summaries.len() >= limit {
+                break;
+            }
+            let entry = entry.map_err(|error| StorageError::Backend(error.to_string()))?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| StorageError::Backend(error.to_string()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StorageError::Validation(format!(
+                    "unsafe session entry {}",
+                    path.display()
+                )));
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let id = uuid::Uuid::parse_str(&name).map_err(|_| {
+                StorageError::Validation(format!(
+                    "session directory name is not a UUID: {}",
+                    path.display()
+                ))
+            })?;
+            let (session, manifest) = self.load_with_manifest(SessionId(id))?;
+            summaries.push(SessionSummary {
+                session_id: session.id,
+                started_at: session.started_at,
+                ended_at: session.ended_at,
+                operation_count: session.timeline.len(),
+                payload_count: manifest.payload_count,
+            });
+        }
+        summaries.sort_by_key(|left| left.session_id);
+        Ok(summaries)
     }
 
     fn inspect_payload(&self, payload: &PayloadRef) -> Result<(), StorageError> {
@@ -1196,5 +1264,125 @@ mod tests {
             digest(b"abc"),
             "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    fn publish_session_with_id(store: &FilesystemSessionStore, id: SessionId) {
+        let mut original = session(b"summary-body".to_vec());
+        original.id = id;
+        store
+            .publish(PublishSession {
+                session: original,
+                checkpoint: Some("checkpoint".into()),
+                issues: vec![],
+                replayability: vec![],
+                complete: true,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn list_summaries_reads_without_payload_hydration() {
+        let root = root();
+        let store = FilesystemSessionStore::new(&root);
+        let first = SessionId::new();
+        let second = SessionId::new();
+        publish_session_with_id(&store, first);
+        publish_session_with_id(&store, second);
+
+        let summaries = store.list_summaries(100).unwrap();
+        assert_eq!(summaries.len(), 2);
+        for summary in &summaries {
+            assert_eq!(summary.operation_count, 1);
+            assert_eq!(summary.payload_count, 1);
+            assert_eq!(summary.started_at, OffsetDateTime::UNIX_EPOCH);
+        }
+        // Deterministic id order.
+        assert!(summaries[0].session_id < summaries[1].session_id);
+
+        // Payloads were not hydrated: the stored canonical session still
+        // references artifacts on disk.
+        let loaded = store.load(first).unwrap();
+        let PayloadRef::Artifact { .. } = &loaded.connections[0].operations[0].request else {
+            panic!("payload must remain externalized");
+        };
+    }
+
+    #[test]
+    fn list_summaries_respects_limit_and_caps_at_hard_limit() {
+        let root = root();
+        let store = FilesystemSessionStore::new(&root);
+        for _ in 0..3 {
+            publish_session_with_id(&store, SessionId::new());
+        }
+        let limited = store.list_summaries(2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(SESSION_SUMMARY_LIMIT, 10_000);
+        let capped = store.list_summaries(usize::MAX).unwrap();
+        assert_eq!(capped.len(), 3);
+    }
+
+    #[test]
+    fn list_summaries_missing_root_is_empty() {
+        let store = FilesystemSessionStore::new(root());
+        assert!(store.list_summaries(100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_summaries_rejects_unsafe_and_irregular_entries() {
+        let root = root();
+        let store = FilesystemSessionStore::new(&root);
+        publish_session_with_id(&store, SessionId::new());
+        std::fs::write(root.join("sessions/stray.txt"), b"x").unwrap();
+        assert!(store.list_summaries(100).is_err());
+        std::fs::remove_file(root.join("sessions/stray.txt")).unwrap();
+
+        std::fs::create_dir_all(root.join("sessions/not-a-uuid")).unwrap();
+        assert!(store.list_summaries(100).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_summaries_rejects_symlinked_session_dir() {
+        let root = root();
+        let store = FilesystemSessionStore::new(&root);
+        std::fs::create_dir_all(root.join("sessions")).unwrap();
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(
+            &real,
+            root.join("sessions").join(SessionId::new().to_string()),
+        )
+        .unwrap();
+        assert!(store.list_summaries(100).is_err());
+    }
+
+    #[test]
+    fn list_summaries_is_non_mutating() {
+        let root = root();
+        let store = FilesystemSessionStore::new(&root);
+        publish_session_with_id(&store, SessionId::new());
+        let before: Vec<_> = walk_all(&root);
+        let _ = store.list_summaries(100).unwrap();
+        let after: Vec<_> = walk_all(&root);
+        assert_eq!(before, after);
+    }
+
+    fn walk_all(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else {
+                        files.push(path.strip_prefix(root).unwrap().to_path_buf());
+                    }
+                }
+            }
+        }
+        files.sort();
+        files
     }
 }

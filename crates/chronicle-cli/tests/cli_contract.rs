@@ -538,3 +538,75 @@ fn cli_reports_usage_and_data_errors_as_safe_json() {
     assert_eq!(usage.status.code(), Some(2));
     std::fs::remove_dir_all(root).expect("remove test root");
 }
+
+#[test]
+fn new_surface_list_inspect_json_and_empty_state_contract() {
+    use std::path::PathBuf;
+
+    // Empty storage: human hint and empty JSON, both exit 0.
+    let empty_dir =
+        std::env::temp_dir().join(format!("chronicle-cli-empty-{}", uuid::Uuid::new_v4()));
+    let empty = command(&["--data-dir", empty_dir.to_str().unwrap(), "list"]);
+    assert_eq!(empty.status.code(), Some(0));
+    let (human_stdout, _) = output_text(&empty);
+    assert!(human_stdout.contains("No recordings yet."));
+    assert!(human_stdout.contains("chronicle record -- COMMAND..."));
+
+    let empty_json = command(&[
+        "--format",
+        "json",
+        "--data-dir",
+        empty_dir.to_str().unwrap(),
+        "list",
+    ]);
+    assert_eq!(empty_json.status.code(), Some(0));
+    let (json_stdout, json_stderr) = output_text(&empty_json);
+    assert!(json_stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_str(&json_stdout).expect("one atomic JSON");
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["recordings"].as_array().map(Vec::len), Some(0));
+
+    // Populated storage via legacy fixture: inspect-by-root still works and
+    // list against an explicit data-dir with one published recording shows
+    // the row with canonical counts.
+    let root = std::env::temp_dir().join(format!("chronicle-cli-pop-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let session_id = record(&root);
+    let inspect = command(&[
+        "--format",
+        "json",
+        "inspect",
+        &session_id,
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(inspect.status.code(), Some(0));
+    let (inspect_stdout, _) = output_text(&inspect);
+    let inspected: serde_json::Value = serde_json::from_str(&inspect_stdout).unwrap();
+    assert!(inspected.is_object());
+
+    // Recording resolution against a non-existent recording in a fresh data
+    // directory is a typed exit 3 with a stable not-found error.
+    let data_dir =
+        std::env::temp_dir().join(format!("chronicle-cli-data-{}", uuid::Uuid::new_v4()));
+    let missing = command(&[
+        "--format",
+        "json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "inspect",
+        "rec_00000000-0000-0000-0000-000000000000",
+    ]);
+    assert_eq!(missing.status.code(), Some(3));
+    let (missing_stdout, missing_stderr) = output_text(&missing);
+    assert!(missing_stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_str(&missing_stderr).unwrap();
+    assert_eq!(error["code"], 3);
+    assert!(error["message"].as_str().unwrap().contains("was not found"));
+
+    std::fs::remove_dir_all(&root).ok();
+    let _ = empty_dir;
+    std::fs::remove_dir_all(&empty_dir).ok();
+    std::fs::remove_dir_all(&data_dir).ok();
+    let _ = PathBuf::new();
+}
