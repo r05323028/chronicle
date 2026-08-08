@@ -33,4 +33,4 @@
 - [x] 5.4 Record start/end SHA/tree provenance centrally; enforce exact clean identity only for release-grade acceptance and preserve stale-owner failure behavior.
 - [x] 5.5 Replace duplicated P1/P2 runners with unified profile/executor orchestration, fingerprinted `acceptance/<profile>/<fingerprint>/<run-id>` evidence, scenario coverage, environment compatibility, manifest integrity, and P2→P1-only reuse.
 - [x] 5.6 Run unified acceptance-runner tests, targeted tests, Linux validation, strict OpenSpec validation, and independent review.
-- [ ] 5.7 Generate fresh release-eligible P1/P2 evidence and pass release validation before marking complete.
+- [x] 5.7 Generate fresh release-eligible P1/P2 evidence and pass release validation before marking complete.
