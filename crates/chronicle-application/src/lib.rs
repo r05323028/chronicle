@@ -87,8 +87,8 @@ pub use recording_catalog::{
     RecordingCatalogStatus, RecordingIntentV1, catalog_path, claim_recording_name,
     list_recording_ids, list_recordings, load_catalog, load_recording_intent,
     persist_reconciled_catalog, reconcile_catalog, reconcile_entry_status, recording_intent_path,
-    recordings_root, resolve_recording, save_catalog, validate_catalog, validate_recording_name,
-    write_recording_intent,
+    recordings_root, resolve_recording, resolve_session, save_catalog, validate_catalog,
+    validate_recording_name, write_recording_intent,
 };
 pub use rollover_transition::{
     ROLLOVER_TRANSITION_FILE, ROLLOVER_TRANSITION_SCHEMA_VERSION, RolloverTransitionError,
@@ -3164,7 +3164,8 @@ where
                 },
             },
             Ok(None) => {}
-            Err(_) => {
+            Err(error) => {
+                eprintln!("chronicle: capture source error: {error}");
                 capture_failed = true;
                 break ShutdownReason::CaptureFailure;
             }

@@ -4,6 +4,7 @@ use chronicle_application::{
     inspect_session, list_recordings, load_recorder_metadata, process_and_publish_recording_wal,
     record_fixture_file, render_inspect_human, render_inspect_json, render_json,
     render_replay_human, replay_session_with_plan, resolve_data_dir, resolve_recording,
+    resolve_session,
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::{
@@ -1207,7 +1208,9 @@ fn run_inspect(
     }
     let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
     let recording_id = resolve_recording(&data_dir, &args.recording)?;
-    let result = inspect_session(&data_dir, chronicle_common::SessionId(recording_id.0))?;
+    let session_id = resolve_session(&data_dir, recording_id)?
+        .ok_or_else(|| ApplicationError::RecordingNotFound(args.recording.clone()))?;
+    let result = inspect_session(&data_dir, session_id)?;
     let output = match format {
         Format::Human => render_inspect_human(&result),
         Format::Json => render_inspect_json(&result)?,

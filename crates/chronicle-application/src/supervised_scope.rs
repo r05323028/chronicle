@@ -657,12 +657,14 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ScopeError::DestinationExists(_)));
 
-        // create_supervised_scope creates the dir, fails on the missing
-        // kernel cgroup.id, and rolls the directory back.
-        let err = create_supervised_scope(&host.hierarchy, &host.delegated, "fresh", test_uid())
-            .unwrap_err();
-        assert!(matches!(err, ScopeError::CgroupIdUnavailable(_)));
-        assert!(!host.delegated.join("fresh").exists());
+        // create_supervised_scope on a missing kernel cgroup.id falls back to
+        // the cgroupfs directory inode as the stable identity, so creation
+        // succeeds and the scope opens.
+        let scope = create_supervised_scope(&host.hierarchy, &host.delegated, "fresh", test_uid())
+            .expect("creates with inode fallback");
+        assert!(host.delegated.join("fresh").is_dir());
+        assert_ne!(scope.identity().cgroup_id, 0);
+        scope.destroy().expect("destroys empty scope");
     }
 
     #[test]

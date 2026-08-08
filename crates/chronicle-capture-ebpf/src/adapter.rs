@@ -119,8 +119,8 @@ impl CaptureAdapter {
             timestamp: self.timestamp(observation.socket.timestamp_ns),
             socket: self.socket_identity(&observation.socket)?,
             recording_scope: self.scope.identity.clone(),
-            network_family: map_family(observation.family),
-            remote_endpoint: map_endpoint(observation.family, &observation.remote_endpoint),
+            network_family: map_endpoint(observation.family, &observation.remote_endpoint).0,
+            remote_endpoint: map_endpoint(observation.family, &observation.remote_endpoint).1,
             role: SocketRole::Active,
             process: process_metadata(&observation.socket),
             observed_cgroup_id,
@@ -128,6 +128,12 @@ impl CaptureAdapter {
         intent
             .validate()
             .map_err(|error| EbpfCaptureError::InvalidSocketEvidence(error.to_string()))?;
+        // Dual-stack listeners emit degenerate connect intents whose remote is
+        // the unspecified address (:: or 0.0.0.0); a real outbound connect has
+        // a concrete peer, so these carry no evidence and are skipped.
+        if is_unspecified_endpoint(&intent.remote_endpoint) {
+            return Ok(None);
+        }
         if let Some(existing) = self.pending_connects.get(&intent.socket)
             && (existing.network_family != intent.network_family
                 || existing.remote_endpoint != intent.remote_endpoint)
@@ -274,9 +280,9 @@ impl CaptureAdapter {
             timestamp: self.timestamp(socket.timestamp_ns),
             socket: identity,
             recording_scope: self.scope.identity.clone(),
-            network_family: map_family(established.family),
-            local_endpoint: map_endpoint(established.family, &established.local_endpoint),
-            remote_endpoint: map_endpoint(established.family, &established.remote_endpoint),
+            network_family: map_endpoint(established.family, &established.local_endpoint).0,
+            local_endpoint: map_endpoint(established.family, &established.local_endpoint).1,
+            remote_endpoint: map_endpoint(established.family, &established.remote_endpoint).1,
             role: map_role(established.role),
             process: pending
                 .and_then(|intent| intent.process.clone())
@@ -376,17 +382,46 @@ const fn map_role(role: RawSocketRole) -> SocketRole {
     }
 }
 
-fn map_endpoint(family: RawNetworkFamily, endpoint: &RawEndpoint) -> Endpoint {
-    let address = match family {
-        RawNetworkFamily::Ipv4 => IpAddr::V4(Ipv4Addr::new(
-            endpoint.address[0],
-            endpoint.address[1],
-            endpoint.address[2],
-            endpoint.address[3],
-        )),
-        RawNetworkFamily::Ipv6 => IpAddr::V6(Ipv6Addr::from(endpoint.address)),
-    };
-    Endpoint::new(address.to_string(), endpoint.port)
+/// Map a raw endpoint to its canonical family and address. v4-mapped IPv6
+/// (`::ffff:a.b.c.d`) sockets are normalized to IPv4 so a dual-stack socket
+/// never appears as two conflicting families.
+fn is_unspecified_endpoint(endpoint: &Endpoint) -> bool {
+    endpoint
+        .host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
+}
+
+fn map_endpoint(family: RawNetworkFamily, endpoint: &RawEndpoint) -> (NetworkFamily, Endpoint) {
+    match family {
+        RawNetworkFamily::Ipv4 => (
+            NetworkFamily::Ipv4,
+            Endpoint::new(
+                IpAddr::V4(Ipv4Addr::new(
+                    endpoint.address[0],
+                    endpoint.address[1],
+                    endpoint.address[2],
+                    endpoint.address[3],
+                ))
+                .to_string(),
+                endpoint.port,
+            ),
+        ),
+        RawNetworkFamily::Ipv6 => {
+            let v6 = Ipv6Addr::from(endpoint.address);
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                (
+                    NetworkFamily::Ipv4,
+                    Endpoint::new(IpAddr::V4(v4).to_string(), endpoint.port),
+                )
+            } else {
+                (
+                    NetworkFamily::Ipv6,
+                    Endpoint::new(IpAddr::V6(v6).to_string(), endpoint.port),
+                )
+            }
+        }
+    }
 }
 
 fn process_metadata(socket: &RawSocketObservation) -> Option<ProcessMetadata> {

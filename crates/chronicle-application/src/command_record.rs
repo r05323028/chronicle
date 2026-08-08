@@ -371,28 +371,29 @@ fn finalize_and_publish(
     use chronicle_common::SessionId;
     let wal_dir = recordings_root(&options.data_dir).join(recording_id.to_string());
     let registry = chronicle_protocol_builtins::registry()?;
-    match process_and_publish_recording_wal(&wal_dir, &options.data_dir, &registry) {
-        Ok(_) => {}
-        Err(error)
-            if matches!(
-                error,
-                ApplicationError::Wal(chronicle_wal::WalError::NoPublishedSegments)
-            ) =>
-        {
-            // Zero-traffic recording: the target made no HTTP requests, so the
-            // WAL has no segments. Publish an empty canonical session so the
-            // recording is a normal published entry (0 operations).
-            publish_empty_session(&options.data_dir, recording_id)?;
-        }
-        Err(error) => return Err(error),
-    }
+    let published_session =
+        match process_and_publish_recording_wal(&wal_dir, &options.data_dir, &registry) {
+            Ok(published) => published.session_id,
+            Err(error)
+                if matches!(
+                    error,
+                    ApplicationError::Wal(chronicle_wal::WalError::NoPublishedSegments)
+                ) =>
+            {
+                // Zero-traffic recording: the target made no HTTP requests, so
+                // the WAL has no segments. Publish an empty canonical session
+                // so the recording is a normal published entry (0 operations).
+                publish_empty_session(&options.data_dir, recording_id)?
+            }
+            Err(error) => return Err(error),
+        };
 
     let mut view = reconcile_catalog(&options.data_dir)?;
     for entry in &mut view.entries {
         if entry.recording_id == recording_id {
             entry.status = RecordingCatalogStatus::Published;
             entry.ended_at = Some(time::OffsetDateTime::now_utc());
-            entry.session_id = Some(SessionId(recording_id.0));
+            entry.session_id = Some(published_session);
             entry.child_exit = child_exit.clone();
         }
     }
@@ -406,7 +407,7 @@ fn finalize_and_publish(
 fn publish_empty_session(
     data_dir: &Path,
     recording_id: RecordingId,
-) -> Result<(), ApplicationError> {
+) -> Result<chronicle_common::SessionId, ApplicationError> {
     use chronicle_canonical::{CANONICAL_SCHEMA_VERSION, CanonicalSession, SourceMetadata};
     use chronicle_storage::PublishSession;
     let now = time::OffsetDateTime::now_utc();
@@ -416,7 +417,10 @@ fn publish_empty_session(
         started_at: now,
         ended_at: Some(now),
         source: SourceMetadata::default(),
-        source_provenance: Default::default(),
+        source_provenance: chronicle_canonical::SourceProvenance {
+            recording_id: Some(recording_id),
+            ..Default::default()
+        },
         connections: Vec::new(),
         connection_completeness: Default::default(),
         operation_completeness: Default::default(),
@@ -431,5 +435,5 @@ fn publish_empty_session(
         replayability: Vec::new(),
         complete: true,
     })?;
-    Ok(())
+    Ok(chronicle_common::SessionId(recording_id.0))
 }

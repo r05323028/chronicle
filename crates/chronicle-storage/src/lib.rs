@@ -202,6 +202,9 @@ fn decode_manifest(bytes: &[u8]) -> Result<SessionManifest, StorageError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionSummary {
     pub session_id: SessionId,
+    /// Recording this session belongs to, from `source_provenance.recording_id`
+    /// (legacy sessions without provenance link by id equality).
+    pub recording_id: Option<chronicle_common::RecordingId>,
     pub started_at: Timestamp,
     pub ended_at: Option<Timestamp>,
     pub operation_count: usize,
@@ -522,6 +525,7 @@ impl FilesystemSessionStore {
             let (session, manifest) = self.load_with_manifest(SessionId(id))?;
             summaries.push(SessionSummary {
                 session_id: session.id,
+                recording_id: session.source_provenance.recording_id,
                 started_at: session.started_at,
                 ended_at: session.ended_at,
                 operation_count: session.timeline.len(),

@@ -171,6 +171,28 @@ pub fn reconcile_entry_status(
     }
 }
 
+/// The recording a published session belongs to: `source_provenance.recording_id`
+/// when present (ETL-published sessions carry it), else id equality (legacy
+/// sessions).
+fn recording_for_summary(summary: &SessionSummary) -> RecordingId {
+    summary
+        .recording_id
+        .unwrap_or(RecordingId(summary.session_id.0))
+}
+
+/// Index sessions by the recording they belong to.
+fn summary_by_recording<'a>(
+    summaries: impl Iterator<Item = &'a SessionSummary>,
+) -> BTreeMap<RecordingId, &'a SessionSummary> {
+    let mut index = BTreeMap::new();
+    for summary in summaries {
+        index
+            .entry(recording_for_summary(summary))
+            .or_insert(summary);
+    }
+    index
+}
+
 pub fn catalog_path(data_dir: &Path) -> PathBuf {
     data_dir.join(CATALOG_FILE)
 }
@@ -222,7 +244,7 @@ fn resolve_latest(data_dir: &Path) -> Result<RecordingId, ApplicationError> {
         .map_err(ApplicationError::from)?;
     let mut candidates: Vec<_> = summaries
         .iter()
-        .filter(|summary| known.contains(&RecordingId(summary.session_id.0)))
+        .filter(|summary| known.contains(&recording_for_summary(summary)))
         .collect();
     candidates.sort_by(|left, right| {
         left.started_at
@@ -231,7 +253,7 @@ fn resolve_latest(data_dir: &Path) -> Result<RecordingId, ApplicationError> {
     });
     candidates
         .pop()
-        .map(|summary| RecordingId(summary.session_id.0))
+        .map(recording_for_summary)
         .ok_or_else(|| ApplicationError::RecordingNotFound("latest".to_owned()))
 }
 
@@ -449,10 +471,7 @@ pub fn reconcile_catalog(data_dir: &Path) -> Result<CatalogV1, ApplicationError>
     let summaries = FilesystemSessionStore::new(data_dir)
         .list_summaries(SESSION_SUMMARY_LIMIT)
         .map_err(ApplicationError::from)?;
-    let summary_by_key: BTreeMap<String, SessionSummary> = summaries
-        .into_iter()
-        .map(|summary| (summary.session_id.to_string(), summary))
-        .collect();
+    let summary_index = summary_by_recording(summaries.iter());
 
     let mut entries = Vec::new();
     let mut seen = BTreeSet::new();
@@ -461,7 +480,7 @@ pub fn reconcile_catalog(data_dir: &Path) -> Result<CatalogV1, ApplicationError>
         let intent = load_recording_intent(data_dir, id)?;
         let wal_directory = recordings_root(data_dir).join(id.to_string());
         let wal = load_recording_metadata(&wal_directory)?;
-        let canonical = summary_by_key.get(&id.to_string());
+        let canonical = summary_index.get(&id);
         let advisory_entry = advisory_by_id.get(&id);
         let canonical_published = canonical.is_some();
         let wal_present = wal.is_some();
@@ -495,7 +514,7 @@ pub fn reconcile_catalog(data_dir: &Path) -> Result<CatalogV1, ApplicationError>
             created_at,
             ended_at,
             status,
-            session_id: canonical.map(|_| SessionId(id.0)),
+            session_id: canonical.map(|summary| summary.session_id),
             child_exit: advisory_entry.and_then(|entry| entry.child_exit.clone()),
         });
     }
@@ -569,6 +588,19 @@ pub struct ListedRecording {
     pub status: RecordingCatalogStatus,
 }
 
+/// Resolve the published session id for a recording, if one exists.
+pub fn resolve_session(
+    data_dir: &Path,
+    recording_id: RecordingId,
+) -> Result<Option<SessionId>, ApplicationError> {
+    let view = reconcile_catalog(data_dir)?;
+    Ok(view
+        .entries
+        .into_iter()
+        .find(|entry| entry.recording_id == recording_id)
+        .and_then(|entry| entry.session_id))
+}
+
 /// Bounded list of every catalog entry with canonical session counts, ordered
 /// newest-first by creation time (tie-broken by recording ID descending).
 /// Unpublished entries report zero sessions/operations and `None` duration.
@@ -577,16 +609,13 @@ pub fn list_recordings(data_dir: &Path) -> Result<Vec<ListedRecording>, Applicat
     let summaries = FilesystemSessionStore::new(data_dir)
         .list_summaries(SESSION_SUMMARY_LIMIT)
         .map_err(ApplicationError::from)?;
-    let summary_by_key: BTreeMap<String, SessionSummary> = summaries
-        .into_iter()
-        .map(|summary| (summary.session_id.to_string(), summary))
-        .collect();
+    let summary_index = summary_by_recording(summaries.iter());
     let mut rows = Vec::with_capacity(view.entries.len());
     for entry in view.entries {
         let canonical = entry
             .session_id
             .as_ref()
-            .and_then(|id| summary_by_key.get(&id.to_string()));
+            .and_then(|_| summary_index.get(&entry.recording_id));
         let duration_ms = match canonical {
             Some(summary) => summary.ended_at.map(|ended| {
                 let millis = (ended - summary.started_at).whole_milliseconds().max(0);
