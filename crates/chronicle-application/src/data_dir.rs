@@ -4,7 +4,9 @@
 //! `CHRONICLE_DATA_DIR` > platform default. Environment/home lookup is
 //! injected so tests never mutate process-global `HOME`/`XDG_DATA_HOME`.
 
-use crate::ApplicationError;
+use crate::{ApplicationError, DoctorProbe, DoctorStatus};
+#[cfg(unix)]
+use rustix::fs::{Access, AtFlags, CWD, accessat};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -135,6 +137,164 @@ pub fn ensure_private_data_dir(path: &Path) -> Result<(), ApplicationError> {
     // a symlink; callers must not proceed when this errors.
     validate_data_dir_path(path)?;
     Ok(())
+}
+
+/// Non-destructively assess the resolved public data directory.
+///
+/// Missing paths are never created. Even when the nearest existing ancestor
+/// appears writable, private-mode semantics cannot be proved without a
+/// mutation, so the result remains `not_checked`.
+pub fn data_dir_doctor_probe(resolved: Result<&ResolvedDataDir, &ApplicationError>) -> DoctorProbe {
+    let Ok(resolved) = resolved else {
+        return DoctorProbe {
+            required: true,
+            status: DoctorStatus::Unsupported,
+            code: "data_dir.access".into(),
+            message: "public data directory could not be resolved safely".into(),
+            remediation: "set --data-dir to an absolute, non-symlink directory path you can access"
+                .into(),
+        };
+    };
+    let path = &resolved.path;
+    let safe_path = escaped_path(path);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => probe_existing_data_dir(resolved, &safe_path, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            probe_prospective_data_dir(resolved, &safe_path)
+        }
+        Err(_) => DoctorProbe {
+            required: true,
+            status: DoctorStatus::NotChecked,
+            code: "data_dir.access".into(),
+            message: format!(
+                "public data directory {safe_path} from {} could not be inspected",
+                resolved.source.label()
+            ),
+            remediation: "fix ancestor search permissions, then rerun doctor".into(),
+        },
+    }
+}
+
+fn probe_existing_data_dir(
+    resolved: &ResolvedDataDir,
+    safe_path: &str,
+    metadata: &fs::Metadata,
+) -> DoctorProbe {
+    let source = resolved.source.label();
+    if !metadata.is_dir() {
+        return DoctorProbe {
+            required: true,
+            status: DoctorStatus::Unsupported,
+            code: "data_dir.access".into(),
+            message: format!("public data directory {safe_path} from {source} is not a directory"),
+            remediation: "choose a directory path with --data-dir".into(),
+        };
+    }
+    #[cfg(unix)]
+    {
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return DoctorProbe {
+                required: true,
+                status: DoctorStatus::Unsupported,
+                code: "data_dir.access".into(),
+                message: format!(
+                    "public data directory {safe_path} from {source} is not private (mode must be 0700)"
+                ),
+                remediation: format!("run `chmod 700 {safe_path}` or choose another --data-dir"),
+            };
+        }
+        let access = Access::READ_OK | Access::WRITE_OK | Access::EXEC_OK;
+        match accessat(CWD, &resolved.path, access, AtFlags::EACCESS) {
+            Ok(()) => DoctorProbe {
+                required: true,
+                status: DoctorStatus::Supported,
+                code: "data_dir.access".into(),
+                message: format!(
+                    "public data directory {safe_path} from {source} exists, is private, and is accessible"
+                ),
+                remediation: "none".into(),
+            },
+            Err(_) => DoctorProbe {
+                required: true,
+                status: DoctorStatus::Unsupported,
+                code: "data_dir.access".into(),
+                message: format!(
+                    "public data directory {safe_path} from {source} is not readable, writable, and searchable"
+                ),
+                remediation: format!(
+                    "grant the invoking user read, write, and search access to {safe_path}"
+                ),
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    DoctorProbe {
+        required: true,
+        status: DoctorStatus::NotChecked,
+        code: "data_dir.access".into(),
+        message: format!(
+            "public data directory {safe_path} from {source} exists; private-mode support was not checked"
+        ),
+        remediation: "verify the directory is private and writable by the Chronicle user".into(),
+    }
+}
+
+fn escaped_path(path: &Path) -> String {
+    path.to_string_lossy().escape_default().to_string()
+}
+
+fn probe_prospective_data_dir(resolved: &ResolvedDataDir, safe_path: &str) -> DoctorProbe {
+    let source = resolved.source.label();
+    let mut ancestor = resolved.path.parent();
+    while let Some(path) = ancestor {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return DoctorProbe {
+                    required: true,
+                    status: DoctorStatus::Unsupported,
+                    code: "data_dir.access".into(),
+                    message: format!(
+                        "public data directory {safe_path} from {source} has a non-directory ancestor"
+                    ),
+                    remediation: "choose a --data-dir beneath an existing directory".into(),
+                };
+            }
+            Ok(_) => {
+                return DoctorProbe {
+                    required: true,
+                    status: DoctorStatus::NotChecked,
+                    code: "data_dir.access".into(),
+                    message: format!(
+                        "public data directory {safe_path} from {source} does not exist; creation and private mode were not tested"
+                    ),
+                    remediation: "create the directory with mode 0700, then rerun doctor".into(),
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = path.parent();
+            }
+            Err(_) => {
+                return DoctorProbe {
+                    required: true,
+                    status: DoctorStatus::NotChecked,
+                    code: "data_dir.access".into(),
+                    message: format!(
+                        "public data directory {safe_path} from {source} has an ancestor that could not be inspected"
+                    ),
+                    remediation: "fix ancestor search permissions, then rerun doctor".into(),
+                };
+            }
+        }
+    }
+    DoctorProbe {
+        required: true,
+        status: DoctorStatus::NotChecked,
+        code: "data_dir.access".into(),
+        message: format!(
+            "public data directory {safe_path} from {source} has no inspectable ancestor"
+        ),
+        remediation: "choose an absolute --data-dir beneath an accessible directory".into(),
+    }
 }
 
 #[cfg(test)]
@@ -337,5 +497,46 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         ensure_private_data_dir(&root).expect("existing dir ok");
         assert!(root.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_probe_supports_existing_private_directory() {
+        let root = temp_root();
+        ensure_private_data_dir(&root).unwrap();
+        let resolved = ResolvedDataDir {
+            path: root.clone(),
+            source: DataDirSource::Explicit,
+        };
+        let probe = data_dir_doctor_probe(Ok(&resolved));
+        assert_eq!(probe.status, DoctorStatus::Supported);
+        assert!(probe.message.contains("--data-dir"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_probe_leaves_prospective_directory_uncreated() {
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("missing").join("data");
+        let resolved = ResolvedDataDir {
+            path: path.clone(),
+            source: DataDirSource::Config,
+        };
+        let probe = data_dir_doctor_probe(Ok(&resolved));
+        assert_eq!(probe.status, DoctorStatus::NotChecked);
+        assert!(probe.message.contains("AppConfig.data_dir"));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_probe_reports_resolution_failure_without_mutation() {
+        let unsafe_path = PathBuf::from("relative/data");
+        let error = ApplicationError::UnsafeDataDir(unsafe_path.clone());
+        let probe = data_dir_doctor_probe(Err(&error));
+        assert_eq!(probe.status, DoctorStatus::Unsupported);
+        assert!(!probe.remediation.is_empty());
+        assert!(!unsafe_path.exists());
     }
 }

@@ -40,7 +40,10 @@ pub use command_replay::{
     COMMAND_REPLAY_SCOPE_PREFIX, CommandReplayOptions, CommandReplayResult, replay_command,
 };
 pub use continuous_recorder::{ContinuousRecorderError, ContinuousRecorderService};
-pub use data_dir::{DataDirSource, ResolvedDataDir, ensure_private_data_dir, resolve_data_dir};
+pub use data_dir::{
+    DataDirSource, ResolvedDataDir, data_dir_doctor_probe, ensure_private_data_dir,
+    resolve_data_dir,
+};
 pub use domain_lock::{
     DOMAIN_LOCK_FILE, DomainLockError, DomainLockGuard, acquire_domain_lock, domain_lock_held,
     resolve_domain_lock_path,
@@ -279,6 +282,60 @@ pub fn doctor_report(options: &DoctorOptions) -> DoctorReport {
         },
     ]);
     DoctorReport::new(probes)
+}
+
+/// Validate replay-related application configuration without contacting a target
+/// or exposing credential values.
+pub fn replay_config_doctor_probe(config: &ReplayConfig) -> DoctorProbe {
+    if let Some(environment) = config.authorization_env.as_deref() {
+        let valid_name = !environment.is_empty()
+            && environment.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+            });
+        if !valid_name {
+            return DoctorProbe {
+                required: false,
+                status: DoctorStatus::Unsupported,
+                code: "replay.configuration".into(),
+                message: "replay authorization environment-variable name is invalid".into(),
+                remediation: "set replay.authorization_env to a valid environment-variable name"
+                    .into(),
+            };
+        }
+        if std::env::var_os(environment).is_none() {
+            return DoctorProbe {
+                required: false,
+                status: DoctorStatus::NotChecked,
+                code: "replay.configuration".into(),
+                message: "configured replay authorization environment variable is not set".into(),
+                remediation: "set the configured authorization environment variable before authenticated replay"
+                    .into(),
+            };
+        }
+    }
+    if !config.dry_run
+        || config.allow_reads
+        || config.allow_writes
+        || config.allow_publication
+        || !config.target_mappings.is_empty()
+    {
+        return DoctorProbe {
+            required: false,
+            status: DoctorStatus::SupportedWithWarnings,
+            code: "replay.configuration".into(),
+            message: "configuration contains replay target or authorization grants that public replay ignores"
+                .into(),
+            remediation: "use explicit replay --target, --execute, --allow-host, and effect gates"
+                .into(),
+        };
+    }
+    DoctorProbe {
+        required: false,
+        status: DoctorStatus::Supported,
+        code: "replay.configuration".into(),
+        message: "replay configuration preserves deny-by-default behavior".into(),
+        remediation: "none".into(),
+    }
 }
 
 fn recorder_metadata_doctor_probe(path: Option<&Path>) -> DoctorProbe {
@@ -604,10 +661,32 @@ fn capture_doctor_probes() -> Vec<DoctorProbe> {
             status,
             code: code.into(),
             message: message.into(),
-            remediation: "resolve this local eBPF prerequisite before recording".into(),
+            remediation: capture_probe_remediation(code, status).into(),
         }
     })
     .collect()
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+fn capture_probe_remediation(code: &str, status: DoctorStatus) -> &'static str {
+    if status == DoctorStatus::Supported {
+        return "none";
+    }
+    match code {
+        "capture.platform" => "run Chronicle on supported Linux",
+        "capture.architecture" => "use a supported little-endian Linux architecture and kernel",
+        "capture.cgroup_v2" => "enable and mount the unified cgroup v2 hierarchy",
+        "capture.btf" => "install a kernel with BTF enabled and /sys/kernel/btf/vmlinux available",
+        "capture.object" | "capture.programs" => {
+            "rebuild Chronicle with the linux-ebpf feature and embedded capture programs"
+        }
+        "capture.cap_bpf" => "grant CAP_BPF to the Chronicle supervisor",
+        "capture.cap_net_admin" => "grant CAP_NET_ADMIN to the Chronicle supervisor",
+        "capture.attach" => {
+            "rerun recording with an explicit PID or cgroup selector to verify attachment"
+        }
+        _ => "resolve the reported local eBPF prerequisite before recording",
+    }
 }
 
 #[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
@@ -7961,6 +8040,47 @@ mod tests {
             assert_eq!(report.status, expected);
             assert_eq!(report.exit_code(), exit);
         }
+    }
+
+    #[test]
+    fn doctor_replay_configuration_failures_are_actionable() {
+        let supported = replay_config_doctor_probe(&ReplayConfig::default());
+        assert_eq!(supported.status, DoctorStatus::Supported);
+
+        let invalid = replay_config_doctor_probe(&ReplayConfig {
+            authorization_env: Some("bad=name".into()),
+            ..ReplayConfig::default()
+        });
+        assert_eq!(invalid.status, DoctorStatus::Unsupported);
+
+        let ignored_grants = replay_config_doctor_probe(&ReplayConfig {
+            dry_run: false,
+            allow_writes: true,
+            ..ReplayConfig::default()
+        });
+        assert_eq!(ignored_grants.status, DoctorStatus::SupportedWithWarnings);
+
+        let missing_name = format!("CHRONICLE_DOCTOR_MISSING_{}", uuid::Uuid::new_v4().simple());
+        let missing = replay_config_doctor_probe(&ReplayConfig {
+            authorization_env: Some(missing_name),
+            ..ReplayConfig::default()
+        });
+        assert_eq!(missing.status, DoctorStatus::NotChecked);
+
+        for probe in [supported, invalid, ignored_grants, missing] {
+            assert!(!probe.remediation.is_empty());
+        }
+    }
+
+    #[test]
+    fn doctor_report_never_emits_empty_remediation() {
+        let report = doctor_report(&DoctorOptions::default());
+        assert!(
+            report
+                .probes
+                .iter()
+                .all(|probe| !probe.remediation.trim().is_empty())
+        );
     }
 
     #[test]

@@ -37,9 +37,9 @@
 
 ## 6. Inspect and doctor improvements
 
-- [ ] 6.1 Update `inspect <RECORDING>` to resolve via `resolve_recording` and default data dir; keep legacy `inspect SESSION --root ROOT` hidden compat; extend JSON with recording identity; human output keeps prioritized metadata/duration/counts/protocols/endpoints/loss warnings/replay eligibility. Acceptance: inspect-by-id, inspect-latest, unknown-exit-3, and legacy-form tests pass.
-- [ ] 6.2 Add data-directory probe reporting source and existing/prospective status without creation. Use `not_checked` when ancestor metadata cannot prove creation/private-mode support; never claim a destructive probe occurred. Acceptance: existing/nonexistent/uncertain/symlink tests plus no persistent artifact/capture/repair/replay traffic.
-- [ ] 6.3 Ensure `doctor` renders remediation strings for unsupported OS, kernel, cgroup v2, BTF, capabilities, data-dir access, and replay configuration failures. Acceptance: probe tests assert non-empty remediation per failing case.
+- [x] 6.1 Update `inspect <RECORDING>` to resolve via `resolve_recording` and default data dir; keep legacy `inspect SESSION --root ROOT` hidden compat; extend JSON with recording identity; human output keeps prioritized metadata/duration/counts/protocols/endpoints/loss warnings/replay eligibility. Acceptance: inspect-by-id, inspect-latest, unknown-exit-3, and legacy-form tests pass.
+- [x] 6.2 Add data-directory probe reporting source and existing/prospective status without creation. Use `not_checked` when ancestor metadata cannot prove creation/private-mode support; never claim a destructive probe occurred. Acceptance: existing/nonexistent/uncertain/symlink tests plus no persistent artifact/capture/repair/replay traffic.
+- [x] 6.3 Ensure `doctor` renders remediation strings for unsupported OS, kernel, cgroup v2, BTF, capabilities, data-dir access, and replay configuration failures. Acceptance: probe tests assert non-empty remediation per failing case.
 
 ## 7. Compatibility entrypoints and deprecation
 

@@ -526,6 +526,11 @@ fn cli_reports_usage_and_data_errors_as_safe_json() {
     assert_eq!(doctor["version"], 1);
     assert_eq!(doctor["status"], "unsupported");
     assert!(doctor["probes"].is_array());
+    assert!(doctor["probes"].as_array().unwrap().iter().all(|probe| {
+        probe["remediation"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    }));
     assert!(doctor_stdout.contains("capture.platform"));
     assert!(!doctor_stdout.contains("distribution"));
 
@@ -541,10 +546,38 @@ fn cli_reports_usage_and_data_errors_as_safe_json() {
 }
 
 #[test]
-fn new_surface_list_inspect_json_and_empty_state_contract() {
-    use std::path::PathBuf;
+fn doctor_config_failure_keeps_independent_probes_and_human_remediation() {
+    let root = std::env::temp_dir().join(format!("chronicle-cli-doctor-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config = root.join("bad.toml");
+    std::fs::write(&config, "not = [valid").unwrap();
+    let json = command(&[
+        "--format",
+        "json",
+        "--config",
+        config.to_str().unwrap(),
+        "--data-dir",
+        root.to_str().unwrap(),
+        "doctor",
+    ]);
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let codes: Vec<_> = report["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|probe| probe["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"replay.configuration"));
+    assert!(codes.contains(&"data_dir.access"));
+    assert!(codes.contains(&"capture.platform"));
 
-    // Empty storage: human hint and empty JSON, both exit 0.
+    let human = command(&["--data-dir", root.to_str().unwrap(), "doctor"]);
+    assert!(output_text(&human).0.contains("remediation:"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn empty_list_and_legacy_inspect_contract() {
     let empty_dir =
         std::env::temp_dir().join(format!("chronicle-cli-empty-{}", uuid::Uuid::new_v4()));
     let empty = command(&["--data-dir", empty_dir.to_str().unwrap(), "list"]);
@@ -567,11 +600,7 @@ fn new_surface_list_inspect_json_and_empty_state_contract() {
     assert_eq!(value["version"], 1);
     assert_eq!(value["recordings"].as_array().map(Vec::len), Some(0));
 
-    // Populated storage via legacy fixture: inspect-by-root still works and
-    // list against an explicit data-dir with one published recording shows
-    // the row with canonical counts.
     let root = std::env::temp_dir().join(format!("chronicle-cli-pop-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&root).unwrap();
     let session_id = record(&root);
     let inspect = command(&[
         "--format",
@@ -582,19 +611,83 @@ fn new_surface_list_inspect_json_and_empty_state_contract() {
         root.to_str().unwrap(),
     ]);
     assert_eq!(inspect.status.code(), Some(0));
-    let (inspect_stdout, _) = output_text(&inspect);
-    let inspected: serde_json::Value = serde_json::from_str(&inspect_stdout).unwrap();
-    assert!(inspected.is_object());
+    assert!(serde_json::from_slice::<serde_json::Value>(&inspect.stdout).is_ok());
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(empty_dir).ok();
+}
 
-    // Recording resolution against a non-existent recording in a fresh data
-    // directory is a typed exit 3 with a stable not-found error.
-    let data_dir =
-        std::env::temp_dir().join(format!("chronicle-cli-data-{}", uuid::Uuid::new_v4()));
+#[test]
+fn public_inspect_resolves_recording_identity() {
+    let root = std::env::temp_dir().join(format!("chronicle-cli-public-{}", uuid::Uuid::new_v4()));
+    let staged_wal = root.join("staged-wal");
+    production_wal(&staged_wal);
+    let public_recording_id = chronicle_application::load_recording_metadata(&staged_wal)
+        .unwrap()
+        .unwrap()
+        .recording_id;
+    let public_wal = root
+        .join("recordings")
+        .join(public_recording_id.to_string());
+    std::fs::create_dir_all(public_wal.parent().unwrap()).unwrap();
+    std::fs::rename(staged_wal, &public_wal).unwrap();
+    let published = command(&[
+        "etl",
+        "--wal-dir",
+        public_wal.to_str().unwrap(),
+        "--output",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(published.status.code(), Some(0));
+    let (published_stdout, _) = output_text(&published);
+    let session_id = published_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("session_id: "))
+        .expect("published session id");
+
+    let listed = command(&[
+        "--format",
+        "json",
+        "--data-dir",
+        root.to_str().unwrap(),
+        "list",
+    ]);
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let recording_id = listed["recordings"][0]["recording_id"]
+        .as_str()
+        .expect("recording id");
+    let latest = command(&[
+        "--format",
+        "json",
+        "--data-dir",
+        root.to_str().unwrap(),
+        "inspect",
+        "latest",
+    ]);
+    assert_eq!(latest.status.code(), Some(0));
+    let latest: serde_json::Value = serde_json::from_slice(&latest.stdout).unwrap();
+    assert_eq!(latest["version"], 1);
+    assert_eq!(latest["recording_id"], recording_id);
+    assert_eq!(latest["session_id"], session_id);
+    assert_eq!(latest["sessions"], 1);
+    assert!(latest["operations"].as_u64().is_some());
+
+    let by_id = command(&[
+        "--data-dir",
+        root.to_str().unwrap(),
+        "inspect",
+        recording_id,
+    ]);
+    assert_eq!(by_id.status.code(), Some(0));
+    let (by_id_stdout, _) = output_text(&by_id);
+    assert!(by_id_stdout.starts_with(&format!("recording_id: {recording_id}\n")));
+    assert!(by_id_stdout.contains("replayability:"));
+    assert!(by_id_stdout.contains("connection: http"));
+
     let missing = command(&[
         "--format",
         "json",
         "--data-dir",
-        data_dir.to_str().unwrap(),
+        root.to_str().unwrap(),
         "inspect",
         "rec_00000000-0000-0000-0000-000000000000",
     ]);
@@ -604,12 +697,38 @@ fn new_surface_list_inspect_json_and_empty_state_contract() {
     let error: serde_json::Value = serde_json::from_str(&missing_stderr).unwrap();
     assert_eq!(error["code"], 3);
     assert!(error["message"].as_str().unwrap().contains("was not found"));
+    std::fs::remove_dir_all(root).unwrap();
+}
 
-    std::fs::remove_dir_all(&root).ok();
-    let _ = empty_dir;
-    std::fs::remove_dir_all(&empty_dir).ok();
-    std::fs::remove_dir_all(&data_dir).ok();
-    let _ = PathBuf::new();
+#[test]
+fn doctor_prospective_data_dir_is_non_mutating_and_actionable() {
+    let root = std::env::temp_dir().join(format!("chronicle-cli-doctor-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let prospective = root.join("prospective").join("chronicle");
+    let doctor = command(&[
+        "--format",
+        "json",
+        "--data-dir",
+        prospective.to_str().unwrap(),
+        "doctor",
+    ]);
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let data_probe = doctor["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|probe| probe["code"] == "data_dir.access")
+        .expect("data-dir probe");
+    assert_eq!(data_probe["status"], "not_checked");
+    assert!(
+        data_probe["message"]
+            .as_str()
+            .unwrap()
+            .contains("--data-dir")
+    );
+    assert!(!data_probe["remediation"].as_str().unwrap().is_empty());
+    assert!(!prospective.exists());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(target_os = "linux")]

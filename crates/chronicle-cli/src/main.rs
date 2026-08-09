@@ -1,13 +1,14 @@
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::record_selector;
 use chronicle_application::{
-    AppConfig, ApplicationError, ChildStdio, CleanupOutcome, CommandReplayOptions,
-    REPLAY_REPORT_VERSION, RecorderConfigV1, RecorderLease, RecorderStatusV1, RecordingCounters,
-    RecordingEtlCheckpoint, RecordingStatus, ShutdownReason, inspect_session, list_recordings,
+    AppConfig, ApplicationError, ChildStdio, CleanupOutcome, CommandReplayOptions, DoctorProbe,
+    DoctorReport, DoctorStatus, InspectSessionResult, ListedRecording, REPLAY_REPORT_VERSION,
+    RecorderConfigV1, RecorderLease, RecorderStatusV1, RecordingCounters, RecordingEtlCheckpoint,
+    RecordingStatus, ShutdownReason, data_dir_doctor_probe, inspect_session, list_recordings,
     load_recorder_metadata, process_and_publish_recording_wal, record_fixture_file,
     render_inspect_human, render_inspect_json, render_json, render_replay_human, replay_command,
-    replay_session_with_plan, resolve_data_dir, resolve_recording, resolve_session,
-    retry_recording,
+    replay_config_doctor_probe, replay_session_with_plan, resolve_data_dir, resolve_recording,
+    resolve_session, retry_recording,
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::{
@@ -521,7 +522,8 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
         &cli.command,
         Command::Recorder | Command::Internal(InternalCommand::Recorder)
     );
-    let config = if is_recorder {
+    let is_doctor = matches!(&cli.command, Command::Doctor(_));
+    let config = if is_recorder || is_doctor {
         AppConfig::default()
     } else {
         match cli.config.clone() {
@@ -1287,6 +1289,44 @@ struct ListJson {
     recordings: Vec<ListRecordingJson>,
 }
 
+#[derive(Serialize)]
+struct InspectRecordingJson<'a> {
+    version: u8,
+    recording_id: String,
+    name: Option<&'a str>,
+    created_at: String,
+    duration_ms: Option<u64>,
+    sessions: usize,
+    operations: usize,
+    status: chronicle_application::RecordingCatalogStatus,
+    #[serde(flatten)]
+    result: &'a InspectSessionResult,
+}
+
+fn render_recording_inspect_human(
+    recording: &ListedRecording,
+    inspected: &InspectSessionResult,
+) -> String {
+    let name = recording
+        .name
+        .as_deref()
+        .map_or_else(|| "none".to_owned(), escape_control);
+    let duration = recording
+        .duration_ms
+        .map_or_else(|| "unknown".to_owned(), format_duration_millis);
+    format!(
+        "recording_id: {}\nname: {}\ncreated_at: {}\nduration: {}\nsessions: {}\noperations: {}\nstatus: {}\n{}",
+        recording.recording_id.to_cli_string(),
+        name,
+        format_created_at(&recording.created_at),
+        duration,
+        recording.sessions,
+        recording.operations,
+        recording_status_human(recording.status),
+        render_inspect_human(inspected),
+    )
+}
+
 fn recording_status_human(status: chronicle_application::RecordingCatalogStatus) -> &'static str {
     match status {
         chronicle_application::RecordingCatalogStatus::InProgress => "in_progress",
@@ -1384,12 +1424,26 @@ fn run_inspect(
     }
     let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
     let recording_id = resolve_recording(&data_dir, &args.recording)?;
+    let recording = list_recordings(&data_dir)?
+        .into_iter()
+        .find(|row| row.recording_id == recording_id)
+        .ok_or_else(|| ApplicationError::RecordingNotFound(args.recording.clone()))?;
     let session_id = resolve_session(&data_dir, recording_id)?
         .ok_or_else(|| ApplicationError::RecordingNotFound(args.recording.clone()))?;
     let result = inspect_session(&data_dir, session_id)?;
     let output = match format {
-        Format::Human => render_inspect_human(&result),
-        Format::Json => render_inspect_json(&result)?,
+        Format::Human => render_recording_inspect_human(&recording, &result),
+        Format::Json => render_json(&InspectRecordingJson {
+            version: 1,
+            recording_id: recording.recording_id.to_cli_string(),
+            name: recording.name.as_deref(),
+            created_at: format_created_at(&recording.created_at),
+            duration_ms: recording.duration_ms,
+            sessions: recording.sessions,
+            operations: recording.operations,
+            status: recording.status,
+            result: &result,
+        })?,
     };
     Ok((output, 0))
 }
@@ -1398,27 +1452,59 @@ fn run_doctor(
     args: DoctorArgs,
     cli_data_dir: Option<&Path>,
     format: Format,
-    recorder_config_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
 ) -> Result<(String, i32), ApplicationError> {
-    let data_dir = resolve_public_data_dir(cli_data_dir, &AppConfig::default()).ok();
-    let report = chronicle_application::doctor_report(&chronicle_application::DoctorOptions {
+    let (config, replay_probe) = if let Some(path) = config_path {
+        match AppConfig::from_file(path) {
+            Ok(config) => {
+                let probe = replay_config_doctor_probe(&config.replay);
+                (config, probe)
+            }
+            Err(_) => (
+                AppConfig::default(),
+                DoctorProbe {
+                    required: false,
+                    status: DoctorStatus::Unsupported,
+                    code: "replay.configuration".into(),
+                    message: "application configuration could not be loaded".into(),
+                    remediation: "fix the TOML file supplied with --config, then rerun doctor"
+                        .into(),
+                },
+            ),
+        }
+    } else {
+        let config = AppConfig::default();
+        let probe = replay_config_doctor_probe(&config.replay);
+        (config, probe)
+    };
+    let resolved = resolve_data_dir(
+        cli_data_dir,
+        config.data_dir.as_deref(),
+        &|key| std::env::var(key).ok(),
+        &std::env::home_dir,
+    );
+    let data_dir_probe = data_dir_doctor_probe(resolved.as_ref());
+    let base = chronicle_application::doctor_report(&chronicle_application::DoctorOptions {
         wal_dir: args.wal_dir,
         output: args.output,
         state_root: args.state_root,
-        config: recorder_config_path,
+        config: None,
     });
+    let mut probes = vec![data_dir_probe, replay_probe];
+    probes.extend(base.probes);
+    let report = DoctorReport::new(probes);
     let rendered = match format {
-        Format::Human => {
-            let mut lines: Vec<String> = report
-                .probes
-                .iter()
-                .map(|probe| format!("{}: {:?} — {}", probe.code, probe.status, probe.message))
-                .collect();
-            if let Some(path) = data_dir {
-                lines.insert(0, format!("data_dir: {} (resolved)", path.display()));
-            }
-            lines.join("\n")
-        }
+        Format::Human => report
+            .probes
+            .iter()
+            .map(|probe| {
+                format!(
+                    "{}: {:?} — {} — remediation: {}",
+                    probe.code, probe.status, probe.message, probe.remediation
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         Format::Json => render_json(&report)?,
     };
     Ok((rendered, report.exit_code()))
