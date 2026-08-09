@@ -1,17 +1,18 @@
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::record_selector;
 use chronicle_application::{
-    AppConfig, ApplicationError, REPLAY_REPORT_VERSION, RecorderConfigV1, RecorderLease,
-    RecorderStatusV1, RecordingCounters, RecordingEtlCheckpoint, RecordingStatus, ShutdownReason,
-    inspect_session, list_recordings, load_recorder_metadata, process_and_publish_recording_wal,
-    record_fixture_file, render_inspect_human, render_inspect_json, render_json,
-    render_replay_human, replay_session_with_plan, resolve_data_dir, resolve_recording,
-    resolve_session, retry_recording,
+    AppConfig, ApplicationError, ChildStdio, CleanupOutcome, CommandReplayOptions,
+    REPLAY_REPORT_VERSION, RecorderConfigV1, RecorderLease, RecorderStatusV1, RecordingCounters,
+    RecordingEtlCheckpoint, RecordingStatus, ShutdownReason, inspect_session, list_recordings,
+    load_recorder_metadata, process_and_publish_recording_wal, record_fixture_file,
+    render_inspect_human, render_inspect_json, render_json, render_replay_human, replay_command,
+    replay_session_with_plan, resolve_data_dir, resolve_recording, resolve_session,
+    retry_recording,
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::{
-    CgroupSelector, ChildExitResult, ChildStdio, CleanupOutcome, CommandRecordOptions,
-    CommandRecordResult, ProductionRecordingBounds, ProductionSignalStop, load_recording_metadata,
+    CgroupSelector, ChildExitResult, CommandRecordOptions, CommandRecordResult,
+    ProductionRecordingBounds, ProductionSignalStop, load_recording_metadata,
     mark_recording_forced_termination, record_command, record_continuous_ebpf, record_live_ebpf,
     recording_physical_wal_bytes,
 };
@@ -157,7 +158,10 @@ struct ReplayArgs {
     /// Recording to replay: `latest`, `rec_<uuid>`, bare UUID, or exact name.
     recording: String,
     /// Command to spawn and replay against, after `--` (command mode).
-    #[arg(last = true)]
+    #[arg(
+        last = true,
+        conflicts_with_all = ["target", "allow_hosts", "allow_read", "execute"]
+    )]
     command: Vec<String>,
     /// Explicit loopback target for an already-running application (target mode).
     #[arg(long)]
@@ -264,6 +268,47 @@ struct ReplayJson<'a> {
     version: u16,
     plan: &'a chronicle_application::ReplaySessionResult,
     result: &'a chronicle_application::ReplaySessionResult,
+}
+
+#[derive(Serialize)]
+struct CommandReplayJson<'a> {
+    version: u16,
+    plan: &'a chronicle_application::ReplaySessionResult,
+    result: &'a chronicle_application::ReplaySessionResult,
+    cleanup: ReplayCleanupJson<'a>,
+}
+
+#[derive(Serialize)]
+struct ReplayCleanupJson<'a> {
+    status: &'static str,
+    possible_orphan_pids: &'a [u32],
+}
+
+fn replay_cleanup_json(cleanup: &CleanupOutcome) -> ReplayCleanupJson<'_> {
+    match cleanup {
+        CleanupOutcome::Clean => ReplayCleanupJson {
+            status: "clean",
+            possible_orphan_pids: &[],
+        },
+        CleanupOutcome::Killed => ReplayCleanupJson {
+            status: "killed",
+            possible_orphan_pids: &[],
+        },
+        CleanupOutcome::TimedOut { remaining } => ReplayCleanupJson {
+            status: "timed_out",
+            possible_orphan_pids: remaining,
+        },
+    }
+}
+
+fn replay_cleanup_human(cleanup: &CleanupOutcome) -> String {
+    match cleanup {
+        CleanupOutcome::Clean => "clean".into(),
+        CleanupOutcome::Killed => "killed".into(),
+        CleanupOutcome::TimedOut { remaining } => {
+            format!("timed_out (possible orphan pids: {remaining:?})")
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -856,7 +901,7 @@ fn record_command_mode(
     config: &AppConfig,
     format: Format,
 ) -> Result<(String, i32), ApplicationError> {
-    use rustix::process::{getegid, geteuid};
+    use rustix::process::{getgid, getuid};
     let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
     let stop = ProductionSignalStop::default();
     spawn_command_signal_watcher(stop.clone());
@@ -876,8 +921,8 @@ fn record_command_mode(
         } else {
             ChildStdio::Inherit
         },
-        invoking_uid: geteuid().as_raw(),
-        invoking_gid: getegid().as_raw(),
+        invoking_uid: getuid().as_raw(),
+        invoking_gid: getgid().as_raw(),
         stop,
     })?;
     // Exit: orphan cleanup is a typed failure (3); otherwise the recording
@@ -903,7 +948,7 @@ fn record_selector_mode(
     config: &AppConfig,
     format: Format,
 ) -> Result<(String, i32), ApplicationError> {
-    use rustix::process::{getegid, geteuid};
+    use rustix::process::{getgid, getuid};
     let selector = match (pid, cgroup) {
         (Some(pid), None) => CgroupSelector::Pid(pid),
         (None, Some(cgroup)) => CgroupSelector::Explicit(cgroup),
@@ -927,8 +972,8 @@ fn record_selector_mode(
             domain_lock_root: config.domain_lock_root.clone(),
             child_stdout: ChildStdio::Null,
             child_stderr: ChildStdio::Null,
-            invoking_uid: geteuid().as_raw(),
-            invoking_gid: getegid().as_raw(),
+            invoking_uid: getuid().as_raw(),
+            invoking_gid: getgid().as_raw(),
             stop,
         },
     )?;
@@ -1094,11 +1139,48 @@ async fn run_replay(
     }
     let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
     let recording_id = resolve_recording(&data_dir, &args.recording)?;
-    let session_id = recording_id.to_string();
+    let session_id = resolve_session(&data_dir, recording_id)?
+        .ok_or_else(|| ApplicationError::RecordingNotFound(args.recording.clone()))?
+        .to_string();
     if !args.command.is_empty() {
-        return Err(ApplicationError::NotImplemented(
-            "replay RECORDING -- COMMAND",
-        ));
+        let child_stdio = match format {
+            Format::Human => ChildStdio::Inherit,
+            Format::Json => ChildStdio::Null,
+        };
+        let result = replay_command(
+            CommandReplayOptions {
+                command: args.command,
+                data_dir,
+                session_id,
+                allow_writes: args.allow_write,
+                child_stdout: child_stdio,
+                child_stderr: child_stdio,
+                invoking_uid: rustix::process::getuid().as_raw(),
+                invoking_gid: rustix::process::getgid().as_raw(),
+            },
+            &config.replay,
+        )
+        .await?;
+        let output = match format {
+            Format::Human => format!(
+                "plan:\n{}\nresult:\n{}\ncleanup: {}",
+                render_replay_human(&result.plan),
+                render_replay_human(&result.replay),
+                replay_cleanup_human(&result.cleanup)
+            ),
+            Format::Json => render_json(&CommandReplayJson {
+                version: REPLAY_REPORT_VERSION,
+                plan: &result.plan,
+                result: &result.replay,
+                cleanup: replay_cleanup_json(&result.cleanup),
+            })?,
+        };
+        let code = if matches!(result.cleanup, CleanupOutcome::TimedOut { .. }) {
+            3
+        } else {
+            replay_exit_code(&result.replay)
+        };
+        return Ok((output, code));
     }
     let target = args.target.ok_or(ApplicationError::ProductionPreflight(
         "replay requires -- COMMAND... or --target URL",
@@ -1388,6 +1470,7 @@ fn error_code(error: &ApplicationError) -> i32 {
     match error {
         ApplicationError::InvalidRecordingName(_, _) => 2,
         ApplicationError::UnsupportedLivePreflight(_)
+        | ApplicationError::ReplayReadiness(_)
         | ApplicationError::ReplayTarget(_)
         | ApplicationError::Replay(ReplayError::PreflightDenied) => 4,
         ApplicationError::Protocol(ProtocolError::Transport { .. })
@@ -1671,6 +1754,17 @@ mod tests {
             6
         );
     }
+
+    #[test]
+    fn command_replay_cleanup_timeout_reports_orphan_evidence() {
+        let cleanup = CleanupOutcome::TimedOut {
+            remaining: vec![41, 42],
+        };
+        let json = serde_json::to_value(replay_cleanup_json(&cleanup)).unwrap();
+        assert_eq!(json["status"], "timed_out");
+        assert_eq!(json["possible_orphan_pids"], serde_json::json!([41, 42]));
+        assert!(replay_cleanup_human(&cleanup).contains("possible orphan pids"));
+    }
 }
 
 #[cfg(test)]
@@ -1718,6 +1812,21 @@ mod new_surface_tests {
         let command_mode =
             Cli::try_parse_from(["chronicle", "record", "--", "echo", "hi"]).unwrap();
         assert!(validate_record_arguments(&command_mode).is_ok());
+    }
+
+    #[test]
+    fn replay_target_and_command_modes_conflict_in_clap() {
+        let error = Cli::try_parse_from([
+            "chronicle",
+            "replay",
+            "latest",
+            "--target",
+            "http://127.0.0.1:8080",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
     }
 
     #[test]

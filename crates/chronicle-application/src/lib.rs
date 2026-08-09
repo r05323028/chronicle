@@ -5,12 +5,16 @@ mod bootstrap;
 mod cgroup_selection;
 #[allow(unsafe_code)] // bootstrap spawn uses pre_exec descriptor manipulation
 mod command_record;
+mod command_replay;
 mod continuous_recorder;
 mod data_dir;
 mod domain_lock;
 mod epoch_catalog;
 mod epoch_rollover;
 mod incremental_worker;
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod listener_discovery;
 mod recorder_config;
 mod recorder_lease;
 mod recorder_lifecycle;
@@ -31,6 +35,9 @@ pub use cgroup_selection::{
 pub use command_record::{
     COMMAND_RECORD_ATTACH_DEADLINE, COMMAND_RECORD_SCOPE_PREFIX, ChildStdio, CommandRecordOptions,
     CommandRecordResult, record_command, record_selector, retry_recording,
+};
+pub use command_replay::{
+    COMMAND_REPLAY_SCOPE_PREFIX, CommandReplayOptions, CommandReplayResult, replay_command,
 };
 pub use continuous_recorder::{ContinuousRecorderError, ContinuousRecorderService};
 pub use data_dir::{DataDirSource, ResolvedDataDir, ensure_private_data_dir, resolve_data_dir};
@@ -118,7 +125,7 @@ use chronicle_protocol::{ProtocolError, ProtocolRegistry, ReplayContext, SecretB
 use chronicle_replay::{
     LoopbackReplayOptions, OperationExecutionState, ReplayError, ReplayExecutor, ReplayOutcome,
     ReplayPlan, ReplayPlanner, ReplayPolicy, ReplayTargetError, Replayability, TargetMap,
-    TimingMode,
+    TargetRule, TimingMode,
 };
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
@@ -2982,6 +2989,8 @@ pub enum ApplicationError {
     DomainLockUnsafePath,
     #[error("unsupported live supervised scope: {0}")]
     UnsupportedLivePreflight(&'static str),
+    #[error("replay target readiness failed: {0}")]
+    ReplayReadiness(String),
     #[error(
         "incompatible domain lock mapping: data directory {data_dir} and lock root {lock_root} resolve different lock paths on the same filesystem; multiple differently locked Chronicle domains on one filesystem are unsupported"
     )]
@@ -5124,6 +5133,62 @@ pub struct ReplaySessionResult {
     pub operations: Vec<ReplayOperationSummary>,
 }
 
+pub(crate) fn hydrate_replay_session(
+    root: &Path,
+    session_id: &str,
+) -> Result<chronicle_canonical::CanonicalSession, ApplicationError> {
+    let parsed = uuid::Uuid::parse_str(session_id)
+        .map(chronicle_common::SessionId)
+        .map_err(|_| ApplicationError::InvalidConfig("session ID must be a UUID".into()))?;
+    Ok(FilesystemSessionStore::new(root).hydrate(parsed)?)
+}
+
+pub(crate) fn command_replay_plan(
+    session: &chronicle_canonical::CanonicalSession,
+    allow_writes: bool,
+) -> Result<ReplayPlan, ApplicationError> {
+    let targets = TargetMap {
+        rules: session
+            .connections
+            .iter()
+            .map(|connection| TargetRule {
+                protocol: None,
+                host: None,
+                port: None,
+                connection_id: Some(connection.id),
+                target: connection.server.clone(),
+            })
+            .collect(),
+    };
+    let policy = ReplayPolicy {
+        dry_run: false,
+        allow_reads: true,
+        allow_writes,
+        block_recorded_destination: false,
+        execution_authorized: true,
+        ..ReplayPolicy::default()
+    };
+    Ok(ReplayPlanner::plan(
+        session,
+        &targets,
+        &policy,
+        TimingMode::Asap,
+    )?)
+}
+
+/// Target-independent command-mode replay plan. Recorded endpoints fill the
+/// planner's mandatory target slots only; destination blocking is deferred to
+/// the discovered loopback target. No executor or network context is created.
+pub fn preplan_command_replay_session(
+    root: impl AsRef<Path>,
+    session_id: &str,
+    allow_writes: bool,
+) -> Result<ReplaySessionResult, ApplicationError> {
+    let session = hydrate_replay_session(root.as_ref(), session_id)?;
+    let plan = command_replay_plan(&session, allow_writes)?;
+    Ok(replay_plan_result(session.id.to_string(), &plan))
+}
+
 /// Replays hydrated filesystem session through explicit loopback-only options.
 pub async fn replay_session(
     root: impl AsRef<Path>,
@@ -5145,16 +5210,32 @@ pub async fn replay_session_with_plan<F>(
 where
     F: FnOnce(&ReplaySessionResult),
 {
-    let parsed = uuid::Uuid::parse_str(session_id)
-        .map(chronicle_common::SessionId)
-        .map_err(|_| ApplicationError::InvalidConfig("session ID must be a UUID".into()))?;
-    let session = FilesystemSessionStore::new(root.as_ref()).hydrate(parsed)?;
+    replay_session_with_plan_guard(root, session_id, config, options, on_plan, || Ok(())).await
+}
+
+/// Same sole replay path with one zero-traffic guard immediately before any
+/// execution context is authorized. Command mode uses it to revalidate owned
+/// listener evidence; explicit-target callers use [`replay_session_with_plan`].
+pub async fn replay_session_with_plan_guard<F, G>(
+    root: impl AsRef<Path>,
+    session_id: &str,
+    config: &ReplayConfig,
+    options: &LoopbackReplayOptions,
+    on_plan: F,
+    before_execute: G,
+) -> Result<ReplaySessionResult, ApplicationError>
+where
+    F: FnOnce(&ReplaySessionResult),
+    G: FnOnce() -> Result<(), ApplicationError>,
+{
+    let session = hydrate_replay_session(root.as_ref(), session_id)?;
     let (targets, policy) = replay_command_inputs(&session, options)?;
     let plan = ReplayPlanner::plan(&session, &targets, &policy, TimingMode::Asap)?;
     on_plan(&replay_plan_result(session.id.to_string(), &plan));
     let mut context = ReplayContext::default();
     if options.execute && plan.is_executable() {
         context = replay_context(config)?;
+        before_execute()?;
         context.authorize_execution_for(options.validate_target()?.endpoint().clone());
     }
     let contexts = BTreeMap::from([(chronicle_common::ProtocolId::new("http/1.1"), context)]);
@@ -5202,7 +5283,7 @@ where
     })
 }
 
-fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> ReplaySessionResult {
+pub(crate) fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> ReplaySessionResult {
     let operations: Vec<_> = plan
         .operations()
         .iter()
@@ -5223,8 +5304,10 @@ fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> ReplaySessionRes
             ReplayOutcome::DryRun
         } else if plan.is_executable() {
             ReplayOutcome::Completed
-        } else {
+        } else if plan.has_policy_denial() {
             ReplayOutcome::StoppedPolicy
+        } else {
+            ReplayOutcome::StoppedInvalidSession
         },
         dry_run: plan.is_dry_run(),
         preflight_denied: !plan.is_executable(),
@@ -6150,6 +6233,73 @@ mod tests {
             replay_context_from(&config, |_| Some("Bearer good\r\nInjected: bad".into())),
             Err(ApplicationError::InvalidReplayCredential)
         ));
+    }
+
+    #[tokio::test]
+    async fn command_replay_write_denial_never_spawns_target() {
+        let root =
+            std::env::temp_dir().join(format!("chronicle-replay-preplan-{}", uuid::Uuid::new_v4()));
+        let marker = root.join("target-ran");
+        let fixture = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/http/binary-body.json"
+        ))
+        .unwrap();
+        let mut source = FixtureCaptureSource::from_json(&fixture).unwrap();
+        let recorded = record_fixture(&mut source, &root, 1024 * 1024).unwrap();
+
+        let result = replay_command(
+            CommandReplayOptions {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("touch '{}'", marker.display()),
+                ],
+                data_dir: root.clone(),
+                session_id: recorded.session_id.to_string(),
+                allow_writes: false,
+                child_stdout: ChildStdio::Null,
+                child_stderr: ChildStdio::Null,
+                invoking_uid: rustix::process::geteuid().as_raw(),
+                invoking_gid: rustix::process::getegid().as_raw(),
+            },
+            &ReplayConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.replay.outcome, ReplayOutcome::StoppedPolicy);
+        assert!(result.replay.preflight_denied);
+        assert!(result.child_exit.is_none());
+        assert!(result.target_origin.is_none());
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_only_command_preplan_is_invalid_session() {
+        let root =
+            std::env::temp_dir().join(format!("chronicle-replay-invalid-{}", uuid::Uuid::new_v4()));
+        let fixture = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let mut source = FixtureCaptureSource::from_json(&fixture).unwrap();
+        let recorded = record_fixture(&mut source, &root, 1024 * 1024).unwrap();
+        let mut session = FilesystemSessionStore::new(&root)
+            .hydrate(recorded.session_id)
+            .unwrap();
+        session.connections[0].operations[0]
+            .attributes
+            .insert("chronicle.replayable".into(), "false".into());
+
+        let plan = command_replay_plan(&session, false).unwrap();
+        let result = replay_plan_result(session.id.to_string(), &plan);
+        assert_eq!(result.outcome, ReplayOutcome::StoppedInvalidSession);
+        assert!(result.preflight_denied);
+        assert_eq!(result.counts.executable, 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

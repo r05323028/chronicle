@@ -96,19 +96,17 @@ fn preflight_command_record(_options: &CommandRecordOptions) -> Result<(), Appli
 pub fn record_command(
     options: CommandRecordOptions,
 ) -> Result<CommandRecordResult, ApplicationError> {
+    use crate::bootstrap::spawn_blocked_bootstrap;
     use crate::recording_catalog::RecordingIntentV1;
     use crate::supervised_scope::{RealClock, SCOPE_POLL_INTERVAL, create_supervised_scope};
     use crate::{
-        CgroupSelection, DomainLockGuard, ProductionRecordingBounds, RecordingMetadata,
-        RecordingSelectorIdentity, ShutdownReason, acquire_domain_lock, claim_recording_name,
-        ensure_private_data_dir, live_capture_metadata, monotonic_millis, reconcile_catalog,
-        record_production, recordings_root, save_catalog, write_recording_intent,
+        CgroupSelection, ProductionRecordingBounds, RecordingMetadata, RecordingSelectorIdentity,
+        ShutdownReason, acquire_domain_lock, claim_recording_name, ensure_private_data_dir,
+        live_capture_metadata, monotonic_millis, reconcile_catalog, recordings_root, save_catalog,
+        write_recording_intent,
     };
     use std::collections::BTreeSet;
-    use std::fs::File;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
@@ -147,73 +145,35 @@ pub fn record_command(
     }
 
     // Spawn the hidden bootstrap blocked on the readiness pipe (fd 3).
-    let (read_end, write_end) =
-        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(|error| {
-            ApplicationError::Io(std::io::Error::from_raw_os_error(error.raw_os_error()))
-        })?;
-    let read_end_raw = read_end.as_raw_fd();
-    let current_exe = std::env::current_exe().map_err(|error| {
-        ApplicationError::InvalidConfig(format!("current executable unavailable: {error}"))
-    })?;
-    let mut command = Command::new(&current_exe);
-    command.args([
-        "internal",
-        "bootstrap",
-        "--uid",
-        &options.invoking_uid.to_string(),
-        "--gid",
-        &options.invoking_gid.to_string(),
-        "--",
-    ]);
-    command.args(&options.command);
-    match options.child_stdout {
-        ChildStdio::Inherit => {
-            command.stdout(Stdio::inherit());
-        }
-        ChildStdio::Null => {
-            command.stdout(Stdio::null());
-        }
-    }
-    match options.child_stderr {
-        ChildStdio::Inherit => {
-            command.stderr(Stdio::inherit());
-        }
-        ChildStdio::Null => {
-            command.stderr(Stdio::null());
-        }
-    }
-    unsafe {
-        command.pre_exec(move || {
-            // Place the readiness pipe read end on fixed fd 3. When it already
-            // is fd 3, only clear CLOEXEC. Both wrappers are forgotten on every
-            // path so no descriptor drops in the child.
-            let source = File::from_raw_fd(read_end_raw);
-            let mut target = std::os::fd::OwnedFd::from_raw_fd(3);
-            let result = if read_end_raw == 3 {
-                rustix::io::fcntl_setfd(&target, rustix::io::FdFlags::empty())
-            } else {
-                rustix::io::dup2(&source, &mut target)
-            };
-            std::mem::forget(source);
-            std::mem::forget(target);
-            result.map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
-        });
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| ApplicationError::InvalidConfig(format!("spawning bootstrap: {error}")))?;
+    let stdout = match options.child_stdout {
+        ChildStdio::Inherit => Stdio::inherit(),
+        ChildStdio::Null => Stdio::null(),
+    };
+    let stderr = match options.child_stderr {
+        ChildStdio::Inherit => Stdio::inherit(),
+        ChildStdio::Null => Stdio::null(),
+    };
+    let mut child = spawn_blocked_bootstrap(
+        &options.command,
+        options.invoking_uid,
+        options.invoking_gid,
+        stdout,
+        stderr,
+    )?;
 
     // The bootstrap must be in the scope before capture attaches.
-    scope.move_process(child.id()).map_err(|error| {
-        let _ = scope.kill_all();
-        ApplicationError::from(error)
-    })?;
+    if let Err(error) = scope.move_process(child.pid()) {
+        child.abort();
+        let _ = scope.destroy();
+        let _ = child.wait_result();
+        return Err(error.into());
+    }
     scope.revalidate()?;
 
     let selection = CgroupSelection {
         canonical_path: scope.identity().canonical_path.clone(),
         cgroup_id: scope.identity().cgroup_id,
-        direct_tgids: BTreeSet::from([child.id()]),
+        direct_tgids: BTreeSet::from([child.pid()]),
         descendant_cgroup_ids: BTreeSet::new(),
         shared_scope_acknowledged: true,
     };
@@ -263,13 +223,10 @@ pub fn record_command(
             .unwrap_or(false);
         empty.then_some(ShutdownReason::SourceCompleted)
     };
-    let on_ready = move || -> Result<(), ApplicationError> {
+    let on_ready = || -> Result<(), ApplicationError> {
+        child.release()?;
         released.store(true, Ordering::SeqCst);
-        let mut file = File::from(write_end);
-        use std::io::Write;
-        file.write_all(b"G").map_err(|error| {
-            ApplicationError::InvalidConfig(format!("releasing bootstrap: {error}"))
-        })
+        Ok(())
     };
 
     let result = crate::record_production(
@@ -291,7 +248,10 @@ pub fn record_command(
             .unwrap_or(crate::CleanupOutcome::TimedOut {
                 remaining: scope.members().unwrap_or_default(),
             });
-    let child_exit = reap_child_exit(&mut child);
+    let child_exit = match cleanup {
+        crate::CleanupOutcome::TimedOut { .. } => child.try_result(),
+        crate::CleanupOutcome::Clean | crate::CleanupOutcome::Killed => child.wait_result(),
+    };
     let _ = watchdog;
 
     match result {
@@ -341,7 +301,6 @@ pub fn retry_recording(
         process_and_publish_recording_wal, reconcile_catalog, recordings_root, resolve_recording,
         save_catalog,
     };
-    use chronicle_common::SessionId;
 
     ensure_private_data_dir(data_dir)?;
     let guard = acquire_domain_lock(data_dir, domain_lock_root)?;
@@ -498,24 +457,6 @@ pub fn record_selector(
     ))
 }
 
-/// Reap the bootstrap child (which exec'd the target): its exit status is the
-/// target's factual exit, reported but never forwarded.
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
-fn reap_child_exit(child: &mut std::process::Child) -> Option<ChildExitResult> {
-    use std::os::unix::process::ExitStatusExt;
-    let status = child.wait().ok()?;
-    if let Some(code) = status.code() {
-        Some(ChildExitResult::ExitCode { code })
-    } else {
-        status
-            .signal()
-            .map(|signal| ChildExitResult::Signal { signal })
-    }
-}
-
 /// ETL, canonical publication, and catalog update under the held domain lock.
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 fn finalize_and_publish(
@@ -530,7 +471,6 @@ fn finalize_and_publish(
         RecordingCatalogStatus, process_and_publish_recording_wal, reconcile_catalog,
         recordings_root, save_catalog,
     };
-    use chronicle_common::SessionId;
     let wal_dir = recordings_root(&options.data_dir).join(recording_id.to_string());
     let registry = chronicle_protocol_builtins::registry()?;
     let published_session =

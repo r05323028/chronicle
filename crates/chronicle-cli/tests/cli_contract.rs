@@ -621,12 +621,18 @@ fn bootstrap_blocks_until_ready_then_hardens_and_execs_target() {
 
     // A pipe becomes the readiness channel: read end is dup2'd onto fd 3 in
     // the child; the parent writes the go byte after "attachment".
-    let mut pipe = os_pipe().expect("pipe");
+    let pipe = os_pipe().expect("pipe");
     let read_end = pipe.0;
     let write_end = pipe.1;
 
     let uid = std::fs::metadata("/proc/self").unwrap().uid();
     let gid = std::fs::metadata("/proc/self").unwrap().gid();
+    let supplementary_groups_remain = std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Groups:"))
+        .is_some_and(|groups| !groups.trim().is_empty());
+    let can_clear_groups = rustix::process::geteuid().as_raw() == 0 || !supplementary_groups_remain;
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_chronicle"));
     command.args([
@@ -689,16 +695,23 @@ fn bootstrap_blocks_until_ready_then_hardens_and_execs_target() {
     let signal = std::os::unix::process::ExitStatusExt::signal(&status);
     #[cfg(not(unix))]
     let signal = None;
-    // The target (sh -c 'exit 42') exit code 42 is reported factually.
-    assert_eq!(
-        status.code(),
-        Some(42),
-        "target exit code must be reported; signal={signal:?} stderr={stderr:?}"
-    );
+    if can_clear_groups {
+        // The target (sh -c 'exit 42') exit code 42 is reported factually.
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "target exit code must be reported; signal={signal:?} stderr={stderr:?}"
+        );
+    } else {
+        // Rootless host with inherited supplementary groups cannot satisfy the
+        // hardening contract; bootstrap fails closed instead of execing.
+        assert_eq!(status.code(), Some(3));
+        assert!(stderr.contains("supplementary groups remain"));
+    }
 
     // Failure path: without the go byte, EOF aborts the bootstrap with the
     // typed Chronicle failure code (never a synthesized 127).
-    let mut pipe = os_pipe().expect("pipe");
+    let pipe = os_pipe().expect("pipe");
     let read_end = pipe.0;
     let write_end = pipe.1;
     let mut command = Command::new(env!("CARGO_BIN_EXE_chronicle"));
@@ -742,11 +755,29 @@ fn bootstrap_blocks_until_ready_then_hardens_and_execs_target() {
         Some(3),
         "EOF before readiness is a typed failure"
     );
+
+    // Hidden bootstrap credentials are not an authorization surface: direct
+    // callers cannot request an identity different from inherited real IDs.
+    let mismatched_uid = if uid == 0 { 1 } else { 0 };
+    let status = Command::new(env!("CARGO_BIN_EXE_chronicle"))
+        .args([
+            "internal",
+            "bootstrap",
+            "--uid",
+            &mismatched_uid.to_string(),
+            "--gid",
+            &gid.to_string(),
+            "--",
+            "/bin/true",
+        ])
+        .status()
+        .expect("run mismatched bootstrap");
+    assert_eq!(status.code(), Some(3));
 }
 
 #[cfg(target_os = "linux")]
 fn os_pipe() -> Option<(std::os::fd::RawFd, std::os::fd::RawFd)> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
     // CLOEXEC so the child's exec of the bootstrap closes every inherited end
     // except the dup2'd fd 3; otherwise the child would keep a write end open
     // and the EOF-abort path could never fire.

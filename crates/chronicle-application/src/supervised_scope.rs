@@ -70,18 +70,18 @@ impl From<ScopeError> for crate::ApplicationError {
     fn from(error: ScopeError) -> Self {
         match error {
             // Live-preflight class: unsupported environment maps to exit 4.
-            ScopeError::UnsupportedPlatform => {
-                Self::UnsupportedLivePreflight("supervised scope requires Linux")
-            }
-            ScopeError::NotV2 => {
-                Self::UnsupportedLivePreflight("cgroup v2 hierarchy is unavailable")
-            }
-            ScopeError::NotDelegated => {
-                Self::UnsupportedLivePreflight("no writable delegated cgroup root is available")
-            }
-            ScopeError::AccessSeparation => {
-                Self::UnsupportedLivePreflight("cgroup scope access separation is violated")
-            }
+            ScopeError::UnsupportedPlatform => Self::UnsupportedLivePreflight(
+                "supervised scope requires Linux; use portable --target mode for replay",
+            ),
+            ScopeError::NotV2 => Self::UnsupportedLivePreflight(
+                "cgroup v2 hierarchy is unavailable; mount/delegate cgroup v2 or use portable --target mode for replay",
+            ),
+            ScopeError::NotDelegated => Self::UnsupportedLivePreflight(
+                "no writable delegated cgroup root is available; configure delegation or use portable --target mode for replay",
+            ),
+            ScopeError::AccessSeparation => Self::UnsupportedLivePreflight(
+                "cgroup scope access separation is violated; fix membership-control permissions or use portable --target mode for replay",
+            ),
             ScopeError::UnsafeName(message) | ScopeError::CgroupIdUnavailable(message) => {
                 Self::InvalidConfig(message)
             }
@@ -378,18 +378,18 @@ fn membership_control_writable(ancestor: &Path, uid: u32) -> Result<bool, ScopeE
     }
 }
 
-/// Access-separation preflight: the delegated root must be writable by `uid`,
-/// and every ancestor up to and including `hierarchy_root` must not be. This
-/// guarantees the dropped-privilege target cannot reach membership control of
-/// an ancestor scope.
+/// Access-separation preflight: the effective supervisor must be able to
+/// create below `delegated_root`, while dropped target `uid` must not be able
+/// to write that root or any ancestor membership control. Supervisor and
+/// target therefore need distinct privilege; no same-UID or root-target
+/// fallback is claimed safe.
 pub fn preflight_scope_access(
     hierarchy_root: &Path,
     delegated_root: &Path,
     uid: u32,
 ) -> Result<(), ScopeError> {
-    // Root can already reach any cgroup; access separation is moot.
     if uid == 0 {
-        return Ok(());
+        return Err(ScopeError::AccessSeparation);
     }
     if !hierarchy_root.is_absolute() || !delegated_root.is_absolute() {
         return Err(ScopeError::UnsafeName(delegated_root.display().to_string()));
@@ -407,14 +407,14 @@ pub fn preflight_scope_access(
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(ScopeError::NotDelegated);
     }
-    if !writable_by(&metadata, uid) {
+    let supervisor_uid = rustix::process::geteuid().as_raw();
+    if supervisor_uid != 0 && !writable_by(&metadata, supervisor_uid) {
         return Err(ScopeError::NotDelegated);
     }
-    // Every ancestor up to and including the hierarchy root must be
-    // non-writable by the invoking credentials — both the directory itself and
-    // its cgroup.procs membership-control file (the actual write vector for
-    // adding or escaping processes).
-    let mut ancestor = delegated_root.parent();
+    // Delegated root itself and every ancestor through hierarchy_root must be
+    // non-writable by target credentials. The effective supervisor may still
+    // create/move through elevated credentials.
+    let mut ancestor = Some(delegated_root);
     while let Some(path) = ancestor {
         let metadata = fs::symlink_metadata(path)?;
         if writable_by(&metadata, uid) || membership_control_writable(path, uid)? {
@@ -467,17 +467,17 @@ pub fn open_scope(path: &Path) -> Result<SupervisedScope, ScopeError> {
     })
 }
 
-/// Discover the delegated cgroup root for the current process: walk up from
-/// `/proc/self/cgroup` to the first directory writable by `uid`. Root
-/// privileges use the hierarchy root itself. Ancestor safety is validated by
+/// Discover a cgroup root writable by the effective supervisor. Target
+/// credential separation is validated independently by
 /// [`preflight_scope_access`].
 #[cfg(target_os = "linux")]
-pub fn discover_delegated_root(uid: u32) -> Result<(PathBuf, PathBuf), ScopeError> {
+pub fn discover_delegated_root(_uid: u32) -> Result<(PathBuf, PathBuf), ScopeError> {
     let hierarchy = PathBuf::from("/sys/fs/cgroup");
     if !hierarchy.is_dir() {
         return Err(ScopeError::NotV2);
     }
-    if uid == 0 {
+    let supervisor_uid = rustix::process::geteuid().as_raw();
+    if supervisor_uid == 0 {
         return Ok((hierarchy.clone(), hierarchy));
     }
     let contents = fs::read_to_string("/proc/self/cgroup").map_err(|_| ScopeError::NotV2)?;
@@ -494,7 +494,9 @@ pub fn discover_delegated_root(uid: u32) -> Result<(PathBuf, PathBuf), ScopeErro
         .ok_or(ScopeError::NotV2)?;
     let mut candidate = hierarchy.join(current);
     loop {
-        if fs::symlink_metadata(&candidate).is_ok_and(|metadata| writable_by(&metadata, uid)) {
+        if fs::symlink_metadata(&candidate)
+            .is_ok_and(|metadata| writable_by(&metadata, supervisor_uid))
+        {
             return Ok((hierarchy, candidate));
         }
         if !candidate.pop() {
@@ -563,8 +565,9 @@ mod tests {
             fs::create_dir_all(&delegated).unwrap();
             // Hierarchy root not writable by anyone (simulating root-owned).
             fs::set_permissions(&hierarchy, fs::Permissions::from_mode(0o555)).unwrap();
-            // Delegated root writable by anyone (simulating user chown).
-            fs::set_permissions(&delegated, fs::Permissions::from_mode(0o777)).unwrap();
+            // Delegated root writable only by the effective supervisor. Test
+            // target uid differs, so it cannot escape through membership.
+            fs::set_permissions(&delegated, fs::Permissions::from_mode(0o700)).unwrap();
             Self {
                 hierarchy,
                 delegated,
@@ -726,6 +729,22 @@ mod tests {
     }
 
     #[test]
+    fn access_separation_rejects_root_target() {
+        let host = FakeHost::new();
+        let err = preflight_scope_access(&host.hierarchy, &host.delegated, 0).unwrap_err();
+        assert!(matches!(err, ScopeError::AccessSeparation));
+    }
+
+    #[test]
+    fn access_separation_rejects_target_writable_delegated_root() {
+        let host = FakeHost::new();
+        fs::set_permissions(&host.delegated, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = preflight_scope_access(&host.hierarchy, &host.delegated, test_uid()).unwrap_err();
+        assert!(matches!(err, ScopeError::AccessSeparation));
+        fs::set_permissions(&host.delegated, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
     fn access_separation_rejects_writable_ancestor() {
         let host = FakeHost::new();
         fs::set_permissions(&host.hierarchy, fs::Permissions::from_mode(0o777)).unwrap();
@@ -760,7 +779,7 @@ mod tests {
         fs::set_permissions(&host.delegated, fs::Permissions::from_mode(0o555)).unwrap();
         let err = preflight_scope_access(&host.hierarchy, &host.delegated, test_uid()).unwrap_err();
         assert!(matches!(err, ScopeError::NotDelegated));
-        fs::set_permissions(&host.delegated, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&host.delegated, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
