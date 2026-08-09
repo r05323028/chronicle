@@ -3070,6 +3070,8 @@ pub enum ApplicationError {
     UnsupportedLivePreflight(&'static str),
     #[error("replay target readiness failed: {0}")]
     ReplayReadiness(String),
+    #[error("target bootstrap, hardening, or exec failed")]
+    TargetLaunchFailed,
     #[error(
         "incompatible domain lock mapping: data directory {data_dir} and lock root {lock_root} resolve different lock paths on the same filesystem; multiple differently locked Chronicle domains on one filesystem are unsupported"
     )]

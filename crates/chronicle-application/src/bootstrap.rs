@@ -26,12 +26,17 @@ use std::process::{Child, Command, Stdio};
 
 /// Exit code for bootstrap/hardening/exec failures (typed Chronicle failure).
 pub const BOOTSTRAP_FAILURE_EXIT: i32 = 3;
+#[cfg(target_os = "linux")]
+const BOOTSTRAP_STATUS_FD: i32 = 4;
+#[cfg(target_os = "linux")]
+const BOOTSTRAP_STATUS_ENV: &str = "CHRONICLE_BOOTSTRAP_STATUS_FD";
 
 /// Target child blocked on Chronicle's readiness pipe before hardening/exec.
 #[cfg(target_os = "linux")]
 pub(crate) struct BlockedBootstrap {
     child: Child,
     readiness: Option<OwnedFd>,
+    status: Option<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -55,18 +60,38 @@ impl BlockedBootstrap {
         let _ = self.child.kill();
     }
 
-    /// Factual target exit; callers report it but never forward it.
-    pub(crate) fn wait_result(&mut self) -> Option<crate::ChildExitResult> {
-        self.child.wait().ok().and_then(child_exit_result)
+    /// Factual target exit; bootstrap/hardening/exec failure is a Chronicle error.
+    pub(crate) fn wait_result(
+        &mut self,
+    ) -> Result<Option<crate::ChildExitResult>, crate::ApplicationError> {
+        let status = self.child.wait()?;
+        self.classify_result(status)
     }
 
     /// Non-blocking factual result for orphan/cleanup-timeout paths.
-    pub(crate) fn try_result(&mut self) -> Option<crate::ChildExitResult> {
-        self.child
-            .try_wait()
-            .ok()
-            .flatten()
-            .and_then(child_exit_result)
+    pub(crate) fn try_result(
+        &mut self,
+    ) -> Result<Option<crate::ChildExitResult>, crate::ApplicationError> {
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(None);
+        };
+        self.classify_result(status)
+    }
+
+    fn classify_result(
+        &mut self,
+        status: std::process::ExitStatus,
+    ) -> Result<Option<crate::ChildExitResult>, crate::ApplicationError> {
+        let status_pipe = self.status.take().ok_or_else(|| {
+            crate::ApplicationError::InvalidConfig("bootstrap result already collected".into())
+        })?;
+        let mut status_pipe = File::from(status_pipe);
+        let mut failure = [0_u8; 1];
+        match status_pipe.read(&mut failure) {
+            Ok(0) => Ok(child_exit_result(status)),
+            Ok(_) => Err(crate::ApplicationError::TargetLaunchFailed),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -101,7 +126,12 @@ pub(crate) fn spawn_blocked_bootstrap(
         rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(|error| {
             crate::ApplicationError::Io(std::io::Error::from_raw_os_error(error.raw_os_error()))
         })?;
+    let (status_read, status_write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+        .map_err(|error| {
+            crate::ApplicationError::Io(std::io::Error::from_raw_os_error(error.raw_os_error()))
+        })?;
     let read_end_raw = read_end.as_raw_fd();
+    let status_write_raw = status_write.as_raw_fd();
     let current_exe = std::env::current_exe().map_err(|error| {
         crate::ApplicationError::InvalidConfig(format!("current executable unavailable: {error}"))
     })?;
@@ -117,6 +147,7 @@ pub(crate) fn spawn_blocked_bootstrap(
             "--",
         ])
         .args(command)
+        .env(BOOTSTRAP_STATUS_ENV, BOOTSTRAP_STATUS_FD.to_string())
         .stdout(stdout)
         .stderr(stderr);
     unsafe {
@@ -130,6 +161,17 @@ pub(crate) fn spawn_blocked_bootstrap(
             };
             std::mem::forget(source);
             std::mem::forget(target);
+            result.map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+
+            let source = File::from_raw_fd(status_write_raw);
+            let mut target = OwnedFd::from_raw_fd(BOOTSTRAP_STATUS_FD);
+            let result = if status_write_raw == BOOTSTRAP_STATUS_FD {
+                rustix::io::fcntl_setfd(&target, rustix::io::FdFlags::empty())
+            } else {
+                rustix::io::dup2(&source, &mut target)
+            };
+            std::mem::forget(source);
+            std::mem::forget(target);
             result.map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
         });
     }
@@ -137,9 +179,11 @@ pub(crate) fn spawn_blocked_bootstrap(
         crate::ApplicationError::InvalidConfig(format!("spawning bootstrap: {error}"))
     })?;
     drop(read_end);
+    drop(status_write);
     Ok(BlockedBootstrap {
         child,
         readiness: Some(write_end),
+        status: Some(status_read),
     })
 }
 
@@ -147,37 +191,69 @@ pub(crate) fn spawn_blocked_bootstrap(
 /// code; on success (target exec) it never returns.
 #[cfg(target_os = "linux")]
 pub fn run_bootstrap(uid: u32, gid: u32, command: &[String]) -> i32 {
+    let mut status = bootstrap_status_file();
     if command.is_empty() {
-        eprintln!("chronicle bootstrap: no target command");
-        return BOOTSTRAP_FAILURE_EXIT;
+        return bootstrap_failure(&mut status, "no target command");
     }
     if rustix::process::getuid().as_raw() != uid || rustix::process::getgid().as_raw() != gid {
-        eprintln!(
-            "chronicle bootstrap: requested credentials do not match inherited real credentials"
+        return bootstrap_failure(
+            &mut status,
+            "requested credentials do not match inherited real credentials",
         );
-        return BOOTSTRAP_FAILURE_EXIT;
     }
     // 1. Block until the parent signals readiness. EOF (parent died before
     //    releasing) or a read failure aborts without running target code.
     if let Err(message) = read_readiness_byte() {
-        eprintln!("chronicle bootstrap: readiness signal failed: {message}");
-        return BOOTSTRAP_FAILURE_EXIT;
+        return bootstrap_failure(&mut status, &format!("readiness signal failed: {message}"));
     }
     // 2. Harden credentials and process state before the target execs.
-    if let Err(message) = harden(uid, gid) {
-        eprintln!("chronicle bootstrap: hardening failed: {message}");
-        return BOOTSTRAP_FAILURE_EXIT;
+    if let Err(message) = harden(uid, gid, status.as_ref().map(AsRawFd::as_raw_fd)) {
+        return bootstrap_failure(&mut status, &format!("hardening failed: {message}"));
     }
     // 3. Verify the resulting credentials and hardening state before exec.
     if let Err(message) = verify_hardening(uid, gid) {
-        eprintln!("chronicle bootstrap: hardening verification failed: {message}");
-        return BOOTSTRAP_FAILURE_EXIT;
+        return bootstrap_failure(
+            &mut status,
+            &format!("hardening verification failed: {message}"),
+        );
     }
-    // 4. Directly exec the target; never returns on success.
+    if let Some(status_file) = status.as_ref()
+        && let Err(error) = rustix::io::fcntl_setfd(status_file, rustix::io::FdFlags::CLOEXEC)
+    {
+        return bootstrap_failure(
+            &mut status,
+            &format!("setting bootstrap status close-on-exec: {error}"),
+        );
+    }
+    // 4. Directly exec the target; successful exec closes the status pipe.
     let mut target = Command::new(&command[0]);
-    target.args(&command[1..]);
+    target.args(&command[1..]).env_remove(BOOTSTRAP_STATUS_ENV);
     let error = target.exec();
-    eprintln!("chronicle bootstrap: exec failed: {error}");
+    bootstrap_failure(&mut status, &format!("exec failed: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn bootstrap_status_file() -> Option<File> {
+    let requested = std::env::var(BOOTSTRAP_STATUS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        == Some(BOOTSTRAP_STATUS_FD);
+    let descriptor_exists =
+        std::fs::symlink_metadata(format!("/proc/self/fd/{BOOTSTRAP_STATUS_FD}")).is_ok();
+    if !requested || !descriptor_exists {
+        return None;
+    }
+    // SAFETY: /proc/self/fd confirmed fd 4 exists. Bootstrap is single-threaded
+    // and no code can close it between that check and ownership adoption.
+    Some(unsafe { File::from_raw_fd(BOOTSTRAP_STATUS_FD) })
+}
+
+#[cfg(target_os = "linux")]
+fn bootstrap_failure(status: &mut Option<File>, message: &str) -> i32 {
+    if let Some(status) = status.as_mut() {
+        let _ = status.write_all(b"F");
+    }
+    eprintln!("chronicle bootstrap: {message}");
     BOOTSTRAP_FAILURE_EXIT
 }
 
@@ -211,15 +287,15 @@ fn read_readiness_byte() -> Result<(), String> {
 /// (no elevation to drop), the kernel rejects them with `EPERM` and the state
 /// they would have produced already holds. Every other failure aborts.
 #[cfg(target_os = "linux")]
-fn harden(uid: u32, gid: u32) -> Result<(), String> {
+fn harden(uid: u32, gid: u32, preserved_fd: Option<i32>) -> Result<(), String> {
     use rustix::process::{Gid, Uid};
     use rustix::thread::{
         CapabilitySet, CapabilitySets, clear_ambient_capability_set, set_capabilities,
         set_no_new_privs, set_thread_groups, set_thread_res_gid, set_thread_res_uid,
     };
 
-    let requested_uid = Uid::from_raw(uid);
-    let requested_gid = Gid::from_raw(gid);
+    let user_identity = Uid::from_raw(uid);
+    let group_identity = Gid::from_raw(gid);
 
     // Clear supplementary groups (requires CAP_SETGROUPS; EPERM is acceptable
     // for an already-unprivileged bootstrap, whose groups are the invoking
@@ -229,9 +305,9 @@ fn harden(uid: u32, gid: u32) -> Result<(), String> {
         .or_else(accept_permission_denied)?;
 
     // Real/effective/saved GID then UID. These must match exactly.
-    set_thread_res_gid(requested_gid, requested_gid, requested_gid)
+    set_thread_res_gid(group_identity, group_identity, group_identity)
         .map_err(|error| format!("setting real/effective/saved GID: {error}"))?;
-    set_thread_res_uid(requested_uid, requested_uid, requested_uid)
+    set_thread_res_uid(user_identity, user_identity, user_identity)
         .map_err(|error| format!("setting real/effective/saved UID: {error}"))?;
 
     // no_new_privs: file capabilities and setuid binaries cannot elevate the
@@ -255,7 +331,7 @@ fn harden(uid: u32, gid: u32) -> Result<(), String> {
 
     reset_signal_mask()?;
     reset_signal_dispositions()?;
-    close_unneeded_descriptors()?;
+    close_unneeded_descriptors(preserved_fd)?;
     Ok(())
 }
 
@@ -337,10 +413,10 @@ fn reset_signal_dispositions() -> Result<(), String> {
     Ok(())
 }
 
-/// Close every descriptor except stdio (0, 1, 2). The readiness fd 3 was
-/// already closed after the signal was read.
+/// Close every descriptor except stdio and the optional bootstrap status pipe.
+/// The readiness fd 3 was already closed after the signal was read.
 #[cfg(target_os = "linux")]
-fn close_unneeded_descriptors() -> Result<(), String> {
+fn close_unneeded_descriptors(preserved_fd: Option<i32>) -> Result<(), String> {
     let entries = match std::fs::read_dir("/proc/self/fd") {
         Ok(entries) => entries,
         Err(error) => return Err(format!("listing descriptors: {error}")),
@@ -349,6 +425,7 @@ fn close_unneeded_descriptors() -> Result<(), String> {
     for entry in entries.flatten() {
         if let Ok(number) = entry.file_name().to_string_lossy().parse::<i32>()
             && !(0..=2).contains(&number)
+            && Some(number) != preserved_fd
         {
             descriptors.push(number);
         }
@@ -378,17 +455,17 @@ fn verify_hardening(uid: u32, gid: u32) -> Result<(), String> {
             .map(str::trim)
             .ok_or_else(|| format!("missing {name} status field"))
     };
-    let expected_uid = uid.to_string();
+    let uid_text = uid.to_string();
     if field("Uid:")?
         .split_whitespace()
-        .any(|value| value != expected_uid)
+        .any(|value| value != uid_text)
     {
         return Err("real/effective/saved/filesystem UID mismatch".into());
     }
-    let expected_gid = gid.to_string();
+    let gid_text = gid.to_string();
     if field("Gid:")?
         .split_whitespace()
-        .any(|value| value != expected_gid)
+        .any(|value| value != gid_text)
     {
         return Err("real/effective/saved/filesystem GID mismatch".into());
     }

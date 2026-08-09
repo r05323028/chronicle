@@ -50,9 +50,9 @@
 
 ## 8. Output and exit contracts
 
-- [ ] 8.1 Implement record human summary per normative spec example and public record v1 JSON (canonical ID, nullable name, stable status/reason, duration ms, operation/drop totals, existing categorized counters, structured nullable child result). Try block uses `COMMAND...`, never raw argv. Acceptance: v1 schema/golden/nullability/enum/control-escape tests.
-- [ ] 8.2 Implement replay human PASS/FAIL summary (`✓ passed` / `✗ failed`, final `Replay passed.`/`Replay failed.`) on top of existing renderers. Acceptance: golden-output tests for pass and fail.
-- [ ] 8.3 Verify 0/2/3/4/5/6 across new/legacy commands; post-exec app exit/signal factual and not forwarded; bootstrap/hardening/exec failure typed 3/4; inspect/replay/retry resolution exit 3; list storage error exit 3. Acceptance: exit matrix.
+- [x] 8.1 Implement record human summary per normative spec example and public record v1 JSON (canonical ID, nullable name, stable status/reason, duration ms, operation/drop totals, existing categorized counters, structured nullable child result). Try block uses `COMMAND...`, never raw argv. Acceptance: v1 schema/golden/nullability/enum/control-escape tests.
+- [x] 8.2 Implement replay human PASS/FAIL summary (`✓ passed` / `✗ failed`, final `Replay passed.`/`Replay failed.`) on top of existing renderers. Acceptance: golden-output tests for pass and fail.
+- [x] 8.3 Verify 0/2/3/4/5/6 across new/legacy commands; post-exec app exit/signal factual and not forwarded; bootstrap/hardening/exec failure typed 3/4; inspect/replay/retry resolution exit 3; list storage error exit 3. Acceptance: exit matrix.
 
 ## 9. Documentation
 

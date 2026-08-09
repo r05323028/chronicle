@@ -12,17 +12,19 @@ use chronicle_application::{
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::{
-    CgroupSelector, ChildExitResult, CommandRecordOptions, CommandRecordResult,
-    ProductionRecordingBounds, ProductionSignalStop, load_recording_metadata,
-    mark_recording_forced_termination, record_command, record_continuous_ebpf, record_live_ebpf,
-    recording_physical_wal_bytes,
+    CgroupSelector, CommandRecordOptions, ProductionRecordingBounds, ProductionSignalStop,
+    load_recording_metadata, mark_recording_forced_termination, record_command,
+    record_continuous_ebpf, record_live_ebpf, recording_physical_wal_bytes,
 };
+#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
+use chronicle_application::{ChildExitResult, CommandRecordResult};
 use chronicle_common::escape_control;
 use chronicle_protocol::{ProtocolError, TransportErrorCategory};
 use chronicle_replay::{LoopbackReplayOptions, ReplayError, ReplayOutcome, TimingMode};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -363,8 +365,51 @@ fn replay_cleanup_human(cleanup: &CleanupOutcome) -> String {
     }
 }
 
+fn render_public_replay_human(
+    plan: &chronicle_application::ReplaySessionResult,
+    result: &chronicle_application::ReplaySessionResult,
+    cleanup: Option<&CleanupOutcome>,
+) -> String {
+    let succeeded = matches!(
+        result.outcome,
+        ReplayOutcome::Completed | ReplayOutcome::CompletedWithSkips | ReplayOutcome::DryRun
+    ) && !cleanup
+        .is_some_and(|value| matches!(value, CleanupOutcome::TimedOut { .. }));
+    let mut output = format!(
+        "plan:\n{}\nresult:\n{}",
+        render_replay_human(plan),
+        render_replay_human(result)
+    );
+    if let Some(cleanup) = cleanup {
+        write!(output, "\ncleanup: {}", replay_cleanup_human(cleanup))
+            .expect("writing into String cannot fail");
+    }
+    write!(
+        output,
+        "\noperations: attempted={} completed={} failed={} unattempted={} verification_failed={}\n{}\n{}",
+        result.counts.attempted,
+        result.counts.completed,
+        result.counts.failed,
+        result.counts.unattempted,
+        result.counts.verification_failed,
+        if succeeded {
+            "✓ passed"
+        } else {
+            "✗ failed"
+        },
+        if succeeded {
+            "Replay passed."
+        } else {
+            "Replay failed."
+        }
+    )
+    .expect("writing into String cannot fail");
+    output
+}
+
 #[derive(Serialize)]
 struct ErrorJson {
+    version: u8,
     code: i32,
     message: String,
 }
@@ -487,8 +532,12 @@ async fn async_main() {
                 |legacy| legacy_error_message(&error.to_string(), legacy),
             );
             let output = if matches!(format, Format::Json) {
-                render_json(&ErrorJson { code, message })
-                    .unwrap_or_else(|render_error| render_error.to_string())
+                render_json(&ErrorJson {
+                    version: 1,
+                    code,
+                    message,
+                })
+                .unwrap_or_else(|render_error| render_error.to_string())
             } else {
                 message
             };
@@ -613,8 +662,12 @@ fn legacy_error_message(message: &str, legacy: LegacyInvocation) -> String {
 fn exit_legacy_error(format: Format, code: i32, message: &str, legacy: LegacyInvocation) -> ! {
     let message = legacy_error_message(message, legacy);
     let output = if matches!(format, Format::Json) {
-        serde_json::to_string(&ErrorJson { code, message })
-            .expect("static legacy error is serializable")
+        serde_json::to_string(&ErrorJson {
+            version: 1,
+            code,
+            message,
+        })
+        .expect("static legacy error is serializable")
     } else {
         message
     };
@@ -1083,7 +1136,6 @@ fn public_record(
         allow_shared_cgroup,
         ..
     } = args;
-    let _ = (config, format, &name, &duration);
     if let Some(reference) = retry {
         let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
         let recording_id =
@@ -1107,6 +1159,7 @@ fn public_record(
             pid,
             cgroup,
             allow_shared_cgroup,
+            (name, duration),
             cli_data_dir,
             config,
             format,
@@ -1173,11 +1226,13 @@ fn record_selector_mode(
     pid: Option<u32>,
     cgroup: Option<std::path::PathBuf>,
     allow_shared_cgroup: bool,
+    intent: (Option<String>, Option<u64>),
     cli_data_dir: Option<&Path>,
     config: &AppConfig,
     format: Format,
 ) -> Result<(String, i32), ApplicationError> {
     use rustix::process::{getgid, getuid};
+    let (name, duration) = intent;
     let selector = match (pid, cgroup) {
         (Some(pid), None) => CgroupSelector::Pid(pid),
         (None, Some(cgroup)) => CgroupSelector::Explicit(cgroup),
@@ -1195,8 +1250,8 @@ fn record_selector_mode(
         allow_shared_cgroup,
         CommandRecordOptions {
             command: vec!["selector".into()],
-            name: None,
-            duration_seconds: 600,
+            name,
+            duration_seconds: duration.unwrap_or(600),
             data_dir,
             domain_lock_root: config.domain_lock_root.clone(),
             child_stdout: ChildStdio::Null,
@@ -1220,6 +1275,7 @@ fn record_selector_mode(
     _pid: Option<u32>,
     _cgroup: Option<std::path::PathBuf>,
     _allow_shared_cgroup: bool,
+    _intent: (Option<String>, Option<u64>),
     _cli_data_dir: Option<&Path>,
     _config: &AppConfig,
     _format: Format,
@@ -1271,34 +1327,37 @@ fn spawn_command_signal_watcher(stop: ProductionSignalStop) {
     });
 }
 
-/// Human/JSON record completion summary (v1). Formalized further by the
-/// output-contract task; raw argv never appears in output.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+/// Human/JSON public record completion summary v1. Raw argv never appears.
+#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
 fn render_command_record(
     result: &CommandRecordResult,
     format: Format,
 ) -> Result<String, ApplicationError> {
     let id = result.recording_id.to_cli_string();
+    let dropped = dropped_records(&result.counters);
     match format {
         Format::Human => {
-            let status = match &result.status {
-                RecordingStatus::Completed => "complete",
-                RecordingStatus::Failed => "failed",
-                RecordingStatus::Aborted => "aborted",
-                _ => "interrupted",
+            let heading = match result.status {
+                RecordingStatus::Completed => "Recording complete.",
+                RecordingStatus::Failed => "Recording failed.",
+                RecordingStatus::Aborted => "Recording aborted.",
+                _ => "Recording interrupted.",
             };
-            let reason = result
-                .shutdown_reason
-                .map(|reason| format!(" ({reason:?})"))
-                .unwrap_or_default();
-            let duration = format_duration_millis(result.duration_ms);
-            let mut lines = vec![format!("Recording {status}{reason}.")];
+            let mut lines = vec![heading.to_owned()];
             lines.push(format!("  id: {id}"));
-            lines.push(format!("  duration: {duration}"));
-            lines.push(format!("  operations: {}", result.committed_records));
-            lines.push("  dropped: 0".to_owned());
+            lines.push(format!(
+                "  duration: {}",
+                format_duration_millis(result.duration_ms)
+            ));
+            lines.push(format!("  operations: {}", result.operations));
+            lines.push(format!("  dropped: {dropped}"));
             if let Some(child_exit) = &result.child_exit {
-                lines.push(format!("  child: {child_exit:?}"));
+                lines.push(match child_exit {
+                    ChildExitResult::ExitCode { code } => {
+                        format!("  child: exit_code {code}")
+                    }
+                    ChildExitResult::Signal { signal } => format!("  child: signal {signal}"),
+                });
             }
             if matches!(result.cleanup, CleanupOutcome::TimedOut { .. }) {
                 lines.push(
@@ -1308,11 +1367,8 @@ fn render_command_record(
             }
             lines.push("Try:".to_owned());
             lines.push(format!("  chronicle inspect {id}"));
-            lines.push("  chronicle replay <id> -- COMMAND...".to_owned());
-            Ok(lines.join(
-                "
-",
-            ))
+            lines.push(format!("  chronicle replay {id} -- COMMAND..."));
+            Ok(lines.join("\n"))
         }
         Format::Json => {
             #[derive(Serialize)]
@@ -1320,40 +1376,62 @@ fn render_command_record(
                 version: u8,
                 recording_id: String,
                 name: Option<&'a str>,
-                status: &'a str,
-                shutdown_reason: Option<&'a str>,
+                status: &'static str,
+                shutdown_reason: Option<&'static str>,
                 duration_ms: u64,
                 operations: u64,
                 dropped: u64,
+                counters: &'a RecordingCounters,
                 child_exit: Option<&'a ChildExitResult>,
             }
             render_json(&RecordResultJson {
                 version: 1,
                 recording_id: id,
                 name: result.name.as_deref(),
-                status: match result.status {
-                    RecordingStatus::Completed => "completed",
-                    RecordingStatus::Failed => "failed",
-                    RecordingStatus::Aborted => "aborted",
-                    _ => "in_progress",
-                },
-                shutdown_reason: result.shutdown_reason.map(|reason| match reason {
-                    ShutdownReason::UserInterrupt => "user_interrupt",
-                    ShutdownReason::TerminationSignal => "termination_signal",
-                    ShutdownReason::SourceCompleted => "source_completed",
-                    ShutdownReason::DurationLimit => "duration_limit",
-                    ShutdownReason::WalSizeLimit => "wal_size_limit",
-                    ShutdownReason::CaptureFailure => "capture_failure",
-                    ShutdownReason::WalFailure => "wal_failure",
-                    ShutdownReason::ProcessCrashRecovered => "process_crash_recovered",
-                    ShutdownReason::ForcedTermination => "forced_termination",
-                }),
+                status: recording_status_json(result.status),
+                shutdown_reason: result.shutdown_reason.map(shutdown_reason_json),
                 duration_ms: result.duration_ms,
-                operations: result.committed_records,
-                dropped: 0,
+                operations: result.operations,
+                dropped,
+                counters: &result.counters,
                 child_exit: result.child_exit.as_ref(),
             })
         }
+    }
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
+fn dropped_records(counters: &RecordingCounters) -> u64 {
+    counters
+        .discarded_from_queue_due_to_wal_limit
+        .records
+        .saturating_add(counters.kernel_or_backend_dropped.records)
+        .saturating_add(counters.rejected_after_stop.records)
+        .saturating_add(counters.rejected_due_to_quota.records)
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
+const fn recording_status_json(status: RecordingStatus) -> &'static str {
+    match status {
+        RecordingStatus::Completed => "completed",
+        RecordingStatus::Failed => "failed",
+        RecordingStatus::Aborted => "aborted",
+        _ => "in_progress",
+    }
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
+const fn shutdown_reason_json(reason: ShutdownReason) -> &'static str {
+    match reason {
+        ShutdownReason::UserInterrupt => "user_interrupt",
+        ShutdownReason::TerminationSignal => "termination_signal",
+        ShutdownReason::SourceCompleted => "source_completed",
+        ShutdownReason::DurationLimit => "duration_limit",
+        ShutdownReason::WalSizeLimit => "wal_size_limit",
+        ShutdownReason::CaptureFailure => "capture_failure",
+        ShutdownReason::WalFailure => "wal_failure",
+        ShutdownReason::ProcessCrashRecovered => "process_crash_recovered",
+        ShutdownReason::ForcedTermination => "forced_termination",
     }
 }
 
@@ -1391,12 +1469,9 @@ async fn run_replay(
         )
         .await?;
         let output = match format {
-            Format::Human => format!(
-                "plan:\n{}\nresult:\n{}\ncleanup: {}",
-                render_replay_human(&result.plan),
-                render_replay_human(&result.replay),
-                replay_cleanup_human(&result.cleanup)
-            ),
+            Format::Human => {
+                render_public_replay_human(&result.plan, &result.replay, Some(&result.cleanup))
+            }
             Format::Json => render_json(&CommandReplayJson {
                 version: REPLAY_REPORT_VERSION,
                 plan: &result.plan,
@@ -1438,11 +1513,7 @@ async fn run_replay(
     .await?;
     let plan = plan.expect("replay plan callback must run");
     let output = match format {
-        Format::Human => format!(
-            "plan:\n{}\nresult:\n{}",
-            render_replay_human(&plan),
-            render_replay_human(&result)
-        ),
+        Format::Human => render_public_replay_human(&plan, &result, None),
         Format::Json => render_json(&ReplayJson {
             version: REPLAY_REPORT_VERSION,
             plan: &plan,
@@ -2059,12 +2130,126 @@ mod tests {
     }
 
     #[test]
-    fn transport_errors_map_to_exit_five() {
-        let error = ApplicationError::Protocol(ProtocolError::Transport {
+    fn public_record_v1_human_and_json_are_stable() {
+        let result = CommandRecordResult {
+            recording_id: chronicle_common::RecordingId(
+                uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            ),
+            name: None,
+            status: RecordingStatus::Completed,
+            shutdown_reason: Some(ShutdownReason::DurationLimit),
+            child_exit: None,
+            cleanup: CleanupOutcome::Clean,
+            duration_ms: 62_000,
+            operations: 3,
+            counters: RecordingCounters::default(),
+        };
+        assert_eq!(
+            render_command_record(&result, Format::Human).unwrap(),
+            "Recording complete.\n  id: rec_00000000-0000-0000-0000-000000000001\n  duration: 1m 2s\n  operations: 3\n  dropped: 0\nTry:\n  chronicle inspect rec_00000000-0000-0000-0000-000000000001\n  chronicle replay rec_00000000-0000-0000-0000-000000000001 -- COMMAND..."
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render_command_record(&result, Format::Json).unwrap()).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(
+            json["recording_id"],
+            "rec_00000000-0000-0000-0000-000000000001"
+        );
+        assert!(json["name"].is_null());
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["shutdown_reason"], "duration_limit");
+        assert_eq!(json["duration_ms"], 62_000);
+        assert_eq!(json["operations"], 3);
+        assert_eq!(json["dropped"], 0);
+        assert!(json["child_exit"].is_null());
+        assert_eq!(json["counters"]["committed"]["records"], 0);
+
+        let mut with_child = result.clone();
+        with_child.child_exit = Some(ChildExitResult::ExitCode { code: 42 });
+        let child_json: serde_json::Value =
+            serde_json::from_str(&render_command_record(&with_child, Format::Json).unwrap())
+                .unwrap();
+        assert_eq!(child_json["child_exit"]["kind"], "exit_code");
+        assert_eq!(child_json["child_exit"]["code"], 42);
+        assert!(
+            render_command_record(&with_child, Format::Human)
+                .unwrap()
+                .contains("child: exit_code 42")
+        );
+
+        let mut lossy = result;
+        lossy.name = Some("escaped\nname".into());
+        lossy.counters.kernel_or_backend_dropped.records = 2;
+        lossy.counters.rejected_due_to_quota.records = 3;
+        let lossy_json = render_command_record(&lossy, Format::Json).unwrap();
+        assert_eq!(lossy_json.lines().count(), 1);
+        assert!(lossy_json.contains("escaped\\nname"));
+        let lossy_json: serde_json::Value = serde_json::from_str(&lossy_json).unwrap();
+        assert_eq!(lossy_json["dropped"], 5);
+        assert_eq!(
+            lossy_json["counters"]["kernel_or_backend_dropped"]["records"],
+            2
+        );
+    }
+
+    #[test]
+    fn public_replay_human_pass_and_fail_are_stable() {
+        let result =
+            |outcome, attempted, completed, failed| chronicle_application::ReplaySessionResult {
+                session_id: "session".into(),
+                replayability: chronicle_replay::Replayability::FullyReplayable,
+                outcome,
+                dry_run: outcome == ReplayOutcome::DryRun,
+                preflight_denied: outcome == ReplayOutcome::StoppedPolicy,
+                transport_failed: outcome == ReplayOutcome::StoppedTransport,
+                counts: chronicle_application::ReplayCounts {
+                    attempted,
+                    completed,
+                    failed,
+                    ..chronicle_application::ReplayCounts::default()
+                },
+                operations: Vec::new(),
+            };
+        let passed = result(ReplayOutcome::Completed, 1, 1, 0);
+        let passed_text = render_public_replay_human(&passed, &passed, None);
+        assert!(passed_text.contains(
+            "operations: attempted=1 completed=1 failed=0 unattempted=0 verification_failed=0"
+        ));
+        assert!(passed_text.ends_with("✓ passed\nReplay passed."));
+
+        let mut failed = result(ReplayOutcome::StoppedVerification, 1, 1, 0);
+        failed.counts.verification_failed = 1;
+        let failed_text = render_public_replay_human(&failed, &failed, None);
+        assert!(failed_text.contains(
+            "operations: attempted=1 completed=1 failed=0 unattempted=0 verification_failed=1"
+        ));
+        assert!(failed_text.ends_with("✗ failed\nReplay failed."));
+        let orphaned = render_public_replay_human(
+            &passed,
+            &passed,
+            Some(&CleanupOutcome::TimedOut { remaining: vec![7] }),
+        );
+        assert!(orphaned.ends_with("✗ failed\nReplay failed."));
+    }
+
+    #[test]
+    fn application_errors_map_to_stable_exit_family() {
+        let transport = ApplicationError::Protocol(ProtocolError::Transport {
             category: TransportErrorCategory::Timeout,
             message: "timeout".into(),
         });
-        assert_eq!(error_code(&error), 5);
+        for (error, expected) in [
+            (
+                ApplicationError::InvalidRecordingName("name".into(), "invalid".into()),
+                2,
+            ),
+            (ApplicationError::RecordingNotFound("missing".into()), 3),
+            (ApplicationError::TargetLaunchFailed, 3),
+            (ApplicationError::UnsupportedLivePreflight("unsupported"), 4),
+            (transport, 5),
+        ] {
+            assert_eq!(error_code(&error), expected);
+        }
     }
 
     #[test]

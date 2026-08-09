@@ -560,6 +560,7 @@ fn cli_reports_usage_and_data_errors_as_safe_json() {
     let (unknown_stdout, unknown_stderr) = output_text(&unknown);
     assert!(unknown_stdout.is_empty());
     let error: serde_json::Value = serde_json::from_str(&unknown_stderr).expect("JSON error");
+    assert_eq!(error["version"], 1);
     assert_eq!(error["code"], 3);
 
     let doctor = command(&["--format", "json", "doctor"]);
@@ -877,8 +878,35 @@ fn doctor_prospective_data_dir_is_non_mutating_and_actionable() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn public_list_storage_error_exits_three_without_stdout() {
+    let root = std::env::temp_dir().join(format!("chronicle-cli-list-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let outside = root.with_extension("outside");
+    std::fs::write(&outside, "{}").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("catalog.json")).unwrap();
+    let output = command(&[
+        "--format",
+        "json",
+        "--data-dir",
+        root.to_str().unwrap(),
+        "list",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    let (stdout, stderr) = output_text(&output);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stderr).unwrap()["code"],
+        3
+    );
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_file(outside).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::too_many_lines)] // One process lifecycle test keeps fd setup and all failure edges visible.
 fn bootstrap_blocks_until_ready_then_hardens_and_execs_target() {
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -947,7 +975,6 @@ fn bootstrap_blocks_until_ready_then_hardens_and_execs_target() {
         panic!("bootstrap must block before readiness; exited {status:?} stderr: {stderr}");
     }
     // Release: capture attached, WAL durable.
-    use std::io::Write;
     let mut write_end = unsafe { std::fs::File::from_raw_fd(write_end) };
     write_end.write_all(b"G").expect("write go byte");
     drop(write_end);
@@ -1023,8 +1050,10 @@ fn bootstrap_blocks_until_ready_then_hardens_and_execs_target() {
 
     // Hidden bootstrap credentials are not an authorization surface: direct
     // callers cannot request an identity different from inherited real IDs.
-    let mismatched_uid = if uid == 0 { 1 } else { 0 };
+    let mismatched_uid = u32::from(uid == 0);
     let status = Command::new(env!("CARGO_BIN_EXE_chronicle"))
+        // Closed/non-inherited fd 4 must be rejected before unsafe ownership.
+        .env("CHRONICLE_BOOTSTRAP_STATUS_FD", "4")
         .args([
             "internal",
             "bootstrap",

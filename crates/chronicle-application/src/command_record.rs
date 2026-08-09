@@ -54,7 +54,8 @@ pub struct CommandRecordResult {
     pub child_exit: Option<ChildExitResult>,
     pub cleanup: crate::CleanupOutcome,
     pub duration_ms: u64,
-    pub committed_records: u64,
+    pub operations: u64,
+    pub counters: crate::RecordingCounters,
 }
 
 /// Non-mutating preflight: every predictable denial happens before the domain
@@ -93,6 +94,7 @@ fn preflight_command_record(_options: &CommandRecordOptions) -> Result<(), Appli
 /// Run one command-mode recording end to end. The domain lock is acquired
 /// before any durable allocation and released last.
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[allow(clippy::too_many_lines)] // Linear capture/scope lifecycle keeps cleanup order explicit.
 pub fn record_command(
     options: CommandRecordOptions,
 ) -> Result<CommandRecordResult, ApplicationError> {
@@ -217,10 +219,7 @@ pub fn record_command(
         if let Some(reason) = signal_stop.shutdown_reason() {
             return Some(reason);
         }
-        let empty = stop_scope
-            .members()
-            .map(|members| members.is_empty())
-            .unwrap_or(false);
+        let empty = stop_scope.members().is_ok_and(|members| members.is_empty());
         empty.then_some(ShutdownReason::SourceCompleted)
     };
     let on_ready = || -> Result<(), ApplicationError> {
@@ -251,28 +250,29 @@ pub fn record_command(
     let child_exit = match cleanup {
         crate::CleanupOutcome::TimedOut { .. } => child.try_result(),
         crate::CleanupOutcome::Clean | crate::CleanupOutcome::Killed => child.wait_result(),
-    };
+    }?;
     let _ = watchdog;
 
     match result {
         Ok(result) => {
-            finalize_and_publish(
+            let operations = finalize_and_publish(
                 &guard,
                 &options,
                 recording_id,
                 &metadata,
-                &child_exit,
+                child_exit.as_ref(),
                 &cleanup,
             )?;
             Ok(CommandRecordResult {
                 recording_id,
-                name: options.name.clone(),
+                name: options.name,
                 status: result.status,
                 shutdown_reason: Some(result.shutdown_reason),
                 child_exit,
                 cleanup,
-                duration_ms: started.elapsed().as_millis() as u64,
-                committed_records: result.counters.committed.records,
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                operations,
+                counters: result.counters,
             })
         }
         Err(error) => {
@@ -322,12 +322,7 @@ pub fn retry_recording(
     let registry = chronicle_protocol_builtins::registry()?;
     let published_session = match process_and_publish_recording_wal(&wal_dir, data_dir, &registry) {
         Ok(published) => published.session_id,
-        Err(error)
-            if matches!(
-                error,
-                ApplicationError::Wal(chronicle_wal::WalError::NoPublishedSegments)
-            ) =>
-        {
+        Err(ApplicationError::Wal(chronicle_wal::WalError::NoPublishedSegments)) => {
             crate::command_record::publish_empty_session(data_dir, recording_id)?
         }
         Err(error) => return Err(error),
@@ -384,6 +379,7 @@ pub fn record_selector(
     };
     use time::OffsetDateTime;
 
+    let started = std::time::Instant::now();
     ensure_private_data_dir(&options.data_dir)?;
     let guard = acquire_domain_lock(&options.data_dir, options.domain_lock_root.as_deref())?;
     let recording_id = RecordingId::new();
@@ -415,7 +411,7 @@ pub fn record_selector(
         &options.stop,
         recording_id,
     )?;
-    finalize_and_publish(
+    let operations = finalize_and_publish(
         &guard,
         &options,
         recording_id,
@@ -430,19 +426,19 @@ pub fn record_selector(
             terminal_wal_loss: None,
             capture: None,
         },
-        &None,
+        None,
         &crate::CleanupOutcome::Clean,
     )?;
-    let _ = ();
     Ok(CommandRecordResult {
         recording_id,
-        name: options.name.clone(),
+        name: options.name,
         status: result.status,
         shutdown_reason: Some(result.shutdown_reason),
         child_exit: None,
         cleanup: crate::CleanupOutcome::Clean,
-        duration_ms: 0,
-        committed_records: result.counters.committed.records,
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        operations,
+        counters: result.counters,
     })
 }
 
@@ -464,9 +460,9 @@ fn finalize_and_publish(
     options: &CommandRecordOptions,
     recording_id: RecordingId,
     metadata: &RecordingMetadata,
-    child_exit: &Option<ChildExitResult>,
+    child_exit: Option<&ChildExitResult>,
     cleanup: &crate::CleanupOutcome,
-) -> Result<(), ApplicationError> {
+) -> Result<u64, ApplicationError> {
     use crate::{
         RecordingCatalogStatus, process_and_publish_recording_wal, reconcile_catalog,
         recordings_root, save_catalog,
@@ -476,12 +472,7 @@ fn finalize_and_publish(
     let published_session =
         match process_and_publish_recording_wal(&wal_dir, &options.data_dir, &registry) {
             Ok(published) => published.session_id,
-            Err(error)
-                if matches!(
-                    error,
-                    ApplicationError::Wal(chronicle_wal::WalError::NoPublishedSegments)
-                ) =>
-            {
+            Err(ApplicationError::Wal(chronicle_wal::WalError::NoPublishedSegments)) => {
                 // Zero-traffic recording: the target made no HTTP requests, so
                 // the WAL has no segments. Publish an empty canonical session
                 // so the recording is a normal published entry (0 operations).
@@ -496,12 +487,16 @@ fn finalize_and_publish(
             entry.status = RecordingCatalogStatus::Published;
             entry.ended_at = Some(time::OffsetDateTime::now_utc());
             entry.session_id = Some(published_session);
-            entry.child_exit = child_exit.clone();
+            entry.child_exit = child_exit.cloned();
         }
     }
     save_catalog(&options.data_dir, &view)?;
+    let operations = crate::list_recordings(&options.data_dir)?
+        .into_iter()
+        .find(|recording| recording.recording_id == recording_id)
+        .map_or(0, |recording| recording.operations);
     let _ = (guard, metadata, cleanup);
-    Ok(())
+    Ok(u64::try_from(operations).unwrap_or(u64::MAX))
 }
 
 /// Publish an empty canonical session for a zero-traffic recording.

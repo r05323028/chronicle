@@ -108,10 +108,10 @@ fn platform_default_data_dir(
 ) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        if let Some(xdg) = env("XDG_DATA_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("chronicle"));
-            }
+        if let Some(xdg) = env("XDG_DATA_HOME")
+            && !xdg.is_empty()
+        {
+            return Some(PathBuf::from(xdg).join("chronicle"));
         }
         home().map(|home| home.join(".local").join("share").join("chronicle"))
     }

@@ -149,7 +149,9 @@ async fn replay_command_after_preplan(
         Ok(discovered) => discovered,
         Err(error) => {
             let cleanup = cleanup_scope(&scope)?;
-            let _ = child_result_after_cleanup(&mut child, &cleanup);
+            if let Err(launch_error) = child_result_after_cleanup(&mut child, &cleanup) {
+                return cleanup_failure_or(cleanup, launch_error);
+            }
             return cleanup_failure_or(cleanup, error.into());
         }
     };
@@ -182,7 +184,7 @@ async fn replay_command_after_preplan(
     .await;
 
     let cleanup = cleanup_scope(&scope)?;
-    let child_exit = child_result_after_cleanup(&mut child, &cleanup);
+    let child_exit = child_result_after_cleanup(&mut child, &cleanup)?;
     let replay = match replay {
         Ok(replay) => replay,
         Err(error) => return cleanup_failure_or(cleanup, error),
@@ -228,7 +230,7 @@ fn cleanup_scope(scope: &crate::SupervisedScope) -> Result<CleanupOutcome, Appli
 fn child_result_after_cleanup(
     child: &mut crate::bootstrap::BlockedBootstrap,
     cleanup: &CleanupOutcome,
-) -> Option<ChildExitResult> {
+) -> Result<Option<ChildExitResult>, ApplicationError> {
     match cleanup {
         CleanupOutcome::TimedOut { .. } => child.try_result(),
         CleanupOutcome::Clean | CleanupOutcome::Killed => child.wait_result(),
