@@ -22,6 +22,7 @@ use chronicle_protocol::{ProtocolError, TransportErrorCategory};
 use chronicle_replay::{LoopbackReplayOptions, ReplayError, ReplayOutcome, TimingMode};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde::Serialize;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -224,6 +225,56 @@ enum Timing {
     Asap,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyInvocation {
+    Recorder,
+    RecorderStatus,
+    Etl,
+    RecordFixture,
+    RecordEbpf,
+    ReplayRoot,
+    InspectRoot,
+}
+
+impl LegacyInvocation {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Recorder => "recorder",
+            Self::RecorderStatus => "recorder_status",
+            Self::Etl => "etl",
+            Self::RecordFixture => "record_source_fixture",
+            Self::RecordEbpf => "record_source_ebpf",
+            Self::ReplayRoot => "replay_root",
+            Self::InspectRoot => "inspect_root",
+        }
+    }
+
+    const fn replacement(self) -> &'static str {
+        match self {
+            Self::Recorder => "chronicle internal recorder --config FILE",
+            Self::RecorderStatus => "chronicle internal recorder-status --state-root DIRECTORY",
+            Self::Etl => "chronicle internal etl --wal-dir DIRECTORY --output DIRECTORY",
+            Self::RecordFixture => {
+                "chronicle internal record-fixture --input FILE --root DIRECTORY"
+            }
+            Self::RecordEbpf => "chronicle record --pid PID | chronicle record --cgroup PATH",
+            Self::ReplayRoot => {
+                "chronicle replay RECORDING --target URL --allow-host HOST [--execute]"
+            }
+            Self::InspectRoot => "chronicle inspect RECORDING",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DeprecationJson {
+    version: u8,
+    level: &'static str,
+    code: &'static str,
+    invocation: &'static str,
+    replacement: &'static str,
+}
+
 #[derive(Serialize)]
 struct RecordJson {
     version: u8,
@@ -384,14 +435,43 @@ async fn async_main() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
-    let cli = Cli::parse();
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
+    let parse_format = format_from_raw_args(&raw_args);
+    let raw_legacy = legacy_invocation_from_raw_args(&raw_args);
+    let cli = match Cli::try_parse_from(&raw_args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            if let Some(legacy) = raw_legacy {
+                exit_legacy_error(parse_format, 2, "invalid deprecated CLI invocation", legacy);
+            }
+            error.exit();
+        }
+    };
+    let legacy = legacy_invocation(&cli);
     if let Err(error) = validate_record_arguments(&cli) {
+        if let Some(legacy) = legacy {
+            exit_legacy_error(cli.format, 2, "invalid deprecated CLI invocation", legacy);
+        }
         error.exit();
     }
     let format = cli.format;
     match run(cli).await {
         Ok((output, code)) => {
+            if code != 0
+                && let Some(legacy) = legacy
+            {
+                exit_legacy_error(format, code, "deprecated CLI invocation failed", legacy);
+            }
             if let Err(error) = write_output(io::stdout().lock(), &output) {
+                let _ = write_output(
+                    io::stderr().lock(),
+                    &format!("CLI output I/O failed: {error}"),
+                );
+                std::process::exit(3);
+            }
+            if let Some(legacy) = legacy
+                && let Err(error) = write_deprecation_warning(format, legacy)
+            {
                 let _ = write_output(
                     io::stderr().lock(),
                     &format!("CLI output I/O failed: {error}"),
@@ -402,19 +482,166 @@ async fn async_main() {
         }
         Err(error) => {
             let code = error_code(&error);
+            let message = legacy.map_or_else(
+                || error.to_string(),
+                |legacy| legacy_error_message(&error.to_string(), legacy),
+            );
             let output = if matches!(format, Format::Json) {
-                render_json(&ErrorJson {
-                    code,
-                    message: error.to_string(),
-                })
-                .unwrap_or_else(|render_error| render_error.to_string())
+                render_json(&ErrorJson { code, message })
+                    .unwrap_or_else(|render_error| render_error.to_string())
             } else {
-                error.to_string()
+                message
             };
             let _ = write_output(io::stderr().lock(), &output);
             std::process::exit(code);
         }
     }
+}
+
+fn legacy_invocation(cli: &Cli) -> Option<LegacyInvocation> {
+    match &cli.command {
+        Command::Recorder => Some(LegacyInvocation::Recorder),
+        Command::RecorderStatus { .. } => Some(LegacyInvocation::RecorderStatus),
+        Command::Etl { .. } => Some(LegacyInvocation::Etl),
+        Command::Record(args) => match args.source {
+            Some(Source::Fixture) => Some(LegacyInvocation::RecordFixture),
+            Some(Source::Ebpf) => Some(LegacyInvocation::RecordEbpf),
+            None => None,
+        },
+        Command::Replay(args) if args.root.is_some() => Some(LegacyInvocation::ReplayRoot),
+        Command::Inspect(args) if args.root.is_some() => Some(LegacyInvocation::InspectRoot),
+        _ => None,
+    }
+}
+
+fn legacy_invocation_from_raw_args(args: &[OsString]) -> Option<LegacyInvocation> {
+    let mut skip_value = false;
+    for (index, argument) in args.iter().enumerate().skip(1) {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        let Some(argument) = argument.to_str() else {
+            continue;
+        };
+        if argument == "--" {
+            break;
+        }
+        if matches!(argument, "--format" | "--config" | "--data-dir") {
+            skip_value = true;
+            continue;
+        }
+        if argument.starts_with("--format=")
+            || argument.starts_with("--config=")
+            || argument.starts_with("--data-dir=")
+        {
+            continue;
+        }
+        let remaining = &args[index + 1..];
+        let legacy = match argument {
+            "recorder" => Some(LegacyInvocation::Recorder),
+            "recorder-status" => Some(LegacyInvocation::RecorderStatus),
+            "etl" => Some(LegacyInvocation::Etl),
+            "record" => raw_legacy_record(remaining),
+            "replay" if raw_has_flag(remaining, "--root") => Some(LegacyInvocation::ReplayRoot),
+            "inspect" if raw_has_flag(remaining, "--root") => Some(LegacyInvocation::InspectRoot),
+            _ => None,
+        };
+        if legacy.is_some() {
+            return legacy;
+        }
+    }
+    None
+}
+
+fn raw_legacy_record(args: &[OsString]) -> Option<LegacyInvocation> {
+    for (index, argument) in args.iter().enumerate() {
+        let argument = argument.to_str()?;
+        if argument == "--" {
+            break;
+        }
+        if argument == "--source" {
+            return Some(
+                if args.get(index + 1).and_then(|value| value.to_str()) == Some("fixture") {
+                    LegacyInvocation::RecordFixture
+                } else {
+                    LegacyInvocation::RecordEbpf
+                },
+            );
+        }
+        if let Some(source) = argument.strip_prefix("--source=") {
+            return Some(if source == "fixture" {
+                LegacyInvocation::RecordFixture
+            } else {
+                LegacyInvocation::RecordEbpf
+            });
+        }
+    }
+    None
+}
+
+fn raw_has_flag(args: &[OsString], flag: &str) -> bool {
+    args.iter()
+        .map_while(|argument| argument.to_str())
+        .take_while(|argument| *argument != "--")
+        .any(|argument| argument == flag || argument.starts_with(&format!("{flag}=")))
+}
+
+fn format_from_raw_args(args: &[OsString]) -> Format {
+    for (index, argument) in args.iter().enumerate().skip(1) {
+        if argument == OsStr::new("--") {
+            break;
+        }
+        if argument == OsStr::new("--format")
+            && args
+                .get(index + 1)
+                .is_some_and(|value| value == OsStr::new("json"))
+            || argument
+                .to_str()
+                .is_some_and(|value| value == "--format=json")
+        {
+            return Format::Json;
+        }
+    }
+    Format::Human
+}
+
+fn legacy_error_message(message: &str, legacy: LegacyInvocation) -> String {
+    format!("{message}\nHint: use {}", legacy.replacement())
+}
+
+fn exit_legacy_error(format: Format, code: i32, message: &str, legacy: LegacyInvocation) -> ! {
+    let message = legacy_error_message(message, legacy);
+    let output = if matches!(format, Format::Json) {
+        serde_json::to_string(&ErrorJson { code, message })
+            .expect("static legacy error is serializable")
+    } else {
+        message
+    };
+    let _ = write_output(io::stderr().lock(), &output);
+    std::process::exit(code);
+}
+
+fn write_deprecation_warning(
+    format: Format,
+    legacy: LegacyInvocation,
+) -> Result<(), std::io::Error> {
+    let warning = match format {
+        Format::Human => format!(
+            "warning: deprecated CLI form '{}'; use: {} (removal in 0.2)",
+            legacy.id(),
+            legacy.replacement()
+        ),
+        Format::Json => serde_json::to_string(&DeprecationJson {
+            version: 1,
+            level: "warning",
+            code: "deprecated_cli",
+            invocation: legacy.id(),
+            replacement: legacy.replacement(),
+        })
+        .expect("static deprecation warning is serializable"),
+    };
+    write_output(io::stderr().lock(), &warning)
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
@@ -1726,6 +1953,49 @@ mod tests {
         assert_eq!(args.duration_seconds, Some(60));
         assert_eq!(args.segment_bytes, Some(16_777_216));
         assert_eq!(args.max_wal_bytes, Some(33_554_432));
+    }
+
+    #[test]
+    fn legacy_invocations_use_fixed_non_secret_diagnostics() {
+        let raw: Vec<OsString> = [
+            "chronicle",
+            "--format",
+            "json",
+            "replay",
+            "session",
+            "--root",
+            "root",
+            "--target",
+            "http://user:super-secret@127.0.0.1:9",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let legacy = legacy_invocation_from_raw_args(&raw).unwrap();
+        assert_eq!(legacy, LegacyInvocation::ReplayRoot);
+        assert!(matches!(format_from_raw_args(&raw), Format::Json));
+        let warning = serde_json::to_string(&DeprecationJson {
+            version: 1,
+            level: "warning",
+            code: "deprecated_cli",
+            invocation: legacy.id(),
+            replacement: legacy.replacement(),
+        })
+        .unwrap();
+        assert!(!warning.contains("super-secret"));
+        assert!(!warning.contains("user:"));
+
+        let internal = Cli::try_parse_from([
+            "chronicle",
+            "internal",
+            "etl",
+            "--wal-dir",
+            "wal",
+            "--output",
+            "output",
+        ])
+        .unwrap();
+        assert_eq!(legacy_invocation(&internal), None);
     }
 
     #[test]

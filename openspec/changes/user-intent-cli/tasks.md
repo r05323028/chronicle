@@ -43,10 +43,10 @@
 
 ## 7. Compatibility entrypoints and deprecation
 
-- [ ] 7.1 Add explicit internal namespace `chronicle internal recorder`, `internal recorder-status`, `internal etl`, `internal record-fixture`; re-register top-level `recorder`, `recorder-status`, `etl`, legacy `record --source fixture|ebpf ...`, legacy `replay SESSION --root ...`, and legacy `inspect SESSION --root` as hidden deprecated aliases routing to the same application services. Acceptance: every existing CLI contract test passes unchanged; `--help` hides them; `internal etl` works.
-- [ ] 7.2 Add deprecation warnings: human stderr; JSON success one v1 warning stderr + byte-stable stdout; JSON failure one normal error only. `invocation` uses fixed form ID and `replacement` safe syntax template—never raw argv, URL userinfo, or child command. Acceptance: secret-bearing argv regression proves no leak.
-- [ ] 7.3 Add new-syntax hints to legacy-form errors. Acceptance: invalid legacy invocation error text names the equivalent new command.
-- [ ] 7.4 Update the systemd unit `docs/systemd/chronicle-recorder.service` invocation to `chronicle --format json internal recorder --config /etc/chronicle/recorder.toml` and document the deprecation schedule (removal 0.2). Acceptance: unit file references the internal form; docs state the 0.2 removal boundary.
+- [x] 7.1 Add explicit internal namespace `chronicle internal recorder`, `internal recorder-status`, `internal etl`, `internal record-fixture`; re-register top-level `recorder`, `recorder-status`, `etl`, legacy `record --source fixture|ebpf ...`, legacy `replay SESSION --root ...`, and legacy `inspect SESSION --root` as hidden deprecated aliases routing to the same application services. Acceptance: every existing CLI contract test passes unchanged; `--help` hides them; `internal etl` works.
+- [x] 7.2 Add deprecation warnings: human stderr; JSON success one v1 warning stderr + byte-stable stdout; JSON failure one normal error only. `invocation` uses fixed form ID and `replacement` safe syntax template—never raw argv, URL userinfo, or child command. Acceptance: secret-bearing argv regression proves no leak.
+- [x] 7.3 Add new-syntax hints to legacy-form errors. Acceptance: invalid legacy invocation error text names the equivalent new command.
+- [x] 7.4 Update the systemd unit `docs/systemd/chronicle-recorder.service` invocation to `chronicle --format json internal recorder --config /etc/chronicle/recorder.toml` and document the deprecation schedule (removal 0.2). Acceptance: unit file references the internal form; docs state the 0.2 removal boundary.
 
 ## 8. Output and exit contracts
 

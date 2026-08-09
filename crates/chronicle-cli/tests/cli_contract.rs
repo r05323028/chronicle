@@ -22,6 +22,21 @@ fn output_text(output: &Output) -> (String, String) {
     )
 }
 
+fn deprecation_warning(stderr: &str, invocation: &str) -> serde_json::Value {
+    assert_eq!(stderr.lines().count(), 1, "one deprecation diagnostic");
+    let warning: serde_json::Value = serde_json::from_str(stderr).expect("deprecation JSON");
+    assert_eq!(warning["version"], 1);
+    assert_eq!(warning["level"], "warning");
+    assert_eq!(warning["code"], "deprecated_cli");
+    assert_eq!(warning["invocation"], invocation);
+    assert!(
+        warning["replacement"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+    warning
+}
+
 fn record(root: &std::path::Path) -> String {
     record_fixture(
         root,
@@ -241,20 +256,11 @@ fn cli_record_inspect_replay_and_exit_contract() {
     ]);
     assert_eq!(json_dry_run.status.code(), Some(0));
     let (stdout, stderr) = output_text(&json_dry_run);
-    assert!(stderr.is_empty());
+    deprecation_warning(&stderr, "replay_root");
     assert_eq!(stdout.matches('\n').count(), 1);
     let report: serde_json::Value = serde_json::from_str(&stdout).expect("replay JSON");
     assert_eq!(report["version"], 1);
     assert_eq!(report["result"]["outcome"], "dry_run");
-
-    let denied = command(&replay_arguments(
-        &session_id,
-        root_text,
-        "http://127.0.0.1:9",
-        true,
-        false,
-    ));
-    assert_eq!(denied.status.code(), Some(4));
 
     let pass_response =
         b"HTTP/1.1 200 OK\r\nx-fixture: basic\r\ncontent-length: 2\r\nconnection: close\r\n\r\nOK";
@@ -289,6 +295,44 @@ fn cli_record_inspect_replay_and_exit_contract() {
     mismatch_task.join().expect("mismatch server completed");
 
     std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn denied_legacy_replay_emits_one_hint_error_and_no_result() {
+    let root = std::env::temp_dir().join(format!("chronicle-cli-denied-{}", uuid::Uuid::new_v4()));
+    let session_id = record(&root);
+    let root = root.to_str().unwrap();
+    for format in [None, Some("json")] {
+        let mut arguments = Vec::new();
+        if let Some(format) = format {
+            arguments.extend(["--format", format]);
+        }
+        arguments.extend([
+            "replay",
+            &session_id,
+            "--root",
+            root,
+            "--target",
+            "http://127.0.0.1:9",
+            "--allow-host",
+            "127.0.0.1",
+            "--execute",
+        ]);
+        let denied = command(&arguments);
+        assert_eq!(denied.status.code(), Some(4));
+        let (stdout, stderr) = output_text(&denied);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("Hint: use"));
+        assert!(!stderr.contains("deprecated_cli"));
+        if format == Some("json") {
+            assert_eq!(stderr.lines().count(), 1);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&stderr).unwrap()["code"],
+                4
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -411,7 +455,7 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
     ]);
     assert!(first.status.success());
     let (stdout, stderr) = output_text(&first);
-    assert!(stderr.is_empty());
+    deprecation_warning(&stderr, "etl");
     let first: serde_json::Value = serde_json::from_str(&stdout).expect("ETL JSON");
     assert_eq!(first["already_processed"], false);
     assert!(first["recording_id"].is_string());
@@ -428,6 +472,7 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
     let same = command(&[
         "--format",
         "json",
+        "internal",
         "etl",
         "--wal-dir",
         wal,
@@ -459,7 +504,7 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
     ]);
     assert!(second.status.success());
     let (stdout, stderr) = output_text(&second);
-    assert!(stderr.is_empty());
+    deprecation_warning(&stderr, "etl");
     let second: serde_json::Value = serde_json::from_str(&stdout).expect("ETL JSON");
     assert_eq!(second["session_id"], session_id);
     assert_eq!(second["already_processed"], false);
@@ -574,6 +619,107 @@ fn doctor_config_failure_keeps_independent_probes_and_human_remediation() {
     let human = command(&["--data-dir", root.to_str().unwrap(), "doctor"]);
     assert!(output_text(&human).0.contains("remediation:"));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_warnings_and_failure_hints_are_atomic_and_non_secret() {
+    let secret = "super-secret-cli-value";
+    let root =
+        std::env::temp_dir().join(format!("chronicle-cli-{secret}-{}", uuid::Uuid::new_v4()));
+    let fixture = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/http/basic-session.json"
+    ));
+    let success = command(&[
+        "--format",
+        "json",
+        "record",
+        "--source",
+        "fixture",
+        "--input",
+        fixture.to_str().unwrap(),
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(success.status.code(), Some(0));
+    let (stdout, stderr) = output_text(&success);
+    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let session_id = result["session_id"].as_str().unwrap();
+    let warning = deprecation_warning(&stderr, "record_source_fixture");
+    assert!(!warning.to_string().contains(secret));
+
+    let human = command(&["inspect", session_id, "--root", root.to_str().unwrap()]);
+    assert_eq!(human.status.code(), Some(0));
+    let (_, human_stderr) = output_text(&human);
+    assert_eq!(human_stderr.lines().count(), 1);
+    assert!(human_stderr.contains("deprecated CLI form 'inspect_root'"));
+    assert!(!human_stderr.contains(secret));
+
+    let invalid = command(&[
+        "--format",
+        "json",
+        "record",
+        "--source",
+        "ebpf",
+        "--wal-dir",
+        secret,
+    ]);
+    assert_eq!(invalid.status.code(), Some(2));
+    let (invalid_stdout, invalid_stderr) = output_text(&invalid);
+    assert!(invalid_stdout.is_empty());
+    assert_eq!(invalid_stderr.lines().count(), 1);
+    let error: serde_json::Value = serde_json::from_str(&invalid_stderr).unwrap();
+    assert_eq!(error["code"], 2);
+    assert!(error["message"].as_str().unwrap().contains("Hint: use"));
+    assert!(!invalid_stderr.contains("deprecated_cli"));
+    assert!(!invalid_stderr.contains(secret));
+
+    let failed = command(&[
+        "--format",
+        "json",
+        "inspect",
+        "00000000-0000-0000-0000-000000000000",
+        "--root",
+        root.join(secret).to_str().unwrap(),
+    ]);
+    assert_eq!(failed.status.code(), Some(3));
+    let (failed_stdout, failed_stderr) = output_text(&failed);
+    assert!(failed_stdout.is_empty());
+    assert_eq!(failed_stderr.lines().count(), 1);
+    let error: serde_json::Value = serde_json::from_str(&failed_stderr).unwrap();
+    assert!(error["message"].as_str().unwrap().contains("Hint: use"));
+    assert!(!failed_stderr.contains("deprecated_cli"));
+    assert!(!failed_stderr.contains(secret));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn malformed_legacy_parse_error_has_safe_new_syntax_hint() {
+    for arguments in [
+        vec!["--format", "json", "record", "--source"],
+        vec![
+            "--format",
+            "json",
+            "--bogus",
+            "super-secret",
+            "etl",
+            "--wal-dir",
+            "wal",
+            "--output",
+            "output",
+        ],
+    ] {
+        let output = command(&arguments);
+        assert_eq!(output.status.code(), Some(2));
+        let (stdout, stderr) = output_text(&output);
+        assert!(stdout.is_empty());
+        assert_eq!(stderr.lines().count(), 1);
+        let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert_eq!(error["code"], 2);
+        assert!(error["message"].as_str().unwrap().contains("Hint: use"));
+        assert!(!stderr.contains("deprecated_cli"));
+        assert!(!stderr.contains("super-secret"));
+    }
 }
 
 #[test]
