@@ -38,9 +38,25 @@ Fixture and eBPF sources emit same `CaptureEvent` v1 model. `SocketConnected` ca
 
 A bounded 4096-event queue feeds segmented WAL v1. Each group appends data, one in-WAL `CommitMarker`, flushes, and performs one `fdatasync`; recording metadata is non-authoritative and reconciled from validated markers. Recovery mutates only a verified incomplete final tail. ETL consumes the final recovery-authoritative prefix, reconstructs socket generations/TCP positions, decodes bounded HTTP/1.1, and publishes one deterministic Canonical Session v1. Active maps local→client and remote→server; passive maps remote→client and local→server. Ingress/egress controls byte direction only. Missing or conflicting evidence is typed failure; production never fabricates `unknown:0` endpoints.
 
-`FilesystemSessionStore` atomically writes sole-v1 manifest, session JSON, and SHA-256-addressed payloads. Replay hydrates only persisted artifacts and requires explicit loopback target, matching allow-host, effect flag, and `--execute`; dry-run stays default. Fake protocol remains available for boundary tests.
+`FilesystemSessionStore` atomically writes sole-v1 manifest, session JSON, and SHA-256-addressed payloads. Replay hydrates only persisted artifacts. Command mode infers one owned loopback listener for supervised target and grants only execution/read/host/target gates; explicit-target mode requires loopback target, matching allow-host, effect flag, and `--execute`. Fake protocol remains available for boundary tests.
 
-JSON is current capture-event payload encoding; WAL framing remains encoding-independent. Live capture is bounded to 600 seconds by default (maximum 3600) and a 4 GiB physical WAL ceiling; always-on capture, rotation, and incremental ETL are deferred.
+JSON is current capture-event payload encoding; WAL framing remains encoding-independent. Public one-shot capture is bounded to 600 seconds by default (maximum 3600) and a 4 GiB physical WAL ceiling. Hidden continuous-recorder service owns epoch rotation and incremental ETL for supported deployments.
+
+## Public data directory and recording identity
+
+Public commands resolve data directory in fixed precedence: `--data-dir`, configured `AppConfig.data_dir`, `CHRONICLE_DATA_DIR`, then platform default. Resolution is non-mutating. Mutating commands lazily create private directory and reject unsafe root/symlink forms. Doctor reports source plus existing/prospective access without creating probe artifact.
+
+```text
+<data-dir>/
+  .chronicle-domain.lock
+  catalog.json                         # bounded advisory v1 view
+  recordings/<bare-recording-uuid>/   # WAL, metadata, private intent
+  sessions/<session-uuid>/             # canonical manifest/session/artifacts
+```
+
+`RecordingId` is user-facing stable identity rendered `rec_<uuid>`; `latest` and exact names resolve through bounded reconciled catalog view. Catalog and `recording-intent.json` sidecars are advisory. Recovery-authoritative WAL metadata and canonical session facts win contradictions. One exact normalized `.chronicle-domain.lock` path protects name claim, capture, ETL, publication, and catalog update as one transaction.
+
+Canonical `SessionId` is independently deterministic and may differ from recording ID. Association uses `source_provenance.recording_id`; ID equality remains legacy fallback only. Public users operate on recording references, while hidden compatibility paths may still address session IDs and explicit roots through 0.1.x.
 
 ## Ownership and backpressure
 
@@ -57,7 +73,8 @@ Rust standard library does not provide derive-based wire serialization, UUIDs, w
 - PostgreSQL metadata repository.
 - S3-compatible artifact store and WAL archival.
 - Additional protocol decoders/canonicalizers/adapters/verifiers.
-- Always-on/rotating capture, incremental ETL, segment retention, scheduling, and expanded redaction policies.
+- Expanded segment-retention policy, scheduling, and redaction policies.
+- Docker and Kubernetes packaging/orchestration (future follow-up only; no implementation).
 
 ## Capture semantics and TLS
 

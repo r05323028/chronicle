@@ -32,7 +32,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(
     name = "chronicle",
-    about = "Record, inspect, and safely replay local HTTP fixtures"
+    about = "Record, inspect, and safely replay local application behavior",
+    long_about = "Record production-like HTTP behavior as portable regression tests.\n\nQuick start:\n  chronicle record -- COMMAND...\n  chronicle list\n  chronicle inspect latest\n  chronicle replay latest -- COMMAND..."
 )]
 struct Cli {
     /// TOML configuration file. Secrets must be referenced through environment variables.
@@ -2390,6 +2391,10 @@ mod new_surface_tests {
         for name in ["record", "replay", "list", "inspect", "doctor"] {
             assert!(help.contains(name), "missing {name}");
         }
+        assert!(help.contains("Quick start:"));
+        assert!(help.contains("chronicle record -- COMMAND..."));
+        assert!(help.contains("chronicle inspect latest"));
+        assert!(!help.contains("HTTP fixtures"));
         // Legacy mechanics are hidden from public help.
         assert!(!help.contains("recorder-status"));
         assert!(!help.contains("etl"));

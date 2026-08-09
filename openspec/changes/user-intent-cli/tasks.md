@@ -56,10 +56,10 @@
 
 ## 9. Documentation
 
-- [ ] 9.1 Rewrite `docs/operations.md` quick-start around `chronicle record -- ...`, `chronicle list`, `chronicle inspect latest`, `chronicle replay latest -- ...`; keep a legacy-syntax migration appendix. Acceptance: doc examples execute against the new CLI.
-- [ ] 9.2 Update `docs/replay-safety.md` with the inference-vs-explicit table and the deny-by-default statement for writes/authentication/publication/unknown. Acceptance: table matches spec scenarios.
-- [ ] 9.3 Update `docs/continuous-recorder.md` and `docs/continuous-recorder-runbook.md` for the hidden daemon form; add data-directory and recording-identity sections to `docs/architecture.md` or a new doc. Acceptance: no doc references removed public flags as normal usage.
-- [ ] 9.4 Note Docker/Kubernetes packaging as future follow-up only in docs; no implementation. Acceptance: docs mention as future work, no code.
+- [x] 9.1 Rewrite `docs/operations.md` quick-start around `chronicle record -- ...`, `chronicle list`, `chronicle inspect latest`, `chronicle replay latest -- ...`; keep a legacy-syntax migration appendix. Acceptance: doc examples execute against the new CLI.
+- [x] 9.2 Update `docs/replay-safety.md` with the inference-vs-explicit table and the deny-by-default statement for writes/authentication/publication/unknown. Acceptance: table matches spec scenarios.
+- [x] 9.3 Update `docs/continuous-recorder.md` and `docs/continuous-recorder-runbook.md` for the hidden daemon form; add data-directory and recording-identity sections to `docs/architecture.md` or a new doc. Acceptance: no doc references removed public flags as normal usage.
+- [x] 9.4 Note Docker/Kubernetes packaging as future follow-up only in docs; no implementation. Acceptance: docs mention as future work, no code.
 - [ ] 9.5 Update README and `chronicle --help`/subcommand help text: replace the fixture-oriented CLI description with the intent-oriented quick start (`record --`, `list`, `inspect latest`, `replay latest --`). Acceptance: README and help text describe the new surface; no primary-path reference to fixture/`--wal-dir` remains.
 
 ## 10. Tests: unit, integration, CLI, rootless, privileged

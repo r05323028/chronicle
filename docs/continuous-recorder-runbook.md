@@ -7,10 +7,7 @@
 3. Validate config and placement:
 
 ```sh
-chronicle --format json doctor \
-  --config /etc/chronicle/recorder.toml \
-  --state-root /var/lib/chronicle \
-  --wal-dir /var/lib/chronicle/wal
+chronicle --format json --data-dir /var/lib/chronicle doctor
 ```
 
 1. Confirm supported kernel, cgroup v2, BTF, required capabilities, and free space.
@@ -19,7 +16,7 @@ chronicle --format json doctor \
 
 ```sh
 systemctl start chronicle-recorder
-chronicle --format json recorder-status --state-root /var/lib/chronicle
+chronicle --format json internal recorder-status --state-root /var/lib/chronicle
 systemctl status chronicle-recorder --no-pager
 ```
 
@@ -50,6 +47,8 @@ Retain machine-readable status, recovery reports, manifests, checkpoints, tombst
 ## Upgrade and rollback
 
 Stop recorder, retain state/store/WAL, deploy exact artifact, run doctor, then start. Roll back binary/config only after schema and lineage validation. Do not mix state from different configuration digests.
+
+Top-level `recorder` and `recorder-status` are hidden deprecated 0.1.x aliases. Migrate automation to `chronicle internal ...`; aliases are removed at 0.2.
 
 ## Ownership
 

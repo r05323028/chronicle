@@ -6,6 +6,19 @@ WAL and published sessions can contain production headers and bodies, including 
 
 P1 live recording is bounded plaintext TCP capture, not always-on capture. It supports Linux 6.1+, cgroup v2, readable BTF, x86_64/aarch64, and required eBPF hooks/capabilities. macOS and ordinary CI use rootless fixtures, ETL, inspect, replay, and eBPF compile checks. Runtime evidence comes only from the opt-in privileged profile.
 
+## Quick start
+
+```bash
+chronicle record --name checkout --duration 5m -- ./bin/my-app
+chronicle list
+chronicle inspect latest
+chronicle replay latest -- ./bin/my-app
+```
+
+`record -- COMMAND...` starts application only after capture attachment. Send representative traffic while recording runs; Chronicle stops on application exit, signal, or duration, then finalizes WAL, runs ETL, publishes canonical session, and updates catalog under one data-domain lock. `replay RECORDING -- COMMAND...` plans first, starts application in supervised cgroup, discovers unique owned loopback listener, then reuses existing replay executor. Writes still require `--allow-write`.
+
+Recording references are `latest`, `rec_<uuid>`, bare UUID, or exact name. Global `--data-dir` overrides configured `data_dir`, then `CHRONICLE_DATA_DIR`, then platform default. Human output suggests next intent command; `--format json` emits one versioned object.
+
 ## Flow and bounds
 
 ```text
@@ -34,55 +47,60 @@ Only a verified incomplete final WAL frame may be repaired. Middle corruption, i
 
 ## Cgroup selection
 
-Use exactly one selector:
+Use exactly one advanced selector for already-running workload:
 
 ```bash
-chronicle --format json record --source ebpf --cgroup /sys/fs/cgroup/my-workload --wal-dir /var/lib/chronicle/wal
-chronicle --format json record --source ebpf --pid 1234 --wal-dir /var/lib/chronicle/wal
+chronicle --data-dir /var/lib/chronicle record --duration 5m --pid 1234
+chronicle --data-dir /var/lib/chronicle record --duration 5m \
+  --cgroup /sys/fs/cgroup/my-workload --allow-shared-cgroup
 ```
+
+Selector mode never terminates selected workload. It uses same recording ID, WAL → ETL → publication, catalog, and exact-lock transaction as command mode.
 
 The selected scope is the exact cgroup node plus descendants, called the **selected subtree**. `cgroup.procs` is read directly from the selected node. Numeric PIDs are resolved to host-visible thread-group IDs and deduplicated into the **direct cgroup TGID set**; its cardinality is **direct TGID count**. This is not POSIX PGID, session ID, thread count, container ID, or descendant membership. Descendant directories are counted separately as **descendant cgroup count**.
 
 A dedicated leaf with direct TGID count zero or one and no descendants needs no acknowledgement. Explicit cgroups with more direct TGIDs or descendants require `--allow-shared-cgroup`:
 
 ```bash
-chronicle --format json record --source ebpf \
-  --cgroup /sys/fs/cgroup/team --allow-shared-cgroup \
-  --wal-dir /var/lib/chronicle/wal
+chronicle --data-dir /var/lib/chronicle record --duration 5m \
+  --cgroup /sys/fs/cgroup/team --allow-shared-cgroup
 ```
 
 The flag is invalid with `--pid` and cannot override `/`, `/system.slice`, `/user.slice`, `/machine.slice`, Chronicle containment anywhere in the subtree, namespace ambiguity, movement, or unreadable enumeration. PID selection rejects unrelated direct TGIDs and never widens to an ancestor. Output includes only canonical path/ID, direct TGID count, descendant cgroup count, selected-subtree scope, and acknowledgement state.
 
-## Record, recover, and ETL
+## Record, recover, and publish
 
-`record` writes `recording.json`, a lock, and `segments/*.chwal`. It stops on signal, duration, or physical WAL limit. WAL-limit shutdown writes only the capacity-safe queued prefix, counts the remainder as `discarded_from_queue_due_to_wal_limit`, and emits typed terminal loss evidence when space permits. Kernel/backend drops, post-stop arrivals, and written-not-committed bytes remain separate counters. Record never runs ETL.
+Public `record` writes private intent/catalog state and `recordings/<uuid>/recording.json` plus `segments/*.chwal`. It stops on application exit, signal, duration, or physical WAL limit. WAL-limit shutdown writes only capacity-safe queued prefix, counts remainder as `discarded_from_queue_due_to_wal_limit`, and emits typed terminal loss evidence when space permits. Kernel/backend drops, post-stop arrivals, and written-not-committed bytes remain separate counters.
+
+After capture, public command/PID/cgroup modes process only recovery-authoritative committed prefix, publish one deterministic Canonical Session v1, write advisory ETL checkpoint, and complete catalog entry before releasing domain lock. Recoverable failures retry without recapture:
 
 ```bash
-chronicle --format json etl --wal-dir /var/lib/chronicle/wal --output /var/lib/chronicle/sessions
+chronicle --data-dir /var/lib/chronicle record --retry RECORDING
 ```
 
-ETL processes only the recovered committed prefix, publishes one deterministic Canonical Session v1, and writes its advisory checkpoint after publication. Rerunning unchanged input in the same root reports `already_processed`; another output root is allowed. No `output-binding.json` is used.
+Hidden `chronicle internal etl --wal-dir DIR --output DIR` remains deployment/compatibility mechanism, not normal user workflow. Rerunning unchanged input in same root reports `already_processed`; another output root is allowed. No `output-binding.json` is used.
 
 ## Inspect and replay
 
 ```bash
-chronicle --format json inspect SESSION_ID --root /var/lib/chronicle/sessions
-chronicle --format json replay SESSION_ID --root /var/lib/chronicle/sessions \
+chronicle --data-dir /var/lib/chronicle inspect latest
+chronicle --data-dir /var/lib/chronicle replay latest -- ./bin/my-app
+chronicle --data-dir /var/lib/chronicle replay latest \
   --target http://127.0.0.1:18080 --allow-host 127.0.0.1 \
-  --allow-read --allow-write --execute
+  --allow-read --execute
 ```
 
-Canonical v1 preserves connection/operation completeness, loss-window provenance, WAL ranges, integrity, and replayability. Complete supported operations outside loss windows may execute while degraded siblings remain visible as not attempted. Replay is dry-run by default, requires explicit loopback target, exact `--allow-host`, effect authorization, and `--execute`; it never contacts recorded destinations, follows redirects, expands DNS, retries, uses a proxy/TLS, or replays captured credentials.
+Canonical v1 preserves connection/operation completeness, loss-window provenance, WAL ranges, integrity, and replayability. Complete supported operations outside loss windows may execute while degraded siblings remain visible as not attempted. Command mode infers only unique owned loopback listener and grants execution/read/host/target needed for that spawned application; writes remain explicit. Explicit `--target` mode is dry-run by default, requires exact `--allow-host`, effect authorization, and `--execute`, and never supervises or terminates target. Neither mode contacts recorded destinations, follows redirects, expands DNS, retries, uses proxy/TLS, or replays captured credentials.
 
 Replay outcomes are `completed`, `completed_with_skips`, `dry_run`, `stopped_policy`, `stopped_invalid_session`, `stopped_transport`, and `stopped_verification`. Exit codes: 0 for successful record/ETL/inspect, dry-run, and completed replay; 3 for data/persistence/finalization errors; 4 for policy, invalid-session, unsupported live preflight, or required doctor probe failure; 5 for transport stop; 6 for executed verification failure.
 
 ## Doctor and test profiles
 
 ```bash
-chronicle --format json doctor --wal-dir /var/lib/chronicle/wal --output /var/lib/chronicle/sessions
+chronicle --format json --data-dir /var/lib/chronicle doctor
 ```
 
-Doctor is diagnostic only. It performs independent non-destructive probes, removes temporary artifacts, and never starts capture, repairs WAL, publishes sessions, or sends replay traffic. Aggregate status is `unsupported` for required unsupported probes, `not_checked` for required undecidable probes, `supported_with_warnings` for warnings/optional gaps, otherwise `supported`. Omitted paths are optional `not_checked`; no default path is guessed.
+Doctor is diagnostic only. It performs independent non-destructive probes and never starts capture, creates public data directory, repairs WAL, publishes sessions, or sends replay traffic. It reports resolved data-directory path/source and existing or prospective access without destructive write test. Aggregate status is `unsupported` for required unsupported probes, `not_checked` for required undecidable probes, `supported_with_warnings` for warnings/optional gaps, otherwise `supported`.
 
 Validation entry point:
 
@@ -109,10 +127,26 @@ Privileged caches stay in reused Multipass VM paths `/home/ubuntu/chronicle-targ
 
 `scripts/acceptance.sh` is the only user-facing acceptance entrypoint. `scripts/acceptance/scenarios.toml` defines scenario/profile coverage; `--profile all` runs the P2 superset once because it includes P1 scenarios. `runner.py` owns selection/fingerprint/report/reuse, and `lib/multipass.sh` owns VM lifecycle, snapshot transfer, reboot, and artifacts. `lib/scenario-dispatch.sh` loads ordered scenario modules; profile scripts provide runtime setup/cleanup only. `scripts/acceptance/p1-*.sh` and `p2-*.sh` remain thin deprecated compatibility wrappers. Run `python3 scripts/tests/acceptance/test_runner.py`, `python3 scripts/tests/validation/test_layered_validation.py`, and `bash scripts/tests/acceptance/test-p2-readiness.sh` for tooling coverage.
 
-P2 readiness contract: `recorder-status` now reports machine-readable `state` values (`starting`, `recovering`, `loading_ebpf`, `ready`, `degraded`, `failed`) alongside liveness, lifecycle, capture readiness, processing readiness, and health. Workload admission waits for `state=ready`; systemd `active` alone is insufficient. Polling prints state transitions, tolerates temporary status-command failures, stops immediately on terminal failure, and uses configurable timeout/interval values (`CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_READINESS_INTERVAL_SECONDS`).
+P2 readiness contract: `chronicle internal recorder-status` reports machine-readable `state` values (`starting`, `recovering`, `loading_ebpf`, `ready`, `degraded`, `failed`) alongside liveness, lifecycle, capture readiness, processing readiness, and health. Workload admission waits for `state=ready`; systemd `active` alone is insufficient. Polling prints state transitions, tolerates temporary status-command failures, stops immediately on terminal failure, and uses configurable timeout/interval values (`CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_READINESS_INTERVAL_SECONDS`).
 
 Previous blocker root cause: P2 treated `processing_readiness=not_ready` as capture-not-ready and waited forever even though capture was safe to admit workload; status-command errors were also suppressed and startup/recovery, stale-owner, and terminal failure collapsed into one generic timeout. Recovery can spend longer than the old 60-second loop validating a large incremental checkpoint. Failure diagnostics now retain status/service/journal, kernel/BTF/cgroup/eBPF, WAL listing, checkpoint metadata, process, and disk evidence without Cargo caches or VM data. Multipass stops stale P2 units and fixes artifact ownership before transfer.
 
 The profile uses local upstream/replay targets and dedicated/shared cgroups. It verifies capture, sampling, one-marker/one-sync WAL behavior, crash/recovery authority, hard-cap queue discard, ETL idempotency across roots, cgroup safety, signal/limit finalization, mixed replay, and original-destination isolation. Unsupported hosts must report skipped/not-checked rather than passing runtime coverage.
 
-Always-on capture, rotating sessions, incremental ETL, TLS decryption, HTTP/2/3, upgrades, pipelining, remote storage, and arbitrary production replay are deferred.
+## Legacy 0.1.x syntax migration
+
+Hidden aliases remain through 0.1.x and emit deprecation warnings; removal occurs at 0.2:
+
+| Deprecated form | Replacement |
+| --- | --- |
+| `chronicle recorder --config FILE` | `chronicle internal recorder --config FILE` |
+| `chronicle recorder-status --state-root DIR` | `chronicle internal recorder-status --state-root DIR` |
+| `chronicle etl --wal-dir WAL --output ROOT` | `chronicle internal etl --wal-dir WAL --output ROOT` |
+| `chronicle record --source fixture ...` | `chronicle internal record-fixture --input FILE --root ROOT` |
+| `chronicle record --source ebpf ...` | `chronicle record -- COMMAND...`, `--pid`, or `--cgroup` |
+| `chronicle inspect SESSION --root ROOT` | `chronicle inspect RECORDING` |
+| `chronicle replay SESSION --root ROOT ...` | `chronicle replay RECORDING -- COMMAND...` or explicit `--target` mode |
+
+Docker and Kubernetes packaging are future follow-up only; no container orchestrator integration is implemented.
+
+Unbounded public capture, TLS decryption, HTTP/2/3, upgrades, pipelining, remote storage, and arbitrary production replay are deferred.
