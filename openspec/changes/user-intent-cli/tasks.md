@@ -60,7 +60,7 @@
 - [x] 9.2 Update `docs/replay-safety.md` with the inference-vs-explicit table and the deny-by-default statement for writes/authentication/publication/unknown. Acceptance: table matches spec scenarios.
 - [x] 9.3 Update `docs/continuous-recorder.md` and `docs/continuous-recorder-runbook.md` for the hidden daemon form; add data-directory and recording-identity sections to `docs/architecture.md` or a new doc. Acceptance: no doc references removed public flags as normal usage.
 - [x] 9.4 Note Docker/Kubernetes packaging as future follow-up only in docs; no implementation. Acceptance: docs mention as future work, no code.
-- [ ] 9.5 Update README and `chronicle --help`/subcommand help text: replace the fixture-oriented CLI description with the intent-oriented quick start (`record --`, `list`, `inspect latest`, `replay latest --`). Acceptance: README and help text describe the new surface; no primary-path reference to fixture/`--wal-dir` remains.
+- [x] 9.5 Update README and `chronicle --help`/subcommand help text: replace the fixture-oriented CLI description with the intent-oriented quick start (`record --`, `list`, `inspect latest`, `replay latest --`). Acceptance: README and help text describe the new surface; no primary-path reference to fixture/`--wal-dir` remains.
 
 ## 10. Tests: unit, integration, CLI, rootless, privileged
 
@@ -75,7 +75,7 @@
 
 - [x] 11.1 Add a dedicated compatibility scenario that runs each legacy form (`etl --wal-dir`, `record --source fixture`, `record --source ebpf`, legacy `replay`, legacy `inspect`) and asserts identical behavior plus deprecation warning. Acceptance: scenario passes on 0.1.x surface.
 - [x] 11.2 Add a migration test asserting new-syntax error hints appear for invalid legacy invocations. Acceptance: test passes.
-- [ ] 11.3 Grep-audit task: ensure docs, systemd unit, acceptance scripts, and tests no longer present legacy syntax as the primary path (migration complete); legacy forms remain only as documented compat. Acceptance: audit report shows zero primary-path legacy invocations.
+- [x] 11.3 Grep-audit task: ensure docs, systemd unit, acceptance scripts, and tests no longer present legacy syntax as the primary path (migration complete); legacy forms remain only as documented compat. Acceptance: audit report shows zero primary-path legacy invocations.
 
 ## 12. Release and rollback
 
