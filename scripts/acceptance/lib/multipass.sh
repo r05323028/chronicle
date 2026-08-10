@@ -158,10 +158,11 @@ transfer_artifacts() {
 
 wait_for_vm() {
 	local timeout=$MULTIPASS_VM_READINESS_TIMEOUT
+	local per_call=${MULTIPASS_VM_READINESS_CALL_TIMEOUT_SECONDS:-30}
 	local deadline=$((SECONDS + timeout)) state=unknown
 	while ((SECONDS < deadline)); do
-		state=$(MULTIPASS_TIMEOUT=10 multipass info "$VM" 2>/dev/null | awk '/State:/ {print $2; exit}')
-		if [[ $state == Running ]] && MULTIPASS_TIMEOUT=10 multipass exec "$VM" -- true >/dev/null 2>&1; then
+		state=$(MULTIPASS_TIMEOUT=$per_call multipass info "$VM" 2>/dev/null | awk '/State:/ {print $2; exit}')
+		if [[ $state == Running ]] && MULTIPASS_TIMEOUT=$per_call multipass exec "$VM" -- true >/dev/null 2>&1; then
 			return 0
 		fi
 		sleep 2

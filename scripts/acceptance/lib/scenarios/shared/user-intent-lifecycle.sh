@@ -7,7 +7,7 @@ user_intent_lifecycle_impl() {
 	phase user_intent_lifecycle 'exercise supervised record/replay, retry, selectors, and cleanup'
 	local root="$ARTIFACT_ROOT/user-intent-lifecycle"
 	local data="$root/data" runtime="$root/runtime"
-	local target_uid target_gid before_scope after_scope
+	local target_uid target_gid
 	target_uid=$(stat -c '%u' "$ROOT")
 	target_gid=$(stat -c '%g' "$ROOT")
 	[[ $target_uid -ne 0 ]]
@@ -17,9 +17,6 @@ user_intent_lifecycle_impl() {
 	# Self-contained cgroup subtree; removed on exit even on failure. Trap uses
 	# globals because EXIT runs outside this function's dynamic scope.
 	UI_CGROUP_PARENT=$(current_cgroup_path) || die "cannot resolve current cgroup v2 path"
-	# Baseline scope listing is captured before the subtree is created so the
-	# end-state comparison proves the subtree itself was removed.
-	before_scope=$(find "$UI_CGROUP_PARENT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
 	UI_SCOPE="$UI_CGROUP_PARENT/chronicle-ui-$RUN_ID"
 	mkdir "$UI_SCOPE"
 	local cgroup_parent="$UI_CGROUP_PARENT" scope="$UI_SCOPE"
@@ -169,16 +166,19 @@ PY
 		[[ $(wc -l <"$ARTIFACT_ROOT/upstream-requests.jsonl") -eq 3 ]]
 	fi
 	cleanup_ui_scope
-	# End-state scope listing is captured after cleanup; the comparison with the
-	# pre-creation baseline proves the subtree was actually removed.
-	after_scope=$(find "$cgroup_parent" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+	# End-state leak check: the scenario-owned subtree and every supervised scope
+	# must be gone. Absolute (not before/after) so systemd's async cleanup of
+	# unrelated units cannot race the comparison.
+	if find "$cgroup_parent" -mindepth 1 -maxdepth 1 -type d \
+		\( -name 'chronicle-ui-*' -o -name 'cr-*' -o -name 'rp-*' \) -print -quit | grep -q .; then
+		die "owned cgroup scopes leaked under $cgroup_parent"
+	fi
 	# Restore the profile's original EXIT trap; the scenario-owned chain exits.
 	if [[ -n ${UI_PREV_EXIT_TRAP:-} ]]; then
 		eval "$UI_PREV_EXIT_TRAP"
 	else
 		trap - EXIT
 	fi
-	[[ $after_scope == "$before_scope" ]]
 	# Absolute end-state check: no chronicle capture program may remain loaded.
 	bpftool prog show -j 2>/dev/null | python3 -c 'import json,sys; names=[p.get("name","") for p in json.load(sys.stdin)]; owned={"connect4","connect6","socket_lifecycle","ingress","egress"}; raise SystemExit(0 if not (set(names) & owned or any(n.startswith("chronicle") for n in names)) else 1)'
 

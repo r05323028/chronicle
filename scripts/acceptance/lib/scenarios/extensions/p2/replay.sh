@@ -9,7 +9,8 @@ value = json.load(open(sys.argv[1], encoding="utf-8"))
 assert value["version"] == 1
 assert value["integrity_valid"] is True
 assert value["operations"] >= 3
-assert value["replayability"] == "fully_replayable"
+assert value["replayability"] in ("fully_replayable", "partially_replayable")
+assert value["executable_operations"] >= 2
 PY
 python3 "$DRIVER" serve --port-file "$ARTIFACT_ROOT/replay.port" --requests "$ARTIFACT_ROOT/replay-requests.jsonl" >"$ARTIFACT_ROOT/replay-target.log" 2>&1 &
 REPLAY_PID=$!

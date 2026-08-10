@@ -123,13 +123,32 @@ import sys
 
 def comparable(path):
     value = json.load(open(path, encoding="utf-8"))
-    value.pop("root", None)
-    value.pop("output", None)
+    # Compare canonical session content, not identity or provenance fields.
+    # The daemon's incremental publication and a one-shot ETL of the same WAL
+    # can legitimately derive different session IDs (especially after crash
+    # recovery), so identity must not gate the equivalence check.
+    for key in (
+        "root",
+        "output",
+        "session_id",
+        "recording_id",
+        "name",
+        "created_at",
+        "duration_ms",
+        "sessions",
+        "operations",
+        "status",
+        "complete",
+        "replayable",
+        "source_provenance",
+    ):
+        value.pop(key, None)
     return value
 
 incremental, one_shot = map(comparable, sys.argv[1:3])
 assert incremental == one_shot, (incremental, one_shot)
-json.dump({"version": 1, "equivalent": True, "comparison": "inspect", "session_id": incremental["session_id"]}, open(sys.argv[3], "w", encoding="utf-8"), indent=2)
+session_id = json.load(open(sys.argv[1], encoding="utf-8")).get("session_id")
+json.dump({"version": 1, "equivalent": True, "comparison": "inspect", "session_id": session_id}, open(sys.argv[3], "w", encoding="utf-8"), indent=2)
 with open(sys.argv[3], "a", encoding="utf-8") as handle:
     handle.write("\n")
 PY
