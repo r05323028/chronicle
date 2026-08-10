@@ -14,6 +14,14 @@ user_intent_lifecycle_impl() {
 	install -d -m 0700 "$data"
 	install -d -o "$target_uid" -g "$target_gid" -m 0700 "$runtime"
 
+	# The shared upstream destination log accumulates requests across every
+	# profile scenario that ran before this one (3 in P1, many more in P2).
+	# Snapshot it now; the scenario must never add a line to it.
+	local upstream_lines=-1
+	if [[ -f "$ARTIFACT_ROOT/upstream-requests.jsonl" ]]; then
+		upstream_lines=$(wc -l <"$ARTIFACT_ROOT/upstream-requests.jsonl")
+	fi
+
 	# Self-contained cgroup subtree; removed on exit even on failure. Trap uses
 	# globals because EXIT runs outside this function's dynamic scope.
 	UI_CGROUP_PARENT=$(current_cgroup_path) || die "cannot resolve current cgroup v2 path"
@@ -161,9 +169,10 @@ PY
 	assert_json "$root/replay-fail.json" 'value["version"] == 1 and value["result"]["outcome"] == "stopped_verification" and value["cleanup"]["status"] in ("clean", "killed")'
 
 	# All owned targets/scopes/programs are gone; production destination log is unchanged.
-	# The upstream log exists only when an earlier scenario generated workload (P1).
-	if [[ -f "$ARTIFACT_ROOT/upstream-requests.jsonl" ]]; then
-		[[ $(wc -l <"$ARTIFACT_ROOT/upstream-requests.jsonl") -eq 3 ]]
+	# The upstream log accumulates requests from every scenario that ran before
+	# this one; the lifecycle itself must add none.
+	if [[ $upstream_lines -ge 0 ]]; then
+		[[ $(wc -l <"$ARTIFACT_ROOT/upstream-requests.jsonl") -eq $upstream_lines ]]
 	fi
 	cleanup_ui_scope
 	# End-state leak check: the scenario-owned subtree and every supervised scope

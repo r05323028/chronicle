@@ -95,7 +95,8 @@ print(value["session_id"])
 PY
 	)
 	test -d "$STORE_ROOT/sessions/$SESSION_ID"
-	P2_RECORDING_UUID=$(python3 - "$ARTIFACT_ROOT/etl.json" <<'PY'
+	P2_RECORDING_UUID=$(
+		python3 - "$ARTIFACT_ROOT/etl.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["recording_id"])
 PY

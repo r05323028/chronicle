@@ -55,6 +55,11 @@ PY
 		collect_recorder_readiness_diagnostics 2>/dev/null || true
 		journalctl --no-pager -u "$UNIT" >"$ARTIFACT_ROOT/checkpoint-restart-journal.log" 2>&1 || true
 		systemctl show "$UNIT" >"$ARTIFACT_ROOT/checkpoint-restart-unit.txt" 2>&1 || true
+		# Archive the durable recorder state for offline crash-recovery
+		# diagnosis (WAL, checkpoint, store, metadata).
+		tar -czf "$ARTIFACT_ROOT/crash-recovery-state.tar.gz" \
+			-C "$(dirname "$STATE_ROOT")" "$(basename "$STATE_ROOT")" \
+			-C "$(dirname "$STORE_ROOT")" "$(basename "$STORE_ROOT")" 2>/dev/null || true
 		exit 1
 	fi
 	wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
