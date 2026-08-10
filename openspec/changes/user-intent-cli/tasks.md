@@ -60,7 +60,7 @@
 - [x] 9.2 Update `docs/replay-safety.md` with the inference-vs-explicit table and the deny-by-default statement for writes/authentication/publication/unknown. Acceptance: table matches spec scenarios.
 - [x] 9.3 Update `docs/continuous-recorder.md` and `docs/continuous-recorder-runbook.md` for the hidden daemon form; add data-directory and recording-identity sections to `docs/architecture.md` or a new doc. Acceptance: no doc references removed public flags as normal usage.
 - [x] 9.4 Note Docker/Kubernetes packaging as future follow-up only in docs; no implementation. Acceptance: docs mention as future work, no code.
-- [x] 9.5 Update README and `chronicle --help`/subcommand help text: replace the fixture-oriented CLI description with the intent-oriented quick start (`record --`, `list`, `inspect latest`, `replay latest --`). Acceptance: README and help text describe the new surface; no primary-path reference to fixture/`--wal-dir` remains.
+- [ ] 9.5 Update README and `chronicle --help`/subcommand help text: replace the fixture-oriented CLI description with the intent-oriented quick start (`record --`, `list`, `inspect latest`, `replay latest --`). Acceptance: README and help text describe the new surface; no primary-path reference to fixture/`--wal-dir` remains.
 
 ## 10. Tests: unit, integration, CLI, rootless, privileged
 
@@ -68,17 +68,17 @@
 - [x] 10.2 Rootless CLI contract tests for all five commands, JSON atomicity, exit codes, deprecation warnings, and legacy forms. Acceptance: `crates/chronicle-cli/tests/cli_contract.rs` extended and passing.
 - [x] 10.3 Linux rootless replay command test: exercise happy discovery only when access-separated delegated cgroup exists; otherwise assert actionable preflight and zero target execution/traffic. Negative fallback is not listener-discovery evidence; task 10.5 privileged scenario remains required happy-path proof.
 - [x] 10.4 Portable rootless integration test for explicit `--target` replay mode (loopback server already running), asserting full authorization gates and no recorded-destination contact; runs on macOS and non-Linux CI without cgroups or `/proc` ownership. Acceptance: portable test passes in CI on macOS.
-- [x] 10.5 Privileged supported-Linux acceptance: release-built `linux-ebpf` binary; real record command/descendants, Ctrl+C cleanup, PID/cgroup attach, retry after injected publication failure without recapture, replay IPv4 and IPv6 PASS/FAIL, denied-write target-not-started, original destination untouched, credential/cgroup access separation, and no owned scope/process/eBPF leak after normal/fault exits. Retain machine-readable evidence per existing rules.
-- [x] 10.6 Keep existing P1/P2 acceptance scenarios green against the new surface after migrating their invocations; run targeted validation group. Acceptance: `validate.sh fast` equivalent passes with migrated scripts.
+- [ ] 10.5 Privileged supported-Linux acceptance: release-built `linux-ebpf` binary; real record command/descendants, Ctrl+C cleanup, PID/cgroup attach, retry after injected publication failure without recapture, replay IPv4 and IPv6 PASS/FAIL, denied-write target-not-started, original destination untouched, credential/cgroup access separation, and no owned scope/process/eBPF leak after normal/fault exits. Retain machine-readable evidence per existing rules.
+- [ ] 10.6 Keep existing P1/P2 acceptance scenarios green against the new surface after migrating their invocations; run targeted validation group. Acceptance: `validate.sh fast` equivalent passes with migrated scripts.
 
 ## 11. Migration tests for old CLI syntax
 
 - [x] 11.1 Add a dedicated compatibility scenario that runs each legacy form (`etl --wal-dir`, `record --source fixture`, `record --source ebpf`, legacy `replay`, legacy `inspect`) and asserts identical behavior plus deprecation warning. Acceptance: scenario passes on 0.1.x surface.
 - [x] 11.2 Add a migration test asserting new-syntax error hints appear for invalid legacy invocations. Acceptance: test passes.
-- [x] 11.3 Grep-audit task: ensure docs, systemd unit, acceptance scripts, and tests no longer present legacy syntax as the primary path (migration complete); legacy forms remain only as documented compat. Acceptance: audit report shows zero primary-path legacy invocations.
+- [ ] 11.3 Grep-audit task: ensure docs, systemd unit, acceptance scripts, and tests no longer present legacy syntax as the primary path (migration complete); legacy forms remain only as documented compat. Acceptance: audit report shows zero primary-path legacy invocations.
 
 ## 12. Release and rollback
 
 - [x] 12.1 Confirm no existing authoritative WAL/canonical/session-manifest format changes while documenting additive catalog/sidecar v1. Rollback reverts coordinated crates; previous release can inspect explicit `<data>` root/process explicit WAL but ignores names/latest/sidecars/retry. Acceptance: controlled previous-release binary fixture test states supported directions; no claim of CLI-only rollback.
 - [x] 12.2 Update release notes with deprecation schedule and migration guide pointer. Acceptance: notes present in release doc.
-- [x] 12.3 Run strict OpenSpec validation, bounded fast/targeted tests, then required privileged P1/P2 scenarios on supported Linux. Acceptance: OpenSpec strict passes structurally; runtime tasks are checked only from their explicit automated/retained privileged evidence, never OpenSpec validation alone.
+- [ ] 12.3 Run strict OpenSpec validation, bounded fast/targeted tests, then required privileged P1/P2 scenarios on supported Linux. Acceptance: OpenSpec strict passes structurally; runtime tasks are checked only from their explicit automated/retained privileged evidence, never OpenSpec validation alone.

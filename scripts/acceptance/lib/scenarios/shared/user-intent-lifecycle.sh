@@ -16,9 +16,13 @@ user_intent_lifecycle_impl() {
 
 	# Self-contained cgroup subtree; removed on exit even on failure. Trap uses
 	# globals because EXIT runs outside this function's dynamic scope.
-	UI_CGROUP_PARENT=""
-	UI_SCOPE=""
-	trap 'printf "UI-ERR line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
+	UI_CGROUP_PARENT=$(current_cgroup_path) || die "cannot resolve current cgroup v2 path"
+	# Baseline scope listing is captured before the subtree is created so the
+	# end-state comparison proves the subtree itself was removed.
+	before_scope=$(find "$UI_CGROUP_PARENT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+	UI_SCOPE="$UI_CGROUP_PARENT/chronicle-ui-$RUN_ID"
+	mkdir "$UI_SCOPE"
+	local cgroup_parent="$UI_CGROUP_PARENT" scope="$UI_SCOPE"
 	cleanup_ui_scope() {
 		local pid
 		[[ -n ${UI_SCOPE:-} ]] || return 0
@@ -32,16 +36,10 @@ user_intent_lifecycle_impl() {
 	# replacing it, so the summary/report trap still runs on every path.
 	UI_PREV_EXIT_TRAP=$(trap -p EXIT)
 	cleanup_ui_chain() {
-		trap - ERR
 		cleanup_ui_scope
 		[[ -n ${UI_PREV_EXIT_TRAP:-} ]] && eval "$UI_PREV_EXIT_TRAP"
 	}
 	trap cleanup_ui_chain EXIT
-	UI_CGROUP_PARENT=$(current_cgroup_path) || die "cannot resolve current cgroup v2 path"
-	UI_SCOPE="$UI_CGROUP_PARENT/chronicle-ui-$RUN_ID"
-	mkdir "$UI_SCOPE"
-	local cgroup_parent="$UI_CGROUP_PARENT" scope="$UI_SCOPE"
-	before_scope=$(find "$cgroup_parent" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
 
 	# Command-mode capture starts one target and descendant only after attachment.
 	python3 "$ROOT/scripts/acceptance/separated-supervisor.py" "$target_uid" "$target_gid" \
@@ -170,10 +168,11 @@ PY
 	if [[ -f "$ARTIFACT_ROOT/upstream-requests.jsonl" ]]; then
 		[[ $(wc -l <"$ARTIFACT_ROOT/upstream-requests.jsonl") -eq 3 ]]
 	fi
-	after_scope=$(find "$cgroup_parent" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
 	cleanup_ui_scope
+	# End-state scope listing is captured after cleanup; the comparison with the
+	# pre-creation baseline proves the subtree was actually removed.
+	after_scope=$(find "$cgroup_parent" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
 	# Restore the profile's original EXIT trap; the scenario-owned chain exits.
-	trap - ERR
 	if [[ -n ${UI_PREV_EXIT_TRAP:-} ]]; then
 		eval "$UI_PREV_EXIT_TRAP"
 	else
@@ -181,7 +180,7 @@ PY
 	fi
 	[[ $after_scope == "$before_scope" ]]
 	# Absolute end-state check: no chronicle capture program may remain loaded.
-	bpftool prog show -j 2>/dev/null | python3 -c 'import json,sys; names=[p.get("name","") for p in json.load(sys.stdin)]; raise SystemExit(0 if not any(n.startswith("chronicle") or n in ("connect4", "connect6") for n in names) else 1)'
+	bpftool prog show -j 2>/dev/null | python3 -c 'import json,sys; names=[p.get("name","") for p in json.load(sys.stdin)]; owned={"connect4","connect6","socket_lifecycle","ingress","egress"}; raise SystemExit(0 if not (set(names) & owned or any(n.startswith("chronicle") for n in names)) else 1)'
 
 	python3 - "$root/acceptance.json" "$recording_ref" "$replay_ref" "$target_uid" "$before_segments" <<'PY'
 import json, sys
