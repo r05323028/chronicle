@@ -315,6 +315,14 @@ impl EtlPipeline {
         let mut operation_completeness = BTreeMap::new();
         let mut timeline = Vec::new();
         let mut operation_count = 0;
+        // Deterministic operation ids collide when the same committed envelope
+        // is reachable from more than one reconstruction connection (e.g. one
+        // exchange split by the per-connection byte limit after a crashed
+        // group commit). The dedup must be session-global: a colliding
+        // identity is kept once with its single authoritative timeline entry,
+        // otherwise the final session fails canonical validation with a
+        // timeline connection-mismatch.
+        let mut emitted_operation_ids = BTreeSet::new();
 
         for connection in assembly.connections {
             let connection_id = deterministic_connection_id(&connection);
@@ -411,11 +419,9 @@ impl EtlPipeline {
             for decoded in &mut decoded_operations {
                 decoded.operation.id = deterministic_operation_id(&decoded.operation);
             }
-            // Deterministic operation ids collide for repeated identical
-            // traffic within one recording, so keep the last occurrence of
-            // each operation in the final session (incremental batch output
-            // applies the same deduplication).
-            let mut emitted_operation_ids = BTreeSet::new();
+            // Keep the last occurrence of each deterministic operation identity
+            // across the whole session; incremental batch output applies the
+            // same deduplication.
             decoded_operations.reverse();
             decoded_operations.retain(|decoded| emitted_operation_ids.insert(decoded.operation.id));
             decoded_operations.reverse();
@@ -1072,6 +1078,133 @@ mod tests {
             batch_sha256: [0; 32],
         })
         .to_vec()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // envelope builders stay inline for the regression fixture
+    fn cross_connection_duplicate_identity_stays_publishable() {
+        // A crashed group commit can leave the same committed envelope reachable
+        // from two reconstruction connections (e.g. one exchange split by the
+        // per-connection byte limit). Both sides decode to the same deterministic
+        // operation identity; the final session must still validate, with the
+        // duplicate kept exactly once and its timeline entry pointing at that
+        // single occurrence. Regression for the post-crash checkpoint-kill loop
+        // where the final publication failed closed on a timeline
+        // connection-mismatch raised from a cross-connection duplicate id.
+        let recording_id = RecordingId::new();
+        let socket_envelope = |cookie: u64, sequence: u64| -> WalRecordEnvelope {
+            let timestamp = MonotonicTimestamp {
+                clock: ClockIdentity {
+                    boot_id: "boot".into(),
+                },
+                nanoseconds: sequence,
+            };
+            WalRecordEnvelope::unplaced(
+                recording_id,
+                sequence,
+                RecordKind::CaptureEvent,
+                CAPTURE_EVENT_SCHEMA_VERSION,
+                0,
+                encode_event(&CaptureEvent {
+                    schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                    kind: CaptureEventKind::SocketConnected(SocketEvidence {
+                        timestamp: timestamp.clone(),
+                        socket: SocketIdentity {
+                            socket_cookie: cookie,
+                            first_seen: timestamp,
+                            network_namespace: None,
+                        },
+                        recording_scope: RecordingScopeIdentity {
+                            cgroup_id: 1,
+                            canonical_path: "/scope".into(),
+                            namespace: None,
+                        },
+                        network_family: NetworkFamily::Ipv4,
+                        local_endpoint: Endpoint::new(
+                            "192.0.2.10",
+                            41_000_u16 + u16::try_from(cookie).unwrap(),
+                        ),
+                        remote_endpoint: Endpoint::new("192.0.2.20", 8_080),
+                        role: SocketRole::Active,
+                        process: None,
+                        observed_cgroup_id: 1,
+                    }),
+                })
+                .unwrap(),
+            )
+        };
+        let payload_envelope = |cookie: u64, sequence: u64| -> WalRecordEnvelope {
+            let timestamp = MonotonicTimestamp {
+                clock: ClockIdentity {
+                    boot_id: "boot".into(),
+                },
+                nanoseconds: sequence,
+            };
+            WalRecordEnvelope::unplaced(
+                recording_id,
+                sequence,
+                RecordKind::CaptureEvent,
+                CAPTURE_EVENT_SCHEMA_VERSION,
+                0,
+                encode_event(&CaptureEvent {
+                    schema_version: CAPTURE_EVENT_SCHEMA_VERSION,
+                    kind: CaptureEventKind::PayloadFragment(PayloadFragment {
+                        timestamp: timestamp.clone(),
+                        socket: SocketIdentity {
+                            socket_cookie: cookie,
+                            first_seen: timestamp,
+                            network_namespace: None,
+                        },
+                        recording_scope: RecordingScopeIdentity {
+                            cgroup_id: 1,
+                            canonical_path: "/scope".into(),
+                            namespace: None,
+                        },
+                        network_family: NetworkFamily::Ipv4,
+                        direction: PayloadDirection::Ingress,
+                        sequence: FragmentSequenceEvidence {
+                            tcp_sequence: 0,
+                            continuation_position: 0,
+                        },
+                        payload: b"opaque".to_vec(),
+                        truncation: TruncationMetadata {
+                            captured_length: 6,
+                            observed_length: Some(6),
+                            state: TruncationState::Complete,
+                            reason: None,
+                        },
+                        flags: CaptureFlags::default(),
+                    }),
+                })
+                .unwrap(),
+            )
+        };
+        // Both payload fragments carry the same envelope sequence (2), so both
+        // decoded operations share one deterministic identity even though they
+        // belong to different reconstruction connections.
+        let mut envelopes = Vec::new();
+        for (cookie, connect_sequence) in [(1, 1), (2, 3)] {
+            envelopes.push(socket_envelope(cookie, connect_sequence));
+            envelopes.push(payload_envelope(cookie, 2));
+        }
+        let output = EtlPipeline::new(SessionLimits::default())
+            .process_envelopes(&envelopes, &ProtocolRegistry::new(), SessionId::new())
+            .unwrap();
+        let ids = output
+            .session
+            .connections
+            .iter()
+            .flat_map(|connection| connection.operations.iter().map(|operation| operation.id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids.len(),
+            ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "duplicate operation identity must be deduplicated across connections"
+        );
+        output.session.validate().unwrap();
     }
 
     #[test]
