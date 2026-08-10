@@ -381,14 +381,17 @@ if [[ "$RELEASE_MODE" == 1 ]]; then
 	}
 fi
 TMP_DIR=$(mktemp -d)
-# Chain the scratch-dir cleanup onto the profile's existing EXIT trap instead
-# of replacing it: on_exit writes the acceptance report and runs final cleanup.
-P2_PREV_EXIT_TRAP=$(trap -p EXIT)
-p2_tmp_cleanup() {
+# Invoke the profile's on_exit from this final trap so it actually runs
+# (re-registering it via eval never fires it again on EXIT). Preserve the
+# script's real exit status for on_exit, which reads \$?.
+p2_final() {
+	local rc=$?
 	rm -rf -- "$TMP_DIR"
-	[[ -n ${P2_PREV_EXIT_TRAP:-} ]] && eval "$P2_PREV_EXIT_TRAP"
+	trap - EXIT
+	(exit "$rc")
+	on_exit
 }
-trap p2_tmp_cleanup EXIT
+trap p2_final EXIT
 
 # shellcheck source=scripts/acceptance/lib/scenario-dispatch.sh
 source "$ROOT/scripts/acceptance/lib/scenario-dispatch.sh"
