@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 RESPONSES = {
     ("GET", "/content-length"): ("200 OK", b"content-length"),
     ("GET", "/chunked"): ("200 OK", b"b"),
+    ("GET", "/hello"): ("200 OK", b"OK"),
+    ("POST", "/bin"): ("200 OK", b"\x80\xff\x00"),
 }
 
 
@@ -57,6 +59,12 @@ def response(method: str, target: str, body: bytes) -> bytes:
         if (method, target) == ("POST", "/echo")
         else ("404 Not Found", b"not found"),
     )
+    if target == "/hello":
+        # Fixture records the X-Fixture header; the verifier compares headers.
+        return (
+            f"HTTP/1.1 {status}\r\nx-fixture: basic\r\ncontent-length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
     if target == "/chunked":
         return (
             f"HTTP/1.1 {status}\r\ntransfer-encoding: chunked\r\n\r\n".encode()
@@ -70,6 +78,7 @@ def response(method: str, target: str, body: bytes) -> bytes:
 
 class Handler(socketserver.BaseRequestHandler):
     requests: Path
+    mismatch = False
 
     def handle(self) -> None:
         buffered = b""
@@ -82,7 +91,11 @@ class Handler(socketserver.BaseRequestHandler):
                 self.requests,
                 {"method": method, "target": target, "body_bytes": len(body)},
             )
-            self.request.sendall(response(method, target, body))
+            self.request.sendall(
+                b"HTTP/1.1 500 Mismatch\r\ncontent-length: 8\r\n\r\nmismatch"
+                if self.mismatch
+                else response(method, target, body)
+            )
 
 
 class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -90,11 +103,20 @@ class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
+class ServerV6(Server):
+    address_family = socket.AF_INET6
+
+
 def serve(args: argparse.Namespace) -> None:
     request_log = Path(args.requests)
     request_log.touch()
-    Handler.requests = request_log
-    with Server(("127.0.0.1", args.port), Handler) as server:
+    handler = type(
+        "BoundHandler",
+        (Handler,),
+        {"requests": request_log, "mismatch": args.mismatch},
+    )
+    server_class = ServerV6 if ":" in args.host else Server
+    with server_class((args.host, args.port), handler) as server:
         Path(args.port_file).write_text(str(server.server_address[1]), encoding="utf-8")
         server.serve_forever(poll_interval=0.1)
 
@@ -182,9 +204,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(required=True)
     server = commands.add_parser("serve")
+    server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=0)
     server.add_argument("--port-file", required=True)
     server.add_argument("--requests", required=True)
+    server.add_argument("--mismatch", action="store_true")
     server.set_defaults(run=serve)
     workload_parser = commands.add_parser("workload")
     workload_parser.add_argument("--origin", required=True)

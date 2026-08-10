@@ -5,11 +5,20 @@ compatibility_version = 1
 # Scenario IDs are the acceptance contract. Executors run these through one
 # profile runtime; profiles only select capability coverage.
 [profiles.p1]
-scenarios = ["capture-basic", "wal-recovery", "replay", "resource-cleanup"]
+scenarios = [
+  "capture-basic",
+  "wal-recovery",
+  "replay",
+  "user-intent-lifecycle",
+  "cli-compatibility",
+  "resource-cleanup",
+]
 execution_order = [
   "capture-basic",
   "wal-recovery",
   "replay",
+  "user-intent-lifecycle",
+  "cli-compatibility",
   "resource-cleanup",
 ]
 
@@ -26,6 +35,8 @@ scenarios = [
   "retention-interruption",
   "corruption-quarantine",
   "reboot-recovery",
+  "user-intent-lifecycle",
+  "cli-compatibility",
 ]
 execution_order = [
   "capture-basic",
@@ -38,6 +49,8 @@ execution_order = [
   "corruption-quarantine",
   "replay",
   "retention-interruption",
+  "user-intent-lifecycle",
+  "cli-compatibility",
   "resource-cleanup",
 ]
 
@@ -64,6 +77,18 @@ capabilities = ["privileged", "replay"]
 phases = ["replay"]
 legacy_p1_checks = ["replay_matrix"]
 legacy_p2_checks = ["inspect_replay", "one_shot_equivalence"]
+
+[scenarios.user-intent-lifecycle]
+timeout_seconds = 600
+capabilities = ["privileged", "ebpf", "cgroup-v2", "replay"]
+phases = ["record", "retry", "selectors", "replay", "cleanup"]
+legacy_p1_checks = ["user_intent_lifecycle"]
+
+[scenarios.cli-compatibility]
+timeout_seconds = 300
+capabilities = ["privileged", "ebpf", "compatibility"]
+phases = ["cli_compatibility"]
+legacy_p1_checks = ["cli_compatibility"]
 
 [scenarios.resource-cleanup]
 timeout_seconds = 900

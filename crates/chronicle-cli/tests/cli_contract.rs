@@ -63,6 +63,16 @@ fn record_fixture(root: &std::path::Path, fixture: &std::path::Path) -> String {
 }
 
 fn production_wal(directory: &std::path::Path) {
+    production_wal_from_fixture(
+        directory,
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/http/basic-session.json"
+        )),
+    );
+}
+
+fn production_wal_from_fixture(directory: &std::path::Path, fixture: &std::path::Path) {
     use chronicle_application::{
         RECORDING_METADATA_SCHEMA_VERSION, RecordByteCount, RecordingCommitBoundary,
         RecordingCounters, RecordingMetadata, RecordingStatus, ShutdownReason,
@@ -78,11 +88,7 @@ fn production_wal(directory: &std::path::Path) {
     };
 
     let recording_id = RecordingId::new();
-    let fixture = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../fixtures/http/basic-session.json"
-    ))
-    .unwrap();
+    let fixture = std::fs::read(fixture).unwrap();
     let mut source = FixtureCaptureSource::from_json(&fixture).unwrap();
     let mut writer = GroupCommitWalWriter::create(directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
         .expect("create production WAL");
@@ -132,6 +138,35 @@ fn production_wal(directory: &std::path::Path) {
         },
     )
     .expect("write metadata");
+}
+
+fn publish_public_recording(root: &std::path::Path, fixture: &std::path::Path) -> (String, String) {
+    let staged = root.join(format!("staged-wal-{}", uuid::Uuid::new_v4()));
+    production_wal_from_fixture(&staged, fixture);
+    let recording_id = chronicle_application::load_recording_metadata(&staged)
+        .unwrap()
+        .unwrap()
+        .recording_id;
+    let wal = root.join("recordings").join(recording_id.to_string());
+    std::fs::create_dir_all(wal.parent().unwrap()).unwrap();
+    std::fs::rename(staged, &wal).unwrap();
+    let published = command(&[
+        "--format",
+        "json",
+        "internal",
+        "etl",
+        "--wal-dir",
+        wal.to_str().unwrap(),
+        "--output",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(published.status.code(), Some(0));
+    assert!(published.stderr.is_empty());
+    let published: serde_json::Value = serde_json::from_slice(&published.stdout).unwrap();
+    (
+        recording_id.to_cli_string(),
+        published["session_id"].as_str().unwrap().to_owned(),
+    )
 }
 
 fn spawn_server(response: &'static [u8]) -> (String, Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
@@ -336,7 +371,7 @@ fn denied_legacy_replay_emits_one_hint_error_and_no_result() {
 }
 
 #[test]
-fn cli_replay_never_contacts_recorded_target_or_follows_redirect() {
+fn public_explicit_replay_requires_gates_and_never_contacts_recorded_target() {
     let root = std::env::temp_dir().join(format!("chronicle-cli-target-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("create test root");
     let recorded_target = TcpListener::bind("127.0.0.1:0").expect("bind recorded target");
@@ -358,17 +393,50 @@ fn cli_replay_never_contacts_recorded_target_or_follows_redirect() {
         &format!("\"host\": \"127.0.0.1\", \"port\": {recorded_port}"),
     );
     std::fs::write(&fixture, fixture_json).expect("write fixture");
-    let session_id = record_fixture(&root, &fixture);
+    let (recording_id, _) = publish_public_recording(&root, &fixture);
+    let root_text = root.to_str().expect("root is UTF-8");
+
+    let dry_run = command(&[
+        "--data-dir",
+        root_text,
+        "replay",
+        &recording_id,
+        "--target",
+        "http://127.0.0.1:9",
+        "--allow-host",
+        "127.0.0.1",
+    ]);
+    assert_eq!(dry_run.status.code(), Some(0));
+    assert_no_connection(&recorded_target);
+
+    let denied = command(&[
+        "--data-dir",
+        root_text,
+        "replay",
+        &recording_id,
+        "--target",
+        "http://127.0.0.1:9",
+        "--allow-host",
+        "127.0.0.1",
+        "--execute",
+    ]);
+    assert_eq!(denied.status.code(), Some(4));
+    assert_no_connection(&recorded_target);
+
     let response = b"HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/escape\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
     let (target, _, target_task) = spawn_server(response);
-
-    let output = command(&replay_arguments(
-        &session_id,
-        root.to_str().expect("root is UTF-8"),
+    let output = command(&[
+        "--data-dir",
+        root_text,
+        "replay",
+        &recording_id,
+        "--target",
         &target,
-        true,
-        true,
-    ));
+        "--allow-host",
+        "127.0.0.1",
+        "--allow-read",
+        "--execute",
+    ]);
     assert_eq!(output.status.code(), Some(6));
     target_task.join().expect("target received replay");
     assert_no_connection(&recorded_target);
@@ -766,30 +834,11 @@ fn empty_list_and_legacy_inspect_contract() {
 #[test]
 fn public_inspect_resolves_recording_identity() {
     let root = std::env::temp_dir().join(format!("chronicle-cli-public-{}", uuid::Uuid::new_v4()));
-    let staged_wal = root.join("staged-wal");
-    production_wal(&staged_wal);
-    let public_recording_id = chronicle_application::load_recording_metadata(&staged_wal)
-        .unwrap()
-        .unwrap()
-        .recording_id;
-    let public_wal = root
-        .join("recordings")
-        .join(public_recording_id.to_string());
-    std::fs::create_dir_all(public_wal.parent().unwrap()).unwrap();
-    std::fs::rename(staged_wal, &public_wal).unwrap();
-    let published = command(&[
-        "etl",
-        "--wal-dir",
-        public_wal.to_str().unwrap(),
-        "--output",
-        root.to_str().unwrap(),
-    ]);
-    assert_eq!(published.status.code(), Some(0));
-    let (published_stdout, _) = output_text(&published);
-    let session_id = published_stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("session_id: "))
-        .expect("published session id");
+    let fixture = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/http/basic-session.json"
+    ));
+    let (recording_id, session_id) = publish_public_recording(&root, fixture);
 
     let listed = command(&[
         "--format",
@@ -799,9 +848,7 @@ fn public_inspect_resolves_recording_identity() {
         "list",
     ]);
     let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
-    let recording_id = listed["recordings"][0]["recording_id"]
-        .as_str()
-        .expect("recording id");
+    assert_eq!(listed["recordings"][0]["recording_id"], recording_id);
     let latest = command(&[
         "--format",
         "json",
@@ -822,7 +869,7 @@ fn public_inspect_resolves_recording_identity() {
         "--data-dir",
         root.to_str().unwrap(),
         "inspect",
-        recording_id,
+        &recording_id,
     ]);
     assert_eq!(by_id.status.code(), Some(0));
     let (by_id_stdout, _) = output_text(&by_id);
@@ -878,6 +925,33 @@ fn doctor_prospective_data_dir_is_non_mutating_and_actionable() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[test]
+fn rootless_public_record_fails_before_target_on_unsupported_build() {
+    let root = std::env::temp_dir().join(format!("chronicle-cli-record-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = root.join("target-started");
+    let output = command(&[
+        "--format",
+        "json",
+        "--data-dir",
+        root.to_str().unwrap(),
+        "record",
+        "--",
+        "/usr/bin/touch",
+        marker.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let (stdout, stderr) = output_text(&output);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stderr).unwrap()["code"],
+        4
+    );
+    assert!(!marker.exists());
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn public_list_storage_error_exits_three_without_stdout() {
@@ -902,6 +976,42 @@ fn public_list_storage_error_exits_three_without_stdout() {
     );
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_file(outside).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rootless_command_replay_fails_before_target_without_access_separation() {
+    let root =
+        std::env::temp_dir().join(format!("chronicle-cli-rootless-{}", uuid::Uuid::new_v4()));
+    let fixture = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/http/basic-session.json"
+    ));
+    let (recording_id, _) = publish_public_recording(&root, fixture);
+    let marker = root.join("target-started");
+    let output = command(&[
+        "--format",
+        "json",
+        "--data-dir",
+        root.to_str().unwrap(),
+        "replay",
+        &recording_id,
+        "--",
+        "/usr/bin/touch",
+        marker.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let (stdout, stderr) = output_text(&output);
+    assert!(stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(error["code"], 4);
+    assert!(
+        error["message"].as_str().is_some_and(|message| {
+            message.contains("cgroup") || message.contains("target user")
+        })
+    );
+    assert!(!marker.exists());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(target_os = "linux")]

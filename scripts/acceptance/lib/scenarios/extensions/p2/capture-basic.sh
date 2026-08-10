@@ -70,7 +70,7 @@ EOF
 		--property=Type=simple --property=KillSignal=SIGTERM --property=TimeoutStopSec=45s \
 		--property=Restart=on-failure --property=RestartSec=1s \
 		--property=NoNewPrivileges=no \
-		"$CHRONICLE" --format json recorder --config "$CONFIG"
+		"$CHRONICLE" --format json internal recorder --config "$CONFIG"
 	if ! wait_for_unit_active "$UNIT" 30; then
 		collect_recorder_readiness_diagnostics
 		exit 1

@@ -51,12 +51,12 @@ level = "info"
 EOF
 	systemd-run --quiet --unit="$QUOTA_UNIT" --working-directory="$ROOT" \
 		--property=Type=simple --property=KillSignal=SIGTERM --property=TimeoutStopSec=30s \
-		--property=Restart=no "$CHRONICLE" --format json recorder --config "$ARTIFACT_ROOT/quota-recorder.toml"
+		--property=Restart=no "$CHRONICLE" --format json internal recorder --config "$ARTIFACT_ROOT/quota-recorder.toml"
 	wait_for_unit_active "$QUOTA_UNIT" 30
 	wait_for_quota_ready() {
 		local deadline=$((SECONDS + 30)) quota_epoch=0 start_epoch=0
 		while ((SECONDS < deadline)); do
-			if bounded_readiness_command 10 "$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-status.json" 2>/dev/null &&
+			if bounded_readiness_command 10 "$CHRONICLE" --format json internal recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-status.json" 2>/dev/null &&
 				grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$ARTIFACT_ROOT/quota-status.json"; then
 				start_epoch=$(systemd_active_epoch 10 "$QUOTA_UNIT")
 				quota_epoch=$(recorder_metadata_epoch "$QUOTA_STATE/recorder.json")
@@ -73,7 +73,7 @@ EOF
 	printf '%s\n' "$$" >"$QUOTA_CGROUP/cgroup.procs"
 	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/quota-workload.json"
 	for _ in $(seq 1 30); do
-		bounded_readiness_command 10 "$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-before-pressure.json" 2>/dev/null || true
+		bounded_readiness_command 10 "$CHRONICLE" --format json internal recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-before-pressure.json" 2>/dev/null || true
 		if python3 - "$ARTIFACT_ROOT/quota-before-pressure.json" <<'PY'; then break; fi
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -94,7 +94,7 @@ PY
 	systemctl is-active --quiet "$QUOTA_UNIT"
 	for pressure_attempt in $(seq 1 30); do
 		: "$pressure_attempt"
-		bounded_readiness_command 10 "$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-pressure-status.json" 2>/dev/null || true
+		bounded_readiness_command 10 "$CHRONICLE" --format json internal recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-pressure-status.json" 2>/dev/null || true
 		if grep -q '"failure"[[:space:]]*:[[:space:]]*"quota_pressure"' "$ARTIFACT_ROOT/quota-pressure-status.json"; then break; fi
 		sleep 0.2
 	done
@@ -103,7 +103,7 @@ PY
 	printf '%s\n' "$$" >"$QUOTA_CGROUP/cgroup.procs"
 	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/quota-pressure-workload.json"
 	sleep 1
-	"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-pressure-status.json"
+	"$CHRONICLE" --format json internal recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-pressure-status.json"
 	python3 - "$ARTIFACT_ROOT/quota-pressure-status.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -111,7 +111,7 @@ if value.get("counters", {}).get("quota_rejected_records", 0) < 1:
     raise SystemExit("quota pressure did not reject admitted source observations")
 PY
 	sleep 1
-	"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-pressure-status-after.json"
+	"$CHRONICLE" --format json internal recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-pressure-status-after.json"
 	python3 - "$ARTIFACT_ROOT/quota-pressure-status.json" "$ARTIFACT_ROOT/quota-pressure-status-after.json" <<'PY'
 import json, sys
 before = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -128,7 +128,7 @@ PY
 	dd if=/dev/zero of="$QUOTA_STATE/filler.bin" bs=1M count=62 conv=fsync status=none
 	sleep 2
 	systemctl is-active --quiet "$QUOTA_UNIT"
-	"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-exhaustion-status.json"
+	"$CHRONICLE" --format json internal recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-exhaustion-status.json"
 	grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"not_ready"' "$ARTIFACT_ROOT/quota-exhaustion-status.json"
 	grep -q '"failure"[[:space:]]*:[[:space:]]*"quota_pressure"' "$ARTIFACT_ROOT/quota-exhaustion-status.json"
 	set_check quota_exhaustion_admission passed
@@ -139,7 +139,7 @@ PY
 	wait_for_unit_stable "$QUOTA_UNIT" "$QUOTA_STATE" || true
 	wait_for_quota_ready
 	systemctl is-active --quiet "$QUOTA_UNIT"
-	"$CHRONICLE" --format json recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-restart-status.json"
+	"$CHRONICLE" --format json internal recorder-status --state-root "$QUOTA_STATE" >"$ARTIFACT_ROOT/quota-restart-status.json"
 	grep -q '"capture_readiness"[[:space:]]*:[[:space:]]*"ready"' "$ARTIFACT_ROOT/quota-restart-status.json"
 	python3 - "$ARTIFACT_ROOT/quota-restart-status.json" <<'PY'
 import json, sys
@@ -152,7 +152,7 @@ PY
 	systemctl stop "$QUOTA_UNIT"
 	test -f "$QUOTA_STATE/wal/recording.json"
 	find "$QUOTA_STATE/wal" -type f -name '*.chwal' -print -quit | grep -q .
-	"$CHRONICLE" --format json etl --wal-dir "$QUOTA_STATE/wal" --output "$QUOTA_ROOT/recovered-store" >"$ARTIFACT_ROOT/quota-recovery-etl.json"
+	"$CHRONICLE" --format json internal etl --wal-dir "$QUOTA_STATE/wal" --output "$QUOTA_ROOT/recovered-store" >"$ARTIFACT_ROOT/quota-recovery-etl.json"
 	python3 - "$ARTIFACT_ROOT/quota-recovery-etl.json" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))

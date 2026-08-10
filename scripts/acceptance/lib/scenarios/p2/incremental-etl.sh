@@ -19,15 +19,8 @@ PY
 	sleep 1
 	SIZE_SEGMENTS_AFTER=$(find "$STATE_ROOT/wal" -type f -name '*.chwal' | wc -l)
 	SIZE_BYTES_AFTER=$(du -sb "$STATE_ROOT/wal" | awk '{print $1}')
-	"$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
-	EPOCH_AFTER=$(
-		python3 - "$RECORDER_STATUS" <<'PY'
-import json, sys
-value = json.load(open(sys.argv[1], encoding="utf-8"))
-epoch = value["current_epoch"]
-print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)
-PY
-	)
+	"$CHRONICLE" --format json internal recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
+	EPOCH_AFTER=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); epoch=value["current_epoch"]; print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)' "$RECORDER_STATUS")
 	[[ $SIZE_SEGMENTS_AFTER -gt $SIZE_SEGMENTS_BEFORE ]]
 	[[ $((SIZE_BYTES_AFTER - SIZE_BYTES_BEFORE)) -ge 524288 ]]
 	[[ $EPOCH_AFTER -gt $EPOCH_BEFORE ]]
@@ -71,28 +64,14 @@ PY
 
 	phase segment_age_rotation 'force age rotation with delayed low-traffic append'
 	AGE_SEGMENTS_BEFORE=$(find "$STATE_ROOT/wal" -type f -name '*.chwal' | wc -l)
-	"$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
-	AGE_EPOCH_BEFORE=$(
-		python3 - "$RECORDER_STATUS" <<'PY'
-import json, sys
-value = json.load(open(sys.argv[1], encoding="utf-8"))
-epoch = value["current_epoch"]
-print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)
-PY
-	)
+	"$CHRONICLE" --format json internal recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
+	AGE_EPOCH_BEFORE=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); epoch=value["current_epoch"]; print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)' "$RECORDER_STATUS")
 	sleep 2
 	printf '%s\n' "$$" >"$CGROUP/cgroup.procs"
 	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/age-workload.json"
 	AGE_SEGMENTS_AFTER=$(find "$STATE_ROOT/wal" -type f -name '*.chwal' | wc -l)
-	"$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
-	AGE_EPOCH_AFTER=$(
-		python3 - "$RECORDER_STATUS" <<'PY'
-import json, sys
-value = json.load(open(sys.argv[1], encoding="utf-8"))
-epoch = value["current_epoch"]
-print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)
-PY
-	)
+	"$CHRONICLE" --format json internal recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
+	AGE_EPOCH_AFTER=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); epoch=value["current_epoch"]; print(epoch["ordinal"] if isinstance(epoch, dict) else epoch)' "$RECORDER_STATUS")
 	[[ $AGE_SEGMENTS_AFTER -gt $AGE_SEGMENTS_BEFORE || $AGE_EPOCH_AFTER -gt $AGE_EPOCH_BEFORE ]]
 	python3 - "$ARTIFACT_ROOT/age-rotation-proof.json" <<PY
 import json

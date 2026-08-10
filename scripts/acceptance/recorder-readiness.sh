@@ -180,7 +180,7 @@ wait_for_recorder_ready() {
 		remaining=$((deadline - SECONDS))
 		command_timeout=$READINESS_COMMAND_TIMEOUT
 		((command_timeout <= remaining)) || command_timeout=$remaining
-		if bounded_readiness_command "$command_timeout" "$CHRONICLE" --format json recorder-status --state-root "$STATE_ROOT" >"$tmp" 2>"$ARTIFACT_ROOT/recorder-status.stderr"; then
+		if bounded_readiness_command "$command_timeout" "$CHRONICLE" --format json internal recorder-status --state-root "$STATE_ROOT" >"$tmp" 2>"$ARTIFACT_ROOT/recorder-status.stderr"; then
 			mv -f "$tmp" "$RECORDER_STATUS"
 			state=$(recorder_status_state "$RECORDER_STATUS" || printf 'unavailable|unknown|unknown|unknown|unknown|false')
 		else

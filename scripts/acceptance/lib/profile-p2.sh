@@ -51,6 +51,9 @@ CHECKS_JSON="$ARTIFACT_ROOT/checks.json"
 CHECKPOINT_PAUSE_FILE="$STATE_ROOT/wal/checkpoint-pause.control"
 CHECKPOINT_READY_FILE="${CHECKPOINT_PAUSE_FILE%.*}.ready"
 UPSTREAM_PID=""
+REPLAY_PID=""
+SELECTOR_TARGET_PID=""
+TMP_DIR=""
 QUOTA_UNIT=""
 QUOTA_CGROUP=""
 QUOTA_MOUNT=""
@@ -67,8 +70,20 @@ TIMEOUT_WRAPPER="$ROOT/scripts/run-with-timeout.sh"
 systemctl() { "$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" systemctl "$@"; }
 systemd-run() { "$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" systemd-run "$@"; }
 journalctl() { "$TIMEOUT_WRAPPER" "$SERVICE_COMMAND_TIMEOUT" journalctl "$@"; }
+
+separated_chronicle() {
+	local uid gid
+	uid=$(stat -c '%u' "$ROOT")
+	gid=$(stat -c '%g' "$ROOT")
+	[[ $uid -ne 0 ]] || die "separated supervisor requires non-root source owner"
+	python3 "$ROOT/scripts/acceptance/separated-supervisor.py" "$uid" "$gid" "$@"
+}
 # shellcheck source=scripts/lib/common.sh
 source "$ROOT/scripts/lib/common.sh"
+# shellcheck source=scripts/lib/env.sh
+source "$ROOT/scripts/lib/env.sh"
+# shellcheck source=scripts/lib/assertions.sh
+source "$ROOT/scripts/lib/assertions.sh"
 source "$ROOT/scripts/acceptance/recorder-readiness.sh"
 
 mkdir -p "$ARTIFACT_ROOT"
@@ -365,6 +380,8 @@ if [[ "$RELEASE_MODE" == 1 ]]; then
 		exit 1
 	}
 fi
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf -- "$TMP_DIR"' EXIT
 
 # shellcheck source=scripts/acceptance/lib/scenario-dispatch.sh
 source "$ROOT/scripts/acceptance/lib/scenario-dispatch.sh"

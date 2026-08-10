@@ -60,11 +60,13 @@ else
 	ACCEPTANCE_MODE=full
 fi
 RELEASE_MODE=${CHRONICLE_ACCEPTANCE_RELEASE:-0}
-CHRONICLE="$TARGET_DIR/debug/chronicle"
+CHRONICLE="$TARGET_DIR/release/chronicle"
 DRIVER="$ROOT/tests/e2e/http_acceptance_driver.py"
+DATA_DIR="$ARTIFACT_ROOT/data"
+RECORDING_REF=""
 WAL_DIR="$ARTIFACT_ROOT/wal"
 VALIDATION_ROOT="$ARTIFACT_ROOT/wal-validation"
-SESSION_ROOT="$ARTIFACT_ROOT/sessions"
+SESSION_ROOT="$DATA_DIR"
 TMP_DIR=""
 DEDICATED_CGROUP=""
 SHARED_CGROUP=""
@@ -74,6 +76,7 @@ UPSTREAM_PID=""
 REPLAY_PID=""
 SHARED_ONE_PID=""
 SHARED_TWO_PID=""
+SELECTOR_TARGET_PID=""
 CURRENT_PHASE="initializing"
 SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
 TOTAL_PHASES=29
@@ -90,6 +93,8 @@ F2_9_RESULT="not_checked"
 F2_10_RESULT="not_checked"
 F2_11_RESULT="not_checked"
 SHARED_RUNTIME_RESULT="not_checked"
+USER_INTENT_RESULT="not_checked"
+CLI_COMPATIBILITY_RESULT="not_checked"
 EXPECTED_SHA=${CHRONICLE_ACCEPTANCE_EXPECTED_SHA:-}
 START_SHA="not_checked"
 END_SHA="not_checked"
@@ -103,6 +108,14 @@ full_mode() {
 
 smoke_mode() {
 	[[ $ACCEPTANCE_MODE == smoke ]]
+}
+
+separated_chronicle() {
+	local uid gid
+	uid=$(stat -c '%u' "$ROOT")
+	gid=$(stat -c '%g' "$ROOT")
+	[[ $uid -ne 0 ]] || die "separated supervisor requires non-root source owner"
+	python3 "$ROOT/scripts/acceptance/separated-supervisor.py" "$uid" "$gid" "$@"
 }
 
 valid_acceptance_mode() {
@@ -178,7 +191,7 @@ write_summary() {
 	if [[ -f "$EBPF_OBJECT" ]]; then
 		EBPF_OBJECT_SHA256=$(sha256sum "$EBPF_OBJECT" | awk '{print $1}')
 	fi
-	python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$working_tree_dirty" "$COMMAND_LOG" "$ACCEPTANCE_MODE" "$WAL_MATRIX_RESULT" "$INGEST_MATRIX_RESULT" "$REPLAY_MATRIX_RESULT" "$CGROUP_MATRIX_RESULT" "$SIGNAL_RESULT" "$FMT_RESULT" "$WORKSPACE_CHECK_RESULT" "$RELEASE_MODE" "$EXPECTED_SHA" "$START_SHA" "$END_SHA" "$TREE_CLEAN" "$F2_8_RESULT" "$F2_9_RESULT" "$F2_10_RESULT" "$F2_11_RESULT" <<'PY'
+	python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$working_tree_dirty" "$COMMAND_LOG" "$ACCEPTANCE_MODE" "$WAL_MATRIX_RESULT" "$INGEST_MATRIX_RESULT" "$REPLAY_MATRIX_RESULT" "$CGROUP_MATRIX_RESULT" "$SIGNAL_RESULT" "$FMT_RESULT" "$WORKSPACE_CHECK_RESULT" "$USER_INTENT_RESULT" "$CLI_COMPATIBILITY_RESULT" "$RELEASE_MODE" "$EXPECTED_SHA" "$START_SHA" "$END_SHA" "$TREE_CLEAN" "$F2_8_RESULT" "$F2_9_RESULT" "$F2_10_RESULT" "$F2_11_RESULT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -187,8 +200,9 @@ summary = Path(sys.argv[1])
 status, phase = sys.argv[2:4]
 commit, kernel, architecture, cgroup, btf, cap_eff, object_sha, dirty, command_log = sys.argv[4:13]
 mode, wal_matrix, ingest_matrix, replay_matrix, cgroup_matrix, signal, fmt, workspace_check = sys.argv[13:21]
-release, expected, start_sha, end_sha, tree_clean = sys.argv[21:26]
-f2_8, f2_9, f2_10, f2_11 = sys.argv[26:30]
+user_intent, cli_compatibility = sys.argv[21:23]
+release, expected, start_sha, end_sha, tree_clean = sys.argv[23:28]
+f2_8, f2_9, f2_10, f2_11 = sys.argv[28:32]
 summary.parent.mkdir(parents=True, exist_ok=True)
 result = "passed" if status == "0" else ("not_checked" if status == "77" else "failed")
 commands = []
@@ -203,6 +217,8 @@ retained = (
     mode == "full"
     and result == "passed"
     and identity_ok
+    and user_intent == "passed"
+    and cli_compatibility == "passed"
     and all(value == "passed" for value in scenarios.values())
 )
 required_matrix = {
@@ -213,6 +229,8 @@ required_matrix = {
     "privileged_signal": signal,
     "format_check": fmt,
     "workspace_check": workspace_check,
+    "user_intent_lifecycle": user_intent,
+    "cli_compatibility": cli_compatibility,
 }
 if result == "passed" and (mode == "full" and (
     not retained or any(value != "passed" for value in required_matrix.values())
@@ -249,14 +267,16 @@ summary.write_text(json.dumps({
         "privileged_signal": signal,
         "format_check": fmt,
         "workspace_check": workspace_check,
+        "user_intent_lifecycle": user_intent,
+        "cli_compatibility": cli_compatibility,
     },
     "status": result,
     "exit_code": int(status),
     "phase": phase,
     "artifacts": {
         "root": ".",
-        "wal": "wal",
-        "sessions": "sessions",
+        "wal": "data/recordings",
+        "sessions": "data/sessions",
         "wal_validation": "wal-validation",
         "commands": "commands.log",
     },
@@ -285,11 +305,13 @@ cleanup_resources() {
 	stop_process "$REPLAY_PID"
 	stop_process "$SHARED_ONE_PID"
 	stop_process "$SHARED_TWO_PID"
+	stop_process "$SELECTOR_TARGET_PID"
 	RECORDER_PID=""
 	UPSTREAM_PID=""
 	REPLAY_PID=""
 	SHARED_ONE_PID=""
 	SHARED_TWO_PID=""
+	SELECTOR_TARGET_PID=""
 	if ! remove_cgroup "$DEDICATED_CGROUP"; then
 		log "ERROR: could not remove dedicated cgroup" >&2
 		failed=1
@@ -330,16 +352,18 @@ trap on_exit EXIT
 if ! prepare_artifact_root; then
 	ARTIFACT_ROOT_ERROR="unsafe or non-dedicated artifact root: $REQUESTED_ARTIFACT_ROOT"
 	ARTIFACT_ROOT="$DEFAULT_ARTIFACT_ROOT"
+	DATA_DIR="$ARTIFACT_ROOT/data"
 	WAL_DIR="$ARTIFACT_ROOT/wal"
 	VALIDATION_ROOT="$ARTIFACT_ROOT/wal-validation"
-	SESSION_ROOT="$ARTIFACT_ROOT/sessions"
+	SESSION_ROOT="$DATA_DIR"
 	SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
 	COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
 	prepare_artifact_root || die "cannot initialize fallback artifact root: $ARTIFACT_ROOT"
 fi
+DATA_DIR="$ARTIFACT_ROOT/data"
 WAL_DIR="$ARTIFACT_ROOT/wal"
 VALIDATION_ROOT="$ARTIFACT_ROOT/wal-validation"
-SESSION_ROOT="$ARTIFACT_ROOT/sessions"
+SESSION_ROOT="$DATA_DIR"
 SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
 COMMAND_LOG="$ARTIFACT_ROOT/commands.log"
 : >"$COMMAND_LOG"

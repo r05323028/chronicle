@@ -57,7 +57,7 @@ EOF
 		--property=Type=simple --property=KillSignal=SIGTERM --property=TimeoutStopSec=45s \
 		--property=Restart=on-failure --property=RestartSec=1s \
 		--property=NoNewPrivileges=no \
-		"$CHRONICLE" --format json recorder --config "$CONFIG"
+		"$CHRONICLE" --format json internal recorder --config "$CONFIG"
 	wait_for_recorder_ready --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
 
 	phase cleanup_epochs 'generate evidence across several one-second epoch boundaries'
@@ -172,7 +172,7 @@ PY
 			--property=Type=simple --property=KillSignal=SIGTERM --property=TimeoutStopSec=45s \
 			--property=Restart=on-failure --property=RestartSec=1s \
 			--property=NoNewPrivileges=no \
-			"$CHRONICLE" --format json recorder --config "$CONFIG"
+			"$CHRONICLE" --format json internal recorder --config "$CONFIG"
 	fi
 
 	phase cleanup_recovery 'restart and prove cleanup recovery convergence'

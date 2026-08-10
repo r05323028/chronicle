@@ -84,7 +84,7 @@ PY
 		)
 		ETL_WAL_DIR="$STATE_ROOT/wal/$ETL_REL"
 	fi
-	"$CHRONICLE" --format json etl --wal-dir "$ETL_WAL_DIR" --output "$STORE_ROOT" >"$ARTIFACT_ROOT/etl.json" 2>"$ARTIFACT_ROOT/etl.log"
+	"$CHRONICLE" --format json internal etl --wal-dir "$ETL_WAL_DIR" --output "$STORE_ROOT" >"$ARTIFACT_ROOT/etl.json" 2>"$ARTIFACT_ROOT/etl.log"
 	SESSION_ID=$(
 		python3 - "$ARTIFACT_ROOT/etl.json" <<'PY'
 import json, sys
@@ -95,18 +95,28 @@ print(value["session_id"])
 PY
 	)
 	test -d "$STORE_ROOT/sessions/$SESSION_ID"
-
-	phase equivalence 'compare one-shot ETL output with incremental checkpoint output'
-	"$CHRONICLE" --format json inspect "$SESSION_ID" --root "$STORE_ROOT" >"$ARTIFACT_ROOT/inspect.json"
-	ONE_SHOT_STORE="$ARTIFACT_ROOT/one-shot-store"
-	"$CHRONICLE" --format json etl --wal-dir "$ETL_WAL_DIR" --output "$ONE_SHOT_STORE" >"$ARTIFACT_ROOT/one-shot-etl.json" 2>"$ARTIFACT_ROOT/one-shot-etl.log"
-	ONE_SHOT_SESSION=$(
-		python3 - "$ARTIFACT_ROOT/one-shot-etl.json" <<'PY'
+	P2_RECORDING_UUID=$(python3 - "$ARTIFACT_ROOT/etl.json" <<'PY'
 import json, sys
-print(json.load(open(sys.argv[1], encoding="utf-8"))["session_id"])
+print(json.load(open(sys.argv[1], encoding="utf-8"))["recording_id"])
 PY
 	)
-	"$CHRONICLE" --format json inspect "$ONE_SHOT_SESSION" --root "$ONE_SHOT_STORE" >"$ARTIFACT_ROOT/one-shot-inspect.json"
+	P2_RECORDING_REF="rec_$P2_RECORDING_UUID"
+	P2_DATA_DIR="$ARTIFACT_ROOT/public-data"
+	install -d -m 0700 "$P2_DATA_DIR"
+	mkdir -p "$P2_DATA_DIR/recordings" "$P2_DATA_DIR/sessions"
+	cp -a "$ETL_WAL_DIR" "$P2_DATA_DIR/recordings/$P2_RECORDING_UUID"
+	cp -a "$STORE_ROOT/sessions/." "$P2_DATA_DIR/sessions/"
+
+	phase equivalence 'compare one-shot ETL output through public recording identity'
+	"$CHRONICLE" --format json --data-dir "$P2_DATA_DIR" inspect "$P2_RECORDING_REF" >"$ARTIFACT_ROOT/inspect.json"
+	ONE_SHOT_STORE="$ARTIFACT_ROOT/one-shot-store"
+	"$CHRONICLE" --format json internal etl --wal-dir "$ETL_WAL_DIR" --output "$ONE_SHOT_STORE" >"$ARTIFACT_ROOT/one-shot-etl.json" 2>"$ARTIFACT_ROOT/one-shot-etl.log"
+	ONE_SHOT_DATA="$ARTIFACT_ROOT/one-shot-data"
+	install -d -m 0700 "$ONE_SHOT_DATA"
+	mkdir -p "$ONE_SHOT_DATA/recordings" "$ONE_SHOT_DATA/sessions"
+	cp -a "$ETL_WAL_DIR" "$ONE_SHOT_DATA/recordings/$P2_RECORDING_UUID"
+	cp -a "$ONE_SHOT_STORE/sessions/." "$ONE_SHOT_DATA/sessions/"
+	"$CHRONICLE" --format json --data-dir "$ONE_SHOT_DATA" inspect "$P2_RECORDING_REF" >"$ARTIFACT_ROOT/one-shot-inspect.json"
 	python3 - "$ARTIFACT_ROOT/inspect.json" "$ARTIFACT_ROOT/one-shot-inspect.json" "$ARTIFACT_ROOT/equivalence.json" <<'PY'
 import json
 import sys
