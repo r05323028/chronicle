@@ -67,13 +67,19 @@ mod incremental_worker;
 mod listener_discovery;
 mod recorder_config;
 mod replay_inspect;
+pub use chronicle_common::{RecordingId, SessionId, Timestamp, escape_control};
+pub use chronicle_protocol::{ProtocolError, TransportErrorCategory};
+pub use chronicle_replay::{
+    LoopbackReplayOptions, OperationExecutionState, ReplayError, ReplayOutcome, Replayability,
+    TimingMode,
+};
 pub use replay_inspect::{
     InspectConnectionSummary, InspectOperationSummary, InspectSessionResult, RecordFixtureResult,
     RecordIssueSummary, ReplayCounts, ReplayOperationSummary, ReplaySessionResult, inspect_session,
-    preplan_command_replay_session, record_fixture, record_fixture_file, render_inspect_human,
-    render_inspect_json, render_json, render_replay_human, render_replay_json,
-    replay_command_inputs, replay_context, replay_session, replay_session_with_plan,
-    replay_session_with_plan_guard,
+    preplan_command_replay_session, production_wal_from_fixture, record_fixture,
+    record_fixture_file, render_inspect_human, render_inspect_json, render_json,
+    render_replay_human, render_replay_json, replay_command_inputs, replay_context, replay_session,
+    replay_session_with_plan, replay_session_with_plan_guard,
 };
 #[cfg(test)]
 pub(crate) use replay_inspect::{MAX_RECORD_ISSUES, replay_context_from};
@@ -184,16 +190,15 @@ use chronicle_capture::{
     CAPTURE_EVENT_SCHEMA_VERSION, CaptureError, CaptureEvent, CaptureEventKind, CaptureSource,
     CaptureSourceSummary, ClockIdentity, FixtureCaptureSource, MonotonicTimestamp, encode_event,
 };
-use chronicle_common::RecordingId;
+
 use chronicle_etl::{
     ETL_PIPELINE_VERSION, EtlError, EtlIssue, EtlOutput, EtlPipeline,
     assign_recording_ids_with_snapshot,
 };
-use chronicle_protocol::{ProtocolError, ProtocolRegistry, ReplayContext, SecretBytes};
+use chronicle_protocol::{ProtocolRegistry, ReplayContext, SecretBytes};
 use chronicle_replay::{
-    LoopbackReplayOptions, OperationExecutionState, ReplayError, ReplayExecutor, ReplayOutcome,
-    ReplayPlan, ReplayPlanner, ReplayPolicy, ReplayTargetError, Replayability, TargetMap,
-    TargetRule, TimingMode,
+    ReplayExecutor, ReplayPlan, ReplayPlanner, ReplayPolicy, ReplayTargetError, TargetMap,
+    TargetRule,
 };
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
@@ -205,7 +210,7 @@ use chronicle_wal::{
     TERMINAL_WAL_LOSS_SCHEMA_VERSION, TerminalWalLoss, TerminalWalLossAmbiguity,
     TerminalWalLossInterval, TerminalWalLossReason, WalCheckpoint, WalError, WalRecordEnvelope,
     cleanup_finalized_segment_verified, encode_envelope, encode_terminal_wal_loss,
-    prepare_group_commit_reopen_from_scan, verified_snapshot_sha256,
+    prepare_group_commit_reopen_from_scan, scan_wal, verified_snapshot_sha256,
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_wal::{prepare_group_commit_reopen, recover_cleanup};
@@ -329,6 +334,44 @@ pub enum ApplicationError {
     },
     #[error("{0} command is not implemented in current scaffold")]
     NotImplemented(&'static str),
+}
+
+/// Stable replay-outcome exit-code classification for outer adapters.
+pub fn replay_outcome_exit_code(outcome: &ReplayOutcome) -> i32 {
+    match outcome {
+        ReplayOutcome::Completed | ReplayOutcome::CompletedWithSkips | ReplayOutcome::DryRun => 0,
+        ReplayOutcome::StoppedPolicy | ReplayOutcome::StoppedInvalidSession => 4,
+        ReplayOutcome::StoppedTransport => 5,
+        ReplayOutcome::StoppedVerification => 6,
+    }
+}
+
+/// Stable application-error exit-code classification for outer adapters.
+pub fn application_error_exit_code(error: &ApplicationError) -> i32 {
+    match error {
+        ApplicationError::InvalidRecordingName(_, _) => 2,
+        ApplicationError::UnsupportedLivePreflight(_)
+        | ApplicationError::ReplayReadiness(_)
+        | ApplicationError::ReplayTarget(_)
+        | ApplicationError::Replay(ReplayError::PreflightDenied) => 4,
+        ApplicationError::Protocol(ProtocolError::Transport { .. })
+        | ApplicationError::Replay(ReplayError::Protocol(ProtocolError::Transport {
+            category:
+                TransportErrorCategory::Refused
+                | TransportErrorCategory::Timeout
+                | TransportErrorCategory::Disconnect
+                | TransportErrorCategory::Io,
+            ..
+        })) => 5,
+        _ => 3,
+    }
+}
+
+/// Protocol registry access for outer adapters, so CLI never imports
+/// chronicle-protocol-builtins directly.
+pub fn protocol_registry() -> Result<ProtocolRegistry, ApplicationError> {
+    chronicle_protocol_builtins::registry()
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))
 }
 
 #[cfg(test)]

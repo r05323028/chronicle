@@ -199,12 +199,6 @@ name = "chronicle-cli"
 version = "0.1.0"
 dependencies = [
  "chronicle-application",
- "chronicle-capture",
- "chronicle-common",
- "chronicle-protocol",
- "chronicle-protocol-builtins",
- "chronicle-replay",
- "chronicle-wal",
  "clap",
  "rustix",
  "serde",

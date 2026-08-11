@@ -73,71 +73,8 @@ fn production_wal(directory: &std::path::Path) {
 }
 
 fn production_wal_from_fixture(directory: &std::path::Path, fixture: &std::path::Path) {
-    use chronicle_application::{
-        RECORDING_METADATA_SCHEMA_VERSION, RecordByteCount, RecordingCommitBoundary,
-        RecordingCounters, RecordingMetadata, RecordingStatus, ShutdownReason,
-        write_recording_metadata,
-    };
-    use chronicle_capture::{
-        CAPTURE_EVENT_SCHEMA_VERSION, CaptureEventKind, CaptureSource, FixtureCaptureSource,
-        encode_event,
-    };
-    use chronicle_common::RecordingId;
-    use chronicle_wal::{
-        DEFAULT_MAX_RECORD_BYTES, GroupCommitWalWriter, MIN_SEGMENT_BYTES, RecordKind, scan_wal,
-    };
-
-    let recording_id = RecordingId::new();
-    let fixture = std::fs::read(fixture).unwrap();
-    let mut source = FixtureCaptureSource::from_json(&fixture).unwrap();
-    let mut writer = GroupCommitWalWriter::create(directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
-        .expect("create production WAL");
-    while let Some(event) = source.next_event().unwrap() {
-        let flags = match &event.kind {
-            CaptureEventKind::PayloadFragment(fragment) => u16::try_from(fragment.flags.0).unwrap(),
-            _ => 0,
-        };
-        writer
-            .append(
-                RecordKind::CaptureEvent,
-                CAPTURE_EVENT_SCHEMA_VERSION,
-                flags,
-                encode_event(&event).expect("encode capture"),
-                0,
-            )
-            .expect("append capture");
-    }
-    writer.flush(1).expect("flush WAL").expect("durable batch");
-    drop(writer);
-    let scan = scan_wal(directory, recording_id, DEFAULT_MAX_RECORD_BYTES).expect("scan WAL");
-    let authority = scan.authority;
-    write_recording_metadata(
-        directory,
-        &RecordingMetadata {
-            version: RECORDING_METADATA_SCHEMA_VERSION,
-            recording_id,
-            selector: None,
-            status: RecordingStatus::Completed,
-            shutdown_reason: Some(ShutdownReason::SourceCompleted),
-            last_valid_commit: Some(RecordingCommitBoundary {
-                marker_sequence: authority.marker_sequence.expect("marker"),
-                durable_through_sequence: authority.durable_through_sequence.expect("boundary"),
-                durable_record_count: authority.durable_record_count,
-                durable_payload_bytes: authority.durable_payload_bytes,
-                segment_ordinal: authority.segment_ordinal.expect("segment"),
-            }),
-            counters: RecordingCounters {
-                committed: RecordByteCount {
-                    records: authority.durable_record_count,
-                    bytes: authority.durable_payload_bytes,
-                },
-                ..RecordingCounters::default()
-            },
-            terminal_wal_loss: None,
-            capture: None,
-        },
-    )
-    .expect("write metadata");
+    chronicle_application::production_wal_from_fixture(directory, fixture)
+        .expect("production fixture WAL");
 }
 
 fn publish_public_recording(root: &std::path::Path, fixture: &std::path::Path) -> (String, String) {

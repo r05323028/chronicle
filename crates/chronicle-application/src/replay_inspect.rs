@@ -538,6 +538,83 @@ pub(crate) fn command_replay_plan(
 /// Target-independent command-mode replay plan. Recorded endpoints fill the
 /// planner's mandatory target slots only; destination blocking is deferred to
 /// the discovered loopback target. No executor or network context is created.
+/// Test-support: builds a production-format WAL directory from a capture fixture
+/// so outer adapter contract tests can exercise the ETL compatibility paths
+/// without capture/WAL dev dependencies in the CLI crate.
+///
+/// # Panics
+///
+/// Panics if the fixture WAL does not contain a committed marker or segment
+/// authority needed to build the recording metadata.
+pub fn production_wal_from_fixture(
+    directory: impl AsRef<Path>,
+    fixture: impl AsRef<Path>,
+) -> Result<RecordingId, ApplicationError> {
+    let directory = directory.as_ref();
+    let recording_id = RecordingId::new();
+    let fixture_bytes = std::fs::read(fixture.as_ref())?;
+    let mut source = FixtureCaptureSource::from_json(&fixture_bytes)
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    let mut writer = GroupCommitWalWriter::create(directory, recording_id, MIN_SEGMENT_BYTES, 1, 0)
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    while let Some(event) = source
+        .next_event()
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?
+    {
+        let flags = match &event.kind {
+            CaptureEventKind::PayloadFragment(fragment) => {
+                u16::try_from(fragment.flags.0).unwrap_or_default()
+            }
+            _ => 0,
+        };
+        writer
+            .append(
+                RecordKind::CaptureEvent,
+                CAPTURE_EVENT_SCHEMA_VERSION,
+                flags,
+                encode_event(&event)
+                    .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?,
+                0,
+            )
+            .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    }
+    writer
+        .flush(1)
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?
+        .ok_or_else(|| ApplicationError::InvalidConfig("fixture WAL flush failed".into()))?;
+    drop(writer);
+    let scan = scan_wal(directory, recording_id, DEFAULT_MAX_RECORD_BYTES)
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    let authority = scan.authority;
+    write_recording_metadata(
+        directory,
+        &RecordingMetadata {
+            version: RECORDING_METADATA_SCHEMA_VERSION,
+            recording_id,
+            selector: None,
+            status: RecordingStatus::Completed,
+            shutdown_reason: Some(ShutdownReason::SourceCompleted),
+            last_valid_commit: Some(RecordingCommitBoundary {
+                marker_sequence: authority.marker_sequence.expect("marker"),
+                durable_through_sequence: authority.durable_through_sequence.expect("boundary"),
+                durable_record_count: authority.durable_record_count,
+                durable_payload_bytes: authority.durable_payload_bytes,
+                segment_ordinal: authority.segment_ordinal.expect("segment"),
+            }),
+            counters: RecordingCounters {
+                committed: RecordByteCount {
+                    records: authority.durable_record_count,
+                    bytes: authority.durable_payload_bytes,
+                },
+                ..RecordingCounters::default()
+            },
+            terminal_wal_loss: None,
+            capture: None,
+        },
+    )?;
+    Ok(recording_id)
+}
+
 pub fn preplan_command_replay_session(
     root: impl AsRef<Path>,
     session_id: &str,

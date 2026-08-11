@@ -17,10 +17,6 @@ linux-ebpf = ["chronicle-application/linux-ebpf", "tokio/signal"]
 
 [dependencies]
 chronicle-application = { path = "../chronicle-application" }
-chronicle-common = { path = "../chronicle-common" }
-chronicle-protocol = { path = "../chronicle-protocol" }
-chronicle-protocol-builtins = { path = "../chronicle-protocol-builtins" }
-chronicle-replay = { path = "../chronicle-replay" }
 clap.workspace = true
 rustix.workspace = true
 serde.workspace = true
@@ -30,8 +26,6 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-chronicle-capture = { path = "../chronicle-capture" }
-chronicle-wal = { path = "../chronicle-wal" }
 rustix.workspace = true
 
 [lints]

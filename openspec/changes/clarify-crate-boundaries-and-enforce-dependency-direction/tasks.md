@@ -26,10 +26,10 @@
 
 ## 5. CLI outer-adapter cleanup
 
-- [ ] 5.1 Add the smallest application-owned request constructors and stable outcome/error classification methods needed for explicit replay, record, inspect, doctor, ETL compatibility paths, rendering, and exit mapping. Acceptance: no duplicate replay planner/policy/error hierarchy and no CLI behavior change.
-- [ ] 5.2 Replace CLI imports/matches of common, protocol, protocol-builtins, replay, capture, and WAL types with application APIs; retain only Clap grammar, binary runtime/signal wiring, checked output writes, and final exit. Acceptance: production CLI source imports no Chronicle crate except `chronicle_application`.
-- [ ] 5.3 Move capture/WAL fixture construction out of CLI tests into application services/test support and remove CLI dev dependencies on capture/WAL. Remove CLI normal dependencies on common/protocol/protocol-builtins/replay. Acceptance: all CLI normal/dev/build Chronicle dependencies target application only.
-- [ ] 5.4 Run CLI golden/contract tests for help, five public commands, hidden compatibility forms, human/JSON output, exit matrix, replay safety, and signal behavior. Acceptance: outputs and exits match pre-cleanup expectations byte-for-byte where contracts require exact output.
+- [x] 5.1 Add the smallest application-owned request constructors and stable outcome/error classification methods needed for explicit replay, record, inspect, doctor, ETL compatibility paths, rendering, and exit mapping. Acceptance: no duplicate replay planner/policy/error hierarchy and no CLI behavior change.
+- [x] 5.2 Replace CLI imports/matches of common, protocol, protocol-builtins, replay, capture, and WAL types with application APIs; retain only Clap grammar, binary runtime/signal wiring, checked output writes, and final exit. Acceptance: production CLI source imports no Chronicle crate except `chronicle_application`.
+- [x] 5.3 Move capture/WAL fixture construction out of CLI tests into application services/test support and remove CLI dev dependencies on capture/WAL. Remove CLI normal dependencies on common/protocol/protocol-builtins/replay. Acceptance: all CLI normal/dev/build Chronicle dependencies target application only.
+- [x] 5.4 Run CLI golden/contract tests for help, five public commands, hidden compatibility forms, human/JSON output, exit matrix, replay safety, and signal behavior. Acceptance: outputs and exits match pre-cleanup expectations byte-for-byte where contracts require exact output.
 
 ## 6. Agent and architecture documentation
 
@@ -64,3 +64,7 @@ All `pub use` blocks in `lib.rs` classified: record (`command_record`/`record`),
 ### 4.2/4.3 Module organization
 
 Root `lib.rs` reduced 8124 -> ~2900 lines; large implementations moved to `doctor.rs`, `record.rs`, `etl.rs`, `replay_inspect.rs`. The mostly-unimplemented `ChronicleApplication` scaffold facade was removed with its two stub tests (design D5); low-level helpers used only inside the crate are `pub(crate)` re-exports. 203 application tests + 34 CLI contract tests pass.
+
+### 5.x CLI application-only evidence
+
+CLI Cargo.toml now declares chronicle-application as its only Chronicle dependency in every kind (normal/dev/build). Production source imports only chronicle_application (re-exported adapter types + escape_control + exit classification + protocol_registry). Fixture WAL construction moved to chronicle_application::production_wal_from_fixture (test support). Architecture check: 0 issues. CLI contract tests: 15/15 (help, five public commands, hidden compat forms, human/JSON output, exit matrix, replay safety).

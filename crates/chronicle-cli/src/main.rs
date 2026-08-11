@@ -1,3 +1,4 @@
+use chronicle_application::escape_control;
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 use chronicle_application::record_selector;
 use chronicle_application::{
@@ -18,9 +19,7 @@ use chronicle_application::{
 };
 #[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
 use chronicle_application::{ChildExitResult, CommandRecordResult};
-use chronicle_common::escape_control;
-use chronicle_protocol::{ProtocolError, TransportErrorCategory};
-use chronicle_replay::{LoopbackReplayOptions, ReplayError, ReplayOutcome, TimingMode};
+use chronicle_application::{LoopbackReplayOptions, ReplayOutcome, TimingMode};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
@@ -903,7 +902,7 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
             let result = process_and_publish_recording_wal(
                 &wal_dir,
                 &output,
-                &chronicle_protocol_builtins::registry()?,
+                &chronicle_application::protocol_registry()?,
             )?;
             let rendered = match format {
                 Format::Human => format!(
@@ -1058,7 +1057,7 @@ fn record_ebpf_legacy(
         &wal_dir,
         bounds,
         &stop,
-        chronicle_common::RecordingId::new(),
+        chronicle_application::RecordingId::new(),
     )?;
     let metadata =
         load_recording_metadata(&wal_dir)?.ok_or(ApplicationError::RecordingMetadataValidation(
@@ -1647,7 +1646,7 @@ fn format_duration_millis(millis: u64) -> String {
     }
 }
 
-fn format_created_at(timestamp: &chronicle_common::Timestamp) -> String {
+fn format_created_at(timestamp: &chronicle_application::Timestamp) -> String {
     timestamp.to_string()
 }
 
@@ -1809,9 +1808,9 @@ fn run_doctor(
     Ok((rendered, report.exit_code()))
 }
 
-fn parse_session_id(value: &str) -> Result<chronicle_common::SessionId, ApplicationError> {
+fn parse_session_id(value: &str) -> Result<chronicle_application::SessionId, ApplicationError> {
     uuid::Uuid::parse_str(value)
-        .map(chronicle_common::SessionId)
+        .map(chronicle_application::SessionId)
         .map_err(|_| ApplicationError::InvalidConfig("session ID must be a UUID".into()))
 }
 
@@ -1843,38 +1842,17 @@ fn parse_duration(value: &str) -> Result<u64, String> {
 }
 
 fn replay_exit_code(result: &chronicle_application::ReplaySessionResult) -> i32 {
-    match result.outcome {
-        ReplayOutcome::Completed | ReplayOutcome::CompletedWithSkips | ReplayOutcome::DryRun => 0,
-        ReplayOutcome::StoppedPolicy | ReplayOutcome::StoppedInvalidSession => 4,
-        ReplayOutcome::StoppedTransport => 5,
-        ReplayOutcome::StoppedVerification => 6,
-    }
+    chronicle_application::replay_outcome_exit_code(&result.outcome)
 }
 
 fn error_code(error: &ApplicationError) -> i32 {
-    match error {
-        ApplicationError::InvalidRecordingName(_, _) => 2,
-        ApplicationError::UnsupportedLivePreflight(_)
-        | ApplicationError::ReplayReadiness(_)
-        | ApplicationError::ReplayTarget(_)
-        | ApplicationError::Replay(ReplayError::PreflightDenied) => 4,
-        ApplicationError::Protocol(ProtocolError::Transport { .. })
-        | ApplicationError::Replay(ReplayError::Protocol(ProtocolError::Transport {
-            category:
-                TransportErrorCategory::Refused
-                | TransportErrorCategory::Timeout
-                | TransportErrorCategory::Disconnect
-                | TransportErrorCategory::Io,
-            ..
-        })) => 5,
-        _ => 3,
-    }
+    chronicle_application::application_error_exit_code(error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronicle_replay::OperationExecutionState;
+    use chronicle_application::{OperationExecutionState, ProtocolError, TransportErrorCategory};
 
     #[derive(Default)]
     struct TestWriter {
@@ -2133,7 +2111,7 @@ mod tests {
     #[test]
     fn public_record_v1_human_and_json_are_stable() {
         let result = CommandRecordResult {
-            recording_id: chronicle_common::RecordingId(
+            recording_id: chronicle_application::RecordingId(
                 uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             ),
             name: None,
@@ -2198,7 +2176,7 @@ mod tests {
         let result =
             |outcome, attempted, completed, failed| chronicle_application::ReplaySessionResult {
                 session_id: "session".into(),
-                replayability: chronicle_replay::Replayability::FullyReplayable,
+                replayability: chronicle_application::Replayability::FullyReplayable,
                 outcome,
                 dry_run: outcome == ReplayOutcome::DryRun,
                 preflight_denied: outcome == ReplayOutcome::StoppedPolicy,
@@ -2257,7 +2235,7 @@ mod tests {
     fn replay_outcomes_map_to_stable_exit_codes() {
         let result = |outcome| chronicle_application::ReplaySessionResult {
             session_id: "session".into(),
-            replayability: chronicle_replay::Replayability::FullyReplayable,
+            replayability: chronicle_application::Replayability::FullyReplayable,
             outcome,
             dry_run: outcome == ReplayOutcome::DryRun,
             preflight_denied: outcome == ReplayOutcome::StoppedPolicy,
