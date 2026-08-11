@@ -1,6 +1,11 @@
 //! Output-then-checkpoint publication transaction boundary.
 #![allow(clippy::format_collect)]
 
+use std::fs::OpenOptions;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use chronicle_common::SessionId;
+
 use crate::{
     CanonicalDeltaBatchV1, CheckpointError, IncrementalEtlCheckpointV1, read_checkpoint,
     write_checkpoint_atomic,
@@ -167,6 +172,107 @@ pub fn finalize_incremental_session(
             complete: output.issues.is_empty(),
         })
         .map_err(|error| PublicationError::FinalSession(error.to_string()))
+}
+
+/// Outcome of an ETL-owned one-shot final session publication.
+pub struct OneShotPublicationOutcome {
+    pub session_id: SessionId,
+    pub already_published: bool,
+    pub manifest_checksum: String,
+}
+
+#[derive(Debug, Error)]
+pub enum OneShotPublicationError {
+    #[error("one-shot session publication failed: {0}")]
+    Store(String),
+    #[error("one-shot published session differs from expected session {session_id}")]
+    Mismatch { session_id: SessionId },
+    #[error("one-shot manifest verification failed: {0}")]
+    Verify(String),
+    #[error("one-shot checkpoint reservation failed: {0}")]
+    Reserve(String),
+    #[error("one-shot checkpoint write failed: {0}")]
+    Checkpoint(String),
+}
+
+static ONESHOT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// ETL-owned Load transaction for one-shot final session publication. Publishes
+/// the canonical session (no-replace), verifies the published manifest, then
+/// advances the recording-local checkpoint in that order. The checkpoint payload
+/// schema and quota reservation stay application-owned; this API owns the
+/// concrete storage publication, verification, and checkpoint advancement order
+/// so application never calls the concrete session publisher or advances ETL
+/// checkpoints directly.
+pub fn publish_final_session(
+    store: &FilesystemSessionStore,
+    expected: &PublishSession,
+    checkpoint_bytes: &[u8],
+    checkpoint_path: &Path,
+    checkpoint_reserve: impl FnOnce(u64) -> Result<(), OneShotPublicationError>,
+    matches_existing: impl Fn(
+        &FilesystemSessionStore,
+        &PublishSession,
+    ) -> Result<bool, OneShotPublicationError>,
+) -> Result<OneShotPublicationOutcome, OneShotPublicationError> {
+    let session_id = expected.session.id;
+    let already_published = match store.publish(expected.clone()) {
+        Ok(()) => false,
+        Err(error) => match matches_existing(store, expected) {
+            Ok(true) => true,
+            Ok(false) => {
+                return Err(OneShotPublicationError::Mismatch { session_id });
+            }
+            Err(_) => return Err(OneShotPublicationError::Store(error.to_string())),
+        },
+    };
+    let inspection = store
+        .verify_existing_manifest(session_id)
+        .map_err(|error| OneShotPublicationError::Verify(error.to_string()))?;
+    checkpoint_reserve(checkpoint_bytes.len() as u64)?;
+    write_atomic_bytes(checkpoint_path, checkpoint_bytes)
+        .map_err(|error| OneShotPublicationError::Checkpoint(error.to_string()))?;
+    Ok(OneShotPublicationOutcome {
+        session_id,
+        already_published,
+        manifest_checksum: inspection.session_checksum,
+    })
+}
+
+fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "checkpoint path has no parent",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".oneshot.tmp-{}",
+        ONESHOT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        use std::io::Write;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        // Sync the parent directory so the rename is durable, matching the
+        // application-side atomic writer it replaces.
+        #[cfg(unix)]
+        if let Ok(directory) = fs::File::open(parent) {
+            directory.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn publish_delta_then_checkpoint<S: RecordingStore>(

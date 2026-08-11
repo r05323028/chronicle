@@ -1491,17 +1491,13 @@ fn process_and_publish_recording_wal_inner(
         .map(|authority| reserve_publication_peak(authority, session_bytes))
         .transpose()?;
     let store = FilesystemSessionStore::new(root);
-    let already_published = match store.publish(expected.clone()) {
-        Ok(()) => false,
-        Err(error) => match published_recording_matches(&store, &expected) {
-            Ok(true) => true,
-            Ok(false) => {
-                return Err(ApplicationError::PublishedRecordingMismatch { session_id });
-            }
-            Err(_) => return Err(error.into()),
-        },
-    };
-    let inspection = store.verify_existing_manifest(session_id)?;
+    // The output root may not exist yet; publication creates it, so create it
+    // up front for the canonicalized checkpoint output_root field.
+    fs::create_dir_all(root)?;
+    // Serialize the recording-local checkpoint with the same serde bytes the
+    // atomic writer used; the ETL-owned transaction writes them after
+    // publication and verification so application never calls the concrete
+    // session publisher or advances ETL checkpoints itself.
     let checkpoint = RecordingEtlCheckpoint {
         version: RECORDING_ETL_CHECKPOINT_VERSION,
         recording_id: processed.recording_id,
@@ -1514,22 +1510,46 @@ fn process_and_publish_recording_wal_inner(
         pipeline_version: ETL_PIPELINE_VERSION.into(),
         canonical_schema_version: chronicle_canonical::CANONICAL_SCHEMA_VERSION,
         session_id,
-        manifest_checksum: inspection.session_checksum,
+        manifest_checksum: String::new(),
         output_root: fs::canonicalize(root)?.display().to_string(),
         output_identity: format!("sessions/{session_id}/manifest.json"),
         status: processed.status,
         shutdown_reason: processed.shutdown_reason,
         counters: processed.counters,
     };
-    if let Some(reservation) = quota_reservation.as_mut() {
-        let checkpoint_bytes = serde_json::to_vec(&checkpoint)?.len() as u64;
-        reservation.reserve_checkpoint(checkpoint_bytes)?;
-    }
-    write_private_atomic_json(wal_directory, "etl-checkpoint.json", &checkpoint, None)?;
+    let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
+    let outcome = chronicle_etl::publish_final_session(
+        &store,
+        &expected,
+        &checkpoint_bytes,
+        &wal_directory.join("etl-checkpoint.json"),
+        |bytes| {
+            if let Some(reservation) = quota_reservation.as_mut() {
+                reservation.reserve_checkpoint(bytes).map_err(|error| {
+                    chronicle_etl::OneShotPublicationError::Reserve(error.to_string())
+                })?;
+            }
+            Ok(())
+        },
+        |store, expected| {
+            published_recording_matches(store, expected)
+                .map_err(|error| chronicle_etl::OneShotPublicationError::Store(error.to_string()))
+        },
+    )
+    .map_err(|error| match error {
+        chronicle_etl::OneShotPublicationError::Mismatch { session_id } => {
+            ApplicationError::PublishedRecordingMismatch { session_id }
+        }
+        other => ApplicationError::InvalidConfig(other.to_string()),
+    })?;
+    let checkpoint = RecordingEtlCheckpoint {
+        manifest_checksum: outcome.manifest_checksum,
+        ..checkpoint
+    };
     drop(quota_reservation);
     Ok(PublishedRecordingResult {
-        session_id,
-        already_published,
+        session_id: outcome.session_id,
+        already_published: outcome.already_published,
         ignored_post_commit_records: processed.ignored_post_commit_records,
         checkpoint,
     })

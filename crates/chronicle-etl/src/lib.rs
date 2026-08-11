@@ -14,9 +14,10 @@ pub use checkpoint::{
 pub use delta::{CANONICAL_DELTA_SCHEMA_VERSION, CanonicalDeltaBatchV1, DeltaBatchError};
 pub use incremental::{CommittedWalSnapshot, IncrementalProcessor, IncrementalResult};
 pub use publication::{
-    CheckpointFault, PublicationError, ReconcileOutcome, finalize_incremental_session,
-    publish_delta_then_checkpoint, publish_delta_then_checkpoint_with_fault,
-    reconcile_delta_checkpoint, recover_pending_checkpoint, verify_one_shot_equivalence,
+    CheckpointFault, OneShotPublicationError, OneShotPublicationOutcome, PublicationError,
+    ReconcileOutcome, finalize_incremental_session, publish_delta_then_checkpoint,
+    publish_delta_then_checkpoint_with_fault, publish_final_session, reconcile_delta_checkpoint,
+    recover_pending_checkpoint, verify_one_shot_equivalence,
 };
 
 /// ETL input boundary before protocol-specific decoding.
