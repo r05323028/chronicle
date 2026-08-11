@@ -1,0 +1,115 @@
+# Chronicle workspace dependency architecture policy (version 1).
+#
+# Executable mirror of AGENTS.md crate architecture rules and
+# docs/architecture/crate-boundaries.md. The policy is a maximum-coupling
+# allowlist: every allowed normal/dev/build Chronicle workspace edge is listed;
+# unlisted workspace edges are forbidden. Deleting an allowed edge is always
+# valid without editing policy. Adding a legitimate edge requires updating this
+# file, AGENTS.md, and docs/architecture/crate-boundaries.md in the same change.
+#
+# Dependency kinds are validated independently: dev/build edges cannot bypass
+# normal-layer architecture. Optional and target-specific declarations are
+# checked from Cargo metadata independent of the current host platform.
+# Package renames are evaluated by package identity, not by the rename string.
+
+version = 1
+
+[members]
+# Every root-workspace Chronicle crate must appear here exactly once. A new
+# workspace Chronicle crate without an entry fails validation until its
+# responsibility and allowed direction are documented.
+members = [
+  "chronicle-application",
+  "chronicle-canonical",
+  "chronicle-capture",
+  "chronicle-capture-ebpf",
+  "chronicle-cli",
+  "chronicle-common",
+  "chronicle-etl",
+  "chronicle-protocol",
+  "chronicle-protocol-builtins",
+  "chronicle-replay",
+  "chronicle-session",
+  "chronicle-storage",
+  "chronicle-wal",
+]
+
+[critical_forbids]
+# Named relationships that are forbidden in every dependency kind. Diagnostics
+# name these explicitly in addition to the allowlist rule.
+dependency_on_cli = true
+session_to_wal = true
+protocol_to_builtins = true
+common_upward = true            # no other Chronicle crate may depend on common's dependents
+cli_non_application = true      # CLI Chronicle edges may only target chronicle-application
+
+[normal]
+# Allowed normal (non-dev, non-build) workspace dependencies per source crate.
+# Keys are source crates; values are allowed dependency target packages.
+"chronicle-common" = []
+"chronicle-canonical" = ["chronicle-common"]
+"chronicle-capture" = ["chronicle-common"]
+"chronicle-capture-ebpf" = ["chronicle-capture", "chronicle-common"]
+"chronicle-wal" = ["chronicle-capture", "chronicle-common"]
+"chronicle-session" = ["chronicle-capture", "chronicle-common"]
+"chronicle-protocol" = ["chronicle-canonical", "chronicle-common", "chronicle-session"]
+"chronicle-protocol-builtins" = ["chronicle-canonical", "chronicle-common", "chronicle-protocol"]
+"chronicle-storage" = ["chronicle-canonical", "chronicle-common"]
+"chronicle-replay" = ["chronicle-canonical", "chronicle-common", "chronicle-protocol"]
+"chronicle-etl" = [
+  "chronicle-canonical",
+  "chronicle-capture",
+  "chronicle-common",
+  "chronicle-protocol",
+  "chronicle-session",
+  "chronicle-storage",
+  "chronicle-wal",
+]
+"chronicle-application" = [
+  "chronicle-canonical",
+  "chronicle-capture",
+  "chronicle-capture-ebpf",
+  "chronicle-common",
+  "chronicle-etl",
+  "chronicle-protocol",
+  "chronicle-protocol-builtins",
+  "chronicle-replay",
+  "chronicle-session",
+  "chronicle-storage",
+  "chronicle-wal",
+]
+"chronicle-cli" = ["chronicle-application"]
+
+[dev]
+# Allowed dev-dependency workspace edges. Tests/build-support cannot bypass
+# normal-layer architecture; only edges required for integration fixtures are
+# listed.
+"chronicle-common" = []
+"chronicle-canonical" = []
+"chronicle-capture" = []
+"chronicle-capture-ebpf" = []
+"chronicle-wal" = []
+"chronicle-session" = []
+"chronicle-protocol" = []
+"chronicle-protocol-builtins" = []
+"chronicle-storage" = []
+"chronicle-replay" = []
+"chronicle-etl" = ["chronicle-protocol-builtins"]
+"chronicle-application" = ["chronicle-wal"]
+"chronicle-cli" = []
+
+[build]
+# Allowed build-dependency workspace edges. Initially none.
+"chronicle-common" = []
+"chronicle-canonical" = []
+"chronicle-capture" = []
+"chronicle-capture-ebpf" = []
+"chronicle-wal" = []
+"chronicle-session" = []
+"chronicle-protocol" = []
+"chronicle-protocol-builtins" = []
+"chronicle-storage" = []
+"chronicle-replay" = []
+"chronicle-etl" = []
+"chronicle-application" = []
+"chronicle-cli" = []

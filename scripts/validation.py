@@ -109,6 +109,145 @@ def select(root: Path, paths: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def workspace_edges(root: Path) -> list[dict[str, Any]]:
+    """Capture Chronicle workspace path dependencies from bounded Cargo metadata."""
+    try:
+        output = subprocess.check_output(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=root,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeError("bounded cargo metadata failed; cannot check architecture")
+    value = json.loads(output)
+    workspace_members = set(value.get("workspace_members", []))
+    packages = {pkg["id"]: pkg for pkg in value.get("packages", [])}
+    ws = {pkg["name"]: pkg for pkg in packages.values() if pkg["id"] in workspace_members}
+    # Resolve package identity by manifest directory so renames and local
+    # aliases never change the evaluated target crate.
+    by_manifest_dir = {
+        str(Path(pkg["manifest_path"]).parent): pkg["name"]
+        for pkg in ws.values()
+    }
+    edges: list[dict[str, Any]] = []
+    for name in sorted(ws):
+        for dep in sorted(ws[name].get("dependencies", []), key=lambda d: d["name"]):
+            if not dep.get("path"):
+                continue
+            identity = by_manifest_dir.get(str(Path(dep["path"])))
+            if identity is None or identity not in ws:
+                continue
+            edges.append({
+                "source": name,
+                "target": identity,
+                "rename": dep.get("rename") or dep["name"],
+                "kind": dep.get("kind") or "normal",
+                "optional": bool(dep.get("optional")),
+                "target_condition": dep.get("target"),
+            })
+    return edges
+
+
+def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
+    """Validate Chronicle workspace dependency direction against architecture policy."""
+    if tomllib is None:
+        raise RuntimeError("Python 3.11+ is required (tomllib missing)")
+    policy_path = path or root / "validation/architecture.toml"
+    with policy_path.open("rb") as handle:
+        policy = tomllib.load(handle)
+    if policy.get("version") != 1:
+        raise RuntimeError(f"unsupported architecture policy version {policy.get('version')}")
+    members = policy.get("members", {}).get("members", [])
+    kinds = ("normal", "dev", "build")
+    tables = {kind: policy.get(kind, {}) for kind in kinds}
+    issues: list[str] = []
+    member_set = set(members)
+    if len(member_set) != len(members):
+        issues.append("policy members contain duplicates")
+    for kind in kinds:
+        for source, targets in tables[kind].items():
+            if source not in member_set:
+                issues.append(f"policy {kind} allowlist names unknown source crate {source!r}")
+            for target in targets:
+                if target not in member_set:
+                    issues.append(f"policy {kind} allowlist names unknown target crate {target!r}")
+    for member in sorted(member_set):
+        for kind in kinds:
+            if member not in tables[kind]:
+                issues.append(f"policy missing {kind} allowlist for member {member!r}")
+    edges = workspace_edges(root)
+    def edge_key(edge):
+        return (edge["source"], edge["target"], edge["kind"])
+    for edge in sorted(edges, key=edge_key):
+        source, target, kind = edge["source"], edge["target"], edge["kind"]
+        if source not in member_set:
+            issues.append(f"workspace crate {source!r} has no architecture policy member entry")
+            continue
+        if target not in member_set:
+            issues.append(f"workspace edge {source} -> {target} targets a crate with no policy entry")
+            continue
+        if target == "chronicle-cli":
+            issues.append(f"forbidden dependency on chronicle-cli: {source} -> {target} [{kind}]")
+            continue
+        if source == "chronicle-session" and target == "chronicle-wal":
+            issues.append(f"forbidden session-to-wal coupling: {source} -> {target} [{kind}]")
+        if source == "chronicle-protocol" and target == "chronicle-protocol-builtins":
+            issues.append(f"forbidden protocol-to-builtins coupling: {source} -> {target} [{kind}]")
+        if source == "chronicle-common" and kind != "build":
+            issues.append(f"forbidden common upward dependency: {source} -> {target} [{kind}]")
+        if source == "chronicle-cli" and target != "chronicle-application":
+            issues.append(f"forbidden cli non-application edge: {source} -> {target} [{kind}]")
+        allow = tables[kind].get(source, [])
+        if target not in allow:
+            detail = f"{source} -> {target} [{kind}]"
+            if edge["optional"]:
+                detail += " [optional]"
+            if edge["target_condition"]:
+                detail += f" [{edge['target_condition']}]"
+            issues.append(f"unclassified or forbidden workspace edge: {detail}")
+    cycles = find_cycles(edges)
+    if cycles:
+        issues.append(f"dependency cycle: {' -> '.join(cycles[0])}")
+    return {
+        "policy": str(policy_path.relative_to(root)),
+        "members": sorted(member_set),
+        "edges": edges,
+        "normal_edges": sum(1 for e in edges if e["kind"] == "normal"),
+        "dev_edges": sum(1 for e in edges if e["kind"] == "dev"),
+        "build_edges": sum(1 for e in edges if e["kind"] == "build"),
+        "cyclic": bool(cycles),
+        "issues": issues,
+    }
+
+
+def find_cycles(edges: list[dict[str, Any]]) -> list[list[str]]:
+    adjacency: dict[str, set[str]] = {}
+    for edge in edges:
+        adjacency.setdefault(edge["source"], set()).add(edge["target"])
+    visiting: set[str] = set()
+    done: set[str] = set()
+    found: list[list[str]] = []
+
+    def dfs(node: str, path: list[str]) -> None:
+        if node in done:
+            return
+        if node in visiting:
+            index = path.index(node)
+            found.append(path[index:] + [node])
+            return
+        visiting.add(node)
+        for neighbor in sorted(adjacency.get(node, ())):
+            dfs(neighbor, path + [node])
+        visiting.discard(node)
+        done.add(node)
+
+    for node in sorted(adjacency):
+        dfs(node, [node])
+    return found
+
+
 def source_ownership(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     """Ensure every production application source has a validation owner."""
     tracked_value = run(root, "git", "ls-files", "crates/chronicle-application/src")
@@ -562,6 +701,9 @@ def main() -> int:
     environment_parser = sub.add_parser("environment")
     environment_parser.add_argument("--root", type=Path, required=True)
     ownership_parser = sub.add_parser("ownership")
+    architecture_parser = sub.add_parser("architecture")
+    architecture_parser.add_argument("--root", type=Path, required=True)
+    architecture_parser.add_argument("--config", type=Path)
     ownership_parser.add_argument("--root", type=Path, required=True)
     ownership_parser.add_argument("--config", type=Path)
     fp_parser = sub.add_parser("fingerprint")
@@ -593,6 +735,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "environment":
         print(json.dumps(environment(args.root), indent=2, sort_keys=True))
+    elif args.command == "architecture":
+        value = architecture_check(args.root, args.config)
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return 1 if value["issues"] else 0
     elif args.command == "ownership":
         value = source_ownership(args.root, config(args.root, args.config))
         print(json.dumps(value, indent=2, sort_keys=True))

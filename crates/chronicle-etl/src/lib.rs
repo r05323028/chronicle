@@ -283,7 +283,9 @@ impl EtlPipeline {
             ..ReconstructionLimits::default()
         });
         for loss in &evidence.terminal_wal_losses {
-            assembler.push(ReconstructionInput::TerminalWalLoss(loss.value.clone()))?;
+            assembler.push(ReconstructionInput::TerminalWalLoss(
+                neutral_terminal_persistence_loss(&loss.value),
+            ))?;
         }
         let mut issues = Vec::new();
         for batch in envelopes.chunks(ENVELOPE_BATCH_SIZE) {
@@ -487,6 +489,33 @@ impl EtlPipeline {
     }
 }
 
+/// Convert a WAL-owned terminal-loss wire record into transport-neutral
+/// persistence-loss evidence before session reconstruction. The wire codec and
+/// serialized field names stay WAL-owned; reconstruction consumes only the
+/// neutral type.
+fn neutral_terminal_persistence_loss(
+    loss: &chronicle_wal::TerminalWalLoss,
+) -> chronicle_capture::TerminalPersistenceLoss {
+    chronicle_capture::TerminalPersistenceLoss {
+        interval: chronicle_capture::PersistenceLossInterval {
+            start: loss.interval.start.clone(),
+            end: loss.interval.end.clone(),
+        },
+        discarded_records: loss.discarded_records,
+        discarded_payload_bytes: loss.discarded_payload_bytes,
+        reason: match loss.reason {
+            chronicle_wal::TerminalWalLossReason::WalHardLimit => {
+                chronicle_capture::PersistenceLossReason::WalHardLimit
+            }
+        },
+        ambiguity: match loss.ambiguity {
+            chronicle_wal::TerminalWalLossAmbiguity::UnknownDownstreamEffects => {
+                chronicle_capture::PersistenceLossAmbiguity::UnknownDownstreamEffects
+            }
+        },
+    }
+}
+
 fn deterministic_operation_id(operation: &CanonicalOperation) -> OperationId {
     let mut normalized = operation.clone();
     normalized.id = OperationId(Uuid::nil());
@@ -614,7 +643,7 @@ fn reconstructed_connection_identity(
 
 fn reconstructed_connection_incomplete(
     connection: &ReconstructionConnection,
-    terminal_losses: &[TerminalWalLoss],
+    terminal_losses: &[chronicle_capture::TerminalPersistenceLoss],
 ) -> bool {
     connection.finalization.is_some()
         || connection
@@ -635,7 +664,7 @@ fn reconstructed_connection_incomplete(
 
 fn terminal_loss_affects_connection(
     connection: &ReconstructionConnection,
-    loss: &TerminalWalLoss,
+    loss: &chronicle_capture::TerminalPersistenceLoss,
 ) -> bool {
     connection.events.iter().any(|event| {
         let timestamp = &event.timestamp.monotonic;
@@ -758,7 +787,9 @@ fn ingest_reconstructed_envelope(
         RecordKind::TerminalWalLoss => {
             match decode_terminal_wal_loss(envelope.schema_version, &envelope.payload) {
                 Ok(loss) => {
-                    assembler.push(ReconstructionInput::TerminalWalLoss(loss.clone()))?;
+                    assembler.push(ReconstructionInput::TerminalWalLoss(
+                        neutral_terminal_persistence_loss(&loss),
+                    ))?;
                     evidence.terminal_wal_losses.push(SequencedEvidence {
                         sequence: Some(envelope.sequence),
                         value: loss,
@@ -1446,6 +1477,137 @@ mod tests {
         assert_eq!(
             metadata_output.evidence.terminal_wal_losses[0].sequence,
             None
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // scenario matrix stays inline for loss-evidence coverage
+    fn terminal_loss_equivalence_persisted_metadata_overlap_clock() {
+        // The same WAL-owned terminal-loss evidence delivered as a persisted
+        // envelope or as metadata must reconstruct equivalently, and only
+        // overlapping same-clock intervals degrade connection completeness.
+        let recording_id = RecordingId::new();
+        let terminal_at = |clock: &str, start: u64, end: u64| chronicle_wal::TerminalWalLoss {
+            interval: chronicle_wal::TerminalWalLossInterval {
+                start: MonotonicTimestamp {
+                    clock: ClockIdentity {
+                        boot_id: clock.into(),
+                    },
+                    nanoseconds: start,
+                },
+                end: MonotonicTimestamp {
+                    clock: ClockIdentity {
+                        boot_id: clock.into(),
+                    },
+                    nanoseconds: end,
+                },
+            },
+            discarded_records: 1,
+            discarded_payload_bytes: 2,
+            reason: chronicle_wal::TerminalWalLossReason::WalHardLimit,
+            ambiguity: chronicle_wal::TerminalWalLossAmbiguity::UnknownDownstreamEffects,
+        };
+        // Payload event at clock "boot", nanoseconds 10..=20.
+        let envelopes_for = |loss: Option<&chronicle_wal::TerminalWalLoss>| {
+            let mut envelopes = vec![
+                socket_envelope(recording_id, 1, 10),
+                payload_envelope(recording_id, 2, 10),
+            ];
+            if let Some(loss) = loss {
+                envelopes.push(WalRecordEnvelope::unplaced(
+                    recording_id,
+                    3,
+                    RecordKind::TerminalWalLoss,
+                    1,
+                    0,
+                    chronicle_wal::encode_terminal_wal_loss(loss).unwrap(),
+                ));
+                envelopes.push(WalRecordEnvelope::unplaced(
+                    recording_id,
+                    4,
+                    RecordKind::CommitMarker,
+                    1,
+                    0,
+                    commit_marker_payload(),
+                ));
+            }
+            envelopes
+        };
+        let overlapping = terminal_at("boot", 5, 15);
+        let outside = terminal_at("boot", 100, 200);
+        let other_clock = terminal_at("other-boot", 5, 15);
+        let registry = ProtocolRegistry::new();
+        let session_id = SessionId::new();
+        // Baseline: no loss, complete.
+        let baseline = EtlPipeline::new(SessionLimits::default())
+            .process_envelopes(&envelopes_for(None), &registry, session_id)
+            .unwrap();
+        assert_eq!(
+            baseline
+                .session
+                .connection_completeness
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            [Completeness::Complete]
+        );
+        for (label, loss) in [
+            ("persisted-overlap", overlapping.clone()),
+            ("metadata-overlap", overlapping.clone()),
+            ("outside-window", outside.clone()),
+            ("clock-mismatch", other_clock.clone()),
+        ] {
+            let output = if label == "metadata-overlap" {
+                EtlPipeline::new(SessionLimits::default())
+                    .process_envelopes_with_terminal_losses(
+                        &envelopes_for(None),
+                        &[loss],
+                        &registry,
+                        session_id,
+                    )
+                    .unwrap()
+            } else {
+                EtlPipeline::new(SessionLimits::default())
+                    .process_envelopes(&envelopes_for(Some(&loss)), &registry, session_id)
+                    .unwrap()
+            };
+            let state = output
+                .session
+                .connection_completeness
+                .values()
+                .copied()
+                .collect::<Vec<_>>();
+            let degraded = state.iter().all(|value| *value != Completeness::Complete);
+            match label {
+                // Overlap degrades; a foreign clock conservatively degrades too
+                // because distinct boot identities are never correlated.
+                "persisted-overlap" | "metadata-overlap" | "clock-mismatch" => {
+                    assert!(degraded, "{label}: terminal loss must degrade completeness");
+                }
+                "outside-window" => assert_eq!(
+                    state,
+                    [Completeness::Complete],
+                    "{label}: non-overlapping same-clock loss must not degrade"
+                ),
+                _ => unreachable!(),
+            }
+        }
+        // Persisted and metadata delivery of the same loss produce the same
+        // canonical completeness.
+        let persisted = EtlPipeline::new(SessionLimits::default())
+            .process_envelopes(&envelopes_for(Some(&overlapping)), &registry, session_id)
+            .unwrap();
+        let metadata = EtlPipeline::new(SessionLimits::default())
+            .process_envelopes_with_terminal_losses(
+                &envelopes_for(None),
+                &[overlapping],
+                &registry,
+                session_id,
+            )
+            .unwrap();
+        assert_eq!(
+            persisted.session.connection_completeness,
+            metadata.session.connection_completeness
         );
     }
 

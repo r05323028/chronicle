@@ -212,6 +212,43 @@ pub struct PayloadFragment {
     pub flags: CaptureFlags,
 }
 
+/// Transport-neutral terminal persistence-loss evidence: records discarded
+/// at the durability boundary before reconstruction could observe them.
+/// WAL-owned wire records are converted into this type by ETL extraction so
+/// reconstruction stays independent of any persistence implementation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalPersistenceLoss {
+    pub interval: PersistenceLossInterval,
+    pub discarded_records: u64,
+    pub discarded_payload_bytes: u64,
+    pub reason: PersistenceLossReason,
+    pub ambiguity: PersistenceLossAmbiguity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistenceLossInterval {
+    pub start: MonotonicTimestamp,
+    pub end: MonotonicTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum PersistenceLossReason {
+    /// The durable WAL hard limit was reached and remaining records were discarded.
+    WalHardLimit = 1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum PersistenceLossAmbiguity {
+    /// Effects downstream of the discarded records cannot be determined.
+    UnknownDownstreamEffects = 1,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LossAmbiguity {
     pub exact_drop_timing_unknown: bool,

@@ -4,10 +4,13 @@ use chronicle_capture::{
     CAPTURE_EVENT_SCHEMA_VERSION, CaptureEvent, CaptureEventKind, CaptureFlags,
     FragmentSequenceEvidence, LossWindowObserved, MonotonicTimestamp, PayloadDirection,
     PayloadFragment, RecordingScopeIdentity, SocketConnectIntent, SocketEvidence, SocketIdentity,
-    SocketRole, SocketStateChangeObserved, TruncationMetadata, TruncationState,
+    SocketRole, SocketStateChangeObserved, TerminalPersistenceLoss, TruncationMetadata,
+    TruncationState,
 };
+#[cfg(test)]
+use chronicle_capture::{PersistenceLossAmbiguity, PersistenceLossInterval, PersistenceLossReason};
 use chronicle_common::{ConnectionKey, Direction, Timestamp, TransportProtocol};
-use chronicle_wal::TerminalWalLoss;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -147,7 +150,7 @@ pub enum ReconstructionInput {
     Event(ReconstructionEvent),
     LossWindow(LossWindowObserved),
     /// WAL-limit discard evidence. Never coerced into kernel loss sampling.
-    TerminalWalLoss(TerminalWalLoss),
+    TerminalWalLoss(TerminalPersistenceLoss),
 }
 
 /// Groups reconstruction evidence by fixture key or kernel socket generation identity.
@@ -547,7 +550,7 @@ pub struct ReconstructionAssembly {
     /// Active connections followed by connections finalized by a reconstruction bound.
     pub connections: Vec<ReconstructionConnection>,
     pub loss_windows: Vec<LossWindowObserved>,
-    pub terminal_wal_losses: Vec<TerminalWalLoss>,
+    pub terminal_wal_losses: Vec<TerminalPersistenceLoss>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -585,7 +588,7 @@ pub struct ReconstructionAssembler {
         ReconstructionFinalization,
     )>,
     loss_windows: Vec<LossWindowObserved>,
-    terminal_wal_losses: Vec<TerminalWalLoss>,
+    terminal_wal_losses: Vec<TerminalPersistenceLoss>,
 }
 
 pub const RECONSTRUCTION_SNAPSHOT_VERSION: u32 = 1;
@@ -601,7 +604,7 @@ pub struct ReconstructionAssemblerSnapshot {
     pub active: Vec<ReconstructionPendingConnection>,
     pub finalized: Vec<ReconstructionFinalizedConnection>,
     pub loss_windows: Vec<LossWindowObserved>,
-    pub terminal_wal_losses: Vec<TerminalWalLoss>,
+    pub terminal_wal_losses: Vec<TerminalPersistenceLoss>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1708,8 +1711,8 @@ mod tests {
 
     #[test]
     fn terminal_wal_loss_is_not_kernel_loss_window() {
-        let terminal = TerminalWalLoss {
-            interval: chronicle_wal::TerminalWalLossInterval {
+        let terminal = TerminalPersistenceLoss {
+            interval: PersistenceLossInterval {
                 start: MonotonicTimestamp {
                     clock: ClockIdentity {
                         boot_id: "boot-a".into(),
@@ -1725,8 +1728,8 @@ mod tests {
             },
             discarded_records: 2,
             discarded_payload_bytes: 3,
-            reason: chronicle_wal::TerminalWalLossReason::WalHardLimit,
-            ambiguity: chronicle_wal::TerminalWalLossAmbiguity::UnknownDownstreamEffects,
+            reason: PersistenceLossReason::WalHardLimit,
+            ambiguity: PersistenceLossAmbiguity::UnknownDownstreamEffects,
         };
         let mut assembler = ReconstructionAssembler::default();
         assembler.push(ReconstructionInput::TerminalWalLoss(terminal.clone()));

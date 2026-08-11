@@ -10,7 +10,6 @@ license.workspace = true
 [dependencies]
 chronicle-capture = { path = "../chronicle-capture" }
 chronicle-common = { path = "../chronicle-common" }
-chronicle-wal = { path = "../chronicle-wal" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
