@@ -85,3 +85,7 @@ Plaintext only is supported by target design. TCP payload capture cannot decode 
 ## Risks
 
 Hook coverage and kernel compatibility; incomplete socket lifecycle observation; temporal loss attribution; disk exhaustion/corruption; sensitive WAL/session data; Oracle protocol uncertainty; stateful/multiplexed replay; authentication replacement; destructive side effects; and redaction before remote persistence remain major risks.
+
+## Crate boundaries
+
+[`docs/architecture/crate-boundaries.md`](architecture/crate-boundaries.md) documents one primary responsibility, allowed dependencies, forbidden knowledge, the current and target dependency graphs, and the reliability boundaries that must not change for every root-workspace crate. `validation/architecture.toml` is the executable mirror; `AGENTS.md` carries the normative rules.

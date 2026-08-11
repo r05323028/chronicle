@@ -108,13 +108,13 @@ Do NOT:
 
 Completion state remains unchecked until implementation evidence exists, per repository task rules:
 
-- [ ] Every crate has one documented primary responsibility.
-- [ ] Dependency direction is documented.
-- [ ] Architecture validation exists.
-- [ ] Forbidden dependency edges fail validation.
-- [ ] CLI only depends on the application boundary for Chronicle APIs across normal, dev, and build dependencies.
-- [ ] Application responsibilities are separated internally.
-- [ ] Session does not depend on WAL-specific implementation types.
-- [ ] `AGENTS.md` contains architecture rules.
-- [ ] Existing tests continue passing.
-- [ ] No user-visible behavior changes.
+- [x] Every crate has one documented primary responsibility.
+- [x] Dependency direction is documented.
+- [x] Architecture validation exists.
+- [x] Forbidden dependency edges fail validation.
+- [x] CLI only depends on the application boundary for Chronicle APIs across normal, dev, and build dependencies.
+- [x] Application responsibilities are separated internally.
+- [x] Session does not depend on WAL-specific implementation types.
+- [x] `AGENTS.md` contains architecture rules.
+- [x] Existing tests continue passing.
+- [x] No user-visible behavior changes.

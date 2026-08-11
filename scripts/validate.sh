@@ -211,6 +211,7 @@ run_fast() {
 	run_shell workspace-tests "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo test --workspace --all-features --locked"
 	run_shell openspec 'openspec validate --all --strict --no-interactive'
 	run_shell source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'"
+	run_shell architecture "python3 '$HELPER' architecture --root '$ROOT' --config '$ROOT/validation/architecture.toml'"
 	printf '\nChanged-crate tests: covered by workspace unit-test invocation.\n'
 }
 
@@ -312,6 +313,7 @@ release)
 	run_shell release-tests "CARGO_TARGET_DIR=\"${CARGO_TARGET_DIR:-target}\" cargo test --workspace --all-features --locked"
 	run_shell release-openspec 'openspec validate --all --strict --no-interactive'
 	run_shell release-source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'"
+	run_shell release-architecture "python3 '$HELPER' architecture --root '$ROOT' --config '$ROOT/validation/architecture.toml'"
 	release_command=("$ROOT/scripts/acceptance.sh" --profile all --executor multipass --vm "$VM" --evidence-root "$EVIDENCE_ROOT/acceptance" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT" --release)
 	if [[ $REUSE_EVIDENCE != true ]]; then release_command+=(--no-reuse); fi
 	run_step acceptance-release "${release_command[@]}"

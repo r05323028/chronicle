@@ -110,3 +110,37 @@ Privileged acceptance MUST NOT become repository lint, documentation consistency
 - A privileged task SHOULD be checked only when retained evidence exists for the required environment and scenario.
 - A fast development acceptance mode MUST NOT be treated as complete retained evidence unless the task explicitly permits it.
 - Removing OpenSpec validation from privileged acceptance does not weaken runtime validation; OpenSpec validation and runtime validation prove different things.
+
+## Crate Architecture (mandatory)
+
+Chronicle's 13-crate workspace is a dependency-direction contract. Every crate has ONE primary owner (detailed in `docs/architecture/crate-boundaries.md`); `validation/architecture.toml` is the executable mirror of the allowed normal/dev/build edges and critical forbids. When you change any Chronicle Cargo manifest, update the architecture documentation, `AGENTS.md`, and policy in the same change, then run the bounded architecture check.
+
+### Primary ownership
+
+- `chronicle-common`: transport-neutral shared primitives (IDs, timestamps, endpoints).
+- `chronicle-canonical`: protocol-independent canonical recording/replay model + validation.
+- `chronicle-capture`: protocol-neutral capture evidence, socket/payload/loss metadata, fixtures.
+- `chronicle-capture-ebpf`: Linux eBPF/kernel interaction; only normalized capture events cross outward.
+- `chronicle-wal`: append-only durable framing, commit authority, recovery, manifests, retention.
+- `chronicle-session`: ordered bidirectional stream reconstruction and loss handling.
+- `chronicle-protocol`: detector/decoder/canonicalizer/replay/verifier SPI and registry.
+- `chronicle-protocol-builtins`: concrete protocol implementations; must never be depended on by protocol core.
+- `chronicle-etl`: complete Extract-Transform-Load from evidence through canonical publication (keeps storage).
+- `chronicle-storage`: persistence abstractions + filesystem/in-memory implementations.
+- `chronicle-replay`: replay planning, execution, verification (no capture/WAL/ETL knowledge).
+- `chronicle-application`: user-facing use-case composition (record/recorder/ETL/replay/inspect/doctor).
+- `chronicle-cli`: argument parsing, application dispatch, rendering/writing, exit mapping.
+
+### Dependency direction
+
+- Allowlist: see `validation/architecture.toml` `[normal]`/`[dev]`/`[build]`. Unlisted workspace edges are forbidden.
+- Forbidden patterns: dependency on `chronicle-cli`; `chronicle-session -> chronicle-wal`; `chronicle-protocol -> chronicle-protocol-builtins`; `chronicle-common` depending upward; any `chronicle-cli` Chronicle edge except `chronicle-application` (in every dependency kind).
+- Dev/build edges cannot bypass normal-layer architecture.
+- Optional and target-specific declarations are checked independent of host platform.
+
+### Rules
+
+- **Application/CLI**: CLI communicates only through application-owned requests/results/errors/rendering; no protocol decoding, replay policy, WAL scanning, ETL orchestration, or eBPF loading in CLI.
+- **ETL is complete Extract-Transform-Load**: it owns storage publication and checkpoint ordering; never refactor it to transform-only.
+- **eBPF privacy**: Aya handles/kernel ABI stay private to `chronicle-capture-ebpf`.
+- Adding a legitimate dependency requires updating `docs/architecture/crate-boundaries.md`, `AGENTS.md`, and `validation/architecture.toml` together, then running the architecture check.

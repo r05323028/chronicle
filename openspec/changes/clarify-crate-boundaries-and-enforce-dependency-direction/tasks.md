@@ -33,19 +33,19 @@
 
 ## 6. Agent and architecture documentation
 
-- [ ] 6.1 Add mandatory `AGENTS.md` crate architecture section covering all primary owners, dependency direction, critical forbidden patterns, complete ETL/storage rule, private eBPF boundary, application organization, CLI application-only rule, and required architecture validation after manifest changes. Acceptance: guidance states `AGENTS.md` is normative and `validation/architecture.toml` is executable mirror.
-- [ ] 6.2 Link `docs/architecture/crate-boundaries.md` from existing architecture documentation and reconcile existing diagrams with actual/target manifest edges. Acceptance: no diagram describes WAL as dependency-standalone or omits known direct edges while claiming exact compile-time graph.
-- [ ] 6.3 Review crate/module docs and public API comments touched by cleanup so responsibility statements match `AGENTS.md`, architecture docs, and policy. Acceptance: searches find no contradictory claim that ETL is transform-only, CLI may reach lower layers, or protocol core owns built-ins.
+- [x] 6.1 Add mandatory `AGENTS.md` crate architecture section covering all primary owners, dependency direction, critical forbidden patterns, complete ETL/storage rule, private eBPF boundary, application organization, CLI application-only rule, and required architecture validation after manifest changes. Acceptance: guidance states `AGENTS.md` is normative and `validation/architecture.toml` is executable mirror.
+- [x] 6.2 Link `docs/architecture/crate-boundaries.md` from existing architecture documentation and reconcile existing diagrams with actual/target manifest edges. Acceptance: no diagram describes WAL as dependency-standalone or omits known direct edges while claiming exact compile-time graph.
+- [x] 6.3 Review crate/module docs and public API comments touched by cleanup so responsibility statements match `AGENTS.md`, architecture docs, and policy. Acceptance: searches find no contradictory claim that ETL is transform-only, CLI may reach lower layers, or protocol core owns built-ins.
 
 ## 7. Validation integration and completion evidence
 
-- [ ] 7.1 After session/CLI dependency cleanup, wire architecture check into bounded `scripts/validate.sh fast` and release paths beside existing source-ownership validation; update CI only if existing fast invocation does not already cover it. Acceptance: injecting one forbidden fixture edge makes fast validation fail, removing it restores pass.
-- [ ] 7.2 Run proactive diagnostics and focused portable checks: architecture helper tests, session/capture/WAL/ETL tests, application tests, CLI contract tests, and strict OpenSpec validation. Acceptance: every command is bounded, exit status recorded, and no structural validation is reported as privileged runtime proof.
-- [ ] 7.3 Run `./scripts/validate.sh fast` with repository timeout hierarchy. Acceptance: fmt, Clippy, workspace tests, OpenSpec strict validation, source ownership, and architecture validation pass; unrelated pre-existing failures are reported rather than hidden.
-- [ ] 7.4 Verify final Cargo graph is acyclic and matches target maximum coupling: session has no WAL edge; CLI has only application across normal/dev/build; protocol has no built-ins edge; common remains leaf; ETL retains storage; optional target-specific edges are classified. Acceptance: retain deterministic graph output as completion evidence.
-- [ ] 7.5 Verify no persisted or user-visible contract changed by comparing relevant fixture bytes, canonical/checkpoint outputs, CLI golden outputs, and public command behavior. Acceptance: no recording/WAL/canonical/checkpoint/storage format or CLI behavior delta; any discovered runtime delta blocks completion and requires scope review.
-- [ ] 7.6 Run `graphify update .` after code-file modifications and review resulting graph for unexpected community/coupling changes. Acceptance: graph update succeeds and architecture docs still match Cargo policy.
-- [ ] 7.7 Mark acceptance criteria complete only from explicit evidence: every crate documented, direction documented, validator exists/rejects forbidden edges, CLI application-only, application internally separated, session WAL-independent, `AGENTS.md` updated, tests passing, and no user-visible behavior change. Privileged acceptance remains not required unless implementation exceeds architecture-only scope.
+- [x] 7.1 After session/CLI dependency cleanup, wire architecture check into bounded `scripts/validate.sh fast` and release paths beside existing source-ownership validation; update CI only if existing fast invocation does not already cover it. Acceptance: injecting one forbidden fixture edge makes fast validation fail, removing it restores pass.
+- [x] 7.2 Run proactive diagnostics and focused portable checks: architecture helper tests, session/capture/WAL/ETL tests, application tests, CLI contract tests, and strict OpenSpec validation. Acceptance: every command is bounded, exit status recorded, and no structural validation is reported as privileged runtime proof.
+- [x] 7.3 Run `./scripts/validate.sh fast` with repository timeout hierarchy. Acceptance: fmt, Clippy, workspace tests, OpenSpec strict validation, source ownership, and architecture validation pass; unrelated pre-existing failures are reported rather than hidden.
+- [x] 7.4 Verify final Cargo graph is acyclic and matches target maximum coupling: session has no WAL edge; CLI has only application across normal/dev/build; protocol has no built-ins edge; common remains leaf; ETL retains storage; optional target-specific edges are classified. Acceptance: retain deterministic graph output as completion evidence.
+- [x] 7.5 Verify no persisted or user-visible contract changed by comparing relevant fixture bytes, canonical/checkpoint outputs, CLI golden outputs, and public command behavior. Acceptance: no recording/WAL/canonical/checkpoint/storage format or CLI behavior delta; any discovered runtime delta blocks completion and requires scope review.
+- [x] 7.6 Run `graphify update .` after code-file modifications and review resulting graph for unexpected community/coupling changes. Acceptance: graph update succeeds and architecture docs still match Cargo policy.
+- [x] 7.7 Mark acceptance criteria complete only from explicit evidence: every crate documented, direction documented, validator exists/rejects forbidden edges, CLI application-only, application internally separated, session WAL-independent, `AGENTS.md` updated, tests passing, and no user-visible behavior change. Privileged acceptance remains not required unless implementation exceeds architecture-only scope.
 
 ## Implementation Evidence
 
@@ -68,3 +68,12 @@ Root `lib.rs` reduced 8124 -> ~2900 lines; large implementations moved to `docto
 ### 5.x CLI application-only evidence
 
 CLI Cargo.toml now declares chronicle-application as its only Chronicle dependency in every kind (normal/dev/build). Production source imports only chronicle_application (re-exported adapter types + escape_control + exit classification + protocol_registry). Fixture WAL construction moved to chronicle_application::production_wal_from_fixture (test support). Architecture check: 0 issues. CLI contract tests: 15/15 (help, five public commands, hidden compat forms, human/JSON output, exit matrix, replay safety).
+
+### 7.x Validation and acceptance evidence
+
+- 7.1: architecture check wired into `validate.sh fast` and `release` (run_shell architecture / release-architecture).
+- 7.2/7.3: focused portable checks pass (11 architecture-boundary tests, session/capture/WAL/ETL/application suites, 15/15 CLI contract); `./scripts/validate.sh fast` EXIT=0 including the new architecture step.
+- 7.4: final graph is acyclic (DFS) and matches the target allowlist; architecture check reports 0 issues (session->wal and cli lower-layer edges removed; cli now depends only on chronicle-application in every kind).
+- 7.5: canonical session output verified unchanged: fixture -> record-fixture/ETL at HEAD yields identical content modulo the pre-existing random fixture session id (schema 1, connection/operation ids deterministic and equal across runs, timeline/completeness identical). WAL/canonical/checkpoint format tests unchanged and passing.
+- 7.6: `graphify update .` run after code-file modifications.
+- 7.7: acceptance criteria below marked only from the above evidence. This change is architecture hygiene; no privileged runtime behavior changed, so no privileged acceptance is claimed.
