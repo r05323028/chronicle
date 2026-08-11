@@ -6,7 +6,8 @@ Minimal record, inspect, and replay command contracts plus end-to-end runnable H
 
 ### Requirement: Minimal record command
 
-CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROOT` and add production form `record --source ebpf (--pid PID | --cgroup PATH [--allow-shared-cgroup]) --wal-dir DIR [--segment-bytes N] [--duration-seconds N] [--max-wal-bytes N]`. Shared acknowledgement SHALL be invalid with `--pid`, fixture source, or no explicit `--cgroup`. Duration SHALL default 600 seconds/max 3600; total WAL SHALL default/hard-cap 4 GiB and be at least segment size. Source-specific/conflicting options SHALL be validated. Production command SHALL show effective cgroup path/ID/direct TGID count/descendant cgroup count/selected-subtree scope/acknowledgement before attach, perform preflight, create/finalize metadata, run eBPF plus bounded in-WAL-marker group commit, handle limits/signals, and print safe categorized summary; it SHALL NOT run ETL implicitly. CLI help and diagnostics SHALL use **direct cgroup TGID set** for distinct host-visible TGIDs resolved from numeric PIDs listed directly in selected node's `cgroup.procs`; they SHALL NOT call it a POSIX process group, thread count, container ID, or descendant union.
+
+CLI SHALL retain the legacy record forms as hidden deprecated 0.1.x compatibility entrypoints (see `user-intent-cli`): fixture form `record --source fixture --input FILE --root ROOT` and production form `record --source ebpf (--pid PID | --cgroup PATH [--allow-shared-cgroup]) --wal-dir DIR [--segment-bytes N] [--duration-seconds N] [--max-wal-bytes N]`. Shared acknowledgement SHALL be invalid with `--pid`, fixture source, or no explicit `--cgroup`. Duration SHALL default 600 seconds/max 3600; total WAL SHALL default/hard-cap 4 GiB and be at least segment size. Source-specific/conflicting options SHALL be validated. The compatibility production form SHALL show effective cgroup path/ID/direct TGID count/descendant cgroup count/selected-subtree scope/acknowledgement before attach, perform preflight, create/finalize metadata, run eBPF plus bounded in-WAL-marker group commit, handle limits/signals, and print safe categorized summary; it SHALL NOT run ETL implicitly — the public `record` command runs ETL/finalization automatically per `user-intent-cli`. CLI help and diagnostics SHALL use **direct cgroup TGID set** for distinct host-visible TGIDs resolved from numeric PIDs listed directly in selected node's `cgroup.procs`; they SHALL NOT call it a POSIX process group, thread count, container ID, or descendant union.
 
 #### Scenario: Fixture record uses current artifacts
 
@@ -17,6 +18,11 @@ CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROO
 
 - **WHEN** supported privileged Linux host records valid dedicated workload selector
 - **THEN** command writes bounded group-committed WAL/metadata, stops gracefully, and outputs recording ID/status/reason/last valid commit boundary/categorized counters
+
+#### Scenario: Compatibility form does not run ETL implicitly
+
+- **WHEN** the hidden compatibility production form completes capture
+- **THEN** it preserves the ETL-ready WAL and does not run ETL, while the public `record` command finalizes and publishes automatically
 
 #### Scenario: Record argument validation
 
@@ -55,40 +61,42 @@ CLI SHALL preserve fixture form `record --source fixture --input FILE --root ROO
 
 ### Requirement: Minimal inspect command
 
-CLI SHALL preserve positional session ID and add required root: `inspect SESSION_ID --root ROOT`. It SHALL support global `--format human|json`, default human, and delegate to application/storage service.
+
+CLI SHALL retain legacy `inspect SESSION_ID --root ROOT` as a hidden deprecated 0.1.x compatibility entrypoint. The public `inspect <RECORDING>` and `inspect latest` SHALL resolve recordings from default or configured storage per `recording-identity` and SHALL NOT require `--root`. It SHALL support global `--format human|json`, default human, and delegate to application/storage service.
 
 #### Scenario: Inspect happy path
 
-- **WHEN** known persisted session is inspected
+- **WHEN** known recording is inspected through the public or compatibility form
 - **THEN** command exits 0 with safe summary required by local-session-artifacts spec
 
-#### Scenario: Unknown session
+#### Scenario: Unknown recording
 
-- **WHEN** session ID is valid UUID but absent
+- **WHEN** recording reference is valid but absent
 - **THEN** command exits 3 with stable not-found error
 
-#### Scenario: Invalid session ID
+#### Scenario: Invalid recording reference
 
-- **WHEN** positional session ID is not UUID
-- **THEN** command exits 3 without path access outside root
+- **WHEN** recording reference is not a valid ID, `latest`, or known name
+- **THEN** command exits 3 without path access outside the data directory
 
 ### Requirement: Minimal replay command
 
-CLI SHALL preserve `replay SESSION_ID --root ROOT --target ORIGIN --allow-host IP [--allow-read] [--allow-write] [--timing asap] [--execute]`. Defaults SHALL remain human output, immediate timing, dry-run, no effect authorization, no target default, and no network. Human/JSON output SHALL include exact replay outcome, fully/partially/not replayable classification, aggregate executable/non-executable counts, and one result per operation.
+
+CLI SHALL retain legacy `replay SESSION_ID --root ROOT --target ORIGIN --allow-host IP [--allow-read] [--allow-write] [--timing asap] [--execute]` as a hidden deprecated 0.1.x compatibility entrypoint whose defaults SHALL remain human output, immediate timing, dry-run, no effect authorization, no target default, and no network. The public forms SHALL be `replay <RECORDING> -- COMMAND...` (spawned target with inferred local target and authorization per `safe-local-http-replay`) and `replay <RECORDING> --target URL` (explicit target requiring full authorization), mutually exclusive per `user-intent-cli`. Human/JSON output SHALL include exact replay outcome, fully/partially/not replayable classification, aggregate executable/non-executable counts, and one result per operation.
 
 #### Scenario: Replay dry-run
 
-- **WHEN** valid session is replayed without execute
-- **THEN** command prints plan/report with dry-run outcome and zero network
+- **WHEN** hidden legacy or public explicit-target replay omits `--execute`
+- **THEN** command prints plan/report with dry-run outcome and zero network; command mode instead infers execution intent from `-- COMMAND...`
 
 #### Scenario: Replay denied
 
-- **WHEN** target/effect authorization or wholly invalid session preflight denies execution
+- **WHEN** target/effect authorization or wholly invalid recording preflight denies execution
 - **THEN** no request is sent, report includes every unattempted/non-executable operation, and execution exits 4
 
 #### Scenario: Mixed-session replay
 
-- **WHEN** partially replayable session has authorized complete operations and degraded operations
+- **WHEN** partially replayable recording has authorized complete operations and degraded operations
 - **THEN** only complete supported operations execute; degraded operations appear not attempted; successful subset yields `completed_with_skips`
 
 #### Scenario: Replay local success
@@ -108,7 +116,8 @@ CLI SHALL preserve `replay SESSION_ID --root ROOT --target ORIGIN --allow-host I
 
 ### Requirement: Stable CLI exit and output contract
 
-CLI SHALL use exit 0 for successful completed record (including handled SIGINT/SIGTERM and clean limits), ETL/inspect, doctor supported/warnings, replay dry-run, `completed`, or `completed_with_skips`; 2 for Clap usage; 3 for recording/WAL/ETL/session/storage/serialization/finalization data errors; 4 for replay target/effect/no-executable invalid-session denial, unsupported live preflight, or doctor required unsupported/not-checked; 5 for replay transport stop; and 6 for executed verification failure. Non-executable unsupported/inconclusive operations in successful mixed replay SHALL NOT force exit 6. Human success SHALL use stdout and errors stderr. All JSON SHALL use shared atomic rendering boundary.
+
+CLI SHALL use exit 0 for successful completed record (including handled SIGINT/SIGTERM and clean limits), ETL/inspect/list, doctor supported/warnings, replay dry-run, `completed`, or `completed_with_skips`; 2 for Clap usage; 3 for recording/WAL/ETL/session/storage/serialization/finalization data errors and recording-resolution failures for inspect/replay/record-retry references; 4 for replay target/effect/no-executable invalid-session denial, unsupported live preflight, or doctor required unsupported/not-checked; 5 for replay transport stop; and 6 for executed verification failure. Unsupported/inconclusive siblings in successful mixed replay SHALL NOT force exit 6. Target application exit after successful exec is factual and not forwarded; bootstrap/hardening/exec failure is a typed Chronicle 3/4 failure. Human success uses stdout and errors stderr; JSON-mode child output is redirected away from Chronicle protocol streams. Deprecated warnings use stderr while success stdout stays atomic. All JSON uses shared atomic rendering.
 
 #### Scenario: Clap usage error
 
@@ -144,6 +153,21 @@ CLI SHALL use exit 0 for successful completed record (including handled SIGINT/S
 
 - **WHEN** signal shutdown cannot flush WAL or finalize metadata
 - **THEN** safe failed summary is emitted and process exits 3
+
+#### Scenario: Child exit not forwarded
+
+- **WHEN** the recorded command exits nonzero or by signal
+- **THEN** recording completes, summary reports the child exit status or signal factually, and Chronicle's exit remains 0
+
+#### Scenario: Recording resolution failure
+
+- **WHEN** inspect, replay, or record retry cannot resolve a recording reference
+- **THEN** command exits 3 with an actionable stable error and no side effect
+
+#### Scenario: List storage failure
+
+- **WHEN** list encounters unsafe, malformed, contradictory, or oversized catalog/storage input
+- **THEN** command exits 3 without treating it as recording-reference resolution
 
 ### Requirement: CLI remains outer adapter
 
@@ -232,22 +256,28 @@ README, architecture, canonical, replay safety, WAL format, capability matrix, a
 
 ### Requirement: Shared atomic JSON rendering
 
-Application SHALL serialize complete bounded versioned result before stdout for production record, ETL, inspect, replay, and doctor. CLI SHALL write serialized bytes through one checked output boundary. Serialization failure SHALL be typed data error before stdout; stdout write/flush failure SHALL be CLI I/O error. Replay SHALL NOT retry network because rendering failed. Per-command report bounds SHALL cap memory. Human renderers SHALL remain command-specific; implementation SHALL NOT add large generic framework.
+
+Application SHALL serialize complete bounded v1 results before stdout for public record/list/inspect/replay/doctor and hidden compatibility reports. CLI SHALL write bytes through one checked boundary. Serialization failure is typed before stdout; write/flush failure is CLI I/O error. Replay never retries traffic because rendering failed. In JSON mode spawned target stdout/stderr SHALL be connected to the platform null sink before exec and SHALL NOT share Chronicle stdout/stderr or create output files/buffers.
 
 #### Scenario: Serialization failure
 
 - **WHEN** any command result cannot serialize
-- **THEN** stdout contains no partial JSON object and stderr reports typed data error
+- **THEN** stdout contains no partial JSON and stderr reports typed data error
 
 #### Scenario: Stdout write failure
 
-- **WHEN** serialization succeeded but stdout write/flush fails
-- **THEN** CLI returns I/O error and does not relabel it serialization/data success
+- **WHEN** serialization succeeds but checked write/flush fails
+- **THEN** CLI returns I/O error without relabeling operation success
+
+#### Scenario: Noisy child in JSON mode
+
+- **WHEN** recorded or replayed target writes arbitrary stdout/stderr while JSON format is selected
+- **THEN** Chronicle stdout remains one JSON object, Chronicle stderr remains reserved for its one diagnostic/error object, and child bytes are absent from both
 
 #### Scenario: Replay render failure
 
-- **WHEN** network replay completed/partially completed but final JSON rendering/write fails
-- **THEN** Chronicle does not repeat any network operation and retains in-memory execution for error handling
+- **WHEN** replay completed but final render/write fails
+- **THEN** Chronicle does not repeat network operations
 
 ### Requirement: Standalone ETL command
 
@@ -275,26 +305,48 @@ CLI SHALL provide `etl --wal-dir DIR --output ROOT` with global human/JSON forma
 
 ### Requirement: Operational doctor command
 
-CLI SHALL provide `doctor [--wal-dir DIR] [--output ROOT]` with global human/JSON format. When path omitted, corresponding destructive-capability probe SHALL be `not_checked` optional with remediation rather than guessing a default; platform/protocol/replay-policy probes still run. It SHALL render all typed probes/aggregate, continue independent checks after failures, and perform no recording/replay/repair side effects.
+
+Public `doctor` SHALL use resolved data directory and expose no required WAL/output mechanics on its happy-path help. Hidden compatibility/advanced path probes may retain `--wal-dir`/`--output`. For a nonexistent data directory, doctor SHALL inspect the nearest existing ancestor and report prospective creation/private-mode status as supported, unsupported, or `not_checked`; it SHALL NOT claim a conclusive write/private-mode probe without performing one. Platform/protocol/replay-policy probes continue independently. Doctor SHALL create no directory, recording metadata, repair, capture, replay traffic, or persistent probe artifact.
+
+#### Scenario: Prospective path cannot be proved
+
+- **WHEN** target data directory does not exist and ancestor metadata cannot prove creation/private-mode support
+- **THEN** doctor reports `not_checked` with remediation rather than claiming writable
+
+#### Scenario: Public doctor help
+
+- **WHEN** user runs `chronicle doctor --help`
+- **THEN** default data-directory diagnostics are shown and WAL/output mechanics remain hidden
 
 #### Scenario: Doctor supported
 
-- **WHEN** supported environment passes all required probes
-- **THEN** command exits 0 with supported report
+- **WHEN** supported environment passes required probes
+- **THEN** command exits 0 with full supported report
 
 #### Scenario: Doctor unsupported
 
-- **WHEN** required capture/storage capability is absent
-- **THEN** command emits full report, remediation, and exit 4; same exit applies when required probe is not-checked
+- **WHEN** required capture/storage capability is unsupported or required probe is `not_checked`
+- **THEN** command emits full report/remediation and exits 4 while independent probes still run
 
 ### Requirement: Versioned command JSON contracts
 
-Production record, ETL, inspect, replay, and doctor success outputs SHALL each use documented versioned JSON object via shared atomic renderer. Arrays SHALL follow deterministic operation/probe/provenance ordering and counters SHALL use stable names including received, queued, written-not-durable, durable, dropped-before-persistence, and ETL-checkpointed where applicable. Schema changes SHALL increment output version rather than silently change field meaning.
+
+Until compatibility freeze, each public or hidden command report contract SHALL remain version 1 per `mvp-schema-versioning`; this change introduces no v2 or version dispatch. New public record/list/recording-oriented-inspect contracts are documented v1 objects. Existing hidden legacy success JSON remains byte-compatible through 0.1.x as its documented v1 contract. Any future version increase requires explicit compatibility-freeze change.
+
+#### Scenario: New public reports
+
+- **WHEN** public record, list, or recording-oriented inspect emits JSON
+- **THEN** object declares version 1 and matches its one current documented schema
+
+#### Scenario: No ad hoc v2
+
+- **WHEN** implementation adds recording identity fields
+- **THEN** it does not introduce v2 or a v1/v2 reader/renderer dispatch
 
 #### Scenario: Automation parses outputs
 
-- **WHEN** commands run with `--format json`
-- **THEN** each stdout object matches documented command schema and contains no human prose outside JSON
+- **WHEN** command runs with JSON format
+- **THEN** stdout matches one documented deterministic v1 schema and contains no human prose
 
 ### Requirement: Foreground recorder command
 

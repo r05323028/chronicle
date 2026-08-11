@@ -8,27 +8,45 @@ Define continuous recorder lifecycle, recovery, readiness, bounded epochs, and e
 
 ### Requirement: One foreground recorder owns one filesystem domain
 
-Recorder service SHALL run in foreground and own exactly one configured cgroup subtree and one private state root. Preflight SHALL resolve configured WAL/store roots to a canonical filesystem-domain identity and deterministic configured domain-lock root. Recorder SHALL acquire an OS-released exclusive lock at `<domain-lock-root>/.chronicle-domain.lock` before the subordinate state-root lock, recovery, or mutation. All Chronicle mutating commands SHALL use the same domain-lock resolution and reject a live owner; read-only commands need neither lock. A filesystem domain SHALL have only one active Chronicle mutating owner; multiple recorder instances sharing the same WAL/store filesystem are unsupported. A second process targeting that domain SHALL fail without attaching capture, opening WAL for append, or changing metadata. Different cgroup scopes requiring independent recorder instances SHALL use isolated filesystem domains. Recorder SHALL NOT implement self-daemonization, PID-file liveness as authority, multi-node ownership, or a custom supervisor.
+
+Recorder service SHALL run in foreground and own one configured cgroup subtree, private state root, and Chronicle data-domain identity. Data-domain identity SHALL include canonical filesystem identity plus one exact normalized `<domain-lock-root>/.chronicle-domain.lock` path; a physical device number alone does not make two different flock files equivalent. Recorder and every standalone mutator targeting the same configured data domain SHALL resolve and acquire that exact path before subordinate state locks, recovery, capture attachment, name reservation, WAL/catalog/sidecar mutation, ETL, publication, or retention. Read-only commands need no lock.
+
+Public intent commands default domain-lock root to their resolved data directory. When daemon and public commands share a domain, configuration SHALL align both to one exact lock path. A command that is configured for the same data root/domain but resolves a different lock path SHALL fail preflight as incompatible rather than claim exclusion. Operating multiple Chronicle data domains on one physical filesystem with different lock paths remains unsupported and SHALL be documented; device equality SHALL NOT be reported as an acquired conflict. A second owner of the exact configured domain SHALL fail before capture, WAL append, or metadata/catalog mutation. OS process death SHALL release locks; persisted evidence, not PID existence, drives recovery.
 
 #### Scenario: First owner starts
 
-- **WHEN** no live owner holds configured state-root lease
-- **THEN** recorder acquires lease before recovery or capture attachment
+- **WHEN** no live owner holds the exact configured domain lock
+- **THEN** recorder acquires it before subordinate state lock, recovery, or capture
 
 #### Scenario: Concurrent owner rejected
 
-- **WHEN** second recorder targets state root or another WAL/store path in the same filesystem domain with live owner
-- **THEN** second recorder exits with stable ownership error and performs no mutation or attachment
+- **WHEN** public record, second recorder, or another mutator targets same configured data domain with live owner
+- **THEN** second process uses same exact lock path, exits with stable ownership error, and performs no mutation or attachment
+
+#### Scenario: Public and daemon configuration align
+
+- **WHEN** public record and daemon recorder resolve same data-domain identity
+- **THEN** both use same exact domain-lock path
+
+#### Scenario: Incompatible lock mapping rejected
+
+- **WHEN** supplied public/daemon configuration names the same Chronicle data root/domain but resolves different lock paths
+- **THEN** preflight rejects configuration and does not treat device identity or state lock as mutual exclusion
 
 #### Scenario: Standalone mutator rejected while recorder owns domain
 
-- **WHEN** a standalone mutating command targets a WAL/store filesystem domain owned by a live recorder
-- **THEN** command exits with stable ownership error; read-only commands may continue without acquiring mutation ownership
+- **WHEN** standalone mutator targets configured data domain owned by live recorder
+- **THEN** command exits with stable ownership error before mutation or attachment
+
+#### Scenario: Read-only command
+
+- **WHEN** list or inspect reads a domain owned by recorder
+- **THEN** it may produce bounded reconciled output without acquiring or mutating domain lock
 
 #### Scenario: Process dies
 
-- **WHEN** recorder process terminates without releasing application state
-- **THEN** operating system releases lease and next process determines recovery from persisted evidence rather than PID existence
+- **WHEN** owner process terminates without application cleanup
+- **THEN** OS releases lock and next exact-domain owner recovers from persisted evidence rather than PID existence
 
 ### Requirement: Persistent recorder lifecycle state machine
 
