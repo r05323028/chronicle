@@ -19,9 +19,9 @@
 
 ## 4. Application use-case ownership cleanup
 
-- [ ] 4.1 Inventory every workspace consumer of `chronicle-application` public items and classify each export under record, recorder, ETL, replay, inspect, doctor, or internal implementation. Acceptance: no public export is moved/removed without a named consumer decision; active `user-intent-cli` changes are preserved.
-- [ ] 4.2 Move root-level doctor, inspect, ETL, replay, and record implementations into focused existing/new internal modules, while grouping existing recorder lifecycle modules under clear recorder ownership where a move reduces ambiguity. Exact directory nesting is optional. Acceptance: `lib.rs` becomes composition/re-export surface rather than home for unrelated large implementations; no new crate, service trait, or factory is added.
-- [ ] 4.3 Curate application exports around user-facing requests/results/errors and documented extension seams; make low-level scope/quota/transition/persistence helpers crate-private when no real cross-crate consumer exists. Remove the mostly unimplemented `ChronicleApplication` facade if still unused rather than completing speculative methods. Acceptance: workspace builds after each bounded move and external behavior tests remain unchanged.
+- [x] 4.1 Inventory every workspace consumer of `chronicle-application` public items and classify each export under record, recorder, ETL, replay, inspect, doctor, or internal implementation. Acceptance: no public export is moved/removed without a named consumer decision; active `user-intent-cli` changes are preserved.
+- [x] 4.2 Move root-level doctor, inspect, ETL, replay, and record implementations into focused existing/new internal modules, while grouping existing recorder lifecycle modules under clear recorder ownership where a move reduces ambiguity. Exact directory nesting is optional. Acceptance: `lib.rs` becomes composition/re-export surface rather than home for unrelated large implementations; no new crate, service trait, or factory is added.
+- [x] 4.3 Curate application exports around user-facing requests/results/errors and documented extension seams; make low-level scope/quota/transition/persistence helpers crate-private when no real cross-crate consumer exists. Remove the mostly unimplemented `ChronicleApplication` facade if still unused rather than completing speculative methods. Acceptance: workspace builds after each bounded move and external behavior tests remain unchanged.
 - [ ] 4.4 Move existing one-shot `FilesystemSessionStore` final publication, no-replace verification, and recording-local checkpoint advancement from application behind one ETL-owned API; keep domain lock, quota policy/reservation, use-case selection, and presentation in application. Acceptance: ETL retains `chronicle-storage`; application no longer calls concrete session publication or advances ETL checkpoints; deterministic IDs, quota accounting, final session/checkpoint bytes, and publication-before-checkpoint fault behavior remain identical.
 
 ## 5. CLI outer-adapter cleanup
@@ -54,3 +54,13 @@
 Bounded `cargo metadata --format-version 1 --no-deps` from the workspace root captured 13 Chronicle root-workspace crates: common, canonical, capture, capture-ebpf, wal, session, protocol, protocol-builtins, storage, replay, etl, application, cli. Edge inventory: 43 normal, 4 dev, 0 build, no dependency cycle (DFS).
 
 Drift vs `proposal.md`/design assessment (43-normal/4-dev/no-cycle): **none**. The working tree already contains the archived user-intent-cli surface; no manifest edge differs from the assessed graph. Known problem edges confirmed present: `session -> wal` (normal), `cli -> {protocol, protocol-builtins, replay, common}` (normal), `cli -> {capture, wal}` (dev).
+
+## Implementation Evidence
+
+### 4.1 Application export inventory
+
+All `pub use` blocks in `lib.rs` classified: record (`command_record`/`record`), recorder lifecycle (`continuous_recorder`, `recorder_*` modules), ETL (`etl`), replay (`command_replay`/`replay_inspect`), inspect (`replay_inspect`), doctor (`doctor`), and internal implementation (bootstrap, data_dir, domain_lock, catalog, supervised_scope, quota, rollover, epoch). Sole external consumer is `chronicle-cli` (production + contract tests) plus crate-internal tests; no export was dropped without a consumer decision. Active user-intent-cli surface preserved (all command_record/command_replay exports unchanged).
+
+### 4.2/4.3 Module organization
+
+Root `lib.rs` reduced 8124 -> ~2900 lines; large implementations moved to `doctor.rs`, `record.rs`, `etl.rs`, `replay_inspect.rs`. The mostly-unimplemented `ChronicleApplication` scaffold facade was removed with its two stub tests (design D5); low-level helpers used only inside the crate are `pub(crate)` re-exports. 203 application tests + 34 CLI contract tests pass.
