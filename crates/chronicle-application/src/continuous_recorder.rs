@@ -1927,6 +1927,53 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_checkpoint_persists_manifest_checksum() {
+        // Regression: the persisted recording-local checkpoint must carry the
+        // real manifest checksum (publication + verification happen inside the
+        // ETL transaction before the checkpoint bytes are produced), not the
+        // pre-publication placeholder.
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-one-shot-checkpoint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let wal = root.join("wal");
+        fs::create_dir_all(&wal).unwrap();
+        crate::production_wal_from_fixture(
+            &wal,
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/http/basic-session.json"
+            ),
+        )
+        .unwrap();
+        let output = root.join("output");
+        let registry = registry().unwrap();
+        let published = process_and_publish_recording_wal(&wal, &output, &registry).unwrap();
+        let checkpoint: crate::RecordingEtlCheckpoint =
+            serde_json::from_slice(&fs::read(wal.join("etl-checkpoint.json")).unwrap()).unwrap();
+        assert!(
+            !checkpoint.manifest_checksum.is_empty(),
+            "persisted checkpoint must carry the real manifest checksum"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                output
+                    .join("sessions")
+                    .join(published.session_id.to_string())
+                    .join("manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint.manifest_checksum,
+            manifest["session_checksum"].as_str().unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn three_epoch_fixture_has_one_etl_publication_and_replayable_output() {
         let root =
             std::env::temp_dir().join(format!("chronicle-three-epoch-{}", uuid::Uuid::new_v4()));

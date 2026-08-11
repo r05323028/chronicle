@@ -207,7 +207,9 @@ static ONESHOT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn publish_final_session(
     store: &FilesystemSessionStore,
     expected: &PublishSession,
-    checkpoint_bytes: &[u8],
+    checkpoint_bytes: impl FnOnce(
+        &OneShotPublicationOutcome,
+    ) -> Result<Vec<u8>, OneShotPublicationError>,
     checkpoint_path: &Path,
     checkpoint_reserve: impl FnOnce(u64) -> Result<(), OneShotPublicationError>,
     matches_existing: impl Fn(
@@ -229,14 +231,16 @@ pub fn publish_final_session(
     let inspection = store
         .verify_existing_manifest(session_id)
         .map_err(|error| OneShotPublicationError::Verify(error.to_string()))?;
-    checkpoint_reserve(checkpoint_bytes.len() as u64)?;
-    write_atomic_bytes(checkpoint_path, checkpoint_bytes)
-        .map_err(|error| OneShotPublicationError::Checkpoint(error.to_string()))?;
-    Ok(OneShotPublicationOutcome {
+    let outcome = OneShotPublicationOutcome {
         session_id,
         already_published,
         manifest_checksum: inspection.session_checksum,
-    })
+    };
+    let bytes = checkpoint_bytes(&outcome)?;
+    checkpoint_reserve(bytes.len() as u64)?;
+    write_atomic_bytes(checkpoint_path, &bytes)
+        .map_err(|error| OneShotPublicationError::Checkpoint(error.to_string()))?;
+    Ok(outcome)
 }
 
 fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -247,6 +251,10 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         )
     })?;
     fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    let mut permissions = fs::metadata(parent)?.permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+    fs::set_permissions(parent, permissions)?;
     let temporary = parent.join(format!(
         ".oneshot.tmp-{}",
         ONESHOT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)

@@ -1441,6 +1441,7 @@ fn process_and_publish_recording_wal_owned(
     process_and_publish_recording_wal_inner(wal_directory, root, registry, Some(quota), true)
 }
 
+#[allow(clippy::too_many_lines)] // transaction keeps publication-before-checkpoint ordering inline
 fn process_and_publish_recording_wal_inner(
     wal_directory: impl AsRef<Path>,
     root: impl AsRef<Path>,
@@ -1517,11 +1518,21 @@ fn process_and_publish_recording_wal_inner(
         shutdown_reason: processed.shutdown_reason,
         counters: processed.counters,
     };
-    let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
     let outcome = chronicle_etl::publish_final_session(
         &store,
         &expected,
-        &checkpoint_bytes,
+        // The manifest checksum is known only after publication and manifest
+        // verification; build the persisted checkpoint bytes inside the
+        // transaction so the real checksum lands on disk.
+        |outcome| {
+            let mut checkpoint = checkpoint.clone();
+            checkpoint
+                .manifest_checksum
+                .clone_from(&outcome.manifest_checksum);
+            serde_json::to_vec(&checkpoint).map_err(|error| {
+                chronicle_etl::OneShotPublicationError::Checkpoint(error.to_string())
+            })
+        },
         &wal_directory.join("etl-checkpoint.json"),
         |bytes| {
             if let Some(reservation) = quota_reservation.as_mut() {

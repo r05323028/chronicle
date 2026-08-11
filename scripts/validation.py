@@ -177,6 +177,18 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
         for kind in kinds:
             if member not in tables[kind]:
                 issues.append(f"policy missing {kind} allowlist for member {member!r}")
+    forbids = policy.get("critical_forbids", {})
+    forbid_keys = {
+        "dependency_on_cli", "session_to_wal", "protocol_to_builtins", "common_upward",
+        "cli_non_application",
+    }
+    if not isinstance(forbids, dict) or not forbid_keys.issubset(forbids):
+        issues.append(
+            "critical_forbids must declare every named forbid: " + ", ".join(sorted(forbid_keys))
+        )
+    for key in sorted(forbid_keys):
+        if not isinstance(forbids.get(key), bool):
+            issues.append(f"critical_forbids.{key} must be a boolean")
     edges = workspace_edges(root)
     def edge_key(edge):
         return (edge["source"], edge["target"], edge["kind"])
@@ -188,16 +200,24 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
         if target not in member_set:
             issues.append(f"workspace edge {source} -> {target} targets a crate with no policy entry")
             continue
-        if target == "chronicle-cli":
+        if forbids.get("dependency_on_cli") and target == "chronicle-cli":
             issues.append(f"forbidden dependency on chronicle-cli: {source} -> {target} [{kind}]")
             continue
-        if source == "chronicle-session" and target == "chronicle-wal":
+        if forbids.get("session_to_wal") and source == "chronicle-session" and target == "chronicle-wal":
             issues.append(f"forbidden session-to-wal coupling: {source} -> {target} [{kind}]")
-        if source == "chronicle-protocol" and target == "chronicle-protocol-builtins":
+        if (
+            forbids.get("protocol_to_builtins")
+            and source == "chronicle-protocol"
+            and target == "chronicle-protocol-builtins"
+        ):
             issues.append(f"forbidden protocol-to-builtins coupling: {source} -> {target} [{kind}]")
-        if source == "chronicle-common" and kind != "build":
+        if forbids.get("common_upward") and source == "chronicle-common" and kind != "build":
             issues.append(f"forbidden common upward dependency: {source} -> {target} [{kind}]")
-        if source == "chronicle-cli" and target != "chronicle-application":
+        if (
+            forbids.get("cli_non_application")
+            and source == "chronicle-cli"
+            and target != "chronicle-application"
+        ):
             issues.append(f"forbidden cli non-application edge: {source} -> {target} [{kind}]")
         allow = tables[kind].get(source, [])
         if target not in allow:

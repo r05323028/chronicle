@@ -39,7 +39,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         target (cfg condition string).
         """
         (self.temp / "Cargo.toml").write_text(
-            "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n"
+            '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n'
         )
         for name, deps in crates.items():
             crate_dir = self.temp / "crates" / name.removeprefix("chronicle-")
@@ -55,7 +55,13 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                     body += ", optional = true"
                 body += " }"
                 if dep.get("rename"):
-                    body = '{ path = "../' + dep["package"].removeprefix("chronicle-") + '", package = "' + dep["package"] + '" }'
+                    body = (
+                        '{ path = "../'
+                        + dep["package"].removeprefix("chronicle-")
+                        + '", package = "'
+                        + dep["package"]
+                        + '" }'
+                    )
                     line = f"{dep['rename']} = {body}"
                 else:
                     line = f"{dep['package']} = {body}"
@@ -69,7 +75,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 else:
                     build.append(line)
             manifest = (
-                f"[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n"
+                f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n\n'
             )
             if normal:
                 manifest += "[dependencies]\n" + "\n".join(normal) + "\n\n"
@@ -78,7 +84,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             if build:
                 manifest += "[build-dependencies]\n" + "\n".join(build) + "\n\n"
             for condition, lines in sorted(target_tables.items()):
-                manifest += f"[target.'{condition}'.dependencies]\n" + "\n".join(lines) + "\n\n"
+                manifest += (
+                    f"[target.'{condition}'.dependencies]\n" + "\n".join(lines) + "\n\n"
+                )
             (crate_dir / "Cargo.toml").write_text(manifest)
             (crate_dir / "src").mkdir(exist_ok=True)
             (crate_dir / "src" / "lib.rs").write_text("pub fn ping() {}\n")
@@ -115,7 +123,12 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         }
         issues = self.issues_for(crates)
         self.assertTrue(any("session-to-wal" in issue for issue in issues))
-        self.assertTrue(any("chronicle-session -> chronicle-wal [normal]" in issue for issue in issues))
+        self.assertTrue(
+            any(
+                "chronicle-session -> chronicle-wal [normal]" in issue
+                for issue in issues
+            )
+        )
 
     def test_forbidden_dev_edge(self):
         crates = {
@@ -179,13 +192,20 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 {"package": "chronicle-canonical"},
                 {"package": "chronicle-common"},
                 {"package": "chronicle-protocol"},
-                {"package": "chronicle-wal",
-                 "optional": True,
-                 "target": "cfg(target_os = \"linux\")"},
+                {
+                    "package": "chronicle-wal",
+                    "optional": True,
+                    "target": 'cfg(target_os = "linux")',
+                },
             ],
         }
         issues = self.issues_for(crates)
-        self.assertTrue(any("chronicle-protocol-builtins -> chronicle-wal" in issue for issue in issues))
+        self.assertTrue(
+            any(
+                "chronicle-protocol-builtins -> chronicle-wal" in issue
+                for issue in issues
+            )
+        )
         self.assertTrue(any("[optional]" in issue for issue in issues))
         self.assertTrue(any("[cfg(target_os" in issue for issue in issues))
 
@@ -210,7 +230,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             {"package": "chronicle-common"},
         ]
         issues = self.issues_for(crates)
-        self.assertTrue(any("chronicle-session -> chronicle-wal" in issue for issue in issues))
+        self.assertTrue(
+            any("chronicle-session -> chronicle-wal" in issue for issue in issues)
+        )
 
     def test_dependency_on_cli_rejected(self):
         crates = {
@@ -252,7 +274,9 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             "chronicle-newcrate": [{"package": "chronicle-common"}],
         }
         issues = self.issues_for(crates)
-        self.assertTrue(any("no architecture policy member" in issue for issue in issues))
+        self.assertTrue(
+            any("no architecture policy member" in issue for issue in issues)
+        )
 
     def test_cycle_detected(self):
         crates = {

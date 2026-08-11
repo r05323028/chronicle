@@ -40,8 +40,8 @@ members = [
 dependency_on_cli = true
 session_to_wal = true
 protocol_to_builtins = true
-common_upward = true            # no other Chronicle crate may depend on common's dependents
-cli_non_application = true      # CLI Chronicle edges may only target chronicle-application
+common_upward = true        # no other Chronicle crate may depend on common's dependents
+cli_non_application = true  # CLI Chronicle edges may only target chronicle-application
 
 [normal]
 # Allowed normal (non-dev, non-build) workspace dependencies per source crate.
@@ -52,10 +52,22 @@ cli_non_application = true      # CLI Chronicle edges may only target chronicle-
 "chronicle-capture-ebpf" = ["chronicle-capture", "chronicle-common"]
 "chronicle-wal" = ["chronicle-capture", "chronicle-common"]
 "chronicle-session" = ["chronicle-capture", "chronicle-common"]
-"chronicle-protocol" = ["chronicle-canonical", "chronicle-common", "chronicle-session"]
-"chronicle-protocol-builtins" = ["chronicle-canonical", "chronicle-common", "chronicle-protocol"]
+"chronicle-protocol" = [
+  "chronicle-canonical",
+  "chronicle-common",
+  "chronicle-session",
+]
+"chronicle-protocol-builtins" = [
+  "chronicle-canonical",
+  "chronicle-common",
+  "chronicle-protocol",
+]
 "chronicle-storage" = ["chronicle-canonical", "chronicle-common"]
-"chronicle-replay" = ["chronicle-canonical", "chronicle-common", "chronicle-protocol"]
+"chronicle-replay" = [
+  "chronicle-canonical",
+  "chronicle-common",
+  "chronicle-protocol",
+]
 "chronicle-etl" = [
   "chronicle-canonical",
   "chronicle-capture",
