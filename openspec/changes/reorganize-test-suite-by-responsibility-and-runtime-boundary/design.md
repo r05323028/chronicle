@@ -135,6 +135,8 @@ Migration order:
 6. Remove duplicate/gate-oriented implementations only after portable replacement proof, complete gate mapping, and any explicitly required migration-time privileged equivalence sample pass. Migration-time privileged samples are PROVISIONAL equivalence evidence only and are distinct from final retained supported-platform evidence: final evidence is task 10.4 and MUST run after cleanup. Post-migration cleanup of obsolete infrastructure (tasks section 11) completes BEFORE task 10.4, so retained evidence reflects the post-cleanup checkout.
 7. Update validation groups, CI, docs, and `AGENTS.md`; run final coverage comparison (10.3), the no-dead-infrastructure invariant (11.10), and the final docs/`AGENTS.md` reconciliation (9.8) BEFORE collecting fresh/reused compatible gate evidence, so retained final evidence corresponds to the final documented source tree.
 
+Cutover vs physical deletion: migration tasks (e.g. 4.4, 8.5) perform cutover — create the replacement, prove it, switch callers/selectors/catalog ownership, prove zero active dependency on the legacy implementation, and mark the legacy item obsolete. Section 11 then performs physical deletion. Legacy implementations may physically exist between cutover and cleanup; physical deletion never occurs while active selectors/catalog/CI reference them. Task 9.7 completes final ACTIVE catalog/gate configuration before cleanup; task 11.9 may only organize migration bookkeeping/history afterwards.
+
 Rollback keeps old gate path available until new selection demonstrates equivalent required scenario coverage. Persisted product data needs no migration.
 
 ## Target Test Directory Architecture
@@ -493,7 +495,7 @@ No speculative directory or file creation is required to reach this target; real
 | `scripts/acceptance/lib/scenarios/{p1,p2,...}` | **[trans]** | Gate-owned storage being replaced by selectors (8.x); removed after mapping (8.5). |
 | `validation/test-architecture/` | **[ok]** | Catalog/ledger/gate/schema metadata in place. |
 | P1/P2 as directories | **[obsolete]** | Prohibited (§13); existing gate-oriented storage is transitional. |
-| Post-migration cleanup | **[plan]** | Section 11 of tasks.md: remove obsolete wrappers/runner logic/helpers/fixtures/generated artifacts/empty scaffolding after replacement proof and gate mapping and BEFORE final supported proof (10.4). |
+| Post-migration cleanup | **[plan]** | Section 11 of tasks.md physically deletes obsolete wrappers/runner logic/helpers/fixtures/generated artifacts/empty scaffolding after replacement proof, final ACTIVE catalog/gate reconciliation (9.7), and gate mapping, and BEFORE final supported proof (10.4); migration tasks perform cutover, not deletion. |
 
 ## Risks / Trade-offs
 
