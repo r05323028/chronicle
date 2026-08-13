@@ -199,6 +199,52 @@ Every non-stay disposition SHALL state responsibility/reliability reason, replac
 - **WHEN** reviewer cannot identify unique purpose or environment requirement
 - **THEN** test remains unmoved and migration is incomplete until classification is resolved
 
+### Requirement: Internal command coverage is integration, not acceptance
+
+Documented public CLI/API behavior SHALL be classified as acceptance. Internal commands and internal compatibility seams SHALL be classified as integration/internal-contract tests owned by the appropriate application/CLI boundary, not as user acceptance. An internal command MUST NOT be the sole evidence for a documented user-facing capability; public acceptance of that capability SHALL be added separately when a documented public surface exists.
+
+#### Scenario: Public command acceptance
+
+- **WHEN** behavior is a documented user-facing command invoked through supported external surfaces
+- **THEN** acceptance proves it through public CLI, process, filesystem/storage, API, or network surfaces
+
+#### Scenario: Internal seam convenience
+
+- **WHEN** an internal command is convenient for rootless execution but has no documented public user surface
+- **THEN** its coverage classifies as an integration/internal contract (for example `integration:internal-etl-cli-contract`) and no gate lists it as acceptance
+
+### Requirement: Privileged directories are topic groupings, not layers
+
+Subdirectory names under `tests/privileged/` (capture, acceptance, e2e, recovery, resources) SHALL be organizational topic groupings, not functional test layers. A directory name under `tests/privileged/` MUST NOT determine the functional layer. Every privileged test SHALL have exactly one functional layer (unit, integration, smoke, acceptance, or e2e) recorded in the catalog, independent of its topic directory. `recovery`, `capture`, and `resources` SHALL NOT be introduced as functional test layers.
+
+#### Scenario: Recovery topic directory
+
+- **WHEN** a reboot-recovery assertion lives under `tests/privileged/recovery/`
+- **THEN** the catalog records its unique functional layer (acceptance or integration depending on the assertion) with environment = privileged, and `recovery` is not a layer
+
+### Requirement: Test catalog is authoritative classification and selector metadata
+
+`validation/test-architecture/test-catalog.toml` SHALL be the authoritative machine-readable classification, ownership, execution, and selector catalog, representing test ID, functional layer, environment requirement, owner, command, status, and gate membership. Actual file locations SHALL conform to the directory responsibility contract in design.md; migration destinations SHALL be tracked in the migration ledger. The catalog SHALL NOT be required to become a file-manifest database; no path field SHALL be added without a demonstrated implementation need.
+
+#### Scenario: Colocated unit tests in catalog
+
+- **WHEN** maintainer checks a colocated Rust unit module against the catalog
+- **THEN** the catalog entry identifies layer, owner, environment, command, and gate membership while the file remains colocated under `crates/<crate>/src/**` rather than being enumerated as a manifest path
+
+### Requirement: No dead testing infrastructure after migration
+
+After migration completes, every retained product test, helper, fixture, scenario wrapper, validation entry, and privileged orchestration file SHALL have a current owner and caller or a documented historical/audit purpose. Dead compatibility wrappers, duplicate assertions, unused fixtures/helpers, generated files, empty scaffolding, and obsolete gate-owned test implementations SHALL be removed before the change is considered complete. Cleanup MUST NOT occur before replacement proof passes, gate coverage mapping is complete, no-coverage-loss checks pass, final selector behavior is proven, and required supported privileged evidence is retained.
+
+#### Scenario: Wrapper with no caller
+
+- **WHEN** a scenario wrapper exists only to run another classified test or to carry milestone naming
+- **THEN** it is removed only after selector equivalence is proven and no caller remains
+
+#### Scenario: Duplicate portable matrix in privileged path
+
+- **WHEN** a privileged scenario still reruns portable WAL/ETL/replay/repository checks after classified prerequisites pass
+- **THEN** the duplicate is removed and the gate references the independent classified prerequisite result
+
 ### Requirement: Testing guidance is durable
 
 After migration implementation completes, `AGENTS.md` and detailed testing documentation SHALL state: unit tests prove local logic; integration tests prove component/crate contracts; smoke tests prove executables are alive; acceptance tests prove individual user-facing features; E2E tests prove complete system composition; privileged tests prove only behavior requiring real supported kernel/environment; validation scripts select and orchestrate tests and contain no product test logic; and always use lowest-cost test layer that conclusively proves behavior.

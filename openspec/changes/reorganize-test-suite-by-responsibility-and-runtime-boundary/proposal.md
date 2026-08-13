@@ -15,6 +15,8 @@ Chronicle needs one responsibility-based test architecture aligned with crate ow
 - Align test helpers and dev dependencies with the 13-crate ownership/allowlist contract; test code cannot create a dependency-direction escape hatch.
 - Recast P1/P2 as milestone selectors over required layers and environment-qualified scenarios, not structural test-suite categories.
 - Preserve existing product behavior, test coverage obligations, timeout containment, scenario attribution, and evidence compatibility while migrating in audited slices.
+- Classify internal command/internal compatibility seams as integration contracts owned by the appropriate application/CLI boundary, never as user acceptance; reclassify the current internal ETL fail-closed coverage accordingly, and add public ETL acceptance only when a documented public command exists.
+- Remove obsolete migration scaffolding, duplicate assertions, dead helpers/fixtures, obsolete wrappers, and generated artifacts only after replacement proof, gate mapping, and no-coverage-loss checks are established.
 
 ## Capabilities
 
@@ -45,3 +47,4 @@ No production behavior, public API, persisted format, crate architecture, depend
 - Test helpers and dev dependencies pass existing crate architecture policy.
 - `AGENTS.md` and detailed testing documentation contain final layer rules and lowest-cost conclusive-proof rule after implementation.
 - No production behavior, persisted format, public CLI/API, protocol, eBPF behavior, P1/P2 feature requirement, or crate architecture changes.
+- No dead testing infrastructure remains after migration: every retained test, helper, fixture, scenario wrapper, validation entry, and orchestration file has a current owner and caller or a documented historical/audit purpose.
