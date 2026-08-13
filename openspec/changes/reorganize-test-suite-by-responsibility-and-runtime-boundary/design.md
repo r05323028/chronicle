@@ -133,7 +133,7 @@ Migration order:
 4. Establish rootless smoke/acceptance/E2E coverage using existing fixtures and public surfaces.
 5. Extract environment preparation and route classified privileged tests through it.
 6. Remove duplicate/gate-oriented implementations only after portable replacement proof, complete gate mapping, and any explicitly required migration-time privileged equivalence sample pass. Migration-time privileged samples are PROVISIONAL equivalence evidence only and are distinct from final retained supported-platform evidence: final evidence is task 10.4 and MUST run after cleanup. Post-migration cleanup of obsolete infrastructure (tasks section 11) completes BEFORE task 10.4, so retained evidence reflects the post-cleanup checkout.
-7. Update validation groups, CI, docs, and `AGENTS.md`; then run final coverage comparison (10.3), the no-dead-infrastructure invariant (11.10), and collect fresh/reused compatible gate evidence as required.
+7. Update validation groups, CI, docs, and `AGENTS.md`; run final coverage comparison (10.3), the no-dead-infrastructure invariant (11.10), and the final docs/`AGENTS.md` reconciliation (9.8) BEFORE collecting fresh/reused compatible gate evidence, so retained final evidence corresponds to the final documented source tree.
 
 Rollback keeps old gate path available until new selection demonstrates equivalent required scenario coverage. Persisted product data needs no migration.
 
@@ -196,7 +196,7 @@ Representative target tree (current files in parentheses):
       fixtures_http_vertical.rs    # [keep] rootless deterministic fixture pipeline
       http_test_server.rs          # [keep] crate-local HTTP support, single consumer
       support/mod.rs               # [keep] crate-local test support, single consumer
-      etl_contract.rs              # [ok] ETL command contract through application seam
+      etl_contract.rs              # [ok] application ETL contract via public APIs (publication, idempotent rerun, output-root equivalence, corruption fail-closed, checkpoint repair)
 
     crates/chronicle-cli/tests/
       cli_contract.rs              # [trans] split by responsibility (task 3.5): arg/exit/rendering
@@ -271,7 +271,7 @@ Classification rule for command surfaces: a documented user-facing feature contr
 
 Record acceptance note: successful real record requires eBPF, so portable failure/fixture-support contracts and privileged public-record acceptance are split; an internal fixture command must not become the sole evidence for the public feature.
 
-ETL coverage note — internal command, not Smoke/Acceptance: the CLI-only fixture path cannot produce WAL recorder metadata (recording identity is written by the real recorder), so the current `tests/acceptance/test_etl.py` proves the internal ETL command's rootless fail-closed contracts (metadata-less WAL rejected, identity mismatch rejected), and `tests/smoke/test_smoke.py` adds an `internal etl` liveness case. ETL currently has no documented public user surface, so ALL internal ETL coverage is **[trans]**: `acceptance:etl-process`, `smoke:etl-minimal-start`, `tests/acceptance/test_etl.py`, and the smoke `internal etl` case converge on the single Integration owner `integration:etl-contract` owned by the chronicle-application/CLI boundary (task 4.3) and must not remain gated as Smoke or Acceptance. Exhaustive ETL idempotence/corruption matrices move to `chronicle-etl` integration (task 3.3). If ETL is later exposed as a documented public command, public ETL acceptance is added separately; an internal command MUST NOT be the sole evidence for a documented user-facing capability.
+ETL coverage note — two distinct responsibilities: (1) **Application ETL behavior** — `crates/chronicle-application/tests/etl_contract.rs` proves publication, canonical session/manifest generation, idempotent rerun, equivalence across output roots, corruption fail-closed, and checkpoint repair/recovery by calling application APIs directly; it stays `integration:etl-contract` owned by chronicle-application. (2) **Internal ETL CLI contract** — `chronicle internal etl` command parsing/wiring, process execution, argument mapping, exit codes, output/error rendering, and fail-closed CLI behavior; current `tests/acceptance/test_etl.py` and the smoke `internal etl` case are **[trans]** and move to the CLI-owned Integration contract (`integration:cli-contract`, or `integration:internal-etl-cli-contract` when a separate ID gives real selection benefit; task 4.3). ETL currently has no documented public user surface, so no Smoke or Acceptance classification survives for the internal ETL seam. Exhaustive ETL idempotence/corruption matrices stay in `chronicle-etl` integration (task 3.3). If ETL is later exposed as a documented public command, public ETL acceptance is added separately; an internal command MUST NOT be the sole evidence for a documented user-facing capability.
 
 ### 7. Rootless E2E
 
@@ -484,7 +484,7 @@ No speculative directory or file creation is required to reach this target; real
 | `tests/support/process.py` | **[ok]** | 3 consumers. |
 | `tests/support/http_driver.py` | **[plan]**/**[trans]** | Mandatory migration of `tests/e2e/http_acceptance_driver.py` + its self-test (task 4.4, reopened); not moved in this task. |
 | `tests/smoke/` | **[ok]** | Single combined `test_smoke.py` retained while small. |
-| `tests/acceptance/` | **[ok]** | Flat per-feature files; subdirs when suites grow. ETL entry reclassifying to `integration:internal-etl-cli-contract` (4.3, reopened). |
+| `tests/acceptance/` | **[ok]** | Flat per-feature files; subdirs when suites grow. ETL split: application contract stays `integration:etl-contract`; internal ETL CLI seam reclassifies to CLI-owned Integration (4.3, reopened). |
 | support → e2e dependency | **[trans]** | `tests/support/process.py` DRIVER reference; removed by task 4.4 (reopened). |
 | `tests/e2e/test_rootless_pipeline.py` | **[ok]** | Canonical rootless composition. |
 | `tests/privileged/` | **[plan]** | Ownership categories defined (§8); created only as tests migrate (8.x). |

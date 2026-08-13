@@ -33,8 +33,8 @@ Unit tests SHALL prove local function, module, parser, serializer, validation, c
 
 #### Scenario: User feature
 
-- **WHEN** required proof is documented record, inspect, ETL, or replay behavior
-- **THEN** black-box acceptance test uses public CLI, process, filesystem/storage, documented API, or network surfaces
+- **WHEN** required proof is a documented public record, inspect, replay, or other user-facing feature contract — including ETL only when ETL has a documented public user surface
+- **THEN** black-box acceptance test uses public CLI, process, filesystem/storage, documented API, or network surfaces; `chronicle internal etl` is not public ETL Acceptance
 
 #### Scenario: Complete composition
 
@@ -231,7 +231,12 @@ Acceptance SHALL prove a documented user-facing feature contract through support
 #### Scenario: Smoke convergence for internal ETL
 
 - **WHEN** internal ETL coverage appears in both smoke (`smoke:etl-minimal-start` / `internal etl` liveness case) and acceptance (`acceptance:etl-process`)
-- **THEN** all internal ETL coverage converges to one Integration owner (for example `integration:etl-contract`) unless each layer retains a genuinely different documented invariant; the seam is not simultaneously Smoke + Acceptance + Integration
+- **THEN** all internal ETL CLI coverage converges to one CLI-owned Integration owner (for example `integration:cli-contract`) while application ETL behavior remains separately owned by `integration:etl-contract` under chronicle-application; the seam is not simultaneously Smoke + Acceptance + Integration
+
+#### Scenario: Internal command is not public feature evidence
+
+- **WHEN** a documented user-facing capability can only be exercised through an internal command seam
+- **THEN** the internal command is not counted as Acceptance for that capability; Acceptance requires a documented public surface and is added in a future change if one is exposed
 
 #### Scenario: Internal seam convenience
 
