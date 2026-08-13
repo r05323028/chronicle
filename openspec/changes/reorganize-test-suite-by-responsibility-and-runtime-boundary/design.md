@@ -132,8 +132,8 @@ Migration order:
 3. Separate portable Cargo/repository checks from privileged profiles.
 4. Establish rootless smoke/acceptance/E2E coverage using existing fixtures and public surfaces.
 5. Extract environment preparation and route classified privileged tests through it.
-6. Remove duplicate/gate-oriented implementations only after lower-cost replacement and required privileged sample both pass.
-7. Update validation groups, CI, docs, and `AGENTS.md`; then collect fresh/reused compatible gate evidence as required.
+6. Remove duplicate/gate-oriented implementations only after lower-cost replacement and required privileged sample both pass; post-migration cleanup of obsolete infrastructure (tasks section 11) completes BEFORE fresh final supported-platform proof is collected (task 10.4), so retained evidence reflects the post-cleanup checkout.
+7. Update validation groups, CI, docs, and `AGENTS.md`; then run final coverage comparison (10.3), the no-dead-infrastructure invariant (11.10), and collect fresh/reused compatible gate evidence as required.
 
 Rollback keeps old gate path available until new selection demonstrates equivalent required scenario coverage. Persisted product data needs no migration.
 
@@ -265,7 +265,7 @@ Responsibility: prove one documented user-facing Chronicle capability through pu
 
 Rules: no direct imports of internal Chronicle crates; no exhaustive parser/WAL/ETL/checkpoint/replay matrices; no assertion merely because an internal file is easy to inspect.
 
-Classification rule for command surfaces: documented public CLI/API behavior → acceptance; internal command / internal compatibility seam → integration/internal contract owned by the appropriate application/CLI boundary. An internal command MUST NOT be the sole evidence for a documented user-facing capability.
+Classification rule for command surfaces: a documented user-facing feature contract → acceptance; public executable liveness / minimal invocation → smoke; CLI argument / rendering / exit-code contract → integration when proving a component or binary contract; internal command / internal compatibility seam → integration/internal contract owned by the appropriate application/CLI boundary. Merely using a public CLI/API surface does not make a test Acceptance. An internal command MUST NOT be the sole evidence for a documented user-facing capability.
 
 Record acceptance note: successful real record requires eBPF, so portable failure/fixture-support contracts and privileged public-record acceptance are split; an internal fixture command must not become the sole evidence for the public feature.
 
@@ -408,9 +408,9 @@ Current state **[trans]**: `tests/support/process.py` still references `tests/e2
 ### 15. Test assertion ownership decision tree
 
     Does it prove local implementation logic?                 → unit
-    Does it prove a crate/component contract?                 → integration
+    Does it prove a crate/component/binary contract?          → integration
     Does it only prove an executable/entry point is alive?    → smoke
-    Does it prove one documented user-facing feature?         → acceptance
+    Does it prove a documented user-facing feature contract?  → acceptance
     Does it prove the complete Chronicle composed path?       → E2E
     Does the assertion itself require real supported
     Linux/kernel/eBPF/system resources?                       → same functional layer + privileged environment
@@ -489,7 +489,7 @@ No speculative directory or file creation is required to reach this target; real
 | `scripts/acceptance/lib/scenarios/{p1,p2,...}` | **[trans]** | Gate-owned storage being replaced by selectors (8.x); removed after mapping (8.5). |
 | `validation/test-architecture/` | **[ok]** | Catalog/ledger/gate/schema metadata in place. |
 | P1/P2 as directories | **[obsolete]** | Prohibited (§13); existing gate-oriented storage is transitional. |
-| Post-migration cleanup | **[plan]** | Section 11 of tasks.md: remove obsolete wrappers/runner logic/helpers/fixtures/generated artifacts/empty scaffolding after replacement proof and gate mapping. |
+| Post-migration cleanup | **[plan]** | Section 11 of tasks.md: remove obsolete wrappers/runner logic/helpers/fixtures/generated artifacts/empty scaffolding after replacement proof and gate mapping and BEFORE final supported proof (10.4). |
 
 ## Risks / Trade-offs
 

@@ -4,7 +4,7 @@
 
 Every significant Chronicle test SHALL be classified as exactly one functional layer: unit, integration, smoke, acceptance, or end-to-end. Selected layer MUST be lowest-cost layer that can conclusively prove behavior. Privileged execution, P1, and P2 SHALL NOT be functional test layers.
 
-Unit tests SHALL prove local function, module, parser, serializer, validation, calculation, or state-machine logic. Integration tests SHALL prove public crate/component contracts and meaningful deterministic combinations. Smoke tests SHALL prove shipped executables and basic entry points start or reject invalid startup sanely. Acceptance tests SHALL prove one documented user-facing feature through supported external surfaces. End-to-end tests SHALL prove important invariants across complete composed Chronicle path.
+Unit tests SHALL prove local function, module, parser, serializer, validation, calculation, or state-machine logic. Integration tests SHALL prove public crate/component/binary contracts and meaningful deterministic combinations. Smoke tests SHALL prove shipped executables and basic entry points start or reject invalid startup sanely. Acceptance tests SHALL prove a documented user-facing feature contract through supported public/external surfaces. End-to-end tests SHALL prove important invariants across complete composed Chronicle path. Merely using a public CLI/API surface does not make a test Acceptance: public executable liveness is smoke, and CLI argument/rendering/exit-code contracts are integration when proving a component or binary contract.
 
 #### Scenario: Local parser behavior
 
@@ -201,12 +201,17 @@ Every non-stay disposition SHALL state responsibility/reliability reason, replac
 
 ### Requirement: Internal command coverage is integration, not acceptance
 
-Documented public CLI/API behavior SHALL be classified as acceptance. Internal commands and internal compatibility seams SHALL be classified as integration/internal-contract tests owned by the appropriate application/CLI boundary, not as user acceptance. An internal command MUST NOT be the sole evidence for a documented user-facing capability; public acceptance of that capability SHALL be added separately when a documented public surface exists.
+Acceptance SHALL prove a documented user-facing feature contract through supported public/external surfaces. Merely using a public CLI/API surface does not make a test Acceptance: public executable liveness is smoke, CLI argument/rendering/exit-code contracts are integration when proving a component or binary contract, and only documented user-facing feature behavior is acceptance. Internal commands and internal compatibility seams SHALL be classified as integration/internal-contract tests owned by the appropriate application/CLI boundary, never as Acceptance. An internal command MUST NOT be the sole evidence for a documented user-facing capability; public acceptance of that capability SHALL be added separately when a documented public surface exists.
 
 #### Scenario: Public command acceptance
 
 - **WHEN** behavior is a documented user-facing command invoked through supported external surfaces
 - **THEN** acceptance proves it through public CLI, process, filesystem/storage, API, or network surfaces
+
+#### Scenario: Public surface is not acceptance
+
+- **WHEN** a test exercises the public binary only for liveness or for argument/rendering/exit-code contract
+- **THEN** it classifies as smoke or integration, not acceptance
 
 #### Scenario: Internal seam convenience
 
