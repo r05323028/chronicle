@@ -132,7 +132,7 @@ Migration order:
 3. Separate portable Cargo/repository checks from privileged profiles.
 4. Establish rootless smoke/acceptance/E2E coverage using existing fixtures and public surfaces.
 5. Extract environment preparation and route classified privileged tests through it.
-6. Remove duplicate/gate-oriented implementations only after lower-cost replacement and required privileged sample both pass; post-migration cleanup of obsolete infrastructure (tasks section 11) completes BEFORE fresh final supported-platform proof is collected (task 10.4), so retained evidence reflects the post-cleanup checkout.
+6. Remove duplicate/gate-oriented implementations only after portable replacement proof, complete gate mapping, and any explicitly required migration-time privileged equivalence sample pass. Migration-time privileged samples are PROVISIONAL equivalence evidence only and are distinct from final retained supported-platform evidence: final evidence is task 10.4 and MUST run after cleanup. Post-migration cleanup of obsolete infrastructure (tasks section 11) completes BEFORE task 10.4, so retained evidence reflects the post-cleanup checkout.
 7. Update validation groups, CI, docs, and `AGENTS.md`; then run final coverage comparison (10.3), the no-dead-infrastructure invariant (11.10), and collect fresh/reused compatible gate evidence as required.
 
 Rollback keeps old gate path available until new selection demonstrates equivalent required scenario coverage. Persisted product data needs no migration.
@@ -251,6 +251,8 @@ Responsibilities: `test_cli.py` — `--help`, basic usage errors, binary livenes
 
 Smoke rules: black-box, fast, bounded, shallow, no exhaustive correctness, no arbitrary time-based synchronization, no full workflow.
 
+Internal commands are not Smoke proof merely because they can be invoked as subprocesses. Deterministic internal fixture setup MAY prepare state for a public invocation (e.g. internal fixture setup → public inspect invocation still proves inspect liveness), because the internal helper is setup, not the assertion target. An internal command invocation cannot itself prove public Smoke when that command has no documented public surface (e.g. `chronicle internal etl` proves no public ETL liveness).
+
 ### 6. Acceptance tests
 
     tests/acceptance/
@@ -269,7 +271,7 @@ Classification rule for command surfaces: a documented user-facing feature contr
 
 Record acceptance note: successful real record requires eBPF, so portable failure/fixture-support contracts and privileged public-record acceptance are split; an internal fixture command must not become the sole evidence for the public feature.
 
-ETL coverage note — internal command, not user acceptance: the CLI-only fixture path cannot produce WAL recorder metadata (recording identity is written by the real recorder), so the current `tests/acceptance/test_etl.py` proves the internal ETL command's rootless fail-closed contracts (metadata-less WAL rejected, identity mismatch rejected). ETL currently has no documented public user surface, so the catalog ID `acceptance:etl-process` is **[trans]**: it reclassifies to `integration:internal-etl-cli-contract` owned by the chronicle-application/CLI boundary (task 4.3) and must not remain gated as acceptance. Exhaustive ETL idempotence/corruption matrices move to `chronicle-etl` integration (task 3.3). If ETL is later exposed as a documented public command, public ETL acceptance is added separately; an internal command MUST NOT be the sole evidence for a documented user-facing capability.
+ETL coverage note — internal command, not Smoke/Acceptance: the CLI-only fixture path cannot produce WAL recorder metadata (recording identity is written by the real recorder), so the current `tests/acceptance/test_etl.py` proves the internal ETL command's rootless fail-closed contracts (metadata-less WAL rejected, identity mismatch rejected), and `tests/smoke/test_smoke.py` adds an `internal etl` liveness case. ETL currently has no documented public user surface, so ALL internal ETL coverage is **[trans]**: `acceptance:etl-process`, `smoke:etl-minimal-start`, `tests/acceptance/test_etl.py`, and the smoke `internal etl` case converge on the single Integration owner `integration:etl-contract` owned by the chronicle-application/CLI boundary (task 4.3) and must not remain gated as Smoke or Acceptance. Exhaustive ETL idempotence/corruption matrices move to `chronicle-etl` integration (task 3.3). If ETL is later exposed as a documented public command, public ETL acceptance is added separately; an internal command MUST NOT be the sole evidence for a documented user-facing capability.
 
 ### 7. Rootless E2E
 
@@ -283,6 +285,8 @@ Canonical rootless flow: synthetic capture input → record/WAL → ETL → cano
 Responsibility: prove complete Chronicle subsystem composition without a real privileged capture environment. Assertions limited to important cross-stage invariants: stage output consumable by the next stage; session identity continuity; correlation continuity; operation survival; replay executes expected operations; verification succeeds. Do not repeat lower-level correctness matrices.
 
 As the protocol matrix grows this may evolve into `tests/e2e/{http,postgres,mysql}/...`; speculative empty directories are not created.
+
+Internal deterministic fixture seams MAY be used as E2E setup (e.g. record-fixture → WAL → ETL → canonical → replay → verification) without reclassifying the whole suite as Integration; the unique assertion remains complete pipeline composition, so the E2E stays E2E. However, an E2E using `record-fixture` MUST NOT claim the fixture proves the public `record` feature; the internal fixture seam is setup, not public Record acceptance evidence. Distinguish `internal command is the assertion target` (→ integration/internal contract) from `internal command is only deterministic test setup for a complete composed pipeline assertion` (→ E2E may remain E2E).
 
 ### 8. Privileged tests (root black-box tree)
 

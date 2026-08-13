@@ -4,7 +4,7 @@
 
 Every significant Chronicle test SHALL be classified as exactly one functional layer: unit, integration, smoke, acceptance, or end-to-end. Selected layer MUST be lowest-cost layer that can conclusively prove behavior. Privileged execution, P1, and P2 SHALL NOT be functional test layers.
 
-Unit tests SHALL prove local function, module, parser, serializer, validation, calculation, or state-machine logic. Integration tests SHALL prove public crate/component/binary contracts and meaningful deterministic combinations. Smoke tests SHALL prove shipped executables and basic entry points start or reject invalid startup sanely. Acceptance tests SHALL prove a documented user-facing feature contract through supported public/external surfaces. End-to-end tests SHALL prove important invariants across complete composed Chronicle path. Merely using a public CLI/API surface does not make a test Acceptance: public executable liveness is smoke, and CLI argument/rendering/exit-code contracts are integration when proving a component or binary contract.
+Unit tests SHALL prove local function, module, parser, serializer, validation, calculation, or state-machine logic. Integration tests SHALL prove public crate/component/binary contracts and meaningful deterministic combinations. Smoke tests SHALL prove shipped executables and basic entry points start or reject invalid startup sanely. Acceptance tests SHALL prove a documented user-facing feature contract through supported public/external surfaces. End-to-end tests SHALL prove important invariants across complete composed Chronicle path. Merely using a public CLI/API surface does not make a test Acceptance, and merely invoking a subprocess does not make a test Smoke: public executable liveness is smoke, and CLI argument/rendering/exit-code contracts are integration when proving a component or binary contract.
 
 #### Scenario: Local parser behavior
 
@@ -18,8 +18,18 @@ Unit tests SHALL prove local function, module, parser, serializer, validation, c
 
 #### Scenario: Executable liveness
 
-- **WHEN** required proof is that `chronicle --help`, `--version`, startup, or one minimal valid/invalid invocation works
+- **WHEN** required proof is that `chronicle --help` (and `--version` when the binary exposes it), startup, or one minimal valid/invalid public invocation works
 - **THEN** bounded black-box smoke test proves only that entry-point contract
+
+#### Scenario: Fixture setup is not the assertion target
+
+- **WHEN** smoke prepares state with an internal fixture seam and then invokes a public entry point (for example internal fixture setup → public inspect invocation)
+- **THEN** smoke may still prove public liveness because the internal helper is setup, not the assertion target
+
+#### Scenario: Internal command as smoke
+
+- **WHEN** a test only proves an internal command can run as a subprocess (for example `chronicle internal etl`) and the command has no documented public surface
+- **THEN** it classifies as an integration/internal contract, not smoke
 
 #### Scenario: User feature
 
@@ -81,6 +91,11 @@ Chronicle SHALL provide deterministic rootless E2E coverage from synthetic captu
 
 - **WHEN** deterministic capture fixture enters pipeline
 - **THEN** rootless E2E proves WAL-to-ETL-to-canonical-to-replay compatibility and verification without eBPF or Multipass
+
+#### Scenario: Fixture seam as E2E setup
+
+- **WHEN** rootless E2E injects synthetic capture evidence through an internal fixture command (for example record-fixture → WAL → ETL → canonical → replay → verification)
+- **THEN** the suite remains E2E because the unique assertion is complete pipeline composition, and the fixture seam is setup, not public Record acceptance evidence
 
 #### Scenario: Downstream corruption matrix
 
@@ -212,6 +227,11 @@ Acceptance SHALL prove a documented user-facing feature contract through support
 
 - **WHEN** a test exercises the public binary only for liveness or for argument/rendering/exit-code contract
 - **THEN** it classifies as smoke or integration, not acceptance
+
+#### Scenario: Smoke convergence for internal ETL
+
+- **WHEN** internal ETL coverage appears in both smoke (`smoke:etl-minimal-start` / `internal etl` liveness case) and acceptance (`acceptance:etl-process`)
+- **THEN** all internal ETL coverage converges to one Integration owner (for example `integration:etl-contract`) unless each layer retains a genuinely different documented invariant; the seam is not simultaneously Smoke + Acceptance + Integration
 
 #### Scenario: Internal seam convenience
 
