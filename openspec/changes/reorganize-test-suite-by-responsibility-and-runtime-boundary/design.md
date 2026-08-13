@@ -137,6 +137,349 @@ Migration order:
 
 Rollback keeps old gate path available until new selection demonstrates equivalent required scenario coverage. Persisted product data needs no migration.
 
+## Target Test Directory Architecture
+
+This section is the architectural contract for where Chronicle tests live. It defines responsibility and ownership, not aesthetics. Every directory and representative file below has one owner and one purpose; anything that does not fit a listed location is either misclassified or missing an owner.
+
+Status legend used throughout:
+
+- **[ok]** — already compliant; current layout matches target responsibility.
+- **[trans]** — transitional; exists at an interim location and migrates to the target owner as implementation tasks land.
+- **[plan]** — planned; does not exist yet and is created only when real tests migrate (never as empty scaffolding).
+- **[keep]** — intentionally retained at current location with an explicit reason.
+
+The final authoritative path set is `validation/test-architecture/test-catalog.toml`; this section is the responsibility contract that catalog paths must satisfy.
+
+### 1. Crate-local unit tests
+
+    crates/<crate>/
+    └── src/
+        └── **/*.rs                 # #[cfg(test)] mod tests — unit
+
+**[ok]**. All 42 colocated Rust unit-test files stay under `crates/<crate>/src/**`; no centralized `tests/unit/` directory exists or will be created.
+
+Responsibility: local function/module correctness — parsing edge cases, serialization rules, state machines, normalization, local retry/checkpoint calculations, validation rules, pure correlation/session logic, WAL primitive encoding/checksum logic.
+
+Rules: deterministic; no subprocess; no complete Chronicle binary; no real daemon lifecycle; no Multipass; no real eBPF requirement.
+
+> Unit tests stay colocated with implementation.
+
+### 2. Crate integration tests
+
+    crates/<crate>/
+    └── tests/
+        └── *.rs                   # integration — public contract of owning crate
+
+Responsibility: prove the public contract of the owning crate or a deliberately owned component composition, through public APIs and allowed dev edges.
+
+Representative target tree (current files in parentheses):
+
+    crates/chronicle-wal/tests/
+      wal_matrix.rs                # [ok] WAL encode/decode/recovery/corruption matrix
+      recovery.rs                  # [plan] crash-point recovery contracts (split from privileged)
+      corruption.rs                # [plan] deterministic copied-WAL corruption matrix (task 3.2)
+
+    crates/chronicle-etl/tests/
+      checkpoint.rs                # [plan] checkpoint transaction/fault matrix (task 3.3)
+      publication.rs               # [plan] publication/restart/idempotence contracts (task 3.3)
+      incremental.rs               # [plan] incremental ETL continuation (task 3.3)
+      corruption.rs                # [plan] ETL corruption fail-closed matrix (task 3.3)
+
+    crates/chronicle-replay/tests/
+      planner.rs                   # [plan] replay plan construction (task 3.4)
+      executor.rs                  # [plan] replay execution contracts (task 3.4)
+      partial_execution.rs         # [plan] partial/aborted replay behavior (task 3.4)
+      verifier.rs                  # [plan] verification matching/policy (task 3.4)
+
+    crates/chronicle-application/tests/
+      fake_vertical.rs             # [keep] rootless synthetic composition contract via public APIs
+      fixtures_http_vertical.rs    # [keep] rootless deterministic fixture pipeline
+      http_test_server.rs          # [keep] crate-local HTTP support, single consumer
+      support/mod.rs               # [keep] crate-local test support, single consumer
+      etl_contract.rs              # [ok] ETL command contract through application seam
+
+    crates/chronicle-cli/tests/
+      cli_contract.rs              # [trans] split by responsibility (task 3.5): arg/exit/rendering
+                                   #         stays CLI integration; liveness→smoke; features→acceptance;
+                                   #         composition→E2E
+
+These are target responsibilities; exact filenames follow current Chronicle ownership as implemented and recorded in `migration-ledger.toml`, not this tree verbatim.
+
+Rules: temporary directories allowed; deterministic real WAL files allowed; fixtures allowed; fake/in-memory adapters allowed; local loopback networking allowed for an owned contract when justified; full product orchestration does not normally live here; portable correctness must not be moved into privileged tests just because Linux can run it.
+
+### 3. Privileged crate integration tests
+
+Privilege is an environment dimension, not a functional layer. Some crate integration tests are therefore integration tests whose environment is privileged:
+
+    crates/chronicle-capture-ebpf/tests/
+      privileged_adapter.rs        # [keep] layer=integration, env=privileged — real eBPF attach/capture
+      privileged_feasibility.rs    # [trans] split (task 3.6): kernel feasibility stays privileged;
+                                   #         loss state machine moved rootless to
+                                   #         crates/chronicle-capture/tests/loss_window_model.rs [ok]
+
+    crates/chronicle-cli/tests/
+      privileged_signal.rs         # [keep] layer=integration, env=privileged — real cgroup/signal behavior
+
+Assertions must genuinely require supported real OS/kernel behavior: real eBPF program load, attach, BTF, ring-buffer behavior, kernel ABI behavior, process/cgroup signal behavior. Portable state machines or data-model assertions are split out (task 3.6 shows the pattern).
+
+### 4. Root black-box support
+
+    tests/
+    └── support/                   # shared black-box infrastructure — not a test classification
+        ├── __init__.py
+        ├── process.py             # [ok] bounded process/readiness/deadline/cleanup support
+        ├── http_driver.py         # [plan] shared workload/replay target (migrate from tests/e2e/ per 4.4)
+        ├── fixtures.py            # [plan] optional — only shared path/fixture construction with real duplication
+        └── assertions.py          # [plan] optional — only small reusable black-box assertions with real duplication
+
+These files are infrastructure, not product-test classifications; nothing in `tests/support/` is itself proof of Chronicle behavior.
+
+- `process.py` — **[ok]**, 3 consumers (smoke/acceptance/e2e). Bounded command execution, subprocess ownership, readiness waiting, deadline handling, deterministic shutdown, temp roots, output parsing, reusable public CLI invocation. Must not contain broad product assertions.
+- `http_driver.py` — **[plan]**. Local HTTP server, deterministic workload generation, request logging, mismatch response mode, readiness signaling. The current `tests/e2e/http_acceptance_driver.py` **[trans]** carries this responsibility and stays in place with explicit infrastructure classification (task 4.4) until migration; it is support infrastructure, not E2E proof by itself.
+- `fixtures.py` / `assertions.py` — **[plan]**, created only when genuine duplication exists. Must not recreate Chronicle's internal domain model in Python; one-owner fixtures stay local.
+
+### 5. Smoke tests
+
+    tests/smoke/
+    ├── test_smoke.py              # [keep] single combined file — acceptable while the suite is small
+    └── (conceptual per-surface split: test_cli.py, test_record.py, test_inspect.py,
+         test_etl.py, test_replay.py — split only when a surface's smoke contract outgrows one file)
+
+The current single `tests/smoke/test_smoke.py` covers help, usage error, empty-list, missing-fixture error, unsupported-build record failure, and minimal fixture liveness. This tree expresses responsibility, not a required file split.
+
+Responsibilities: `test_cli.py` — `--help`, basic usage errors, binary liveness, minimal argument-handling sanity; `test_record.py` — only minimal record startup/liveness or supported fast-failure behavior, never full capture-to-replay; `test_inspect.py` — minimal successful or safe-failure invocation; `test_etl.py` — minimal supported ETL entry-point invocation (internal ETL liveness belongs to CLI/application integration contract, not pretend user acceptance — see §6); `test_replay.py` — minimal replay/dry-run liveness.
+
+Smoke rules: black-box, fast, bounded, shallow, no exhaustive correctness, no arbitrary time-based synchronization, no full workflow.
+
+### 6. Acceptance tests
+
+    tests/acceptance/
+    ├── test_record.py             # [ok] documented record behavior through public surfaces
+    ├── test_inspect.py            # [ok] user-visible inspection output and safe errors
+    ├── test_etl.py                # [keep] internal-command fail-closed contracts (see note)
+    └── test_replay.py             # [ok] dry-run, authorization, successful replay, verification, mismatch exit
+
+Flat per-feature files are acceptable while the suite is small. Subdirectories (`tests/acceptance/{record,inspect,etl,replay}/`) become useful when a feature accumulates several independent suites or shared per-feature fixtures; do not create them speculatively.
+
+Responsibility: prove one documented user-facing Chronicle capability through public surfaces — CLI, process behavior, documented network surfaces, filesystem/storage artifacts users observe.
+
+Rules: no direct imports of internal Chronicle crates; no exhaustive parser/WAL/ETL/checkpoint/replay matrices; no assertion merely because an internal file is easy to inspect.
+
+Record acceptance note: successful real record requires eBPF, so portable failure/fixture-support contracts and privileged public-record acceptance are split; an internal fixture command must not become the sole evidence for the public feature.
+
+ETL acceptance note: the CLI-only fixture path cannot produce WAL recorder metadata (recording identity is written by the real recorder), so `acceptance:etl-process` proves the ETL command's rootless fail-closed contracts (metadata-less WAL rejected, identity mismatch rejected). This is **[keep]** intentional internal-command coverage (task 4.3): ETL is exercised as a deterministic rootless surface while exhaustive ETL idempotence/corruption matrices move to `chronicle-etl` integration (task 3.3). Public ETL acceptance through real record output remains privileged on supported Linux.
+
+### 7. Rootless E2E
+
+    tests/e2e/
+    ├── test_rootless_pipeline.py  # [ok] synthetic capture → WAL → ETL → canonical → replay → verification
+    └── http_acceptance_driver.py  # [trans] infrastructure; migrates to tests/support/ per task 4.4
+        test_http_acceptance_driver.py  # [trans] its rootless self-test
+
+Canonical rootless flow: synthetic capture input → record/WAL → ETL → canonical publication → inspect/stage consumption → replay → verification.
+
+Responsibility: prove complete Chronicle subsystem composition without a real privileged capture environment. Assertions limited to important cross-stage invariants: stage output consumable by the next stage; session identity continuity; correlation continuity; operation survival; replay executes expected operations; verification succeeds. Do not repeat lower-level correctness matrices.
+
+As the protocol matrix grows this may evolve into `tests/e2e/{http,postgres,mysql}/...`; speculative empty directories are not created.
+
+### 8. Privileged tests (root black-box tree)
+
+    tests/privileged/              # [plan] created only as real privileged black-box tests migrate
+    ├── capture/
+    │   ├── test_real_capture.py
+    │   ├── test_cgroup_filtering.py
+    │   └── test_process_attribution.py
+    ├── acceptance/
+    │   ├── test_record.py
+    │   ├── test_recorder_readiness.py
+    │   └── test_systemd_lifecycle.py
+    ├── e2e/
+    │   └── test_capture_pipeline.py
+    ├── recovery/
+    │   └── test_reboot_recovery.py
+    └── resources/
+        └── test_quota_pressure.py
+
+These are ownership categories, not required immediate directories. Crate-owned kernel contracts (e.g. `crates/chronicle-capture-ebpf/tests/privileged_adapter.rs`) may remain in their crate; root `tests/privileged/` hosts cross-crate/process/system black-box assertions.
+
+The design distinguishes **functional layer** from **privileged environment requirement**:
+
+- `tests/privileged/e2e/test_capture_pipeline.py` → layer = e2e, environment = privileged.
+- `crates/chronicle-capture-ebpf/tests/privileged_adapter.rs` → layer = integration, environment = privileged.
+- `tests/privileged/acceptance/test_record.py` → layer = acceptance, environment = privileged.
+
+### 9. Minimal privileged E2E
+
+Canonical privileged E2E: real workload → real eBPF capture → WAL → ETL → canonical → replay → verification.
+
+Unique purpose: prove real kernel capture output feeds a replayable Chronicle pipeline. It must not rerun the entire WAL matrix, complete ETL corruption matrix, replay algorithm matrix, fmt, Clippy, workspace tests, or repository architecture validation — those are prerequisites selected separately by validation. There are very few privileged E2E cases (one; task 5.3).
+
+### 10. Scripts directory is not a product test tree
+
+    scripts/
+    ├── validate.sh                # [ok] stable developer/release entry point (fast/targeted/gate/release)
+    ├── validation.py              # [ok] selection, catalog, gate mapping, fingerprinting, evidence reuse, reporting
+    ├── run-with-timeout.sh        # [ok] bounded command execution wrapper
+    ├── acceptance/                # [trans] gate-oriented scenario storage being replaced by selectors
+    │   └── lib/scenarios/{shared,extensions/p1,extensions/p2,p2}/   # [trans] task 8.x; removed after mapping
+    ├── privileged/                # [trans] environment preparation/execution/evidence
+    │   ├── preflight.py           # [ok] supported/unsupported_environment/infrastructure_error contract
+    │   ├── prepare-vm.sh          # [plan] task 7.2
+    │   ├── multipass-run.sh       # [plan] task 7.2
+    │   ├── executor.py            # [plan] task 7.2 — selected test IDs only, no product assertions
+    │   ├── collect-evidence.py    # [plan] task 7.2
+    │   └── cleanup.sh             # [plan] task 7.2
+    └── tests/                     # [ok] validation/runner tooling self-tests
+        ├── validation/            # selector/catalog/preflight/ledger/architecture meta-tests
+        └── acceptance/            # runner/report/wait/readiness tooling tests
+
+`scripts/validate.sh` orchestrates and selects tests; it must not encode Chronicle product correctness assertions. `scripts/validation.py` owns changed-path selection, dependency-aware test selection, test catalog handling, gate mapping, fingerprinting, evidence reuse decisions, reporting, and orchestration metadata.
+
+`scripts/privileged/` obtains and manages a supported privileged execution environment: Multipass VM ensure/start, readiness, bootstrap, source/artifact transfer, preflight, remote execution, reboot handoff, cleanup, evidence collection/sealing.
+
+> Privileged orchestration knows how and where to run a selected test; it does not own the product assertion.
+
+Eventually the executor consumes selected catalog IDs (`integration:capture-ebpf-privileged-feasibility`, `e2e:privileged-capture-pipeline`) without hardcoding portable WAL/ETL/replay correctness.
+
+### 11. Script tooling tests
+
+    scripts/tests/validation/
+      test_layered_validation.py   # [ok] mode composition / selection semantics
+      test_test_architecture.py    # [ok] catalog + ledger structural validation
+      test_preflight.py            # [ok] preflight classifier outcomes
+      test_sleep_policy.py         # [ok] sleep/condition-wait policy
+      test_lifecycle_cleanup.py    # [ok] deterministic cleanup contracts
+      test_select_fixtures.py      # [ok] dependency-aware selection fixtures
+      test_evidence_reuse.py       # [ok] evidence reuse decisions
+      test_architecture_boundaries.py  # [ok] dev/build edge enforcement
+
+    scripts/tests/acceptance/
+      test_runner.py               # [ok] runner/selector orchestration
+      test-wait.sh                 # [ok] bounded condition waits
+      test-p1-privileged-runner.sh # [ok] profile runner contracts
+      test-p2-privileged-runner.sh # [ok] profile runner contracts
+      test-p2-readiness.sh         # [ok] readiness convergence
+
+Responsibility: test Chronicle's testing/validation infrastructure itself. These are not product acceptance tests. `scripts/tests/validation/test_preflight.py` tests the privileged preflight classifier; it does not prove Chronicle's eBPF product behavior.
+
+### 12. Validation architecture metadata
+
+    validation/
+    └── test-architecture/         # [ok] machine-readable policy + coverage mapping
+        ├── README.md
+        ├── test-catalog.toml      # test ID, layer, environment, owner, command, gate membership, status
+        ├── gate-coverage.toml     # P1/P2/release obligations → classified tests
+        ├── migration-ledger.toml  # old assertion → target layer → owner → replacement → disposition
+        ├── privileged-preflight-schema.toml  # stable environment/result classification
+        ├── baseline.json          # before-state inventory
+        ├── decisions.md           # deliberate per-suite migration decisions
+        ├── boundary-review.md     # helper ownership / dependency direction
+        ├── process-patterns.md    # lifecycle pattern inventory
+        └── path-classification.md # per-path layer/environment classification
+
+Metadata does not itself prove product correctness; it makes classification and gate mapping machine-checkable.
+
+### 13. P1/P2 are selectors, not test directories
+
+These are undesirable as structural locations:
+
+    tests/p1/            ✗
+    tests/p2/            ✗
+    tests/privileged/p1/ ✗
+    tests/privileged/p2/ ✗
+
+P1 selects classified proofs required by P1; P2 selects classified proofs required by P2. They are not architectural ownership, and files are not named by milestone solely because a milestone currently invokes them. The current gate-oriented `scripts/acceptance/lib/scenarios/{extensions/p1,extensions/p2,p2}/` storage is **[trans]** and is replaced by selector configuration (tasks 8.x); obsolete wrappers are deleted only after mapped replacements pass (task 8.5).
+
+### 14. Desired dependency direction between root test directories
+
+    tests/smoke --------┐
+    tests/acceptance ---+----> tests/support
+    tests/e2e ----------┘
+
+No dependency such as `tests/acceptance → tests/e2e` or `tests/support → tests/e2e` exists merely to obtain shared infrastructure. If a helper is shared by acceptance and E2E, ownership belongs in `tests/support/`. This is particularly important for HTTP workload/replay drivers: both suites may consume `tests/support/http_driver.py`, but neither may import the other's suite to reach it. Crate-local support stays crate-local (e.g. `chronicle-application/tests/http_test_server.rs`) when only one consumer exists.
+
+### 15. Test assertion ownership decision tree
+
+    Does it prove local implementation logic?                 → unit
+    Does it prove a crate/component contract?                 → integration
+    Does it only prove an executable/entry point is alive?    → smoke
+    Does it prove one documented user-facing feature?         → acceptance
+    Does it prove the complete Chronicle composed path?       → E2E
+    Does the assertion itself require real supported
+    Linux/kernel/eBPF/system resources?                       → same functional layer + privileged environment
+
+The final question must not replace the functional classification:
+
+- real eBPF adapter test = integration + privileged
+- real record CLI feature = acceptance + privileged
+- real capture → replay pipeline = E2E + privileged
+
+### 16. Lowest-cost conclusive-proof rule
+
+> Every behavior MUST be proven at the lowest-cost layer that can conclusively prove it.
+
+    parser correctness                     → unit
+    WAL writer/reader/recovery             → integration
+    chronicle --help                       → smoke
+    replay user contract                   → acceptance
+    capture → WAL → ETL → replay           → E2E
+    real kernel capture                    → privileged integration/acceptance/E2E depending on the assertion
+
+Higher layers retain only the cross-boundary invariant they exist to prove.
+
+### 17. Final target overview
+
+    chronicle/
+    ├── crates/
+    │   └── <crate>/
+    │       ├── src/
+    │       │   └── **/*.rs            # unit
+    │       └── tests/
+    │           └── *.rs               # integration (privileged variant stays crate-owned where kernel contract)
+    │
+    ├── tests/
+    │   ├── support/                   # shared black-box infrastructure
+    │   ├── smoke/                     # executable liveness
+    │   ├── acceptance/                # individual user-facing features
+    │   ├── e2e/                       # complete rootless system path
+    │   └── privileged/                # black-box assertions whose environment must be privileged
+    │
+    ├── scripts/
+    │   ├── validate.sh
+    │   ├── validation.py
+    │   ├── run-with-timeout.sh
+    │   ├── privileged/                # environment preparation/execution/evidence
+    │   └── tests/                     # validation/runner tooling self-tests
+    │
+    └── validation/
+        └── test-architecture/         # catalog, gate mapping, migration metadata, schemas
+
+Architectural summary:
+
+> `tests/` defines what Chronicle proves.
+> `scripts/` defines how tests are selected, prepared, executed, bounded, and evidenced.
+> `validation/` defines machine-readable policy and coverage mapping.
+> P1/P2/release select classified tests; they do not own test implementations.
+
+### Current-state vs target-state reconciliation
+
+| Area | Status | Note |
+| --- | --- | --- |
+| Colocated unit tests | **[ok]** | 42 files stay under `crates/*/src/**`; no `tests/unit/`. |
+| Crate integration suites | **[ok]**/**[trans]** | Existing contracts stay; WAL/ETL/replay matrices planned per tasks 3.2–3.4; `cli_contract.rs` split (3.5). |
+| Privileged crate integration | **[keep]** | `privileged_adapter.rs`, `privileged_signal.rs` remain; `privileged_feasibility.rs` split (3.6, done). |
+| `tests/support/process.py` | **[ok]** | 3 consumers. |
+| `tests/support/http_driver.py` | **[plan]** | Migrate `tests/e2e/http_acceptance_driver.py` (task 4.4); not moved in this task. |
+| `tests/smoke/` | **[ok]** | Single combined `test_smoke.py` retained while small. |
+| `tests/acceptance/` | **[ok]** | Flat per-feature files; subdirs when suites grow. ETL internal-command coverage intentionally retained (4.3). |
+| `tests/e2e/test_rootless_pipeline.py` | **[ok]** | Canonical rootless composition. |
+| `tests/privileged/` | **[plan]** | Ownership categories defined (§8); created only as tests migrate (8.x). |
+| `scripts/privileged/` | **[trans]** | `preflight.py` exists; executor/prepare/collect/cleanup planned (7.2). |
+| `scripts/tests/` | **[ok]** | Tooling self-tests in place. |
+| `scripts/acceptance/lib/scenarios/{p1,p2,...}` | **[trans]** | Gate-owned storage being replaced by selectors (8.x); removed after mapping (8.5). |
+| `validation/test-architecture/` | **[ok]** | Catalog/ledger/gate/schema metadata in place. |
+| P1/P2 as directories | **[obsolete]** | Prohibited (§13); existing gate-oriented storage is transitional. |
+
 ## Risks / Trade-offs
 
 - **[Risk] Classification becomes subjective.** → Require assertion-level purpose, public surface, environment dependency, owner, and lowest-conclusive-layer rationale in ledger; review ambiguous cases before moves.
