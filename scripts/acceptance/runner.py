@@ -7,8 +7,8 @@ import argparse
 import base64
 import json
 import os
-import shutil
 import shlex
+import shutil
 import subprocess
 import sys
 import uuid
@@ -476,15 +476,29 @@ def run_profile(
                     failed.append(scenario)
             elif scenario not in not_checked:
                 not_checked.append(scenario)
+    legacy_status = status
+    scenario_state_error = False
+    try:
+        scenario_state = report.load_scenario_state(runtime_root, selected, profile)
+    except ValueError:
+        scenario_state = None
+        scenario_state_error = True
+    if scenario_state is not None:
+        completed, failed, not_checked = scenario_state
+        status = (
+            "passed"
+            if len(completed) == len(selected) and not failed and not not_checked
+            else "failed"
+            if failed
+            else "not_checked"
+        )
+        if legacy_status == "failed":
+            status = "failed"
     timeouts = report.timeout_records(runtime_root)
     if return_code == 77 and not failed:
         status = "not_checked"
-    if return_code not in {0, 77} or timeouts:
+    if return_code not in {0, 77} or timeouts or scenario_state_error:
         status = "failed"
-        if not failed:
-            failed = list(selected)
-            completed = []
-            not_checked = []
     phases_path = runtime_root / "phases.json"
     phase_evidence_error = False
     if phases_path.is_file():
@@ -509,9 +523,6 @@ def run_profile(
         phases = []
     if phase_evidence_error:
         status = "failed"
-        failed = list(selected)
-        completed = []
-        not_checked = []
 
     end_fingerprint, _ = source_fingerprint(profile, args.executor)
     source_end = report.source_provenance(ROOT, end_fingerprint)
@@ -524,9 +535,6 @@ def run_profile(
     }
     if args.release and not source_stable:
         status = "failed"
-        failed = list(selected)
-        completed = []
-        not_checked = []
     final_environment = environment_value
     guest_environment_paths = sorted(runtime_root.rglob("guest-environment.json"))
     if guest_environment_paths:
@@ -541,9 +549,6 @@ def run_profile(
     )
     if args.executor == "multipass" and not guest_source_ok and status == "passed":
         status = "failed"
-        failed = list(selected)
-        completed = []
-        not_checked = []
     final_report = report.make_report(
         run_id=run_id,
         profile=profile,

@@ -42,13 +42,16 @@ EOF
 	[[ ! -d $CGROUP ]]
 	[[ $(systemctl is-active "$UNIT" 2>/dev/null || true) == inactive ]]
 	set_check resource_cleanup passed
-	if python3 - "$CHECKS_JSON" <<'PY'; then
+	set +e
+	python3 - "$CHECKS_JSON" <<'PY'
 import json, sys
 checks = json.load(open(sys.argv[1], encoding="utf-8"))
-raise SystemExit(0 if all(value != "not_checked" for value in checks.values()) else 77)
+if any(value not in {"passed", "complete", "not_checked"} for value in checks.values()):
+    raise SystemExit(1)
+raise SystemExit(77 if any(value == "not_checked" for value in checks.values()) else 0)
 PY
-		exit 0
-	fi
-	exit 77
+	check_status=$?
+	set -e
+	return "$check_status"
 
 }

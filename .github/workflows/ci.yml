@@ -40,6 +40,19 @@ jobs:
       - name: Run fast layered validation
         run: ./scripts/validate.sh fast
 
+      - name: Build CLI binary
+        run: cargo build -p chronicle-cli --locked
+
+      - name: Portable smoke and rootless coverage
+        run: |
+          python3 tests/smoke/test_smoke.py
+          python3 tests/acceptance/test_record.py
+          python3 tests/acceptance/test_inspect.py
+          python3 tests/acceptance/test_etl.py
+          python3 tests/acceptance/test_replay.py
+          python3 tests/e2e/test_rootless_pipeline.py
+          python3 tests/e2e/http_acceptance_driver.py
+
       - name: Validate layered tooling
         run: |
           python3 scripts/tests/validation/test_layered_validation.py

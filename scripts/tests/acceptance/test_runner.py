@@ -386,6 +386,191 @@ class AcceptanceRunnerTests(unittest.TestCase):
             )
         )
 
+    def test_scenario_state_preserves_pass_fail_and_not_checked(self):
+        selected = ["capture-basic", "wal-recovery", "replay", "resource-cleanup"]
+        runtime = self.temp / "scenario-state"
+        runtime.mkdir()
+        (runtime / "scenario-state.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "profile": "p1",
+                    "selected": selected,
+                    "current": "wal-recovery",
+                    "completed": ["capture-basic"],
+                    "failed": "wal-recovery",
+                    "statuses": {
+                        "capture-basic": "passed",
+                        "wal-recovery": "failed",
+                        "replay": "not_checked",
+                        "resource-cleanup": "not_checked",
+                    },
+                }
+            )
+        )
+        self.assertEqual(
+            report.load_scenario_state(runtime, selected, "p1"),
+            (["capture-basic"], ["wal-recovery"], ["replay", "resource-cleanup"]),
+        )
+
+    def test_scenario_state_merges_pre_and_post_reboot_ledgers(self):
+        selected = ["capture-basic", "wal-recovery", "replay", "resource-cleanup"]
+        runtime = self.temp / "scenario-state-pre-post"
+        runtime.mkdir()
+        (runtime / "pre-reboot").mkdir()
+        (runtime / "post-reboot").mkdir()
+        (runtime / "pre-reboot" / "scenario-state.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "profile": "p2",
+                    "selected": selected,
+                    "current": "wal-recovery",
+                    "completed": ["capture-basic"],
+                    "failed": None,
+                    "statuses": {
+                        "capture-basic": "passed",
+                        "wal-recovery": "not_checked",
+                        "replay": "not_checked",
+                        "resource-cleanup": "not_checked",
+                    },
+                }
+            )
+        )
+        (runtime / "post-reboot" / "scenario-state.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "profile": "p2",
+                    "selected": selected,
+                    "current": None,
+                    "completed": ["wal-recovery", "replay", "resource-cleanup"],
+                    "failed": None,
+                    "statuses": {
+                        "capture-basic": "not_checked",
+                        "wal-recovery": "passed",
+                        "replay": "passed",
+                        "resource-cleanup": "passed",
+                    },
+                }
+            )
+        )
+        # Lexicographic rglob order must not matter: the union of both phase
+        # ledgers attributes every executed scenario, not just the last file.
+        self.assertEqual(
+            report.load_scenario_state(runtime, selected, "p2"),
+            (selected, [], []),
+        )
+
+    def test_scenario_state_timeout_attributes_only_current(self):
+        selected = ["capture-basic", "wal-recovery", "replay"]
+        runtime = self.temp / "scenario-timeout-state"
+        runtime.mkdir()
+        (runtime / "scenario-state.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "profile": "p1",
+                    "selected": selected,
+                    "current": "wal-recovery",
+                    "completed": ["capture-basic"],
+                    "failed": "wal-recovery",
+                    "statuses": {
+                        "capture-basic": "passed",
+                        "wal-recovery": "failed",
+                        "replay": "not_checked",
+                    },
+                }
+            )
+        )
+        (runtime / "scenario-timeout.json").write_text(
+            json.dumps(
+                {
+                    "timeout_layer": "scenario",
+                    "scenario": "wal-recovery",
+                    "configured_timeout_seconds": 1,
+                }
+            )
+        )
+        completed, failed, not_checked = report.load_scenario_state(
+            runtime, selected, "p1"
+        )
+        # Scenario timeout classification remains execution-ledger based even
+        # when a legacy profile report has coarse failed status.
+        legacy_status, _, legacy_failed, _ = report.normalize_legacy_report(
+            self.definition,
+            "p1",
+            {"status": "failed", "checks": {}},
+            report.profile_scenarios(self.definition, "p1"),
+            124,
+        )
+        self.assertEqual(legacy_status, "failed")
+        self.assertEqual(legacy_failed, [])
+        value = report.make_report(
+            run_id="scenario-timeout",
+            profile="p1",
+            executor="local",
+            selected=selected,
+            completed=completed,
+            failed=failed,
+            skipped=[],
+            not_checked=not_checked,
+            phases=[{"name": "run", "status": "failed"}],
+            source=self.source,
+            environment_value=self.environment,
+            return_code=124,
+            timeouts=report.timeout_records(runtime),
+        )
+        self.assertEqual(value["completed_scenarios"], ["capture-basic"])
+        self.assertEqual(value["failed_scenarios"], ["wal-recovery"])
+        self.assertEqual(value["not_checked_scenarios"], ["replay"])
+        self.assertEqual(value["status"], "failed")
+
+    def test_scenario_state_rejects_malformed_ledger(self):
+        runtime = self.temp / "malformed-state"
+        runtime.mkdir()
+        (runtime / "scenario-state.json").write_text("{not-json")
+        with self.assertRaises(ValueError):
+            report.load_scenario_state(runtime, ["capture-basic"], "p1")
+
+    def test_scenarios_use_explicit_wait_convention(self):
+        scenario_root = ROOT / "scripts/acceptance/lib/scenarios"
+        allowed_fixture_sleep = "sleep 600"
+        for path in scenario_root.rglob("*.sh"):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith("sleep "):
+                    self.assertIn(
+                        allowed_fixture_sleep,
+                        stripped,
+                        f"undocumented synchronization sleep at {path}:{number}",
+                    )
+        wait_text = (ROOT / "scripts/acceptance/lib/wait.sh").read_text()
+        self.assertEqual(wait_text.count("while :; do"), 1)
+        self.assertIn("SECONDS >= deadline", wait_text)
+        self.assertLess(
+            wait_text.index("SECONDS >= deadline"),
+            wait_text.index('sleep "$interval"'),
+        )
+        readiness = (ROOT / "scripts/acceptance/recorder-readiness.sh").read_text()
+        self.assertIn("while ((SECONDS < deadline)); do", readiness)
+        self.assertIn("systemd_active_epoch", readiness)
+        self.assertIn("recorder_metadata_epoch", readiness)
+
+    def test_destructive_scenarios_have_postcondition_barriers(self):
+        root = ROOT / "scripts/acceptance/lib/scenarios/p2"
+        checkpoint = (root / "checkpoint-kill-restart.sh").read_text()
+        self.assertIn('wait_for_path_absent "$CHECKPOINT_PAUSE_FILE"', checkpoint)
+        self.assertIn('wait_for_path_absent "$CHECKPOINT_READY_FILE"', checkpoint)
+        quota = (root / "quota-pressure.sh").read_text()
+        self.assertIn("quota mount to disappear", quota)
+        self.assertIn("quota loop device to detach", quota)
+        retention = (root / "retention-interruption.sh").read_text()
+        self.assertIn('wait_for_path_absent "$CLEANUP_PAUSE_FILE"', retention)
+        self.assertIn('wait_for_path_absent "$CLEANUP_READY_FILE"', retention)
+        reboot = (root / "reboot-recovery.sh").read_text()
+        self.assertIn('wait_for_unit_inactive "$UNIT"', reboot)
+
     def test_multipass_environment_timeout_does_not_fallback_to_host(self):
         with mock.patch.object(
             runner.subprocess,
@@ -1202,16 +1387,18 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertNotIn("--exclude='./docs'", snapshot)
         self.assertIn("--exclude='./target'", snapshot)
         self.assertIn("--exclude='./graphify-out'", snapshot)
+        self.assertIn("--exclude='./.codegraph'", snapshot)
+        self.assertIn("--exclude='./.pi'", snapshot)
 
-    def test_p2_common_coverage_requires_p1_pass(self):
+    def test_legacy_profile_failure_does_not_fail_every_scenario(self):
         p1 = report.profile_scenarios(self.definition, "p1")
         status, completed, failed, not_checked = report.normalize_legacy_report(
             self.definition, "p1", {"status": "failed", "checks": {}}, p1, 1
         )
         self.assertEqual(status, "failed")
         self.assertEqual(completed, [])
-        self.assertEqual(set(failed), set(p1))
-        self.assertEqual(not_checked, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(set(not_checked), set(p1))
 
     def test_reboot_phases_are_single_run(self):
         selected = report.profile_scenarios(self.definition, "p2")

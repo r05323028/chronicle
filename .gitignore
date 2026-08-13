@@ -35,3 +35,4 @@ target/validation-evidence/
 # Python
 __pycache__
 .ruff_cache
+.pi-lens/

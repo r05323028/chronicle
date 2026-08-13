@@ -1170,6 +1170,10 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         result
             .persist_metadata(&self.wal_directory, &mut self.metadata)
             .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        // Final in-process ETL re-acquires the WAL lock; flock(2) treats a
+        // second fd for the same file in the same process as a conflicting
+        // owner, so release the active epoch lock before publication runs.
+        self.recorder.ingest_mut().release_wal_lock();
         self.sync_active_progress();
         self.active_metadata.lifecycle = crate::RecorderLifecycleState::Stopped;
         self.active_metadata.capture_readiness = RecorderReadiness::NotReady;

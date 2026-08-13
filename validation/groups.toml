@@ -86,7 +86,13 @@ gates = ["p1", "p2"]
 
 [groups.build_tooling]
 description = "validation and CI tooling"
-paths = ["scripts/**", "validation/**", ".github/**", "deny.toml"]
+paths = [
+  "scripts/**",
+  "validation/**",
+  ".github/**",
+  "deny.toml",
+  "validation/test-architecture/**",
+]
 commands = ["build_tooling"]
 gates = ["p1", "p2"]
 

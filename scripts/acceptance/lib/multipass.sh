@@ -53,7 +53,10 @@ make_snapshot() {
 	# the guest-side release clean-tree check see spurious deletions.
 	(
 		cd "$ROOT"
-		tar --exclude='./target' --exclude='./graphify-out' -cf - .
+		tar --exclude='./target' --exclude='./graphify-out' \
+			--exclude='./.codegraph' --exclude='./.pi' \
+			--exclude='./.mypy_cache' --exclude='./.pytest_cache' --exclude='./.ruff_cache' \
+			-cf - .
 	) | (cd "$SNAPSHOT" && tar -xf -)
 }
 

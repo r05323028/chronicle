@@ -67,17 +67,17 @@ EOF
 	printf '%s\n' "$$" >"$CGROUP/cgroup.procs" 2>/dev/null || true
 	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" \
 		>"$ARTIFACT_ROOT/retention-workload.json" 2>/dev/null || true
-	sleep 4
+	wait_for_elapsed_time 2 'configured one-second retention and epoch age thresholds'
 	# Leave the recorder's capture cgroup: the interrupted stop's cgroup sweep
 	# would otherwise SIGTERM this scenario shell mid-recovery.
 	printf '%s\n' "$$" >/sys/fs/cgroup/cgroup.procs 2>/dev/null || true
-	for _ in $(seq 1 60); do
+	retention_epochs_ready() {
 		count=$(find "$STATE_ROOT/wal/epochs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-		if ((count >= 3)); then
-			break
-		fi
-		sleep 0.5
-	done
+		printf 'finalized_epoch_dirs=%s expected>=3\n' "$count"
+		((count >= 3))
+	}
+	wait_until 30 0.5 'at least three retention epoch directories' retention_epochs_ready
+	count=$(find "$STATE_ROOT/wal/epochs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 	if ((count < 3)); then
 		echo "cleanup_setup: expected >= 3 finalized epoch dirs, saw $count" >&2
 		exit 1
@@ -97,7 +97,7 @@ PY
 		echo 'cleanup_setup: no eligible finalized segment for cleanup' >&2
 		exit 1
 	fi
-	sleep 2
+	wait_for_elapsed_time 2 'configured retention minimum age before cleanup trigger'
 	# Protected lineage marker inside the active epoch survives cleanup
 	# (cleanup only ever targets .chwal proof-eligible segments in the
 	# segments subdirectory).
@@ -178,6 +178,8 @@ PY
 	phase cleanup_recovery 'restart and prove cleanup recovery convergence'
 	wait_for_unit_stable "$UNIT"
 	wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
+	wait_for_path_absent "$CLEANUP_PAUSE_FILE" 5
+	wait_for_path_absent "$CLEANUP_READY_FILE" 5
 	# Recovery replayed the durable cleanup intent: no intent or trash remnant
 	# survives and the interrupted segment stays deleted. Protected lineage
 	# (the marker, and any active-epoch segments) remains untouched.
@@ -225,6 +227,8 @@ PY
 		echo 'cleanup_restart: protected lineage marker lost' >&2
 		exit 1
 	fi
+	wait_for_path_absent "$CLEANUP_PAUSE_FILE" 5
+	wait_for_path_absent "$CLEANUP_READY_FILE" 5
 	systemctl reset-failed "$UNIT" 2>/dev/null || true
 	set_check cleanup_interrupted_recovery passed
 	set_check cleanup_protected_lineage passed

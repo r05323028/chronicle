@@ -2,6 +2,8 @@
 # Central-dispatch scenario: checkpoint-kill-restart.
 scenario_p2_checkpoint_kill_restart() {
 	phase checkpoint_crash_matrix 'exercise production publication crash boundaries'
+	wait_for_unit_stable "$UNIT"
+	wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
 	rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
 	: >"$CHECKPOINT_PAUSE_FILE"
 	# The workload must run inside the recorder's capture cgroup so the
@@ -46,7 +48,9 @@ artifact = json.load(open(sys.argv[2], encoding="utf-8"))
 assert any(output["key"] == artifact["key"] and output["digest"] == artifact["checksum"] for output in pending["outputs"])
 PY
 	systemctl kill --kill-who=main -s SIGKILL "$UNIT"
-	rm -f "$CHECKPOINT_PAUSE_FILE"
+	# The paused recorder never resumed to remove its readiness marker; remove
+	# both scenario-owned control files so no stale pause state survives.
+	rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
 	# The unit restarts itself on failure; a manual restart would race the
 	# auto-restart and can double-start the recorder (WAL lock contention).
 	if ! wait_for_unit_stable "$UNIT"; then
@@ -63,6 +67,8 @@ PY
 		exit 1
 	fi
 	wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
+	wait_for_path_absent "$CHECKPOINT_PAUSE_FILE" 5
+	wait_for_path_absent "$CHECKPOINT_READY_FILE" 5
 	PID_AFTER=$(systemctl show "$UNIT" -p ExecMainPID --value)
 	test "$PID_BEFORE" != "$PID_AFTER"
 	if find "$STATE_ROOT/wal" -type f -name '*.pending' -print -quit | grep -q .; then

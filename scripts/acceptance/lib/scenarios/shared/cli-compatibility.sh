@@ -72,12 +72,24 @@ PY
 	wait_for_file "$compat/upstream.port" 5 || die "compatibility upstream did not become ready"
 	upstream_origin="http://127.0.0.1:$(<"$compat/upstream.port")"
 	"$CHRONICLE" --format json record --source ebpf --cgroup "$scope" \
-		--wal-dir "$compat/ebpf-wal" --duration-seconds 3 --segment-bytes 16777216 --max-wal-bytes 16777216 \
+		--wal-dir "$compat/ebpf-wal" --duration-seconds 20 --segment-bytes 16777216 --max-wal-bytes 16777216 \
 		>"$compat/ebpf.json" 2>"$compat/ebpf.warning.json" &
 	COMPAT_RECORD_PID=$!
-	sleep 1
-	bash -c 'printf "%s\n" "$$" >"$1/cgroup.procs"; exec python3 "$2" workload --origin "$3"' \
-		bash "$scope" "$DRIVER" "$upstream_origin" >"$compat/ebpf-workload.json" 2>/dev/null
+	wait_for_path "$compat/ebpf-wal/recording.json" 15
+	# recording.json appears before the eBPF ring is attached; a workload
+	# racing that window can finish before capture is live. The legacy writer
+	# also defers commits to record end (300s segment age, small events), so
+	# mid-record commit is not observable. Drive bounded probes across the
+	# record window so at least one lands after attach; the final result then
+	# proves capture committed evidence.
+	_legacy_ebpf_probe() {
+		bash -c 'printf "%s\n" "$$" >"$1/cgroup.procs"; exec python3 "$2" workload --origin "$3"' \
+			bash "$scope" "$DRIVER" "$upstream_origin" >"$compat/ebpf-workload.json" 2>/dev/null
+	}
+	for _legacy_probe_attempt in 1 2 3 4 5 6 7 8; do
+		_legacy_ebpf_probe
+		wait_for_elapsed_time 2 "legacy eBPF probe cadence"
+	done
 	wait "$COMPAT_RECORD_PID"
 	assert_compat_warning "$compat/ebpf.warning.json" record_source_ebpf
 	assert_json "$compat/ebpf.json" 'value["version"] == 1 and value["status"] == "completed" and value["shutdown_reason"] == "duration_limit" and value["physical_wal_bytes"] > 0'

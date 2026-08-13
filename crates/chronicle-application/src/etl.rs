@@ -1351,7 +1351,7 @@ pub struct RecordingEtlCheckpoint {
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-fn has_published_wal(wal_directory: &Path) -> Result<bool, ApplicationError> {
+pub(crate) fn has_published_wal(wal_directory: &Path) -> Result<bool, ApplicationError> {
     let segments = wal_directory.join("segments");
     if !segments.exists() {
         return Ok(false);
@@ -1432,7 +1432,7 @@ pub fn process_and_publish_recording_wal(
 }
 
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
-fn process_and_publish_recording_wal_owned(
+pub(crate) fn process_and_publish_recording_wal_owned(
     wal_directory: impl AsRef<Path>,
     root: impl AsRef<Path>,
     registry: &ProtocolRegistry,

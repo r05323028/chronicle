@@ -114,20 +114,17 @@ mod tests {
         StoreConfig,
     };
 
-    #[test]
-    fn domain_lease_is_exclusive_and_released_on_drop() {
-        let root = std::env::temp_dir().join(format!("chronicle-lease-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        let config = RecorderConfigV1 {
+    fn lease_config(root: &std::path::Path) -> NormalizedRecorderConfig {
+        RecorderConfigV1 {
             version: 1,
             scope: RecorderScopeConfig {
-                cgroup_path: root.clone(),
+                cgroup_path: root.to_path_buf(),
                 cgroup_id: 1,
                 shared_scope_acknowledged: true,
             },
             state_root: root.join("state"),
             store_root: root.join("store"),
-            domain_lock_root: root.clone(),
+            domain_lock_root: root.to_path_buf(),
             epoch: EpochConfig {
                 max_age_seconds: 3600,
                 max_bytes: chronicle_wal::DEFAULT_MAX_WAL_BYTES,
@@ -137,7 +134,7 @@ mod tests {
                 max_bytes: chronicle_wal::DEFAULT_SEGMENT_BYTES,
             },
             domains: vec![FilesystemDomainConfig {
-                root: root.clone(),
+                root: root.to_path_buf(),
                 quota_bytes: 8 * 1024 * 1024 * 1024,
                 minimum_free_bytes: 1024 * 1024,
             }],
@@ -158,8 +155,16 @@ mod tests {
             logging: LoggingConfig {
                 level: LogLevel::Info,
             },
-        };
-        let normalized = config.normalize().unwrap();
+        }
+        .normalize()
+        .unwrap()
+    }
+
+    #[test]
+    fn domain_lease_is_exclusive_and_released_on_drop() {
+        let root = std::env::temp_dir().join(format!("chronicle-lease-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let normalized = lease_config(&root);
         let lease = RecorderLease::acquire(&normalized).unwrap();
         assert!(RecorderLease::domain_is_owned(&normalized).unwrap());
         assert!(matches!(
@@ -169,5 +174,18 @@ mod tests {
         drop(lease);
         assert!(!RecorderLease::domain_is_owned(&normalized).unwrap());
         let _second = RecorderLease::acquire(&normalized).unwrap();
+    }
+
+    #[test]
+    fn state_lease_reported_while_held_and_released_on_drop() {
+        let root = std::env::temp_dir().join(format!("chronicle-lease-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let normalized = lease_config(&root);
+        assert!(!RecorderLease::state_is_owned(&normalized.state_root).unwrap());
+        let lease = RecorderLease::acquire(&normalized).unwrap();
+        assert!(RecorderLease::state_is_owned(&normalized.state_root).unwrap());
+        drop(lease);
+        assert!(!RecorderLease::state_is_owned(&normalized.state_root).unwrap());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

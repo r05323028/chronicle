@@ -212,7 +212,9 @@ run_fast() {
 	run_shell openspec 'openspec validate --all --strict --no-interactive'
 	run_shell source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'"
 	run_shell architecture "python3 '$HELPER' architecture --root '$ROOT' --config '$ROOT/validation/architecture.toml'"
-	printf '\nChanged-crate tests: covered by workspace unit-test invocation.\n'
+	run_shell catalog "python3 '$HELPER' catalog --root '$ROOT'"
+	run_shell tooling-tests 'python3 scripts/tests/validation/test_test_architecture.py && python3 scripts/tests/validation/test_sleep_policy.py && python3 scripts/tests/validation/test_preflight.py && python3 scripts/tests/validation/test_lifecycle_cleanup.py && python3 scripts/tests/validation/test_select_fixtures.py && python3 scripts/tests/validation/test_evidence_reuse.py && python3 scripts/tests/validation/test_layered_validation.py && python3 scripts/tests/validation/test_architecture_boundaries.py'
+	printf '\nUnit + integration: workspace test invocation. Cheap integration: catalog + tooling meta-tests above.\n'
 }
 
 print_selection() {

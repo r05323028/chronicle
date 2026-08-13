@@ -8,7 +8,7 @@ scenario_p1_capture_basic() {
 
 	phase 2 "Build isolated eBPF object"
 	(
-		cd "$ROOT/ebpf"
+		cd "$ROOT/ebpf" || exit
 		CARGO_TARGET_DIR="$EBPF_TARGET_DIR" \
 			CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" \
 			cargo build --release --locked
@@ -56,20 +56,23 @@ scenario_p1_capture_basic() {
 	phase 7 "Start public Chronicle recorder"
 	"$CHRONICLE" --format json --data-dir "$DATA_DIR" record --cgroup "$DEDICATED_CGROUP" --duration 60 >"$ARTIFACT_ROOT/record.json" 2>"$ARTIFACT_ROOT/record.log" &
 	RECORDER_PID=$!
-	local recording_ready=false
 	RECORDING_METADATA=""
-	for _ in $(seq 1 150); do
+	recording_metadata_ready() {
 		RECORDING_METADATA=$(find "$DATA_DIR/recordings" -mindepth 2 -maxdepth 2 -name recording.json -print -quit 2>/dev/null || true)
-		if [[ -n $RECORDING_METADATA ]] && python3 - "$RECORDING_METADATA" <<'PY'; then
-import json, sys
-raise SystemExit(0 if json.load(open(sys.argv[1], encoding="utf-8"))["status"] == "recording" else 1)
-PY
-			recording_ready=true
-			break
+		if [[ -z $RECORDING_METADATA ]]; then
+			printf 'recording metadata absent under %s\n' "$DATA_DIR/recordings"
+			return 1
 		fi
-		sleep 0.1
-	done
-	[[ $recording_ready == true ]] || die "recorder did not reach recording status; see $ARTIFACT_ROOT/record.log"
+		python3 - "$RECORDING_METADATA" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+print(f"metadata={sys.argv[1]} status={value.get('status')}")
+raise SystemExit(0 if value.get("status") == "recording" else 1)
+PY
+	}
+	wait_until 15 0.1 "public recorder to reach recording metadata state" recording_metadata_ready ||
+		die "recorder did not reach recording status; see $ARTIFACT_ROOT/record.log"
+	RECORDING_METADATA=$(find "$DATA_DIR/recordings" -mindepth 2 -maxdepth 2 -name recording.json -print -quit)
 	WAL_DIR=$(dirname "$RECORDING_METADATA")
 
 	phase 8 "Generate real HTTP workload"

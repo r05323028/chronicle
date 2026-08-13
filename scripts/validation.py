@@ -101,11 +101,54 @@ def select(root: Path, paths: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
                 "paths": decisions[name]["paths"],
                 "reason": f"unknown path requires conservative full validation: {', '.join(unknown_paths)}",
             }
+    # Catalog-aware annotation (task 9.1): report functional layer, environment,
+    # owner, and gate reason for each selected group's gate-relevant tests, plus
+    # a no-coverage-loss marker. Missing catalog degrades to group-level report.
+    layers: set[str] = set()
+    environments: set[str] = set()
+    owners: set[str] = set()
+    catalog_path = root / "validation/test-architecture/test-catalog.toml"
+    catalog = None
+    if tomllib is not None and catalog_path.is_file():
+        with catalog_path.open("rb") as handle:
+            catalog = tomllib.load(handle)
+    if catalog is not None:
+        tests = catalog.get("test", [])
+        for name in selected:
+            group_gates = set(groups[name].get("gates", []))
+            relevant = [
+                test
+                for test in tests
+                if not group_gates or (set(test.get("gates", [])) & group_gates)
+            ]
+            decisions[name]["tests"] = [
+                {
+                    "id": test["id"],
+                    "layer": test.get("layer"),
+                    "environment": test.get("environment"),
+                    "owner": test.get("owner"),
+                }
+                for test in relevant
+            ]
+            for test in relevant:
+                if test.get("layer"):
+                    layers.add(test["layer"])
+                if test.get("environment"):
+                    environments.add(test["environment"])
+                if test.get("owner"):
+                    owners.add(test["owner"])
+        coverage = "catalog obligations verified: required selectors reference classified tests"
+    else:
+        coverage = "no coverage-loss decision available: catalog not present"
     return {
         "changed_paths": paths,
         "unknown_paths": unknown_paths,
         "selected": selected,
         "decisions": decisions,
+        "layers_covered": sorted(layers),
+        "environments_covered": sorted(environments),
+        "owners_covered": sorted(owners),
+        "coverage": coverage,
     }
 
 
@@ -121,15 +164,21 @@ def workspace_edges(root: Path) -> list[dict[str, Any]]:
         )
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("bounded cargo metadata failed; cannot check architecture")
-    value = json.loads(output)
+    try:
+        value = json.loads(output)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(
+            "cargo metadata returned malformed JSON; cannot check architecture"
+        ) from exc
     workspace_members = set(value.get("workspace_members", []))
     packages = {pkg["id"]: pkg for pkg in value.get("packages", [])}
-    ws = {pkg["name"]: pkg for pkg in packages.values() if pkg["id"] in workspace_members}
+    ws = {
+        pkg["name"]: pkg for pkg in packages.values() if pkg["id"] in workspace_members
+    }
     # Resolve package identity by manifest directory so renames and local
     # aliases never change the evaluated target crate.
     by_manifest_dir = {
-        str(Path(pkg["manifest_path"]).parent): pkg["name"]
-        for pkg in ws.values()
+        str(Path(pkg["manifest_path"]).parent): pkg["name"] for pkg in ws.values()
     }
     edges: list[dict[str, Any]] = []
     for name in sorted(ws):
@@ -139,14 +188,16 @@ def workspace_edges(root: Path) -> list[dict[str, Any]]:
             identity = by_manifest_dir.get(str(Path(dep["path"])))
             if identity is None or identity not in ws:
                 continue
-            edges.append({
-                "source": name,
-                "target": identity,
-                "rename": dep.get("rename") or dep["name"],
-                "kind": dep.get("kind") or "normal",
-                "optional": bool(dep.get("optional")),
-                "target_condition": dep.get("target"),
-            })
+            edges.append(
+                {
+                    "source": name,
+                    "target": identity,
+                    "rename": dep.get("rename") or dep["name"],
+                    "kind": dep.get("kind") or "normal",
+                    "optional": bool(dep.get("optional")),
+                    "target_condition": dep.get("target"),
+                }
+            )
     return edges
 
 
@@ -158,7 +209,9 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
     with policy_path.open("rb") as handle:
         policy = tomllib.load(handle)
     if policy.get("version") != 1:
-        raise RuntimeError(f"unsupported architecture policy version {policy.get('version')}")
+        raise RuntimeError(
+            f"unsupported architecture policy version {policy.get('version')}"
+        )
     members = policy.get("members", {}).get("members", [])
     kinds = ("normal", "dev", "build")
     tables = {kind: policy.get(kind, {}) for kind in kinds}
@@ -169,56 +222,88 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
     for kind in kinds:
         for source, targets in tables[kind].items():
             if source not in member_set:
-                issues.append(f"policy {kind} allowlist names unknown source crate {source!r}")
+                issues.append(
+                    f"policy {kind} allowlist names unknown source crate {source!r}"
+                )
             for target in targets:
                 if target not in member_set:
-                    issues.append(f"policy {kind} allowlist names unknown target crate {target!r}")
+                    issues.append(
+                        f"policy {kind} allowlist names unknown target crate {target!r}"
+                    )
     for member in sorted(member_set):
         for kind in kinds:
             if member not in tables[kind]:
                 issues.append(f"policy missing {kind} allowlist for member {member!r}")
     forbids = policy.get("critical_forbids", {})
     forbid_keys = {
-        "dependency_on_cli", "session_to_wal", "protocol_to_builtins", "common_upward",
+        "dependency_on_cli",
+        "session_to_wal",
+        "protocol_to_builtins",
+        "common_upward",
         "cli_non_application",
     }
     if not isinstance(forbids, dict) or not forbid_keys.issubset(forbids):
         issues.append(
-            "critical_forbids must declare every named forbid: " + ", ".join(sorted(forbid_keys))
+            "critical_forbids must declare every named forbid: "
+            + ", ".join(sorted(forbid_keys))
         )
     for key in sorted(forbid_keys):
         if not isinstance(forbids.get(key), bool):
             issues.append(f"critical_forbids.{key} must be a boolean")
     edges = workspace_edges(root)
+
     def edge_key(edge):
         return (edge["source"], edge["target"], edge["kind"])
+
     for edge in sorted(edges, key=edge_key):
         source, target, kind = edge["source"], edge["target"], edge["kind"]
         if source not in member_set:
-            issues.append(f"workspace crate {source!r} has no architecture policy member entry")
+            issues.append(
+                f"workspace crate {source!r} has no architecture policy member entry"
+            )
             continue
         if target not in member_set:
-            issues.append(f"workspace edge {source} -> {target} targets a crate with no policy entry")
+            issues.append(
+                f"workspace edge {source} -> {target} targets a crate with no policy entry"
+            )
             continue
         if forbids.get("dependency_on_cli") and target == "chronicle-cli":
-            issues.append(f"forbidden dependency on chronicle-cli: {source} -> {target} [{kind}]")
+            issues.append(
+                f"forbidden dependency on chronicle-cli: {source} -> {target} [{kind}]"
+            )
             continue
-        if forbids.get("session_to_wal") and source == "chronicle-session" and target == "chronicle-wal":
-            issues.append(f"forbidden session-to-wal coupling: {source} -> {target} [{kind}]")
+        if (
+            forbids.get("session_to_wal")
+            and source == "chronicle-session"
+            and target == "chronicle-wal"
+        ):
+            issues.append(
+                f"forbidden session-to-wal coupling: {source} -> {target} [{kind}]"
+            )
         if (
             forbids.get("protocol_to_builtins")
             and source == "chronicle-protocol"
             and target == "chronicle-protocol-builtins"
         ):
-            issues.append(f"forbidden protocol-to-builtins coupling: {source} -> {target} [{kind}]")
-        if forbids.get("common_upward") and source == "chronicle-common" and kind != "build":
-            issues.append(f"forbidden common upward dependency: {source} -> {target} [{kind}]")
+            issues.append(
+                f"forbidden protocol-to-builtins coupling: {source} -> {target} [{kind}]"
+            )
+        if (
+            forbids.get("common_upward")
+            and source == "chronicle-common"
+            and kind != "build"
+        ):
+            issues.append(
+                f"forbidden common upward dependency: {source} -> {target} [{kind}]"
+            )
         if (
             forbids.get("cli_non_application")
             and source == "chronicle-cli"
             and target != "chronicle-application"
         ):
-            issues.append(f"forbidden cli non-application edge: {source} -> {target} [{kind}]")
+            issues.append(
+                f"forbidden cli non-application edge: {source} -> {target} [{kind}]"
+            )
         allow = tables[kind].get(source, [])
         if target not in allow:
             detail = f"{source} -> {target} [{kind}]"
@@ -298,6 +383,143 @@ def source_ownership(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
         "files": len(owners) + len(unowned),
         "owners": owners,
         "unowned": sorted(unowned),
+    }
+
+
+def catalog_check(
+    root: Path,
+    catalog_path: Path | None = None,
+    scenarios_path: Path | None = None,
+) -> dict[str, Any]:
+    """Validate the classified test catalog and its gate/scenario obligations.
+
+    The catalog is the machine-readable representation of the responsibility-
+    based test architecture. P1/P2/release select classified tests; privilege is
+    an environment dimension, not a layer. Fails on duplicate/unknown IDs,
+    missing fields, invalid layer/environment, undefined commands, selector
+    membership inconsistencies, superset violations, and unmapped scenario or
+    legacy-check obligations.
+    """
+    if tomllib is None:
+        raise RuntimeError("Python 3.11+ is required (tomllib missing)")
+    path = catalog_path or root / "validation/test-architecture/test-catalog.toml"
+    with path.open("rb") as handle:
+        catalog = tomllib.load(handle)
+    issues: list[str] = []
+    if catalog.get("version") != 1:
+        issues.append(f"unsupported catalog version {catalog.get('version')}")
+    layers = set(catalog.get("layers", []))
+    environments = set(catalog.get("environments", []))
+    selectors = set(catalog.get("selectors", []))
+    tests = catalog.get("test", [])
+    ids: set[str] = set()
+    declared_gates: dict[str, set[str]] = {}
+    statuses = {"existing", "planned"}
+    for index, test in enumerate(tests):
+        label = f"test[{index}]"
+        test_id = test.get("id")
+        if not test_id:
+            issues.append(f"{label}: missing id")
+            continue
+        if test_id in ids:
+            issues.append(f"duplicate test id: {test_id}")
+        ids.add(test_id)
+        for field in ("layer", "environment", "owner", "command", "status"):
+            if not test.get(field):
+                issues.append(f"test {test_id}: missing {field}")
+        if test.get("layer") not in layers:
+            issues.append(f"test {test_id}: invalid layer {test.get('layer')!r}")
+        if test.get("environment") not in environments:
+            issues.append(
+                f"test {test_id}: invalid environment {test.get('environment')!r}"
+            )
+        if test.get("status") not in statuses:
+            issues.append(f"test {test_id}: invalid status {test.get('status')!r}")
+        gates = test.get("gates", [])
+        unknown_gates = [gate for gate in gates if gate not in selectors]
+        if unknown_gates:
+            issues.append(f"test {test_id}: unknown gate(s) {sorted(unknown_gates)}")
+        declared_gates[test_id] = set(gates)
+    required = catalog.get("required", {})
+    for selector in sorted(required):
+        if selector not in selectors:
+            issues.append(f"unknown selector {selector!r} in required section")
+            continue
+        for test_id in required[selector].get("tests", []):
+            if test_id not in ids:
+                issues.append(
+                    f"selector {selector}: required test {test_id} is undefined"
+                )
+            elif selector not in declared_gates.get(test_id, set()):
+                issues.append(
+                    f"selector {selector}: required test {test_id} does not declare gate {selector}"
+                )
+    p1 = set(required.get("p1", {}).get("tests", []))
+    p2 = set(required.get("p2", {}).get("tests", []))
+    release = set(required.get("release", {}).get("tests", []))
+    for name, smaller, larger in (("p1", p1, p2), ("p2", p2, release)):
+        missing = sorted(smaller - larger)
+        if missing:
+            issues.append(
+                f"selector {name} required coverage missing from superset: {missing}"
+            )
+    resolved_scenarios = scenarios_path or root / "scripts/acceptance/scenarios.toml"
+    scenario_def: dict[str, Any] = {}
+    try:
+        with resolved_scenarios.open("rb") as handle:
+            scenario_def = tomllib.load(handle)
+    except OSError as exc:
+        issues.append(f"cannot read scenarios {resolved_scenarios}: {exc}")
+    scenario_ids = set(scenario_def.get("scenarios", {}))
+    scenario_tests = catalog.get("scenario_tests", {})
+    uncovered = sorted(scenario_ids - set(scenario_tests))
+    if uncovered:
+        issues.append(f"scenario(s) without classified coverage: {uncovered}")
+    for scenario, mapped in sorted(scenario_tests.items()):
+        if scenario not in scenario_ids:
+            issues.append(f"scenario_tests references unknown scenario {scenario!r}")
+        for test_id in mapped:
+            if test_id not in ids:
+                issues.append(
+                    f"scenario {scenario}: mapped test {test_id} is undefined"
+                )
+    legacy_checks: set[str] = set()
+    for cfg in scenario_def.get("scenarios", {}).values():
+        legacy_checks.update(cfg.get("legacy_p1_checks", []))
+        legacy_checks.update(cfg.get("legacy_p2_checks", []))
+    legacy_map = catalog.get("legacy_check_tests", {})
+    unmapped = sorted(legacy_checks - set(legacy_map))
+    if unmapped:
+        issues.append(f"legacy check(s) without classified coverage: {unmapped}")
+    for check, mapped in sorted(legacy_map.items()):
+        if check not in legacy_checks:
+            issues.append(f"legacy_check_tests references unknown check {check!r}")
+        for test_id in mapped:
+            if test_id not in ids:
+                issues.append(
+                    f"legacy check {check}: mapped test {test_id} is undefined"
+                )
+    status_by_id = {entry.get("id"): entry.get("status") for entry in tests}
+    planned_required = sorted(
+        {
+            test_id
+            for selector in required
+            for test_id in required.get(selector, {}).get("tests", [])
+            if status_by_id.get(test_id) == "planned"
+        }
+    )
+    return {
+        "catalog": str(path.relative_to(root)),
+        "tests": len(tests),
+        "selectors": sorted(selectors),
+        "layers": sorted(layers),
+        "environments": sorted(environments),
+        "p1_required": len(p1),
+        "p2_required": len(p2),
+        "release_required": len(release),
+        "scenarios": len(scenario_ids),
+        "planned_required": planned_required,
+        "issues": issues,
     }
 
 
@@ -752,6 +974,10 @@ def main() -> int:
     reuse_parser.add_argument("--checks", default="")
     reuse_parser.add_argument("--commit")
     reuse_parser.add_argument("--release", action="store_true")
+    catalog_parser = sub.add_parser("catalog")
+    catalog_parser.add_argument("--root", type=Path, required=True)
+    catalog_parser.add_argument("--catalog", type=Path)
+    catalog_parser.add_argument("--scenarios", type=Path)
     args = parser.parse_args()
     if args.command == "environment":
         print(json.dumps(environment(args.root), indent=2, sort_keys=True))
@@ -776,6 +1002,10 @@ def main() -> int:
                 select(args.root, sorted(set(paths)), cfg), indent=2, sort_keys=True
             )
         )
+    elif args.command == "catalog":
+        value = catalog_check(args.root, args.catalog, args.scenarios)
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return 1 if value["issues"] else 0
     elif args.command == "fingerprint":
         print(
             json.dumps(

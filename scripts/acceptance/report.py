@@ -261,7 +261,7 @@ def normalize_legacy_report(
         values = [checks.get(name, "not_checked") for name in names]
         if values and all(value in {"passed", "complete"} for value in values):
             completed.append(scenario)
-        elif any(value == "failed" for value in values) or status == "failed":
+        elif any(value == "failed" for value in values):
             failed.append(scenario)
         else:
             not_checked.append(scenario)
@@ -272,6 +272,60 @@ def normalize_legacy_report(
     else:
         result = "not_checked"
     return result, completed, failed, not_checked
+
+
+def load_scenario_state(
+    root: Path, selected: list[str], profile: str
+) -> tuple[list[str], list[str], list[str]] | None:
+    """Load strict atomic dispatcher state for scenario-level attribution.
+
+    P2 runs pre-reboot and post-reboot phases with one ledger per phase; the
+    final attribution is the union across all phase ledgers (a scenario passes
+    once any phase completed it, fails once any phase failed it, and stays
+    not_checked only when no phase ran it).
+    """
+    paths = sorted(root.rglob("scenario-state.json"))
+    if not paths:
+        return None
+    merged: dict[str, str] = {}
+    for path in paths:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid scenario execution state") from exc
+        statuses = value.get("statuses")
+        completed_value = value.get("completed")
+        if (
+            value.get("version") != 1
+            or value.get("profile") != profile
+            or not isinstance(value.get("selected"), list)
+            or len(value["selected"]) != len(selected)
+            or set(value["selected"]) != set(selected)
+            or not isinstance(statuses, dict)
+            or set(statuses) != set(selected)
+            or any(
+                status not in {"passed", "failed", "not_checked"}
+                for status in statuses.values()
+            )
+            or not isinstance(completed_value, list)
+            or completed_value
+            != [name for name in value["selected"] if statuses.get(name) == "passed"]
+            or value.get("failed") not in {None, *selected}
+            or value.get("current") not in {None, *selected}
+        ):
+            raise ValueError("invalid scenario execution state")
+        for name, status in statuses.items():
+            prior = merged.get(name)
+            if status == "passed" or prior == "passed":
+                merged[name] = "passed"
+            elif status == "failed" or prior == "failed":
+                merged[name] = "failed"
+            else:
+                merged[name] = status
+    completed = [name for name in selected if merged[name] == "passed"]
+    failed = [name for name in selected if merged[name] == "failed"]
+    not_checked = [name for name in selected if merged[name] == "not_checked"]
+    return completed, failed, not_checked
 
 
 def timeout_records(root: Path) -> list[dict[str, Any]]:

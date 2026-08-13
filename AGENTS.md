@@ -144,3 +144,37 @@ Chronicle's 13-crate workspace is a dependency-direction contract. Every crate h
 - **ETL is complete Extract-Transform-Load**: it owns storage publication and checkpoint ordering; never refactor it to transform-only.
 - **eBPF privacy**: Aya handles/kernel ABI stay private to `chronicle-capture-ebpf`.
 - Adding a legitimate dependency requires updating `docs/architecture/crate-boundaries.md`, `AGENTS.md`, and `validation/architecture.toml` together, then running the architecture check.
+
+## Test Architecture
+
+Every significant test is classified as exactly one functional layer, and the
+lowest-cost layer that conclusively proves the behavior wins:
+
+- **unit** — local logic (functions, modules, parsers, state machines); colocated under `crates/<crate>/src/**`.
+- **integration** — public crate/component contracts; normally `crates/<crate>/tests/`.
+- **smoke** — shipped executables start or reject invalid startup sanely (`tests/smoke/`).
+- **acceptance** — one documented user-facing feature through public surfaces (`tests/acceptance/`).
+- **end-to-end** — important invariants across the complete composed path (`tests/e2e/`).
+- **privileged** — only behavior requiring real supported Linux/kernel/environment behavior (real eBPF load/attach, cgroup, BTF, kernel, ring buffer, crash/reboot); always the last resort.
+
+Privileged execution, P1, and P2 are NOT layers: P1/P2 are gate selectors that
+map milestone obligations to classified tests. Privileged acceptance proves
+only kernel/environment-dependent behavior and does NOT own portable
+correctness. Portable assertions (WAL encoding/checksums, deterministic
+recovery/corruption, ETL transforms, CLI parsing/rendering, protocol parsing,
+replay matching, repository checks) MUST NOT be privileged proof merely
+because a Multipass profile can run them.
+
+Root black-box tests live under `tests/{smoke,acceptance,e2e}/`; acceptance
+and E2E tests MUST NOT import internal crate implementation details.
+Privileged execution runs bounded preflight first (`scripts/privileged/preflight.py`,
+schema in `validation/test-architecture/privileged-preflight-schema.toml`):
+`supported`, `unsupported_environment`, `infrastructure_error`, `not_checked`;
+unsupported/infrastructure never count as product regression and never
+satisfy gate evidence. Validation scripts (`scripts/validate.sh`,
+`scripts/validation.py`) select/orchestrate/report classified tests and contain
+no product test logic. Repeated helpers are language-local
+(crate-local or `tests/support/`); no new shared workspace crate without
+demonstrated multi-crate need plus architecture/policy updates. Crate-boundary
+constraints and migrations are tracked in `validation/test-architecture/`
+(catalog, ledger, gate coverage, decisions); see its README for exact rules.

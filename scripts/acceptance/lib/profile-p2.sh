@@ -85,6 +85,7 @@ source "$ROOT/scripts/lib/env.sh"
 # shellcheck source=scripts/lib/assertions.sh
 source "$ROOT/scripts/lib/assertions.sh"
 source "$ROOT/scripts/acceptance/recorder-readiness.sh"
+source "$ROOT/scripts/acceptance/lib/wait.sh"
 
 mkdir -p "$ARTIFACT_ROOT"
 rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
@@ -99,69 +100,68 @@ phase() {
 	printf '[%s] %s\n' "$1" "$2"
 }
 
-# Waits until the unit is active, its restart counter is stable, and the
-# recorder status is fresh (written after the unit's latest start). Restart
-# attempts can transiently fail closed on WAL lock contention while systemd
-# auto-restart converges, and the status file of a killed predecessor must
-# not satisfy readiness.
+# Unit convergence composes with recorder readiness; it does not infer
+# recorder readiness from systemd liveness.
+_unit_stable_condition() {
+	local unit=$1 status_root=$2 sample_file=$3 state restarts before start_epoch status_epoch
+	state=$(systemctl is-active "$unit" 2>/dev/null || true)
+	restarts=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || printf '0')
+	before=$(cat "$sample_file" 2>/dev/null || printf '%s 0' "$restarts")
+	printf 'state=%s restarts=%s prior=%s\n' "$state" "$restarts" "$before"
+	[[ $state != failed ]] || return 2
+	if [[ $state != active ]]; then
+		printf '%s 0\n' "$restarts" >"$sample_file"
+		return 1
+	fi
+	if ! python3 - "$sample_file" "$before" "$restarts" <<'PY'
+import sys
+path, before, restarts = sys.argv[1:]
+prior_restarts, samples = before.split()
+samples = int(samples) + 1 if prior_restarts == restarts else 0
+open(path, "w", encoding="utf-8").write(f"{restarts} {samples}\n")
+raise SystemExit(0 if samples >= 2 else 1)
+PY
+	then
+		return 1
+	fi
+	start_epoch=$(systemd_active_epoch "$SERVICE_COMMAND_TIMEOUT" "$unit")
+	status_epoch=$(recorder_metadata_epoch "$status_root/recorder.json")
+	printf 'start_epoch=%s status_epoch=%s\n' "$start_epoch" "$status_epoch"
+	((start_epoch == 0 || status_epoch >= start_epoch))
+}
+
 wait_for_unit_stable() {
-	local unit=${1:?unit required}
-	local status_root=${2:-$STATE_ROOT}
-	local timeout=${3:-90}
-	local deadline=$((SECONDS + timeout)) restarts_before restarts_after stable=0 state=unknown
-	restarts_before=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || printf '0')
-	while ((SECONDS < deadline)); do
-		state=$(systemctl is-active "$unit" 2>/dev/null || true)
-		[[ $state != failed ]] || {
-			printf 'unit %s entered terminal failed state; restarts=%s\n' "$unit" "$restarts_before" >&2
-			return 1
-		}
-		if [[ $state == active ]]; then
-			restarts_after=$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || printf '0')
-			if [[ "$restarts_after" == "$restarts_before" ]]; then
-				stable=$((stable + 1))
-			else
-				stable=0
-				restarts_before=$restarts_after
-			fi
-			if ((stable >= 2)); then
-				local start_epoch=0 status_epoch=0
-				start_epoch=$(systemd_active_epoch "$SERVICE_COMMAND_TIMEOUT" "$unit")
-				status_epoch=$(recorder_metadata_epoch "$status_root/recorder.json")
-				if ((start_epoch == 0)) || ((status_epoch >= start_epoch)); then
-					return 0
-				fi
-			fi
-		fi
-		sleep 1
-	done
-	printf 'unit %s did not stabilize after %ss; last state=%s restarts=%s\n' "$unit" "$timeout" "$state" "$restarts_before" >&2
-	return 1
+	local unit=${1:?unit required} status_root=${2:-$STATE_ROOT} timeout=${3:-90}
+	local sample_file="${ARTIFACT_ROOT:-${TMPDIR:-/tmp}}/.unit-stable-${unit//\//_}"
+	printf '%s 0\n' "$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || printf '0')" >"$sample_file"
+	local status
+	set +e
+	wait_until "$timeout" 1 "unit $unit to stabilize with fresh recorder metadata" _unit_stable_condition "$unit" "$status_root" "$sample_file"
+	status=$?
+	set -e
+	rm -f "$sample_file"
+	return "$status"
+}
+
+_unit_state_condition() {
+	local unit=$1 expected=$2 state
+	state=$(systemctl is-active "$unit" 2>/dev/null || true)
+	printf 'state=%s expected=%s\n' "$state" "$expected"
+	case $expected:$state in
+	inactive:inactive | stopped:inactive | stopped:failed | stopped:unknown | active:active) return 0 ;;
+	inactive:failed | active:failed) return 2 ;;
+	*) return 1 ;;
+	esac
 }
 
 wait_for_unit_inactive() {
 	local unit=${1:?unit required} timeout=${2:-30}
-	local deadline=$((SECONDS + timeout)) state=unknown
-	while ((SECONDS < deadline)); do
-		state=$(systemctl is-active "$unit" 2>/dev/null || true)
-		[[ $state == inactive ]] && return 0
-		[[ $state != failed ]] || break
-		sleep 0.1
-	done
-	printf 'unit %s did not become cleanly inactive after %ss; last state=%s\n' "$unit" "$timeout" "$state" >&2
-	return 1
+	wait_until "$timeout" 0.1 "unit $unit to become cleanly inactive" _unit_state_condition "$unit" inactive
 }
 
 wait_for_unit_stopped() {
 	local unit=${1:?unit required} timeout=${2:-30}
-	local deadline=$((SECONDS + timeout)) state=unknown
-	while ((SECONDS < deadline)); do
-		state=$(systemctl is-active "$unit" 2>/dev/null || true)
-		case $state in inactive | failed | unknown) return 0 ;; esac
-		sleep 0.1
-	done
-	printf 'unit %s did not stop after %ss; last state=%s\n' "$unit" "$timeout" "$state" >&2
-	return 1
+	wait_until "$timeout" 0.1 "unit $unit to stop" _unit_state_condition "$unit" stopped
 }
 
 stop_managed_unit() {
@@ -177,26 +177,7 @@ stop_managed_unit() {
 
 wait_for_unit_active() {
 	local unit=${1:?unit required} timeout=${2:-30}
-	local deadline=$((SECONDS + timeout)) state=unknown
-	while ((SECONDS < deadline)); do
-		state=$(systemctl is-active "$unit" 2>/dev/null || true)
-		[[ $state == active ]] && return 0
-		[[ $state == failed ]] && break
-		sleep 0.1
-	done
-	printf 'unit %s did not become active after %ss; last state=%s\n' "$unit" "$timeout" "$state" >&2
-	return 1
-}
-
-wait_for_path() {
-	local path=${1:?path required} timeout=${2:?timeout required}
-	local deadline=$((SECONDS + timeout))
-	while ((SECONDS < deadline)); do
-		[[ -e $path ]] && return 0
-		sleep 0.1
-	done
-	printf 'path did not appear after %ss: %s\n' "$timeout" "$path" >&2
-	return 1
+	wait_until "$timeout" 0.1 "unit $unit to become active" _unit_state_condition "$unit" active
 }
 
 set_check() {
@@ -336,6 +317,7 @@ cleanup() {
 on_exit() {
 	local rc=$? cleanup_status=0
 	declare -F stop_scenario_watchdog >/dev/null && stop_scenario_watchdog
+	declare -F finalize_scenario_state >/dev/null && finalize_scenario_state "$rc" || true
 	cleanup || cleanup_status=$?
 	if [[ $rc -eq 0 && $cleanup_status -ne 0 ]]; then
 		rc=1

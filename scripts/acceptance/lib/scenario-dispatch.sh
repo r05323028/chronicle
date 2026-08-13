@@ -8,6 +8,56 @@ SCENARIO_TIMEOUT_PROFILE=""
 SCENARIO_TIMEOUT_NAME=""
 SCENARIO_TIMEOUT_SECONDS=""
 SCENARIO_TIMED_OUT=0
+SCENARIO_STATE_FILE=""
+
+write_scenario_state() {
+	local action=$1 profile=$2 scenario=${3:-}
+	shift 3 || true
+	python3 - "${SCENARIO_STATE_FILE:-${ARTIFACT_ROOT:-${TMPDIR:-/tmp}}/scenario-state.json}" "$action" "$profile" "$scenario" "$@" <<'PY'
+import json, os, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+action, profile, scenario = sys.argv[2:5]
+if action == "init":
+    selected = sys.argv[5:]
+    value = {
+        "version": 1, "profile": profile, "selected": selected,
+        "current": None, "completed": [], "failed": None,
+        "statuses": {name: "not_checked" for name in selected},
+    }
+else:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if action == "start":
+        value["current"] = scenario
+    elif action == "pass":
+        value["statuses"][scenario] = "passed"
+        if scenario not in value["completed"]:
+            value["completed"].append(scenario)
+        value["current"] = None
+    elif action == "fail" and scenario in value["statuses"]:
+        value["statuses"][scenario] = "failed"
+        value["failed"] = scenario
+        value["current"] = scenario
+    else:
+        raise SystemExit(f"invalid scenario state action: {action}")
+temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
+temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+}
+
+finalize_scenario_state() {
+	local status=${1:-1}
+	[[ $status -eq 0 || -z ${SCENARIO_STATE_FILE:-} || ! -f $SCENARIO_STATE_FILE ]] && return 0
+	local current
+	current=$(
+		python3 - "$SCENARIO_STATE_FILE" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8")).get("current") or "")
+PY
+	)
+	[[ -z $current ]] || write_scenario_state fail "${SCENARIO_TIMEOUT_PROFILE:-unknown}" "$current"
+}
 
 scenario_timeout_handler() {
 	trap - TERM
@@ -15,6 +65,7 @@ scenario_timeout_handler() {
 	local phase_file="${ARTIFACT_ROOT:-${TMPDIR:-/tmp}}/current-phase.txt"
 	local timed_out_phase=${CURRENT_PHASE:-$(cat "$phase_file" 2>/dev/null || printf unknown)}
 	SCENARIO_TIMED_OUT=1
+	write_scenario_state fail "$SCENARIO_TIMEOUT_PROFILE" "$SCENARIO_TIMEOUT_NAME" || true
 	CURRENT_PHASE="scenario_timeout:${SCENARIO_TIMEOUT_PROFILE}/${SCENARIO_TIMEOUT_NAME}"
 	# Watchdog writes marker before signalling. Update phase only when profile
 	# observed a newer phase than persisted phase file.
@@ -240,6 +291,8 @@ run_scenario_plan() {
 	local unique_count
 	unique_count=$(printf '%s\n' "${selected[@]}" | sort -u | wc -l | tr -d ' ')
 	[[ "$unique_count" == "${#selected[@]}" ]] || die "scenario selection is duplicated for $profile"
+	SCENARIO_STATE_FILE="${ARTIFACT_ROOT:-${TMPDIR:-/tmp}}/scenario-state.json"
+	write_scenario_state init "$profile" "" "${selected[@]}"
 	source_scenarios "$profile" "${selected[@]}"
 	for scenario in "${selected[@]}"; do
 		if [[ -f "$SCENARIO_ROOT/shared/$scenario.sh" ]]; then
@@ -260,9 +313,11 @@ run_scenario_plan() {
 		SCENARIO_TIMEOUT_NAME=$scenario
 		SCENARIO_TIMEOUT_SECONDS=$scenario_timeout
 		printf 'scenario:%s/%s\n' "$profile" "$scenario" >"${ARTIFACT_ROOT:-${TMPDIR:-/tmp}}/current-phase.txt"
+		write_scenario_state start "$profile" "$scenario"
 		trap scenario_timeout_handler TERM
 		start_scenario_watchdog "$profile" "$scenario" "$scenario_timeout" "$command_grace" "$cleanup_grace"
 		"$function"
+		write_scenario_state pass "$profile" "$scenario"
 		stop_scenario_watchdog
 		trap - TERM
 	done

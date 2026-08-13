@@ -1,0 +1,118 @@
+# Privileged preflight contract (version 1)
+#
+# Machine-readable contract for distinguishing environment support from product
+# failure in privileged execution. Task 7.1 defines the schema and outcome/exit
+# mapping; tasks 7.2-7.3 wire it into executor, runner, and evidence.
+
+version = 1
+
+[outcomes]
+# Stable machine-readable outcomes for one privileged execution.
+supported = "preflight passed; product assertions may run"
+unsupported_environment = "required support probes failed or could not be proven; no product pass/fail claimed"
+infrastructure_error = "VM/tooling/transfer/bootstrap/executor preparation failed; no product pass/fail claimed"
+not_checked = "a required probe could not decide; treated as unsupported for gate purposes"
+
+[exit_mapping]
+# Distinct stable exit codes. 0 = supported and all assertions passed.
+supported_pass = 0
+product_failure = 1
+usage_or_contract = 2
+not_checked = 77
+unsupported_environment = 78
+infrastructure_error = 79
+timeout = 124
+
+[probe_codes]
+os = "PRIV-OS"
+architecture = "PRIV-ARCH"
+ubuntu_version = "PRIV-UBUNTU"
+kernel_version = "PRIV-KERNEL"
+privileges = "PRIV-CAPS"
+cgroup_v2 = "PRIV-CGROUP2"
+btf = "PRIV-BTF"
+bpffs = "PRIV-BPFFS"
+hooks_tooling = "PRIV-HOOKS"
+executor_readiness = "PRIV-EXEC"
+
+[probe_status]
+# Each probe reports one status; unsupported/not_checked never satisfies a gate.
+supported = "probe passed"
+unsupported = "probe failed with remediation"
+not_checked = "probe could not decide safely"
+
+[[probes]]
+id = "os"
+required = true
+check = "uname -s == Linux"
+message = "privileged Chronicle tests require Linux"
+remediation = "run on a supported Linux host or Multipass Ubuntu VM"
+
+[[probes]]
+id = "architecture"
+required = true
+check = "machine matches supported architecture"
+message = "architecture is not supported"
+remediation = "use an aarch64/x86_64 supported image"
+
+[[probes]]
+id = "ubuntu_version"
+required = true
+check = "Ubuntu 24.04 (VERSION_ID)"
+message = "supported Ubuntu release not detected"
+remediation = "use Ubuntu 24.04 image"
+
+[[probes]]
+id = "kernel_version"
+required = true
+check = "kernel >= 6.8"
+message = "kernel too old for supported capture"
+remediation = "update kernel or use supported image"
+
+[[probes]]
+id = "privileges"
+required = true
+check = "effective CAP_NET_ADMIN, CAP_SYS_ADMIN, CAP_BPF (or documented root equivalence)"
+message = "insufficient capabilities"
+remediation = "grant required capabilities or run as privileged service"
+
+[[probes]]
+id = "cgroup_v2"
+required = true
+check = "/sys/fs/cgroup/cgroup.controllers present and unified"
+message = "cgroup v2 unified hierarchy missing"
+remediation = "boot with cgroup v2 (systemd.unified_cgroup_hierarchy)"
+
+[[probes]]
+id = "btf"
+required = true
+check = "/sys/kernel/btf/vmlinux readable"
+message = "kernel BTF unavailable"
+remediation = "install linux-image with BTF or enable CONFIG_DEBUG_INFO_BTF"
+
+[[probes]]
+id = "bpffs"
+required = true
+check = "/sys/fs/bpf mounted as bpffs"
+message = "bpffs not mounted"
+remediation = "mount -t bpf bpf /sys/fs/bpf"
+
+[[probes]]
+id = "hooks_tooling"
+required = true
+check = "required capture hooks/helpers and tooling available (cargo, python3, bpf-linker, bpftool, find, mountpoint)"
+message = "required tooling missing"
+remediation = "install required packages per operations docs"
+
+[[probes]]
+id = "executor_readiness"
+required = true
+check = "VM running, source transferred, executor reachable"
+message = "executor or VM not ready"
+remediation = "check Multipass/VM state and re-run prepare"
+
+[evidence]
+# Preflight result is recorded with evidence and can never be reused as a pass.
+unsupported_never_passes = true
+infrastructure_never_passes = true
+doctor_vocabulary = "reuses supported/unsupported/not_checked semantics without mutating production doctor state"

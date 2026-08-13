@@ -59,45 +59,65 @@ pub fn recover_pending_checkpoint<S: RecordingStore>(
         return Ok(None);
     }
     let candidate = read_checkpoint(&pending_path)?;
+    let existing = match read_checkpoint(checkpoint_path) {
+        Ok(existing) => Some(existing),
+        Err(CheckpointError::Io) => None,
+        Err(error) => return Err(PublicationError::Checkpoint(error)),
+    };
+    let existing_len = existing.as_ref().map_or(0, |value| value.outputs.len());
+    // The pending candidate must be a strict successor of the durable
+    // checkpoint: same output prefix and predecessor digest. Otherwise the
+    // interrupted transaction is ambiguous evidence and recovery fails closed.
+    if candidate.outputs.len() < existing_len
+        || existing.as_ref().is_some_and(|value| {
+            candidate.predecessor_digest.as_ref() != Some(&value.checksum)
+                || candidate.outputs[..existing_len] != value.outputs
+        })
+    {
+        return Err(PublicationError::OutputLineage);
+    }
     let mut present = 0usize;
-    for output in &candidate.outputs {
-        match store.head(&output.key) {
+    for (index, output) in candidate.outputs.iter().enumerate() {
+        let head = match store.head(&output.key) {
             Ok(head)
                 if head.kind == RecordingArtifactKind::CanonicalDeltaBatch
                     && head.checksum == output.digest
                     && head.bytes == output.bytes =>
             {
-                present += 1;
+                Some(())
             }
             Ok(_) => return Err(PublicationError::Verification),
-            Err(RecordingStoreError::NotFound) => {}
+            Err(RecordingStoreError::NotFound) => None,
             Err(error) => return Err(PublicationError::Store(error)),
+        };
+        if head.is_some() {
+            present += 1;
+        }
+        // Outputs already referenced by the durable checkpoint must still be
+        // durable; a missing interior output is evidence loss and fails closed.
+        if index < existing_len && head.is_none() {
+            return Err(PublicationError::OutputLineage);
         }
     }
-    if present == 0 {
+    if present != candidate.outputs.len() {
+        // Some new suffix outputs are not durable, so the transaction did not
+        // complete. Every existing output is intact; discard only private
+        // staging and let the retry reprocess the suffix to convergence.
         remove_pending_checkpoint(&pending_path)?;
         return Ok(None);
     }
-    if present != candidate.outputs.len() {
-        return Err(PublicationError::OutputLineage);
-    }
-    let outcome = match read_checkpoint(checkpoint_path) {
-        Ok(existing) if existing.encode()? == candidate.encode()? => {
+    let outcome = match existing {
+        Some(existing) if existing.encode()? == candidate.encode()? => {
             ReconcileOutcome::AlreadyConsistent
         }
-        Ok(existing)
-            if candidate.predecessor_digest.as_ref() == Some(&existing.checksum)
-                && existing.outputs.len() <= candidate.outputs.len()
-                && existing.outputs == candidate.outputs[..existing.outputs.len()] =>
-        {
+        Some(_) => {
             write_checkpoint_atomic(checkpoint_path, &candidate)?;
             ReconcileOutcome::AdoptedOutput
         }
-        Err(CheckpointError::Io) => {
+        None => {
             write_checkpoint_atomic(checkpoint_path, &candidate)?;
             ReconcileOutcome::RepairedCheckpoint
         }
-        Ok(_) | Err(_) => return Err(PublicationError::OutputLineage),
     };
     remove_pending_checkpoint(&pending_path)?;
     Ok(Some(outcome))
@@ -549,6 +569,101 @@ mod tests {
             read_checkpoint(&checkpoint_path).unwrap().encode().unwrap(),
             value.encode().unwrap()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_partial_suffix_discards_staging_and_converges() {
+        let store = InMemoryRecordingStore::default();
+        let batch = CanonicalDeltaBatchV1::new(0, 0, Vec::new()).unwrap();
+        let key_a = "delta/partial-a";
+        let key_b = "delta/partial-b";
+        let artifact_a = RecordingArtifact::new(
+            key_a,
+            RecordingArtifactKind::CanonicalDeltaBatch,
+            batch.encode().unwrap(),
+        )
+        .unwrap();
+        store.put_if_absent(artifact_a).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("chronicle-pub-partial-{}", std::process::id()));
+        let checkpoint_path = root.join("checkpoint.json");
+        std::fs::create_dir_all(&root).unwrap();
+        let existing = checkpoint_with_output(key_a, &batch);
+        write_checkpoint_atomic(&checkpoint_path, &existing).unwrap();
+        let existing = read_checkpoint(&checkpoint_path).unwrap();
+        let mut candidate = checkpoint_with_output(key_b, &batch);
+        let suffix = candidate.outputs.clone();
+        let mut outputs = existing.outputs.clone();
+        outputs.extend(suffix);
+        candidate.outputs = outputs;
+        candidate.predecessor_digest = Some(existing.checksum.clone());
+        let pending = pending_checkpoint_path(&checkpoint_path);
+        write_checkpoint_atomic(&pending, &candidate).unwrap();
+        // Crash after pending-checkpoint write but before the new delta is
+        // durable: only private staging is discarded and the retry converges.
+        assert_eq!(
+            recover_pending_checkpoint(&store, &checkpoint_path).unwrap(),
+            None
+        );
+        assert!(!pending.exists());
+        assert_eq!(
+            read_checkpoint(&checkpoint_path).unwrap().outputs,
+            existing.outputs
+        );
+        // Once the missing suffix delta is durable, the retry adopts it.
+        let artifact_b = RecordingArtifact::new(
+            key_b,
+            RecordingArtifactKind::CanonicalDeltaBatch,
+            batch.encode().unwrap(),
+        )
+        .unwrap();
+        store.put_if_absent(artifact_b).unwrap();
+        write_checkpoint_atomic(&pending, &candidate).unwrap();
+        assert_eq!(
+            recover_pending_checkpoint(&store, &checkpoint_path).unwrap(),
+            Some(ReconcileOutcome::AdoptedOutput)
+        );
+        assert!(!pending.exists());
+        assert_eq!(
+            read_checkpoint(&checkpoint_path).unwrap().outputs,
+            candidate.outputs
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_interior_missing_output_fails_closed() {
+        let store = InMemoryRecordingStore::default();
+        let batch = CanonicalDeltaBatchV1::new(0, 0, Vec::new()).unwrap();
+        let key_a = "delta/interior-a";
+        let key_b = "delta/interior-b";
+        // Only the suffix output is durable; an existing-prefix output vanished.
+        let artifact_b = RecordingArtifact::new(
+            key_b,
+            RecordingArtifactKind::CanonicalDeltaBatch,
+            batch.encode().unwrap(),
+        )
+        .unwrap();
+        store.put_if_absent(artifact_b).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("chronicle-pub-interior-{}", std::process::id()));
+        let checkpoint_path = root.join("checkpoint.json");
+        std::fs::create_dir_all(&root).unwrap();
+        let existing = checkpoint_with_output(key_a, &batch);
+        write_checkpoint_atomic(&checkpoint_path, &existing).unwrap();
+        let existing = read_checkpoint(&checkpoint_path).unwrap();
+        let mut candidate = checkpoint_with_output(key_b, &batch);
+        let suffix = candidate.outputs.clone();
+        let mut outputs = existing.outputs.clone();
+        outputs.extend(suffix);
+        candidate.outputs = outputs;
+        candidate.predecessor_digest = Some(existing.checksum.clone());
+        write_checkpoint_atomic(pending_checkpoint_path(&checkpoint_path), &candidate).unwrap();
+        assert!(matches!(
+            recover_pending_checkpoint(&store, &checkpoint_path),
+            Err(PublicationError::OutputLineage)
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 

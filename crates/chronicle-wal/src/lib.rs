@@ -1988,6 +1988,14 @@ impl GroupCommitWalWriter {
             .expect("group commit writer always owns recording lock")
     }
 
+    /// Release the recording lock after graceful shutdown. flock(2) treats a
+    /// second open of the same file in the same process as a conflicting
+    /// owner, so in-process final ETL must re-acquire only after this call.
+    /// Callers must not append after releasing.
+    pub fn release_recording_lock(&mut self) {
+        self.lock.take();
+    }
+
     /// Seal current epoch, release its lock, and acquire same-recording lock for next epoch.
     pub fn rollover(&mut self, now_millis: u64, first_sequence: u64) -> Result<(), WalError> {
         self.shutdown(now_millis)?;
@@ -2983,6 +2991,25 @@ mod tests {
             Err(WalError::RecordingLockHeld)
         ));
         drop(first);
+        assert!(RecordingLock::acquire(&directory).is_ok());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn released_writer_lock_can_be_reacquired_in_process() {
+        // flock(2) treats a second fd for the same file in the same process
+        // as a conflicting owner, so a live writer blocks re-acquisition;
+        // after release_recording_lock the process may re-acquire (final ETL).
+        let directory = discovery_directory();
+        let mut writer =
+            GroupCommitWalWriter::create(&directory, RecordingId::new(), MIN_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        assert!(matches!(
+            RecordingLock::acquire(&directory),
+            Err(WalError::RecordingLockHeld)
+        ));
+        writer.release_recording_lock();
         assert!(RecordingLock::acquire(&directory).is_ok());
         fs::remove_dir_all(directory).unwrap();
     }

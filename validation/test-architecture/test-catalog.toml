@@ -1,0 +1,762 @@
+# Chronicle classified test catalog (version 1)
+#
+# Machine-readable representation of the responsibility-based test architecture.
+# Validation tooling selects and orchestrates these tests; P1/P2/release are
+# selectors over required coverage, not test categories.
+#
+# Functional layers (exclusive): unit | integration | smoke | acceptance | e2e.
+# Environment dimension (orthogonal): portable | privileged.
+# status: existing (present in checkout) | planned (added by a later task in
+# this change; defined now so coverage mapping is explicit).
+
+version = 1
+layers = ["unit", "integration", "smoke", "acceptance", "e2e"]
+environments = ["portable", "privileged"]
+selectors = ["p1", "p2", "release"]
+
+# ---------------------------------------------------------------------------
+# Required gate coverage (selectors over catalog test ids)
+# ---------------------------------------------------------------------------
+
+[required.p1]
+tests = [
+  "unit:chronicle-common",
+  "unit:chronicle-canonical",
+  "unit:chronicle-capture",
+  "unit:chronicle-capture-ebpf",
+  "unit:chronicle-wal",
+  "unit:chronicle-session",
+  "unit:chronicle-protocol",
+  "unit:chronicle-protocol-builtins",
+  "unit:chronicle-etl",
+  "unit:chronicle-storage",
+  "unit:chronicle-replay",
+  "unit:chronicle-application",
+  "unit:chronicle-cli",
+  "integration:application-vertical-fake",
+  "integration:application-vertical-http",
+  "integration:etl-contract",
+  "integration:capture-loss-window-model",
+  "integration:chronicle-wal-matrix",
+  "integration:cli-contract",
+  "integration:capture-ebpf-privileged-adapter",
+  "integration:capture-ebpf-privileged-feasibility",
+  "integration:cli-privileged-signal",
+  "tooling:validation-tests",
+  "tooling:acceptance-tests",
+  "tooling:timeout-wrapper",
+  "tooling:cli-rollback",
+  "smoke:cli-help",
+  "smoke:list-empty",
+  "smoke:cli-invalid-config",
+  "smoke:replay-minimal-fixture",
+  "smoke:inspect-minimal-recording",
+  "smoke:etl-minimal-start",
+  "smoke:recorder-basic-startup",
+  "acceptance:record-basic",
+  "acceptance:inspect-display",
+  "acceptance:etl-process",
+  "acceptance:replay-report",
+  "e2e:rootless-synthetic-pipeline",
+  "e2e:privileged-capture-pipeline",
+  "tooling:privileged-preflight",
+  "acceptance:user-intent-lifecycle-privileged",
+  "acceptance:cli-compat-privileged-sample",
+]
+
+[required.p2]
+tests = [
+  # P2 is a superset of P1 required coverage (subset check enforced).
+  "unit:chronicle-common",
+  "unit:chronicle-canonical",
+  "unit:chronicle-capture",
+  "unit:chronicle-capture-ebpf",
+  "unit:chronicle-wal",
+  "unit:chronicle-session",
+  "unit:chronicle-protocol",
+  "unit:chronicle-protocol-builtins",
+  "unit:chronicle-etl",
+  "unit:chronicle-storage",
+  "unit:chronicle-replay",
+  "unit:chronicle-application",
+  "unit:chronicle-cli",
+  "integration:application-vertical-fake",
+  "integration:application-vertical-http",
+  "integration:etl-contract",
+  "integration:capture-loss-window-model",
+  "integration:chronicle-wal-matrix",
+  "integration:cli-contract",
+  "integration:capture-ebpf-privileged-adapter",
+  "integration:capture-ebpf-privileged-feasibility",
+  "integration:cli-privileged-signal",
+  "tooling:validation-tests",
+  "tooling:acceptance-tests",
+  "tooling:timeout-wrapper",
+  "tooling:cli-rollback",
+  "smoke:cli-help",
+  "smoke:list-empty",
+  "smoke:cli-invalid-config",
+  "smoke:replay-minimal-fixture",
+  "smoke:inspect-minimal-recording",
+  "smoke:etl-minimal-start",
+  "smoke:recorder-basic-startup",
+  "acceptance:record-basic",
+  "acceptance:inspect-display",
+  "acceptance:etl-process",
+  "acceptance:replay-report",
+  "e2e:rootless-synthetic-pipeline",
+  "e2e:privileged-capture-pipeline",
+  "acceptance:recorder-readiness",
+  "acceptance:checkpoint-kill-restart",
+  "acceptance:quota-pressure",
+  "acceptance:retention-interruption",
+  "acceptance:reboot-recovery",
+  "tooling:privileged-preflight",
+  "acceptance:user-intent-lifecycle-privileged",
+  "acceptance:cli-compat-privileged-sample",
+]
+
+[required.release]
+tests = [
+  "unit:chronicle-common",
+  "unit:chronicle-canonical",
+  "unit:chronicle-capture",
+  "unit:chronicle-capture-ebpf",
+  "unit:chronicle-wal",
+  "unit:chronicle-session",
+  "unit:chronicle-protocol",
+  "unit:chronicle-protocol-builtins",
+  "unit:chronicle-etl",
+  "unit:chronicle-storage",
+  "unit:chronicle-replay",
+  "unit:chronicle-application",
+  "unit:chronicle-cli",
+  "integration:application-vertical-fake",
+  "integration:application-vertical-http",
+  "integration:etl-contract",
+  "integration:capture-loss-window-model",
+  "integration:chronicle-wal-matrix",
+  "integration:cli-contract",
+  "integration:capture-ebpf-privileged-adapter",
+  "integration:capture-ebpf-privileged-feasibility",
+  "integration:cli-privileged-signal",
+  "tooling:validation-tests",
+  "tooling:acceptance-tests",
+  "tooling:timeout-wrapper",
+  "tooling:cli-rollback",
+  "smoke:cli-help",
+  "smoke:list-empty",
+  "smoke:cli-invalid-config",
+  "smoke:replay-minimal-fixture",
+  "smoke:inspect-minimal-recording",
+  "smoke:etl-minimal-start",
+  "smoke:recorder-basic-startup",
+  "acceptance:record-basic",
+  "acceptance:inspect-display",
+  "acceptance:etl-process",
+  "acceptance:replay-report",
+  "acceptance:recorder-readiness",
+  "acceptance:checkpoint-kill-restart",
+  "acceptance:quota-pressure",
+  "acceptance:retention-interruption",
+  "acceptance:reboot-recovery",
+  "e2e:rootless-synthetic-pipeline",
+  "e2e:privileged-capture-pipeline",
+  "tooling:privileged-preflight",
+  "acceptance:user-intent-lifecycle-privileged",
+  "acceptance:cli-compat-privileged-sample",
+]
+
+# ---------------------------------------------------------------------------
+# Classified tests
+# ---------------------------------------------------------------------------
+
+[[test]]
+id = "unit:chronicle-common"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-common"
+command = "cargo test -p chronicle-common"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-canonical"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-canonical"
+command = "cargo test -p chronicle-canonical"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-capture"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-capture"
+command = "cargo test -p chronicle-capture"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-capture-ebpf"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-capture-ebpf"
+command = "cargo test -p chronicle-capture-ebpf"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-wal"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-wal"
+command = "cargo test -p chronicle-wal"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-session"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-session"
+command = "cargo test -p chronicle-session"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-protocol"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-protocol"
+command = "cargo test -p chronicle-protocol"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-protocol-builtins"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-protocol-builtins"
+command = "cargo test -p chronicle-protocol-builtins"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-etl"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-etl"
+command = "cargo test -p chronicle-etl"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-storage"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-storage"
+command = "cargo test -p chronicle-storage"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-replay"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-replay"
+command = "cargo test -p chronicle-replay"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-application"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-application"
+command = "cargo test -p chronicle-application"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "unit:chronicle-cli"
+layer = "unit"
+environment = "portable"
+owner = "chronicle-cli"
+command = "cargo test -p chronicle-cli"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "integration:application-vertical-fake"
+layer = "integration"
+environment = "portable"
+owner = "chronicle-application"
+command = "cargo test -p chronicle-application --test fake_vertical"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "integration:application-vertical-http"
+layer = "integration"
+environment = "portable"
+owner = "chronicle-application"
+command = "cargo test -p chronicle-application --test fixtures_http_vertical"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "integration:etl-contract"
+layer = "integration"
+environment = "portable"
+owner = "chronicle-application"
+command = "cargo test -p chronicle-application --test etl_contract"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "integration:capture-loss-window-model"
+layer = "integration"
+environment = "portable"
+owner = "chronicle-capture"
+command = "cargo test -p chronicle-capture --test loss_window_model"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "integration:chronicle-wal-matrix"
+layer = "integration"
+environment = "portable"
+owner = "chronicle-wal"
+command = "cargo test -p chronicle-wal --test wal_matrix"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "integration:cli-contract"
+layer = "integration"
+environment = "portable"
+owner = "chronicle-cli"
+command = "cargo test -p chronicle-cli --test cli_contract"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "integration:capture-ebpf-privileged-adapter"
+layer = "integration"
+environment = "privileged"
+owner = "chronicle-capture-ebpf"
+command = "cargo test -p chronicle-capture-ebpf --test privileged_adapter -- --ignored"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "integration:capture-ebpf-privileged-feasibility"
+layer = "integration"
+environment = "privileged"
+owner = "chronicle-capture-ebpf"
+command = "cargo test -p chronicle-capture-ebpf --test privileged_feasibility -- --ignored"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "integration:cli-privileged-signal"
+layer = "integration"
+environment = "privileged"
+owner = "chronicle-cli"
+command = "cargo test -p chronicle-cli --test privileged_signal -- --ignored"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "tooling:validation-tests"
+layer = "integration"
+environment = "portable"
+owner = "validation-tooling"
+command = "python3 scripts/tests/validation/test_layered_validation.py ; python3 scripts/tests/validation/test_architecture_boundaries.py ; python3 scripts/tests/validation/test_test_architecture.py ; python3 scripts/tests/validation/test_sleep_policy.py ; python3 scripts/tests/validation/test_lifecycle_cleanup.py ; python3 scripts/tests/validation/test_select_fixtures.py ; python3 scripts/tests/validation/test_evidence_reuse.py"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "tooling:privileged-preflight"
+layer = "integration"
+environment = "portable"
+owner = "validation"
+command = "python3 scripts/tests/validation/test_preflight.py"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "tooling:acceptance-tests"
+layer = "integration"
+environment = "portable"
+owner = "acceptance-tooling"
+command = "python3 scripts/tests/acceptance/test_runner.py ; bash scripts/tests/acceptance/test-p2-readiness.sh ; bash scripts/tests/acceptance/test-wait.sh"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "tooling:timeout-wrapper"
+layer = "integration"
+environment = "portable"
+owner = "validation-tooling"
+command = "bash scripts/tests/test-run-with-timeout.sh"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "tooling:cli-rollback"
+layer = "integration"
+environment = "portable"
+owner = "chronicle-cli"
+command = "bash scripts/tests/test-user-intent-cli-rollback.sh"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "smoke:cli-help"
+layer = "smoke"
+environment = "portable"
+owner = "chronicle-cli"
+command = "tests/smoke suite: chronicle --help"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "smoke:list-empty"
+layer = "smoke"
+environment = "portable"
+owner = "chronicle-cli"
+command = "tests/smoke suite: list on empty data-dir; the binary exposes no --version flag, --help is the liveness probe"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "smoke:cli-invalid-config"
+layer = "smoke"
+environment = "portable"
+owner = "chronicle-cli"
+command = "tests/smoke suite: usage errors and missing fixture return sane errors"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "smoke:replay-minimal-fixture"
+layer = "smoke"
+environment = "portable"
+owner = "chronicle-replay"
+command = "tests/smoke suite: replay dry-run on minimal fixture"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "smoke:inspect-minimal-recording"
+layer = "smoke"
+environment = "portable"
+owner = "chronicle-application"
+command = "tests/smoke suite: inspect on minimal fixture recording"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "smoke:etl-minimal-start"
+layer = "smoke"
+environment = "portable"
+owner = "chronicle-etl"
+command = "tests/smoke suite: ETL command alive and rejects metadata-less WAL (fail-closed)"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "smoke:recorder-basic-startup"
+layer = "smoke"
+environment = "portable"
+owner = "chronicle-application"
+command = "tests/smoke suite: public record fails fast on unsupported build before touching target"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "acceptance:record-basic"
+layer = "acceptance"
+environment = "portable"
+owner = "chronicle-application"
+command = "tests/acceptance/test_record.py: fixture record publishes session+WAL; malformed fixture and unsupported-build contracts"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "acceptance:inspect-display"
+layer = "acceptance"
+environment = "portable"
+owner = "chronicle-application"
+command = "tests/acceptance/test_inspect.py: user-visible inspect information, no payload leak"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "acceptance:etl-process"
+layer = "acceptance"
+environment = "portable"
+owner = "chronicle-etl"
+command = "tests/acceptance/test_etl.py: ETL fail-closed contracts (metadata-less WAL, identity mismatch); full matrix in chronicle-etl integration (task 3.3)"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "acceptance:replay-report"
+layer = "acceptance"
+environment = "portable"
+owner = "chronicle-replay"
+command = "tests/acceptance/test_replay.py: dry-run default, read gating, verification, mismatch exit"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "acceptance:recorder-readiness"
+layer = "acceptance"
+environment = "privileged"
+owner = "chronicle-application"
+command = "privileged acceptance scenario recorder-readiness (real systemd)"
+status = "planned"
+gates = ["p2", "release"]
+
+[[test]]
+id = "acceptance:checkpoint-kill-restart"
+layer = "acceptance"
+environment = "privileged"
+owner = "chronicle-etl"
+command = "privileged acceptance scenario checkpoint-kill-restart (real process interruption)"
+status = "planned"
+gates = ["p2", "release"]
+
+[[test]]
+id = "acceptance:quota-pressure"
+layer = "acceptance"
+environment = "privileged"
+owner = "chronicle-application"
+command = "privileged acceptance scenario quota-pressure (real loop/mount/systemd)"
+status = "planned"
+gates = ["p2", "release"]
+
+[[test]]
+id = "acceptance:retention-interruption"
+layer = "acceptance"
+environment = "privileged"
+owner = "chronicle-wal"
+command = "privileged acceptance scenario retention-interruption (real systemd cleanup interruption)"
+status = "planned"
+gates = ["p2", "release"]
+
+[[test]]
+id = "acceptance:reboot-recovery"
+layer = "acceptance"
+environment = "privileged"
+owner = "chronicle-application"
+command = "privileged acceptance scenario reboot-recovery (real VM reboot)"
+status = "planned"
+gates = ["p2", "release"]
+
+[[test]]
+id = "e2e:rootless-synthetic-pipeline"
+layer = "e2e"
+environment = "portable"
+owner = "root-e2e"
+command = "tests/e2e/test_rootless_pipeline.py: record-fixture -> inspect -> replay dry-run -> execute verification"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "e2e:privileged-capture-pipeline"
+layer = "e2e"
+environment = "privileged"
+owner = "root-e2e"
+command = "tests/privileged/e2e suite: real workload + eBPF capture -> downstream pipeline"
+status = "planned"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "acceptance:user-intent-lifecycle-privileged"
+layer = "acceptance"
+environment = "privileged"
+owner = "chronicle-application"
+command = "privileged acceptance scenario user-intent-lifecycle (real cgroup selection + eBPF cleanup + process attribution)"
+status = "planned"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "acceptance:cli-compat-privileged-sample"
+layer = "acceptance"
+environment = "privileged"
+owner = "chronicle-cli"
+command = "privileged acceptance sample: real capture output consumed by cli-compatibility forms"
+status = "planned"
+gates = ["p1", "p2", "release"]
+
+# ---------------------------------------------------------------------------
+# Scenario obligations: every scenario id in scripts/acceptance/scenarios.toml
+# must be covered by at least one classified test (no-coverage-loss).
+# ---------------------------------------------------------------------------
+
+[scenario_tests]
+capture-basic = [
+  "unit:chronicle-application",
+  "unit:chronicle-wal",
+  "integration:chronicle-wal-matrix",
+  "integration:capture-ebpf-privileged-adapter",
+  "integration:capture-ebpf-privileged-feasibility",
+  "smoke:recorder-basic-startup",
+  "e2e:rootless-synthetic-pipeline",
+  "e2e:privileged-capture-pipeline",
+]
+wal-recovery = [
+  "unit:chronicle-wal",
+  "unit:chronicle-etl",
+  "integration:application-vertical-fake",
+  "integration:etl-contract",
+  "integration:chronicle-wal-matrix",
+]
+replay = [
+  "unit:chronicle-replay",
+  "acceptance:inspect-display",
+  "acceptance:replay-report",
+  "e2e:rootless-synthetic-pipeline",
+  "e2e:privileged-capture-pipeline",
+]
+user-intent-lifecycle = [
+  "unit:chronicle-application",
+  "acceptance:record-basic",
+  "integration:cli-privileged-signal",
+  "acceptance:user-intent-lifecycle-privileged",
+]
+cli-compatibility = [
+  "integration:cli-contract",
+  "acceptance:record-basic",
+  "acceptance:inspect-display",
+  "acceptance:cli-compat-privileged-sample",
+]
+resource-cleanup = [
+  "unit:chronicle-application",
+  "integration:cli-privileged-signal",
+  "integration:capture-ebpf-privileged-adapter",
+]
+recorder-readiness = [
+  "smoke:recorder-basic-startup",
+  "acceptance:recorder-readiness",
+]
+incremental-etl = [
+  "unit:chronicle-etl",
+  "unit:chronicle-application",
+  "integration:etl-contract",
+]
+checkpoint-kill-restart = [
+  "unit:chronicle-etl",
+  "unit:chronicle-application",
+  "acceptance:checkpoint-kill-restart",
+]
+quota-pressure = ["unit:chronicle-application", "acceptance:quota-pressure"]
+retention-interruption = [
+  "unit:chronicle-wal",
+  "unit:chronicle-application",
+  "acceptance:retention-interruption",
+]
+corruption-quarantine = [
+  "unit:chronicle-etl",
+  "unit:chronicle-wal",
+  "integration:etl-contract",
+]
+reboot-recovery = [
+  "acceptance:reboot-recovery",
+  "e2e:privileged-capture-pipeline",
+]
+
+# ---------------------------------------------------------------------------
+# Legacy check obligations: every legacy check declared in scenarios.toml must
+# map to at least one classified test id. Deleting a mapping fails validation.
+# ---------------------------------------------------------------------------
+
+[legacy_check_tests]
+privileged_acceptance = [
+  "integration:capture-ebpf-privileged-adapter",
+  "integration:capture-ebpf-privileged-feasibility",
+]
+wal_fault_matrix = ["unit:chronicle-wal"]
+ingest_limit_matrix = ["unit:chronicle-application"]
+replay_matrix = ["unit:chronicle-replay"]
+cgroup_matrix = ["unit:chronicle-application"]
+privileged_signal = ["integration:cli-privileged-signal"]
+format_check = ["tooling:validation-tests"]
+workspace_check = ["tooling:validation-tests"]
+systemd_type_simple = ["acceptance:recorder-readiness"]
+three_epochs = ["integration:capture-ebpf-privileged-adapter"]
+checkpoint_output_committed_checkpoint_missing = [
+  "unit:chronicle-etl",
+  "acceptance:checkpoint-kill-restart",
+]
+checkpoint_committed_status_missing = [
+  "unit:chronicle-etl",
+  "acceptance:checkpoint-kill-restart",
+]
+incremental_worker = ["unit:chronicle-etl", "unit:chronicle-application"]
+standalone_etl_live_rejection = ["unit:chronicle-etl"]
+one_shot_equivalence = ["unit:chronicle-etl", "integration:etl-contract"]
+inspect_replay = ["acceptance:inspect-display", "acceptance:replay-report"]
+quota_exhaustion_admission = [
+  "unit:chronicle-application",
+  "acceptance:quota-pressure",
+]
+quota_restart_accounting = [
+  "unit:chronicle-application",
+  "acceptance:quota-pressure",
+]
+quota_recovery_after_space = [
+  "unit:chronicle-application",
+  "acceptance:quota-pressure",
+]
+minimum_free_enforcement = [
+  "unit:chronicle-application",
+  "acceptance:quota-pressure",
+]
+minimum_free_recovery = [
+  "unit:chronicle-application",
+  "acceptance:quota-pressure",
+]
+cleanup_interrupted_recovery = [
+  "unit:chronicle-wal",
+  "acceptance:retention-interruption",
+]
+cleanup_protected_lineage = [
+  "unit:chronicle-wal",
+  "acceptance:retention-interruption",
+]
+cleanup_restart_consistency = [
+  "unit:chronicle-wal",
+  "acceptance:retention-interruption",
+]
+corruption_fail_closed = ["unit:chronicle-etl", "integration:etl-contract"]
+corruption_evidence_preservation = [
+  "unit:chronicle-etl",
+  "integration:etl-contract",
+]
+pre_reboot_persistence = ["acceptance:reboot-recovery"]
+host_reboot_recovery = ["acceptance:reboot-recovery"]
+user_intent_lifecycle = [
+  "unit:chronicle-application",
+  "acceptance:record-basic",
+  "acceptance:user-intent-lifecycle-privileged",
+]
+cli_compatibility = [
+  "integration:cli-contract",
+  "acceptance:record-basic",
+  "acceptance:cli-compat-privileged-sample",
+]
+resource_cleanup = [
+  "unit:chronicle-application",
+  "integration:cli-privileged-signal",
+]
+signal_shutdown = [
+  "integration:cli-privileged-signal",
+  "integration:cli-contract",
+]
+process_restart_readiness = ["acceptance:recorder-readiness"]

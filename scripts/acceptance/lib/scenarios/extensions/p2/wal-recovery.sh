@@ -2,21 +2,60 @@
 # Central-dispatch scenario: wal-recovery.
 scenario_p2_wal_recovery() {
 	phase stop 'request graceful SIGTERM and verify unit exit'
-	wait_for_unit_stable "$UNIT" || true
+	wait_for_unit_stable "$UNIT"
 	RECORDER_STATUS="$ARTIFACT_ROOT/recorder-before-stop.json" \
 		wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"
-	# Ensure the active epoch carries committed evidence before the final stop:
-	# with one-second epochs the stop can otherwise land on an empty epoch.
+	# Ensure committed evidence advances before final stop; do not infer flush
+	# completion from elapsed scheduler time.
+	COMMITTED_BEFORE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("counters", {}).get("committed_records", 0))' "$ARTIFACT_ROOT/recorder-before-stop.json")
+	epoch_ordinal() {
+		"$CHRONICLE" --format json internal recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
+		python3 -c 'import json,sys; v=json.load(open(sys.argv[1], encoding="utf-8")); e=v.get("current_epoch", 0); print(e.get("ordinal", e) if isinstance(e, dict) else e)' "$RECORDER_STATUS"
+	}
+	epoch_advanced() {
+		local current
+		current=$(epoch_ordinal)
+		printf 'current_epoch=%s expected>%s\n' "$current" "$EPOCH_REF"
+		((current > EPOCH_REF))
+	}
+	committed_advanced() {
+		"$CHRONICLE" --format json internal recorder-status --state-root "$STATE_ROOT" >"$RECORDER_STATUS"
+		local committed
+		committed=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("counters", {}).get("committed_records", 0))' "$RECORDER_STATUS")
+		printf 'committed_records=%s expected>%s\n' "$committed" "$COMMITTED_BEFORE"
+		((committed > COMMITTED_BEFORE)) || return 1
+		# The first commit lands while the ring still drains tail events; a
+		# stable second sample proves the workload was fully committed before
+		# the graceful stop (an early stop drops the tail request).
+		local prior=${COMMITTED_PROBE:-}
+		COMMITTED_PROBE=$committed
+		[[ -n $prior && $prior == "$committed" ]]
+	}
+	# With one-second epochs a workload straddling a boundary splits across
+	# two recordings; run it inside a fresh epoch so the published recording
+	# carries the whole workload, then stop only after that epoch rolls. The
+	# primer keeps the epoch cadence live: without commits the recorder skips
+	# empty epoch rolls, so the fresh-window wait would otherwise time out.
 	printf '%s\n' "$$" >"$CGROUP/cgroup.procs" 2>/dev/null || true
-	for _attempt in 1 2 3; do
-		python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/final-workload.json" 2>/dev/null && break
-		sleep 1
-	done
-	sleep 1
-	systemctl stop "$UNIT"
-	if systemctl is-active --quiet "$UNIT"; then
-		exit 1
-	fi
+	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/primer-workload.json" 2>/dev/null
+	printf '%s\n' "$$" >/sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+	COMMITTED_PROBE=
+	wait_until 30 0.5 'primer workload committed and drained' committed_advanced
+	COMMITTED_PROBE=
+	EPOCH_REF=$(epoch_ordinal)
+	wait_until 10 0.1 'fresh epoch window for the final workload' epoch_advanced
+	EPOCH_REF=$(epoch_ordinal)
+	COMMITTED_BEFORE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("counters", {}).get("committed_records", 0))' "$RECORDER_STATUS")
+	printf '%s\n' "$$" >"$CGROUP/cgroup.procs" 2>/dev/null || true
+	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/final-workload.json"
+	printf '%s\n' "$$" >/sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+	COMMITTED_PROBE=
+	wait_until 30 0.5 'final workload committed and drained before graceful stop' committed_advanced
+	COMMITTED_PROBE=
+	# Seal the workload's epoch so the published recording is complete.
+	wait_until 10 0.1 'final workload epoch sealed by rollover' epoch_advanced
+	systemctl stop --no-block "$UNIT"
+	wait_for_unit_inactive "$UNIT" 45
 	journalctl --no-pager -u "$UNIT" >"$ARTIFACT_ROOT/recorder.log" || true
 	[[ "$(systemctl show "$UNIT" -p ExecMainStatus --value 2>/dev/null || true)" == 0 ]]
 	set_check signal_shutdown passed

@@ -1724,6 +1724,13 @@ impl RecordingIngest {
         Ok(boundary)
     }
 
+    /// Release the active epoch's WAL lock (call only after finish/shutdown).
+    /// flock(2) treats a second fd for the same file in the same process as a
+    /// conflicting owner, so the final in-process ETL must run after this.
+    pub fn release_wal_lock(&mut self) {
+        self.writer.release_recording_lock();
+    }
+
     fn reset_after_rollover(&mut self) {
         self.queue.clear();
         self.written_records.clear();

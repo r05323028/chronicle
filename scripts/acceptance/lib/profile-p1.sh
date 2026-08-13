@@ -328,6 +328,7 @@ on_exit() {
 	local status=$?
 	set +e
 	declare -F stop_scenario_watchdog >/dev/null && stop_scenario_watchdog
+	declare -F finalize_scenario_state >/dev/null && finalize_scenario_state "$status" || true
 	local cleanup_status=0
 	cleanup_resources || cleanup_status=$?
 	END_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf '%s' 'not_checked')
@@ -390,6 +391,8 @@ fi
 export CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR"
 log "Acceptance mode: $ACCEPTANCE_MODE"
 
+# shellcheck source=scripts/acceptance/lib/wait.sh
+source "$ROOT/scripts/acceptance/lib/wait.sh"
 # shellcheck source=scripts/acceptance/lib/scenario-dispatch.sh
 source "$ROOT/scripts/acceptance/lib/scenario-dispatch.sh"
 run_scenario_plan p1

@@ -35,6 +35,8 @@ pub(crate) use record::{
     mark_epoch_cleanup_complete, recover_rollover_transition_for_root, save_lifecycle_index,
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+pub(crate) use record::{live_capture_metadata, monotonic_millis, preflight_embedded_ebpf};
+#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 pub use record::{record_continuous_ebpf, record_live_ebpf};
 mod epoch_catalog;
 mod etl;
@@ -52,7 +54,7 @@ pub use etl::{
 };
 #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
 pub(crate) use etl::{
-    load_production_ebpf_source, persist_live_failure, persist_pre_attach_failure,
+    has_published_wal, load_production_ebpf_source, process_and_publish_recording_wal_owned,
 };
 #[cfg(test)]
 pub(crate) use etl::{
