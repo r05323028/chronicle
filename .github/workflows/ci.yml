@@ -48,10 +48,9 @@ jobs:
           python3 tests/smoke/test_smoke.py
           python3 tests/acceptance/test_record.py
           python3 tests/acceptance/test_inspect.py
-          python3 tests/acceptance/test_etl.py
           python3 tests/acceptance/test_replay.py
           python3 tests/e2e/test_rootless_pipeline.py
-          python3 tests/e2e/http_acceptance_driver.py
+          python3 tests/support/test_http_driver.py
 
       - name: Validate layered tooling
         run: |

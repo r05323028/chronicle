@@ -68,14 +68,14 @@ Implemented this session:
 
 - `tests/support/process.py` — shared bounded process/JSON/fixture/driver support (3 consumers: smoke, acceptance, e2e). No new dependency or workspace crate.
 - `tests/smoke/test_smoke.py` — help, usage error, empty list, missing-fixture error, unsupported-build record failure, minimal fixture liveness per public surface.
-- `tests/acceptance/test_record.py`, `test_inspect.py`, `test_etl.py`, `test_replay.py` — per-feature black-box contracts.
+- `tests/acceptance/test_record.py`, `test_inspect.py`, `test_replay.py` — per-feature black-box contracts (internal ETL CLI coverage reclassified to `integration:cli-contract` in task 4.3; no public ETL user surface exists).
 - `tests/e2e/test_rootless_pipeline.py` — synthetic capture -> WAL -> canonical -> replay -> verification through the binary (invariants only).
 
 Decisions:
 
-- **ETL acceptance scope.** The CLI-only fixture path cannot produce a WAL with recorder metadata (recording identity is written by the real recorder; fixture record writes sessions + segments only). `acceptance:etl-process` therefore proves the ETL command's rootless fail-closed contracts (metadata-less WAL rejected, identity mismatch rejected). Exhaustive ETL idempotence/corruption matrices move to `chronicle-etl` integration ownership in task 3.3, per lowest-conclusive-layer rule.
+- **Internal ETL CLI contract (task 4.3).** ETL has no documented public user surface, so the internal ETL seam is not Smoke or Acceptance. `tests/acceptance/test_etl.py` and the `internal etl` smoke liveness case were removed; their fail-closed contracts (metadata-less WAL rejected, identity mismatch rejected) now live in `crates/chronicle-cli/tests/cli_contract.rs` under the CLI-owned `integration:cli-contract` (exit-code mapping, JSON error rendering, fail-closed before processing). Application ETL correctness stays separately owned by `integration:etl-contract` (chronicle-application); the two are never merged. Exhaustive ETL idempotence/corruption matrices remain `chronicle-etl` integration ownership (task 3.3). Public ETL acceptance will be added separately only if ETL gains a documented public command.
 - **Smoke version probe.** The binary exposes no `--version` flag; `smoke:cli-version` was renamed `smoke:list-empty` and `--help` serves as the liveness probe.
-- **Internal forms retained intentionally.** `internal record-fixture` (fixture capture input) and `internal etl` (WAL canonicalization) are exercised as the deterministic rootless surfaces; task 4.3 records them as intentional internal-command coverage, while public `record`, `inspect`, `replay` drive user acceptance. Real capture/catalog flows remain privileged on supported Linux.
+- **Internal forms retained intentionally.** `internal record-fixture` (fixture capture input) remains exercised as deterministic rootless setup for public smoke/acceptance/E2E surfaces; the `internal etl` seam is covered only by the CLI-owned Integration contract (`integration:cli-contract`), never as Smoke/Acceptance proof. Public `record`, `inspect`, `replay` drive user acceptance. Real capture/catalog flows remain privileged on supported Linux.
 - **Catalog status.** 39 tests `existing`; 8 remain `planned` (all privileged: recorder-readiness, checkpoint-kill-restart, quota-pressure, retention-interruption, reboot-recovery, privileged-capture-pipeline, user-intent-lifecycle-privileged, cli-compat-privileged-sample).
 
 ## ETL coverage closure (task 3.3)

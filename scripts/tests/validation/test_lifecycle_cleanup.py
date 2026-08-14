@@ -33,7 +33,7 @@ def port_free(port: int) -> bool:
 
 def driver_processes() -> list:
     out = subprocess.run(
-        ["pgrep", "-f", "http_acceptance_driver.py"],
+        ["pgrep", "-f", "http_driver.py"],
         capture_output=True,
         text=True,
         timeout=30,

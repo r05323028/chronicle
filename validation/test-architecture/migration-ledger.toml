@@ -123,7 +123,7 @@ verify = "cargo test -p chronicle-capture --test loss_window_model (portable, an
 [[entries]]
 id = "integration:crates/chronicle-cli/tests/cli_contract.rs"
 path = "crates/chronicle-cli/tests/cli_contract.rs"
-purpose = "binary-level CLI grammar, argument/output/exit mapping, replay safety, ETL corruption, doctor, storage errors, bootstrap"
+purpose = "binary-level CLI grammar, argument/output/exit mapping, replay safety, ETL corruption + internal ETL fail-closed (4.3), doctor, storage errors, bootstrap"
 current_layer = "integration"
 target_layer = "integration"
 environment = "portable"
@@ -131,9 +131,9 @@ owner = "chronicle-cli"
 surface = "binary"
 gates = ["p1", "p2"]
 disposition = "split"
-destination = "integration stays; smoke (4.1), acceptance (4.2), E2E (5.1) are additive suites"
+destination = "integration stays; smoke (4.1), acceptance (4.2), E2E (5.1) are additive suites; internal ETL CLI seam reclassified to integration:cli-contract (4.3)"
 dependency_impact = "none"
-rationale = "task 3.5 audits assertion-by-assertion: argument/rendering/exit mapping remain CLI-owned integration; executable liveness becomes smoke; public feature behavior becomes acceptance; record-to-replay composition becomes E2E; cgroup/signal behavior already split into privileged_signal.rs; must not add lower Chronicle dev dependencies"
+rationale = "task 3.5 audits assertion-by-assertion: argument/rendering/exit mapping remain CLI-owned integration; executable liveness becomes smoke; public feature behavior becomes acceptance; record-to-replay composition becomes E2E; cgroup/signal behavior already split into privileged_signal.rs; must not add lower Chronicle dev dependencies; task 4.3 added cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch as the CLI-owned Integration home for the internal ETL seam after removing tests/acceptance/test_etl.py and the smoke internal-etl liveness case"
 verify = "cargo test -p chronicle-cli --test cli_contract"
 
 [[entries]]
@@ -166,27 +166,27 @@ environment = "portable"
 owner = "root-black-box-support"
 surface = "process"
 gates = []
-disposition = "stay"
-destination = ""
+disposition = "move"
+destination = "tests/support/http_driver.py (task 4.4 cutover); legacy file remains physically until task 11.4 deletes it"
 dependency_impact = "none"
-rationale = "task 4.4 explicitly classifies it as infrastructure, not E2E proof; it is not counted as Chronicle E2E coverage"
-verify = "python3 tests/e2e/test_http_acceptance_driver.py"
+rationale = "task 4.4 cutover: shared support must live under tests/support/ with one owner; root black-box layers never import another root functional layer for shared infrastructure; legacy file is obsolete with zero active callers, preserved for rollback until section 11 cleanup"
+verify = "python3 tests/support/test_http_driver.py"
 
 [[entries]]
 id = "root:tests/e2e/test_http_acceptance_driver.py"
 path = "tests/e2e/test_http_acceptance_driver.py"
-purpose = "rootless self-test of the HTTP acceptance driver (condition-based readiness, workload semantics)"
+purpose = "rootless self-test of the HTTP driver (condition-based readiness, workload semantics)"
 current_layer = "integration"
 target_layer = "integration"
 environment = "portable"
 owner = "root-black-box-support"
 surface = "process"
 gates = []
-disposition = "stay"
-destination = ""
+disposition = "move"
+destination = "tests/support/test_http_driver.py (task 4.4); superseded self-test path remains physically until task 11.4"
 dependency_impact = "none"
-rationale = "support self-test stays rootless and condition-based; driver remains classified infrastructure"
-verify = "python3 tests/e2e/test_http_acceptance_driver.py"
+rationale = "support self-test stays rootless and condition-based; moved with the driver to tests/support/ so support depends on nothing outside tests/support/"
+verify = "python3 tests/support/test_http_driver.py"
 
 # ---------------------------------------------------------------------------
 # Validation and acceptance tooling self-tests
@@ -1365,3 +1365,38 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-wal"
 # Entries are maintained by hand per baseline dispositions; see coverage-comparison.md for the blind-spot audit.
+
+# ---------------------------------------------------------------------------
+# Task 4.3: internal ETL CLI reclassification (removed wrappers)
+# ---------------------------------------------------------------------------
+[[entries]]
+id = "root:tests/acceptance/test_etl.py"
+path = "tests/acceptance/test_etl.py"
+purpose = "internal ETL CLI fail-closed contracts (metadata-less WAL rejected, identity mismatch rejected)"
+current_layer = "acceptance"
+target_layer = "integration"
+environment = "portable"
+owner = "chronicle-cli"
+surface = "binary internal command"
+gates = ["p1", "p2"]
+disposition = "move"
+destination = "crates/chronicle-cli/tests/cli_contract.rs (integration:cli-contract), added cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch"
+dependency_impact = "none"
+rationale = "task 4.3: internal command seams are Integration contracts, never Smoke/Acceptance; ETL has no documented public user surface; application ETL correctness stays separately in integration:etl-contract (chronicle-application)"
+verify = "cargo test -p chronicle-cli --test cli_contract cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch"
+
+[[entries]]
+id = "root:tests/smoke/test_smoke.py:test_etl_liveness_minimal_wal"
+path = "tests/smoke/test_smoke.py"
+purpose = "internal etl liveness case (rejects metadata-less WAL)"
+current_layer = "smoke"
+target_layer = "integration"
+environment = "portable"
+owner = "chronicle-cli"
+surface = "binary internal command"
+gates = ["p1", "p2"]
+disposition = "move"
+destination = "crates/chronicle-cli/tests/cli_contract.rs (integration:cli-contract); smoke:etl-minimal-start removed from catalog"
+dependency_impact = "none"
+rationale = "task 4.1/4.3: merely invoking an internal subprocess does not make a test Smoke; internal ETL seam belongs to the CLI-owned Integration contract"
+verify = "cargo test -p chronicle-cli --test cli_contract cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch"

@@ -37,7 +37,7 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ARTIFACT_ROOT=${CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT:-"$ROOT/target/p2-acceptance/$RUN_ID"}
 TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT/target"}
 CHRONICLE="$TARGET_DIR/debug/chronicle"
-DRIVER="$ROOT/tests/e2e/http_acceptance_driver.py"
+DRIVER="$ROOT/tests/support/http_driver.py"
 UNIT="chronicle-p2-${RANDOM}-$$"
 CGROUP="/sys/fs/cgroup/$UNIT"
 STATE_ROOT=${CHRONICLE_ACCEPTANCE_STATE_ROOT:-"$ARTIFACT_ROOT/state"}
@@ -113,7 +113,7 @@ _unit_stable_condition() {
 		printf '%s 0\n' "$restarts" >"$sample_file"
 		return 1
 	fi
-	if ! python3 - "$sample_file" "$before" "$restarts" <<'PY'
+	if ! python3 - "$sample_file" "$before" "$restarts" <<'PY'; then
 import sys
 path, before, restarts = sys.argv[1:]
 prior_restarts, samples = before.split()
@@ -121,7 +121,6 @@ samples = int(samples) + 1 if prior_restarts == restarts else 0
 open(path, "w", encoding="utf-8").write(f"{restarts} {samples}\n")
 raise SystemExit(0 if samples >= 2 else 1)
 PY
-	then
 		return 1
 	fi
 	start_epoch=$(systemd_active_epoch "$SERVICE_COMMAND_TIMEOUT" "$unit")

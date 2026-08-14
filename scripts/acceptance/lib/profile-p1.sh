@@ -61,7 +61,7 @@ else
 fi
 RELEASE_MODE=${CHRONICLE_ACCEPTANCE_RELEASE:-0}
 CHRONICLE="$TARGET_DIR/release/chronicle"
-DRIVER="$ROOT/tests/e2e/http_acceptance_driver.py"
+DRIVER="$ROOT/tests/support/http_driver.py"
 DATA_DIR="$ARTIFACT_ROOT/data"
 RECORDING_REF=""
 WAL_DIR="$ARTIFACT_ROOT/wal"

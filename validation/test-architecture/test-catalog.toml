@@ -51,11 +51,9 @@ tests = [
   "smoke:cli-invalid-config",
   "smoke:replay-minimal-fixture",
   "smoke:inspect-minimal-recording",
-  "smoke:etl-minimal-start",
   "smoke:recorder-basic-startup",
   "acceptance:record-basic",
   "acceptance:inspect-display",
-  "acceptance:etl-process",
   "acceptance:replay-report",
   "e2e:rootless-synthetic-pipeline",
   "e2e:privileged-capture-pipeline",
@@ -98,11 +96,9 @@ tests = [
   "smoke:cli-invalid-config",
   "smoke:replay-minimal-fixture",
   "smoke:inspect-minimal-recording",
-  "smoke:etl-minimal-start",
   "smoke:recorder-basic-startup",
   "acceptance:record-basic",
   "acceptance:inspect-display",
-  "acceptance:etl-process",
   "acceptance:replay-report",
   "e2e:rootless-synthetic-pipeline",
   "e2e:privileged-capture-pipeline",
@@ -149,11 +145,9 @@ tests = [
   "smoke:cli-invalid-config",
   "smoke:replay-minimal-fixture",
   "smoke:inspect-minimal-recording",
-  "smoke:etl-minimal-start",
   "smoke:recorder-basic-startup",
   "acceptance:record-basic",
   "acceptance:inspect-display",
-  "acceptance:etl-process",
   "acceptance:replay-report",
   "acceptance:recorder-readiness",
   "acceptance:checkpoint-kill-restart",
@@ -460,15 +454,6 @@ status = "existing"
 gates = ["p1", "p2", "release"]
 
 [[test]]
-id = "smoke:etl-minimal-start"
-layer = "smoke"
-environment = "portable"
-owner = "chronicle-etl"
-command = "tests/smoke suite: ETL command alive and rejects metadata-less WAL (fail-closed)"
-status = "existing"
-gates = ["p1", "p2", "release"]
-
-[[test]]
 id = "smoke:recorder-basic-startup"
 layer = "smoke"
 environment = "portable"
@@ -492,15 +477,6 @@ layer = "acceptance"
 environment = "portable"
 owner = "chronicle-application"
 command = "tests/acceptance/test_inspect.py: user-visible inspect information, no payload leak"
-status = "existing"
-gates = ["p1", "p2", "release"]
-
-[[test]]
-id = "acceptance:etl-process"
-layer = "acceptance"
-environment = "portable"
-owner = "chronicle-etl"
-command = "tests/acceptance/test_etl.py: ETL fail-closed contracts (metadata-less WAL, identity mismatch); full matrix in chronicle-etl integration (task 3.3)"
 status = "existing"
 gates = ["p1", "p2", "release"]
 

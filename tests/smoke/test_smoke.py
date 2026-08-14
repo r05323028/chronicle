@@ -4,7 +4,7 @@
 Black-box, minimal, bounded. No full workflows, no arbitrary correctness
 sleeps, no daemon lifecycle. Covers help, usage errors, empty list, invalid
 fixture/config errors, unsupported-build record failure, and one minimal
-fixture invocation per public surface (record -> inspect/etl/replay liveness).
+fixture invocation per public surface (record -> inspect/replay liveness).
 
 Run: python3 tests/smoke/test_smoke.py
 """
@@ -91,25 +91,6 @@ class SmokeTests(unittest.TestCase):
         inspection = process.inspect_session(self.binary, session, self.root)
         self.assertEqual(inspection["version"], 1)
         self.assertEqual(inspection["replayability"], "fully_replayable")
-
-    def test_etl_liveness_minimal_wal(self):
-        # Minimal ETL contract on a fixture WAL: the command is alive and
-        # rejects a WAL without recorder metadata (fail-closed validation).
-        session = process.record_fixture(self.binary, process.FIXTURE_BASIC, self.root)
-        result = process.run(
-            self.binary,
-            [
-                "internal",
-                "etl",
-                "--wal-dir",
-                str(self.root / "wal" / session),
-                "--output",
-                str(self.root / "out"),
-            ],
-            timeout=15,
-        )
-        self.assertEqual(result.returncode, 3)
-        self.assertEqual(json.loads(result.stderr.decode())["code"], 3)
 
     def test_replay_liveness_minimal_fixture(self):
         session = process.record_fixture(self.binary, process.FIXTURE_BASIC, self.root)

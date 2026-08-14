@@ -219,7 +219,7 @@ def require_rootless_record_failure(binary: Path, root: Path, marker: Path) -> N
         raise CommandError("record must fail before touching the target")
 
 
-DRIVER = REPO_ROOT / "tests/e2e/http_acceptance_driver.py"
+DRIVER = REPO_ROOT / "tests/support/http_driver.py"
 
 
 class DriverHandle:

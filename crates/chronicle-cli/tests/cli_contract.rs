@@ -536,6 +536,86 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
 }
 
 #[test]
+fn cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch() {
+    // CLI-owned Integration contract for the internal ETL seam (task 4.3):
+    // fail-closed behavior before any processing. Application ETL correctness
+    // stays in integration:etl-contract (chronicle-application); this test
+    // proves only the internal-command CLI contract.
+    let root = std::env::temp_dir().join(format!(
+        "chronicle-cli-etl-failclosed-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).expect("create test root");
+
+    // Fixture WAL carries no recording.json -> rejected before processing.
+    let session = record_fixture(
+        &root,
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/http/basic-session.json"
+        )),
+    );
+    let fixture_wal = root.join("wal").join(session);
+    let first = command(&[
+        "--format",
+        "json",
+        "internal",
+        "etl",
+        "--wal-dir",
+        fixture_wal.to_str().expect("WAL path is UTF-8"),
+        "--output",
+        root.join("out-1").to_str().expect("output path is UTF-8"),
+    ]);
+    assert_eq!(first.status.code(), Some(3));
+    let (stdout, stderr) = output_text(&first);
+    assert!(stdout.is_empty());
+    let first_error: serde_json::Value =
+        serde_json::from_str(&stderr).expect("ETL failure is JSON");
+    assert_eq!(first_error["code"], 3);
+    assert!(
+        first_error["message"]
+            .as_str()
+            .expect("message")
+            .contains("recording metadata")
+    );
+
+    // Rewriting recording.json with a foreign recording ID is rejected:
+    // WAL segment identity must match the recorded identity.
+    let production = root.join("production-wal");
+    production_wal(&production);
+    let mut metadata = chronicle_application::load_recording_metadata(&production)
+        .expect("load metadata")
+        .expect("production WAL has metadata");
+    metadata.recording_id = chronicle_application::RecordingId::new();
+    chronicle_application::write_recording_metadata(&production, &metadata)
+        .expect("rewrite metadata");
+    let second = command(&[
+        "--format",
+        "json",
+        "internal",
+        "etl",
+        "--wal-dir",
+        production.to_str().expect("WAL path is UTF-8"),
+        "--output",
+        root.join("out-2").to_str().expect("output path is UTF-8"),
+    ]);
+    assert_eq!(second.status.code(), Some(3));
+    let (stdout, stderr) = output_text(&second);
+    assert!(stdout.is_empty());
+    let second_error: serde_json::Value =
+        serde_json::from_str(&stderr).expect("ETL failure is JSON");
+    assert_eq!(second_error["code"], 3);
+    assert!(
+        second_error["message"]
+            .as_str()
+            .expect("message")
+            .contains("identity mismatch")
+    );
+
+    std::fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
 fn cli_reports_usage_and_data_errors_as_safe_json() {
     let root = std::env::temp_dir().join(format!("chronicle-cli-errors-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("create test root");
