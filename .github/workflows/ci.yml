@@ -37,6 +37,9 @@ jobs:
       - name: Check toolchain
         run: rustup show active-toolchain
 
+      - name: Install OpenSpec CLI
+        run: npm install -g openspec@1.9.0
+
       - name: Run fast layered validation
         run: ./scripts/validate.sh fast
 
