@@ -326,7 +326,7 @@ run_scenario_plan() {
 		if [[ -f "$SCENARIO_ROOT/shared/$scenario.sh" ]]; then
 			function="scenario_${scenario//-/_}"
 		else
-			function="scenario_${profile}_${scenario//-/_}"
+			function="scenario_${profile//-/_}_${scenario//-/_}"
 		fi
 		declare -F "$function" >/dev/null || die "scenario function missing: $function"
 		if declare -F log >/dev/null; then
