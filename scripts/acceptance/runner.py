@@ -496,8 +496,11 @@ def run_profile(
             status = "failed"
     timeouts = report.timeout_records(runtime_root)
     preflight_result = None
-    preflight_path = assertions_root / "preflight.json"
-    if preflight_path.is_file():
+    preflight_paths = sorted(assertions_root.rglob("preflight.json"))
+    if preflight_paths:
+        # P2 writes one preflight.json per phase (pre-reboot, post-reboot);
+        # the last phase is the binding environment for the completed run.
+        preflight_path = preflight_paths[-1]
         try:
             preflight_value = json.loads(preflight_path.read_text(encoding="utf-8"))
             if isinstance(preflight_value, dict):
