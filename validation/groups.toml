@@ -22,7 +22,7 @@ paths = [
   "crates/chronicle-capture/src/**",
 ]
 commands = ["ebpf"]
-gates = ["p1"]
+gates = ["live-capture"]
 
 [groups.wal]
 description = "WAL recovery, checkpoint, retention, and quota tests"
@@ -33,13 +33,13 @@ paths = [
   "crates/chronicle-application/src/checkpoint.rs",
 ]
 commands = ["wal"]
-gates = ["p2"]
+gates = ["recorder"]
 
 [groups.etl]
 description = "ETL and checkpoint tests"
 paths = [
   "crates/chronicle-etl/**",
-  # Recorder admission/lifecycle/quota/checkpoint wiring is P2-owned.
+  # Recorder admission/lifecycle/quota/checkpoint wiring is recorder-owned.
   "crates/chronicle-application/src/**",
   "crates/chronicle-application/src/incremental_worker.rs",
   "crates/chronicle-application/src/checkpoint.rs",
@@ -48,7 +48,7 @@ paths = [
   "crates/chronicle-application/src/lib.rs",
 ]
 commands = ["etl"]
-gates = ["p2"]
+gates = ["recorder"]
 
 [groups.replay]
 description = "replay and verification tests"
@@ -58,7 +58,7 @@ paths = [
   "docs/replay-safety.md",
 ]
 commands = ["replay"]
-gates = ["p1"]
+gates = ["live-capture"]
 
 [groups.cli_docs]
 description = "CLI, documentation, OpenSpec checks, and shell installer"
@@ -84,7 +84,7 @@ paths = [
   "scripts/tests/acceptance/**",
 ]
 commands = ["acceptance"]
-gates = ["p1", "p2"]
+gates = ["live-capture", "recorder"]
 
 [groups.build_tooling]
 description = "validation and CI tooling"
@@ -96,9 +96,9 @@ paths = [
   "validation/test-architecture/**",
 ]
 commands = ["build_tooling"]
-gates = ["p1", "p2"]
+gates = ["live-capture", "recorder"]
 
-[gates.p1]
+[gates.live-capture]
 source_groups = ["ebpf", "replay", "acceptance", "build_tooling"]
 acceptance_paths = [
   "scripts/acceptance.sh",
@@ -107,9 +107,9 @@ acceptance_paths = [
   "validation/groups.toml",
 ]
 build_inputs = ["ebpf/**", "ebpf-feasibility/**"]
-checks = ["P1 complete privileged acceptance"]
+checks = ["live-capture complete privileged acceptance"]
 
-[gates.p2]
+[gates.recorder]
 source_groups = ["wal", "etl", "acceptance", "build_tooling"]
 acceptance_paths = [
   "scripts/acceptance.sh",
@@ -119,7 +119,7 @@ acceptance_paths = [
 ]
 build_inputs = ["ebpf/**", "ebpf-feasibility/**"]
 checks = [
-  "P2 complete privileged acceptance",
+  "recorder complete privileged acceptance",
   "reboot recovery",
   "quota",
   "corruption",

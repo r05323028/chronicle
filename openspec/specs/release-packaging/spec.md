@@ -6,12 +6,12 @@ Minimal release packaging so a public developer-facing installation path is real
 
 ### Requirement: Release workflow and targets
 
-The repository SHALL provide a release workflow triggered on version tags that builds release binaries for supported targets: x86_64 Linux and aarch64 Linux on native runners. Each release binary SHALL be built with `--features linux-ebpf` and `--locked` so live eBPF capture is available in the shipped artifact, with the eBPF object built from `ebpf/` source (nightly + rust-src + bpf-linker, `-Z build-std=core`, `--target bpfel-unknown-none --release`) and embedded through the existing `chronicle-capture-ebpf` build path.
+The repository SHALL provide a release workflow triggered on version tags that builds release binaries for supported targets: x86_64 Linux and aarch64 Linux on native runners. Each release binary SHALL be built with `--locked` on the Linux target so live eBPF capture is available in the shipped artifact automatically (selected from the compilation target; no feature flag), with the eBPF object built from `ebpf/` source (nightly + rust-src + bpf-linker, `-Z build-std=core`, `--target bpfel-unknown-none --release`) and embedded through the existing `chronicle-capture-ebpf` build path.
 
 #### Scenario: Tagged release builds
 
 - **WHEN** a `v*` tag is pushed
-- **THEN** the workflow builds x86_64 and aarch64 Linux binaries with `linux-ebpf`, embeds the eBPF object, and publishes release artifacts
+- **THEN** the workflow builds x86_64 and aarch64 Linux binaries with live capture embedded, and publishes release artifacts
 
 ### Requirement: Artifact format and checksums
 

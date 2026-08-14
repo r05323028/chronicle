@@ -11,10 +11,6 @@ license.workspace = true
 name = "chronicle"
 path = "src/main.rs"
 
-[features]
-default = []
-linux-ebpf = ["chronicle-application/linux-ebpf", "tokio/signal"]
-
 [dependencies]
 chronicle-application = { path = "../chronicle-application" }
 clap.workspace = true
@@ -24,6 +20,9 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 rustix.workspace = true

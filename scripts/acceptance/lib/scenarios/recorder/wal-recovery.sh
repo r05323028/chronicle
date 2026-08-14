@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: wal-recovery.
-scenario_p2_wal_recovery() {
+scenario_recorder_wal_recovery() {
 	phase stop 'request graceful SIGTERM and verify unit exit'
 	wait_for_unit_stable "$UNIT"
 	RECORDER_STATUS="$ARTIFACT_ROOT/recorder-before-stop.json" \

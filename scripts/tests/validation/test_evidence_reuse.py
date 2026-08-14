@@ -31,7 +31,7 @@ def compact(dest: pathlib.Path, status: str) -> pathlib.Path:
     source = dest / "workdir"
     source.mkdir(parents=True)
     (source / "artifact.txt").write_text("evidence", encoding="utf-8")
-    gate_root = dest / "p1"
+    gate_root = dest / "live-capture"
     gate_root.mkdir(parents=True)
     run = subprocess.run(
         [
@@ -43,7 +43,7 @@ def compact(dest: pathlib.Path, status: str) -> pathlib.Path:
             "--dest",
             str(gate_root),
             "--gate",
-            "p1",
+            "live-capture",
             "--status",
             status,
             "--fingerprint",
@@ -51,7 +51,7 @@ def compact(dest: pathlib.Path, status: str) -> pathlib.Path:
             "--commit",
             "abc123",
             "--checks",
-            "p1",
+            "live-capture",
             "--artifact-mode",
             "artifact-on-failure",
         ],
@@ -72,11 +72,11 @@ def reuse(dest: pathlib.Path) -> int:
             "--evidence-root",
             str(dest),
             "--gate",
-            "p1",
+            "live-capture",
             "--fingerprint",
             "fp-test",
             "--checks",
-            "p1",
+            "live-capture",
         ],
         capture_output=True,
         text=True,

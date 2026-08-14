@@ -985,7 +985,7 @@ mod tests {
                 sequence: 7,
             }),
             wal_snapshot_sha256: Some("sha256:wal".into()),
-            pipeline_version: Some("p1".into()),
+            pipeline_version: Some("1".into()),
             evidence: vec![ProvenanceEntry {
                 kind: ProvenanceKind::CommitMarker,
                 sequence_range: Some((7, 7)),

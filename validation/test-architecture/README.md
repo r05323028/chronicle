@@ -6,9 +6,9 @@ no-coverage-loss obligations.
 
 | Artifact | Purpose |
 | --- | --- |
-| `test-catalog.toml` | Classified tests + P1/P2/release selectors + scenario/legacy obligations; validated by `scripts/validation.py catalog` |
+| `test-catalog.toml` | Classified tests + live-capture/recorder/release selectors + scenario/legacy obligations; validated by `scripts/validation.py catalog` |
 | `privileged-preflight-schema.toml` | Versioned preflight contract: outcomes, exit codes, probes, remediation |
-| `path-classification.md` | P1/P2 scenario classification and privileged E2E definition |
+| `path-classification.md` | Privileged scenario classification and privileged E2E definition |
 | `decisions.md` | Deliberate, still-applicable test-architecture decisions |
 
 Migration-era artifacts (baseline inventory, migration ledger, gate-coverage
@@ -37,7 +37,7 @@ privileged gates.
 ### Functional layers — lowest cost that conclusively proves behavior
 
 Every significant test is exactly one functional layer; privileged execution,
-P1, and P2 are NOT layers:
+live-capture, and recorder are NOT layers:
 
 - **unit** — local function/module/parser/serializer/validation/calculation/state-machine logic; colocated under `crates/<crate>/src/**`
 - **integration** — public crate/component contracts and meaningful deterministic combinations; normally `crates/<crate>/tests/`
@@ -60,7 +60,7 @@ Privileged execution runs bounded preflight first and emits machine-readable out
 
 ### Gate semantics
 
-P1/P2/release are selectors that map required milestone obligations to classified tests (`test-catalog.toml` `required.*` lists). P2 remains a superset of P1, and release of P2, per the current evidence contract (enforced by `scripts/validation.py catalog` and `scenarios.toml`). Gates do NOT require tests to live under P1/P2 directories.
+live-capture/recorder/release are selectors that map required acceptance obligations to classified tests (`test-catalog.toml` `required.*` lists). recorder remains a superset of live-capture, and release of recorder, per the current evidence contract (enforced by `scripts/validation.py catalog` and `scenarios.toml`). Gates do NOT require tests to live under live-capture/recorder directories.
 
 ### Helper ownership
 
@@ -76,4 +76,4 @@ No forbidden workspace dev edges (see `validation/architecture.toml`); Aya/kerne
 
 ## Terminology
 
-P1 and P2 are gate/milestone selectors, not test categories or directories. Privileged acceptance proves only kernel/environment-dependent behavior; it does NOT own portable correctness. Tests are classified by functional layer + environment dimension, and live under owning paths.
+live-capture and recorder are gate/acceptance selectors, not test categories or directories. Privileged acceptance proves only kernel/environment-dependent behavior; it does NOT own portable correctness. Tests are classified by functional layer + environment dimension, and live under owning paths.

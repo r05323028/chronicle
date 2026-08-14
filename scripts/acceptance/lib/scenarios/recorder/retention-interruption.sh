@@ -3,7 +3,7 @@
 # Self-contained: generates committed evidence across several one-second
 # epoch boundaries under delete-after retention, then SIGKILLs the recorder
 # while its cleanup is paused mid-commit and proves recovery convergence.
-scenario_p2_retention_interruption() {
+scenario_recorder_retention_interruption() {
 	phase cleanup_setup 'restart recorder with delete-after retention and cleanup pause'
 	CLEANUP_PAUSE_FILE="$STATE_ROOT/wal/cleanup-pause.control"
 	CLEANUP_READY_FILE="${CLEANUP_PAUSE_FILE%.*}.ready"

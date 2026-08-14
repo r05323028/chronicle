@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: quota-pressure.
-scenario_p2_quota_pressure() {
+scenario_recorder_quota_pressure() {
 	phase quota_pressure 'exercise quota and minimum-free admission on isolated loopback filesystem'
 	QUOTA_IMAGE="$ARTIFACT_ROOT/quota.img"
 	QUOTA_MOUNT="$ARTIFACT_ROOT/quota-mount"

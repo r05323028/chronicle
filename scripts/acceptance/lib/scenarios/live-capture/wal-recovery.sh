@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: wal-recovery.
-scenario_p1_wal_recovery() {
+scenario_live_capture_wal_recovery() {
 	phase 17 "Verify recovery report and categorized counters"
 	for key in received accepted_into_queue written_not_committed committed discarded_from_queue_due_to_wal_limit kernel_or_backend_dropped rejected_after_stop etl_checkpointed; do
 		grep -q "\"$key\"" "$ARTIFACT_ROOT/record.json"

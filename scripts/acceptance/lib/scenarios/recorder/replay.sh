@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: replay.
-scenario_p2_replay() {
+scenario_recorder_replay() {
 	phase inspect_replay 'inspect and replay through public recording identity'
 	"$CHRONICLE" --format json --data-dir "$P2_DATA_DIR" inspect "$P2_RECORDING_REF" >"$ARTIFACT_ROOT/inspect.json" 2>"$ARTIFACT_ROOT/inspect.log"
 	python3 - "$ARTIFACT_ROOT/inspect.json" <<'PY'

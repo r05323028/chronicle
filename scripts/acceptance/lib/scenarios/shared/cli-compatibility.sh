@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034 # result globals are consumed by profile summary after scenario returns
 # Dedicated 0.1.x CLI compatibility scenario. Legacy syntax belongs only here.
 # Fully self-contained: own cgroup subtree and WAL copies, so it runs under
-# both P1 and P2 profiles without depending on other scenarios' state.
+# both live-capture and recorder profiles without depending on other scenarios' state.
 cli_compatibility_impl() {
 	phase cli_compatibility 'prove legacy forms preserve behavior and emit one safe warning'
 	local compat="$ARTIFACT_ROOT/cli-compatibility"

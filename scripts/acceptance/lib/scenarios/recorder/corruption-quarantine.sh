@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: corruption-quarantine.
-scenario_p2_corruption_quarantine() {
+scenario_recorder_corruption_quarantine() {
 	phase corruption 'corrupt committed WAL copy and prove fail-closed preservation'
 	CORRUPT_WAL="$ARTIFACT_ROOT/corrupt-wal"
 	CORRUPT_STORE="$ARTIFACT_ROOT/corrupt-store"

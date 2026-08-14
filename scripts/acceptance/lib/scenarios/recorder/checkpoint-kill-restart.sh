@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: checkpoint-kill-restart.
-scenario_p2_checkpoint_kill_restart() {
+scenario_recorder_checkpoint_kill_restart() {
 	phase checkpoint_crash_matrix 'exercise production publication crash boundaries'
 	wait_for_unit_stable "$UNIT"
 	wait_for_recorder_ready --allow-stale-owner --timeout "$READINESS_TIMEOUT" --interval "$READINESS_INTERVAL"

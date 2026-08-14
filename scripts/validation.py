@@ -372,7 +372,7 @@ def source_ownership(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
         matches_for_file = [
             group_name
             for group_name, group in groups.items()
-            if "p2" in group.get("gates", [])
+            if "recorder" in group.get("gates", [])
             and any(matches(name, pattern) for pattern in group.get("paths", []))
         ]
         if matches_for_file:
@@ -394,7 +394,7 @@ def catalog_check(
     """Validate the classified test catalog and its gate/scenario obligations.
 
     The catalog is the machine-readable representation of the responsibility-
-    based test architecture. P1/P2/release select classified tests; privilege is
+    based test architecture. live-capture/recorder/release select classified tests; privilege is
     an environment dimension, not a layer. Fails on duplicate/unknown IDs,
     missing fields, invalid layer/environment, undefined commands, selector
     membership inconsistencies, superset violations, and unmapped scenario or
@@ -454,10 +454,13 @@ def catalog_check(
                 issues.append(
                     f"selector {selector}: required test {test_id} does not declare gate {selector}"
                 )
-    p1 = set(required.get("p1", {}).get("tests", []))
-    p2 = set(required.get("p2", {}).get("tests", []))
+    live_capture = set(required.get("live-capture", {}).get("tests", []))
+    recorder = set(required.get("recorder", {}).get("tests", []))
     release = set(required.get("release", {}).get("tests", []))
-    for name, smaller, larger in (("p1", p1, p2), ("p2", p2, release)):
+    for name, smaller, larger in (
+        ("live-capture", live_capture, recorder),
+        ("recorder", recorder, release),
+    ):
         missing = sorted(smaller - larger)
         if missing:
             issues.append(
@@ -485,8 +488,8 @@ def catalog_check(
                 )
     legacy_checks: set[str] = set()
     for cfg in scenario_def.get("scenarios", {}).values():
-        legacy_checks.update(cfg.get("legacy_p1_checks", []))
-        legacy_checks.update(cfg.get("legacy_p2_checks", []))
+        legacy_checks.update(cfg.get("legacy_live_capture_checks", []))
+        legacy_checks.update(cfg.get("legacy_recorder_checks", []))
     legacy_map = catalog.get("legacy_check_tests", {})
     unmapped = sorted(legacy_checks - set(legacy_map))
     if unmapped:
@@ -514,8 +517,8 @@ def catalog_check(
         "selectors": sorted(selectors),
         "layers": sorted(layers),
         "environments": sorted(environments),
-        "p1_required": len(p1),
-        "p2_required": len(p2),
+        "live_capture_required": len(live_capture),
+        "recorder_required": len(recorder),
         "release_required": len(release),
         "scenarios": len(scenario_ids),
         "planned_required": planned_required,
@@ -652,10 +655,10 @@ def fingerprint(
 
 
 def acceptance_fingerprint(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
-    """Fingerprint union of P1/P2 acceptance-sensitive source, independent of profile."""
+    """Fingerprint union of live-capture/recorder acceptance-sensitive source."""
     patterns: list[str] = []
     checks: set[str] = set()
-    for gate in ("p1", "p2"):
+    for gate in ("live-capture", "recorder"):
         gate_cfg = cfg.get("gates", {}).get(gate, {})
         for group_name in gate_cfg.get("source_groups", []):
             patterns.extend(cfg.get("groups", {}).get(group_name, {}).get("paths", []))

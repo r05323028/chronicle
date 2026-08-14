@@ -1,5 +1,5 @@
 use chronicle_application::escape_control;
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 use chronicle_application::record_selector;
 use chronicle_application::{
     AppConfig, ApplicationError, ChildStdio, CleanupOutcome, CommandReplayOptions, DoctorProbe,
@@ -11,13 +11,13 @@ use chronicle_application::{
     replay_config_doctor_probe, replay_session_with_plan, resolve_data_dir, resolve_recording,
     resolve_session, retry_recording,
 };
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 use chronicle_application::{
     CgroupSelector, CommandRecordOptions, ProductionRecordingBounds, ProductionSignalStop,
     load_recording_metadata, mark_recording_forced_termination, record_command,
     record_continuous_ebpf, record_live_ebpf, recording_physical_wal_bytes,
 };
-#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(any(test, target_os = "linux"))]
 use chronicle_application::{ChildExitResult, CommandRecordResult};
 use chronicle_application::{LoopbackReplayOptions, ReplayOutcome, TimingMode};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
@@ -299,7 +299,7 @@ struct EtlJson<'a> {
     checkpoint: &'a RecordingEtlCheckpoint,
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 #[derive(Serialize)]
 struct ProductionRecordJson<'a> {
     version: u8,
@@ -698,7 +698,7 @@ fn write_deprecation_warning(
     write_output(io::stderr().lock(), &warning)
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn spawn_signal_watcher(stop: ProductionSignalStop, wal_directory: PathBuf) {
     tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
@@ -840,7 +840,7 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
                 .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?
                 .normalize()
                 .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-            #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+            #[cfg(target_os = "linux")]
             {
                 let wal_dir = recorder_config.state_root.join("wal");
                 let stop = ProductionSignalStop::default();
@@ -890,11 +890,11 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
                 };
                 Ok((output, 0))
             }
-            #[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+            #[cfg(not(target_os = "linux"))]
             {
                 let _ = recorder_config;
                 Err(ApplicationError::ProductionPreflight(
-                    "Linux eBPF capture unavailable",
+                    "live capture is unavailable on this platform",
                 ))
             }
         }
@@ -1022,7 +1022,7 @@ fn record_fixture_legacy(
     Ok((output, 0))
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn record_ebpf_legacy(
     args: RecordArgs,
     config: &AppConfig,
@@ -1106,7 +1106,7 @@ fn record_ebpf_legacy(
     Ok((output, 0))
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 fn record_ebpf_legacy(
     args: RecordArgs,
     _config: &AppConfig,
@@ -1114,7 +1114,7 @@ fn record_ebpf_legacy(
 ) -> Result<(String, i32), ApplicationError> {
     drop(args);
     Err(ApplicationError::ProductionPreflight(
-        "Linux eBPF capture unavailable",
+        "live capture is unavailable on this platform",
     ))
 }
 
@@ -1175,7 +1175,7 @@ fn public_record(
 }
 
 /// Command mode: supervised-scope record of `-- COMMAND...`.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn record_command_mode(
     command: Vec<String>,
     name: Option<String>,
@@ -1222,7 +1222,7 @@ fn record_command_mode(
 }
 
 /// Selector mode: record an already-running workload by PID or cgroup path.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn record_selector_mode(
     pid: Option<u32>,
     cgroup: Option<std::path::PathBuf>,
@@ -1271,7 +1271,7 @@ fn record_selector_mode(
     Ok((output, code))
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 fn record_selector_mode(
     _pid: Option<u32>,
     _cgroup: Option<std::path::PathBuf>,
@@ -1282,11 +1282,11 @@ fn record_selector_mode(
     _format: Format,
 ) -> Result<(String, i32), ApplicationError> {
     Err(ApplicationError::UnsupportedLivePreflight(
-        "record --pid/--cgroup requires the Linux eBPF build",
+        "record --pid/--cgroup requires a Linux build with live capture",
     ))
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 fn record_command_mode(
     _command: Vec<String>,
     _name: Option<String>,
@@ -1296,13 +1296,13 @@ fn record_command_mode(
     _format: Format,
 ) -> Result<(String, i32), ApplicationError> {
     Err(ApplicationError::UnsupportedLivePreflight(
-        "command-mode recording requires the Linux eBPF build",
+        "command-mode recording requires a Linux build with live capture",
     ))
 }
 
 /// Signal watcher for command mode (no WAL marker: the recording directory is
 /// internal to the orchestration; a second signal just exits).
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn spawn_command_signal_watcher(stop: ProductionSignalStop) {
     tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
@@ -1329,7 +1329,7 @@ fn spawn_command_signal_watcher(stop: ProductionSignalStop) {
 }
 
 /// Human/JSON public record completion summary v1. Raw argv never appears.
-#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(any(test, target_os = "linux"))]
 fn render_command_record(
     result: &CommandRecordResult,
     format: Format,
@@ -1401,7 +1401,7 @@ fn render_command_record(
     }
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(any(test, target_os = "linux"))]
 fn dropped_records(counters: &RecordingCounters) -> u64 {
     counters
         .discarded_from_queue_due_to_wal_limit
@@ -1411,7 +1411,7 @@ fn dropped_records(counters: &RecordingCounters) -> u64 {
         .saturating_add(counters.rejected_due_to_quota.records)
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(any(test, target_os = "linux"))]
 const fn recording_status_json(status: RecordingStatus) -> &'static str {
     match status {
         RecordingStatus::Completed => "completed",
@@ -1421,7 +1421,7 @@ const fn recording_status_json(status: RecordingStatus) -> &'static str {
     }
 }
 
-#[cfg(any(test, all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(any(test, target_os = "linux"))]
 const fn shutdown_reason_json(reason: ShutdownReason) -> &'static str {
     match reason {
         ShutdownReason::UserInterrupt => "user_interrupt",

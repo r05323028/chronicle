@@ -7,10 +7,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = []
-linux-ebpf = ["dep:chronicle-capture-ebpf", "chronicle-capture-ebpf/linux-ebpf"]
-
 [dependencies]
 chronicle-canonical = { path = "../chronicle-canonical" }
 chronicle-capture = { path = "../chronicle-capture" }
@@ -33,7 +29,7 @@ toml.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-chronicle-capture-ebpf = { path = "../chronicle-capture-ebpf", optional = true }
+chronicle-capture-ebpf = { path = "../chronicle-capture-ebpf" }
 
 [dev-dependencies]
 chronicle-wal = { path = "../chronicle-wal", features = ["test-support"] }

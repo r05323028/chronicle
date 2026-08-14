@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: replay.
-scenario_p1_replay() {
+scenario_live_capture_replay() {
 phase 20 "Prove public inspect remains stable after WAL validation"
 "$CHRONICLE" --format json --data-dir "$DATA_DIR" inspect "$RECORDING_REF" >"$ARTIFACT_ROOT/inspect-after-relocation.json" 2>"$ARTIFACT_ROOT/inspect-after-relocation.log"
 assert_json "$ARTIFACT_ROOT/inspect-after-relocation.json" 'value["version"] == 1 and value["recording_id"] == "'"$RECORDING_REF"'" and value["integrity_valid"] is True'

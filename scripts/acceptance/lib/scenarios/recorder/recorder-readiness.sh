@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: recorder-readiness.
-scenario_p2_recorder_readiness() {
+scenario_recorder_recorder_readiness() {
 	phase incremental 'prove recorder-owned incremental worker processes live committed WAL'
 	printf '%s\n' "$$" >"$CGROUP/cgroup.procs"
 	python3 "$DRIVER" workload --origin "http://127.0.0.1:$PORT" >"$ARTIFACT_ROOT/incremental-workload.json"

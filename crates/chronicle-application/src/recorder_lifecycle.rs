@@ -1,4 +1,4 @@
-//! Recorder lifecycle and readiness semantics, separate from P1 one-shot status.
+//! Recorder lifecycle and readiness semantics, separate from one-shot live-capture status.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

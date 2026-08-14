@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034 # scenario globals are consumed by profile cleanup/report
 # Central-dispatch scenario: capture-basic.
-scenario_p1_capture_basic() {
+scenario_live_capture_capture_basic() {
 	phase 1 "Validate environment"
 	[[ $(uname -s) == Linux ]] || skip "privileged runtime requires Linux; rootless fixture and eBPF compile profiles remain available"
 	validate_environment
@@ -15,8 +15,8 @@ scenario_p1_capture_basic() {
 	) >"$ARTIFACT_ROOT/build.log" 2>&1
 	assert_file "$EBPF_OBJECT"
 
-	phase 3 "Build release Chronicle CLI with linux-ebpf"
-	CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build --release -p chronicle-cli --features linux-ebpf --locked >>"$ARTIFACT_ROOT/build.log" 2>&1
+	phase 3 "Build release Chronicle CLI"
+	CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build --release -p chronicle-cli --locked >>"$ARTIFACT_ROOT/build.log" 2>&1
 	assert_file "$CHRONICLE"
 
 	phase 4 "Prepare artifacts and cgroups"
@@ -24,8 +24,8 @@ scenario_p1_capture_basic() {
 	mkdir -p "$VALIDATION_ROOT"
 	CGROUP_PARENT=$(current_cgroup_path) || die "cannot resolve current cgroup v2 path"
 	[[ -w $CGROUP_PARENT/cgroup.procs ]] || die "current cgroup is not writable: $CGROUP_PARENT"
-	DEDICATED_CGROUP="$CGROUP_PARENT/chronicle-p1-dedicated-$RUN_ID"
-	SHARED_CGROUP="$CGROUP_PARENT/chronicle-p1-shared-$RUN_ID"
+	DEDICATED_CGROUP="$CGROUP_PARENT/chronicle-live-capture-dedicated-$RUN_ID"
+	SHARED_CGROUP="$CGROUP_PARENT/chronicle-live-capture-shared-$RUN_ID"
 	mkdir "$DEDICATED_CGROUP" "$SHARED_CGROUP"
 	sleep 600 >"$ARTIFACT_ROOT/shared-one.log" 2>&1 &
 	SHARED_ONE_PID=$!

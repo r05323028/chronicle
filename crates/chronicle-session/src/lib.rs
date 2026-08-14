@@ -176,7 +176,7 @@ pub enum ReconstructionFinalization {
 #[serde(rename_all = "snake_case")]
 pub enum DerivedTermination {
     CleanClose,
-    /// Reserved until directional close evidence is available from Gate A.
+    /// Reserved until directional close evidence is available from kernel capture feasibility evidence.
     HalfClose,
     Reset,
     UnknownTermination,

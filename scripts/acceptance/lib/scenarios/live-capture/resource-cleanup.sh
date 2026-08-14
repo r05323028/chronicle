@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: resource-cleanup.
-scenario_p1_resource_cleanup() {
+scenario_live_capture_resource_cleanup() {
 phase 25 "Verify doctor has no persistent side effects"
 [[ ! -e "$ARTIFACT_ROOT/doctor-wal/recording.json" ]] || die "doctor created recording metadata"
 [[ ! -e "$ARTIFACT_ROOT/doctor-output/sessions" ]] || die "doctor published session"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: capture-basic.
-scenario_p2_capture_basic() {
+scenario_recorder_capture_basic() {
 	phase environment 'validate supported host and collect source provenance'
 	if [[ "$REBOOT_RESUME" == 1 ]]; then
 		[[ -f "$STATE_ROOT/wal/recording.json" ]] || exit 1
@@ -12,7 +12,7 @@ scenario_p2_capture_basic() {
 	phase build 'build Linux eBPF object and Chronicle CLI'
 	EBPF_TARGET_DIR=${CHRONICLE_EBPF_TARGET_DIR:-"$ROOT/ebpf/target"}
 	cargo +nightly build -Z build-std=core --manifest-path "$ROOT/ebpf/Cargo.toml" --target bpfel-unknown-none --release --locked
-	CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build -p chronicle-cli --features linux-ebpf --locked
+	CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build -p chronicle-cli --locked
 
 	phase config 'write short-epoch recorder configuration'
 	cat >"$CONFIG" <<EOF

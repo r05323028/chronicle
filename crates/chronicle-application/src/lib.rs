@@ -34,9 +34,9 @@ pub(crate) use record::{
     LIFECYCLE_INDEX_FILE, apply_retention_cleanup, compact_lifecycle_index, load_lifecycle_index,
     mark_epoch_cleanup_complete, recover_rollover_transition_for_root, save_lifecycle_index,
 };
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub(crate) use record::{live_capture_metadata, monotonic_millis, preflight_embedded_ebpf};
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub use record::{record_continuous_ebpf, record_live_ebpf};
 mod epoch_catalog;
 mod etl;
@@ -52,7 +52,7 @@ pub use etl::{
     recovery_issue_code, render_recovery_report_json, write_capture_to_wal,
     write_recording_metadata,
 };
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub(crate) use etl::{
     has_published_wal, load_production_ebpf_source, process_and_publish_recording_wal_owned,
 };
@@ -214,7 +214,7 @@ use chronicle_wal::{
     cleanup_finalized_segment_verified, encode_envelope, encode_terminal_wal_loss,
     prepare_group_commit_reopen_from_scan, scan_wal, verified_snapshot_sha256,
 };
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 use chronicle_wal::{prepare_group_commit_reopen, recover_cleanup};
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, RenameFlags, renameat_with};
@@ -232,7 +232,7 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 use std::time::{Duration, SystemTime};
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 use std::time::{Instant, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -254,7 +254,7 @@ pub enum ApplicationError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Capture(#[from] CaptureError),
-    #[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+    #[cfg(target_os = "linux")]
     #[error(transparent)]
     Ebpf(#[from] chronicle_capture_ebpf::EbpfCaptureError),
     #[error(transparent)]

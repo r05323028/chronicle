@@ -30,17 +30,17 @@ def load_scenarios(path: Path) -> dict[str, Any]:
     with path.open("rb") as handle:
         value = tomllib.load(handle)
     profiles = value.get("profiles", {})
-    p1 = set(profiles.get("p1", {}).get("scenarios", []))
-    p2 = set(profiles.get("p2", {}).get("scenarios", []))
-    if not p1.issubset(p2):
-        raise ValueError("p2 profile must include every p1 scenario")
+    live_capture = set(profiles.get("live-capture", {}).get("scenarios", []))
+    recorder = set(profiles.get("recorder", {}).get("scenarios", []))
+    if not live_capture.issubset(recorder):
+        raise ValueError("recorder profile must include every live-capture scenario")
     scenario_definitions = value.get("scenarios", {})
     if any(
         not isinstance(item.get("timeout_seconds"), int) or item["timeout_seconds"] <= 0
         for item in scenario_definitions.values()
     ):
         raise ValueError("every scenario timeout_seconds must be a positive integer")
-    for profile in ("p1", "p2"):
+    for profile in ("live-capture", "recorder"):
         selected = list(profiles.get(profile, {}).get("scenarios", []))
         if any(scenario not in scenario_definitions for scenario in selected):
             raise ValueError(f"{profile} selects undefined scenario")
@@ -62,7 +62,7 @@ def load_scenarios(path: Path) -> dict[str, Any]:
 
 
 def profile_scenarios(definition: dict[str, Any], profile: str) -> list[str]:
-    if profile not in {"p1", "p2"}:
+    if profile not in {"live-capture", "recorder"}:
         raise ValueError(f"unknown evidence profile: {profile}")
     return list(definition["profiles"][profile]["scenarios"])
 
@@ -232,7 +232,7 @@ def verify_manifest(root: Path) -> bool:
 
 def _legacy_checks(profile: str, legacy: dict[str, Any]) -> dict[str, str]:
     checks = legacy.get("checks", {})
-    if profile == "p1":
+    if profile == "live-capture":
         return {key: value for key, value in checks.items() if isinstance(value, str)}
     return {key: value for key, value in checks.items() if isinstance(value, str)}
 
@@ -277,7 +277,7 @@ def load_scenario_state(
 ) -> tuple[list[str], list[str], list[str]] | None:
     """Load strict atomic dispatcher state for scenario-level attribution.
 
-    P2 runs pre-reboot and post-reboot phases with one ledger per phase; the
+    Recorder runs pre-reboot and post-reboot phases with one ledger per phase; the
     final attribution is the union across all phase ledgers (a scenario passes
     once any phase completed it, fails once any phase failed it, and stays
     not_checked only when no phase ran it).
@@ -508,7 +508,7 @@ def report_is_complete(value: dict[str, Any], required: Iterable[str]) -> bool:
         and bool(value.get("run_id"))
         and isinstance(value.get("created_at"), str)
         and bool(value.get("created_at"))
-        and value.get("profile") in {"p1", "p2"}
+        and value.get("profile") in {"live-capture", "recorder"}
         and value.get("executor") in {"local", "multipass"}
         and isinstance(value.get("environment"), dict)
         and value["environment"].get("executor") == value.get("executor")

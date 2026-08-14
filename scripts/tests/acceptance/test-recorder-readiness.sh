@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rootless contract tests for machine-readable P2 readiness polling.
+# Rootless contract tests for machine-readable recorder readiness polling.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
@@ -172,4 +172,4 @@ if wait_for_recorder_ready --timeout 1 --interval 0; then
 fi
 PATH=$old_path
 export PATH
-printf '%s\n' 'p2 readiness contract tests passed'
+printf '%s\n' 'recorder readiness contract tests passed'

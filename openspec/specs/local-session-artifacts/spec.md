@@ -49,7 +49,7 @@ Each session SHALL use existing `<root>/sessions/<session-id>/manifest.json`, `s
 
 #### Scenario: Production provenance manifest
 
-- **WHEN** P1 ETL publishes recovered recording
+- **WHEN** the recording ETL publishes a recovered recording
 - **THEN** manifest v1 contains recording/checkpoint/provenance/completeness metadata without raw payload/header values
 
 #### Scenario: Read P0 manifest
@@ -106,7 +106,7 @@ Default inspect output SHALL show session ID, source recording ID/status/shutdow
 
 #### Scenario: Complete replayable session
 
-- **WHEN** complete valid P1 session is inspected
+- **WHEN** a complete valid session is inspected
 - **THEN** output reports complete, integrity valid, replay ready, operation order, and provenance summary without payload values
 
 #### Scenario: Unsupported or truncated session
@@ -149,7 +149,7 @@ Canonical Session MVP v1 SHALL represent source recording/status/reason, source 
 
 ### Requirement: Sensitive production data boundary
 
-WAL and session documentation/metadata SHALL state that stored headers and bodies can contain sensitive production data. Filesystem adapter SHALL use restrictive supported permissions and default logs/inspect SHALL remain value-safe. P1 SHALL NOT claim encryption at rest, secret detection, comprehensive redaction, or tenant isolation.
+WAL and session documentation/metadata SHALL state that stored headers and bodies can contain sensitive production data. Filesystem adapter SHALL use restrictive supported permissions and default logs/inspect SHALL remain value-safe. Chronicle SHALL NOT claim encryption at rest, secret detection, comprehensive redaction, or tenant isolation.
 
 #### Scenario: Private publication
 
@@ -159,7 +159,7 @@ WAL and session documentation/metadata SHALL state that stored headers and bodie
 #### Scenario: Security documentation
 
 - **WHEN** user follows recording documentation
-- **THEN** sensitive-data warning and P1 non-guarantees appear before runnable production workflow
+- **THEN** sensitive-data warning and non-guarantees appear before runnable production workflow
 
 ### Requirement: Atomic deterministic re-publication
 

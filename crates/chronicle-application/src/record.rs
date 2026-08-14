@@ -112,7 +112,7 @@ pub fn preflight_production_record(
     Ok(selection)
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
     chronicle_capture_ebpf::probe_embedded()
         .is_ready()
@@ -122,17 +122,17 @@ pub(crate) fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
         ))
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
     Err(ApplicationError::ProductionPreflight(
-        "Linux eBPF capture unavailable",
+        "live capture is unavailable on this platform",
     ))
 }
 
 /// Runs live eBPF recording. Signal adapters request stop through `stop`.
 /// `recording_id` is caller-allocated so orchestration can persist intent and
 /// catalog linkage before capture.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub fn record_live_ebpf(
     selector: CgroupSelector,
     allow_shared_cgroup: bool,
@@ -189,7 +189,7 @@ pub fn record_live_ebpf(
 }
 
 /// Runs capture through the continuous startup/rollover/drain runtime.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_lines)]
 fn recover_cleanup_for_root(root: &Path) -> Result<(), RecorderStartupError> {
     // The cleanup intent is written beside its source segment (inside the
@@ -223,10 +223,7 @@ fn recover_cleanup_for_root(root: &Path) -> Result<(), RecorderStartupError> {
     Ok(())
 }
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn rollover_path_matches(expected: &str, actual: &Path) -> bool {
     match (fs::canonicalize(expected), fs::canonicalize(actual)) {
         (Ok(expected), Ok(actual)) => expected == actual,
@@ -234,10 +231,7 @@ fn rollover_path_matches(expected: &str, actual: &Path) -> bool {
     }
 }
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[allow(clippy::too_many_lines)]
 pub(crate) fn recover_rollover_transition_for_root(
     state_root: &Path,
@@ -385,26 +379,14 @@ pub(crate) fn recover_rollover_transition_for_root(
     Ok(())
 }
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const LIFECYCLE_INDEX_FILE: &str = "lifecycle-index.json";
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const LIFECYCLE_INDEX_MAX_ENTRIES: usize = 4096;
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const LIFECYCLE_INDEX_MAX_BYTES: usize = 1 << 20;
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn load_lifecycle_index(root: &Path) -> Result<LifecycleIndexV1, ApplicationError> {
     match fs::read(root.join(LIFECYCLE_INDEX_FILE)) {
         Ok(bytes) => {
@@ -431,10 +413,7 @@ pub(crate) fn load_lifecycle_index(root: &Path) -> Result<LifecycleIndexV1, Appl
     }
 }
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn save_lifecycle_index(
     root: &Path,
     index: &LifecycleIndexV1,
@@ -445,10 +424,7 @@ pub(crate) fn save_lifecycle_index(
     write_private_atomic_json(root, LIFECYCLE_INDEX_FILE, index, None)
 }
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn mark_epoch_cleanup_complete(
     index: &mut LifecycleIndexV1,
     ordinal: u64,
@@ -472,10 +448,7 @@ pub(crate) fn mark_epoch_cleanup_complete(
 
 /// Drop the oldest half of cleanup-complete entries once the entry bound is
 /// reached, keeping full lineage of not-yet-cleaned epochs.
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn compact_lifecycle_index(
     index: &mut LifecycleIndexV1,
 ) -> Result<bool, ApplicationError> {
@@ -489,10 +462,7 @@ pub(crate) fn compact_lifecycle_index(
     Ok(true)
 }
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[allow(clippy::too_many_lines)]
 pub(crate) fn apply_retention_cleanup(
     root: &Path,
@@ -626,7 +596,7 @@ pub(crate) fn apply_retention_cleanup(
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn reserve_recording_quota(
     config: &NormalizedRecorderConfig,
     wal_root: &Path,
@@ -684,7 +654,7 @@ fn reserve_recording_quota(
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn persist_startup_recorder_metadata(
     config: &NormalizedRecorderConfig,
     catalog: Option<&EpochCatalogV1>,
@@ -757,7 +727,7 @@ fn persist_startup_recorder_metadata(
     .map_err(|_| RecorderStartupError::Recovery)
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_lines)]
 pub fn record_continuous_ebpf(
     selector: CgroupSelector,
@@ -1301,7 +1271,7 @@ pub fn record_continuous_ebpf(
     })
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn live_capture_metadata(
     selection: &CgroupSelection,
     bounds: ProductionRecordingBounds,
@@ -1349,7 +1319,7 @@ pub(crate) fn live_capture_metadata(
     })
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn monotonic_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

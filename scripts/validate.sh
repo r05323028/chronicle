@@ -21,7 +21,7 @@ ACCEPTANCE_PROFILE_TIMEOUT=${CHRONICLE_ACCEPTANCE_PROFILE_TIMEOUT_SECONDS:-3300}
 	printf '%s\n' 'CHRONICLE_ACCEPTANCE_PROFILE_TIMEOUT_SECONDS must be positive and shorter than validation gate timeout' >&2
 	exit 2
 }
-if [[ $MODE =~ ^(fast|targeted|gate|release)$ && ${CHRONICLE_VALIDATION_GATE_WRAPPED:-0} != 1 ]]; then
+if [[ $MODE =~ ^(fast|targeted|live-capture|recorder|release)$ && ${CHRONICLE_VALIDATION_GATE_WRAPPED:-0} != 1 ]]; then
 	mkdir -p "$ROOT/target/validation-work"
 	exec env CHRONICLE_VALIDATION_GATE_WRAPPED=1 CHRONICLE_TIMEOUT_LAYER=validation_gate CHRONICLE_TIMEOUT_NAME="$MODE" CHRONICLE_TIMEOUT_PHASE="$MODE" \
 		CHRONICLE_TIMEOUT_EVIDENCE_FILE="$ROOT/target/validation-work/$MODE-gate-timeout-$$.json" \
@@ -44,7 +44,7 @@ usage() {
 Usage:
   ./scripts/validate.sh fast [--no-artifact] [--keep-workdir]
   ./scripts/validate.sh targeted --changed-since <git-ref> [options]
-  ./scripts/validate.sh gate p1|p2 [--reuse-evidence] [options]
+  ./scripts/validate.sh live-capture|recorder [--reuse-evidence] [options]
   ./scripts/validate.sh release [--reuse-evidence] [options]
 
 Options: --changed-since REF --reuse-evidence --force --no-artifact --artifact-on-failure --keep-workdir
@@ -58,13 +58,8 @@ EOF
 	exit 2
 }
 GATE=
-if [[ $MODE == gate ]]; then
-	GATE=${1:-}
-	shift || true
-	[[ $GATE == p1 || $GATE == p2 ]] || {
-		usage >&2
-		exit 2
-	}
+if [[ $MODE == live-capture || $MODE == recorder ]]; then
+	GATE=$MODE
 fi
 
 while (($#)); do
@@ -263,7 +258,7 @@ run_targeted() {
 	fi
 	print_selection "$selection"
 	local groups group package
-	local ran_p1=false ran_p2=false
+	local ran_live_capture=false ran_recorder=false
 	groups=$(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["selected"]))' "$selection")
 	while IFS= read -r group; do
 		[[ -n $group ]] || continue
@@ -288,14 +283,14 @@ PY
 			;;
 		ebpf)
 			run_shell ebpf-build 'cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release --locked'
-			printf 'eBPF source changed: minimal privileged smoke selects P1 smoke path.\n'
+			printf 'eBPF source changed: minimal privileged smoke selects the live-capture smoke path.\n'
 			if [[ ${CHRONICLE_SKIP_PRIVILEGED_SMOKE:-false} != true ]]; then
 				if [[ $DRY_RUN == true || $DRY_RUN == 1 ]]; then
-					printf 'WOULD RUN privileged P1 smoke: %q ' "$ROOT/scripts/acceptance.sh" --profile p1 --executor multipass --vm "$VM" --evidence-root "$WORKDIR/p1-smoke-source" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT" --no-reuse --compact
+					printf 'WOULD RUN privileged live-capture smoke: %q ' "$ROOT/scripts/acceptance.sh" --profile live-capture --executor multipass --vm "$VM" --evidence-root "$WORKDIR/live-capture-smoke-source" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT" --no-reuse --compact
 					printf '\n'
 				else
-					"$ROOT/scripts/acceptance.sh" --profile p1 --executor multipass --vm "$VM" \
-						--evidence-root "$WORKDIR/p1-smoke-source" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT" --no-reuse --compact
+					"$ROOT/scripts/acceptance.sh" --profile live-capture --executor multipass --vm "$VM" \
+						--evidence-root "$WORKDIR/live-capture-smoke-source" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT" --no-reuse --compact
 				fi
 			fi
 			;;
@@ -314,13 +309,13 @@ PY
 			run_shell installer-test 'python3 tests/smoke/test_installer.py'
 			;;
 		acceptance | build_tooling)
-			if [[ $ran_p1 == false ]]; then
-				run_gate p1
-				ran_p1=true
+			if [[ $ran_live_capture == false ]]; then
+				run_gate live-capture
+				ran_live_capture=true
 			fi
-			if [[ $ran_p2 == false ]]; then
-				run_gate p2
-				ran_p2=true
+			if [[ $ran_recorder == false ]]; then
+				run_gate recorder
+				ran_recorder=true
 			fi
 			;;
 		esac
@@ -330,7 +325,8 @@ PY
 case $MODE in
 fast) run_fast ;;
 targeted) run_targeted ;;
-gate) run_gate "$GATE" ;;
+live-capture) run_gate live-capture ;;
+recorder) run_gate recorder ;;
 release)
 	# Release must prove portable quality before privileged gates.
 	run_shell release-fmt 'cargo fmt --all --check'

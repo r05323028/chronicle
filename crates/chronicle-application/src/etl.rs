@@ -261,7 +261,7 @@ pub fn recording_physical_wal_bytes(
 
 /// Builds the Linux eBPF source after `recording.json` reached `starting`.
 /// PID baselines are rechecked after links attach; source construction drops links on failure.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub fn load_production_ebpf_source(
     selection: &CgroupSelection,
     pid_baseline: Option<&PidCgroupSelection>,
@@ -1306,7 +1306,7 @@ pub fn process_recording_wal(
             sequence: boundary.marker_sequence,
         }),
         wal_snapshot_sha256: Some(sha256_string(&wal_snapshot_sha256)),
-        pipeline_version: Some(ETL_PIPELINE_VERSION.into()),
+        pipeline_version: Some(ETL_PIPELINE_VERSION.to_string()),
         evidence: source_evidence,
     };
     Ok(RecordingEtlResult {
@@ -1350,7 +1350,7 @@ pub struct RecordingEtlCheckpoint {
     pub counters: RecordingCounters,
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn has_published_wal(wal_directory: &Path) -> Result<bool, ApplicationError> {
     let segments = wal_directory.join("segments");
     if !segments.exists() {
@@ -1431,7 +1431,7 @@ pub fn process_and_publish_recording_wal(
     process_and_publish_recording_wal_inner(wal_directory, root, registry, None, false)
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn process_and_publish_recording_wal_owned(
     wal_directory: impl AsRef<Path>,
     root: impl AsRef<Path>,
@@ -1508,7 +1508,7 @@ fn process_and_publish_recording_wal_inner(
         wal_snapshot_sha256: sha256_string(&processed.wal_snapshot_sha256),
         recovery_sha256: sha256_string(&processed.recovery_sha256),
         wal_format_version: chronicle_wal::WAL_FORMAT_VERSION,
-        pipeline_version: ETL_PIPELINE_VERSION.into(),
+        pipeline_version: ETL_PIPELINE_VERSION.to_string(),
         canonical_schema_version: chronicle_canonical::CANONICAL_SCHEMA_VERSION,
         session_id,
         manifest_checksum: String::new(),

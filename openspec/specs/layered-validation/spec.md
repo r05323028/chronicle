@@ -6,7 +6,7 @@ Layered validation modes, dependency selection, gate coverage, fingerprinting, e
 
 ### Requirement: Unified validation modes
 
-Validation SHALL expose one entry point with `fast`, `targeted`, `gate p1`, `gate p2`, and `release` modes. `fast` SHALL run formatting, warnings-denied workspace Clippy, workspace unit tests, strict OpenSpec validation, and applicable changed-crate tests without privileged acceptance. `gate p1` and `gate p2` SHALL preserve complete named gate coverage. `release` SHALL execute or validly reuse every required P1/P2 check and fail when any obligation is neither executed nor reused. Every mode SHALL execute potentially long-running commands beneath configurable hard deadlines, and complete gate/release modes SHALL have an outer gate deadline that terminates their process trees and retains failed evidence. Contributor guidance SHALL recommend fast, then targeted recorder/acceptance validation, then complete privileged gates only when required; no development workflow SHALL rely on an unbounded foreground daemon or poll.
+Validation SHALL expose one entry point with `fast`, `targeted`, `live-capture`, `recorder`, and `release` modes. `fast` SHALL run formatting, warnings-denied workspace Clippy, workspace unit tests, strict OpenSpec validation, and applicable changed-crate tests without privileged acceptance. `live-capture` and `recorder` SHALL preserve complete named gate coverage. `release` SHALL execute or validly reuse every required live-capture/recorder check and fail when any obligation is neither executed nor reused. Every mode SHALL execute potentially long-running commands beneath configurable hard deadlines, and complete gate/release modes SHALL have an outer gate deadline that terminates their process trees and retains failed evidence. Contributor guidance SHALL recommend fast, then targeted recorder/acceptance validation, then complete privileged gates only when required; no development workflow SHALL rely on an unbounded foreground daemon or poll.
 
 #### Scenario: Fast local validation
 
@@ -15,13 +15,13 @@ Validation SHALL expose one entry point with `fast`, `targeted`, `gate p1`, `gat
 
 #### Scenario: Explicit gate
 
-- **WHEN** developer runs `scripts/validate.sh gate p1` or `gate p2`
+- **WHEN** developer runs `scripts/validate.sh live-capture` or `recorder`
 - **THEN** corresponding existing complete privileged gate is run and reported beneath an outer gate deadline
 
 #### Scenario: Release completeness
 
 - **WHEN** release mode finishes
-- **THEN** every required P1/P2 check is executed or matched by valid reusable evidence, otherwise command fails
+- **THEN** every required live-capture/recorder check is executed or matched by valid reusable evidence, otherwise command fails
 
 #### Scenario: Agent recorder workflow
 
@@ -30,7 +30,7 @@ Validation SHALL expose one entry point with `fast`, `targeted`, `gate p1`, `gat
 
 ### Requirement: Changed-path dependency selection
 
-Targeted mode SHALL accept `--changed-since <git-ref>`, inspect changed paths, select affected validation groups from declarative configuration, and print changed paths, selected groups, skipped groups, and a reason for every selection decision. Documentation-only changes SHALL select no privileged gate. ETL/checkpoint changes SHALL select ETL/checkpoint validation without selecting the full eBPF gate. WAL/recovery/retention/quota changes SHALL select focused recovery and P2 checks. eBPF changes SHALL select decoder/build checks and a minimal privileged smoke check. Acceptance-script or build-tooling changes SHALL invalidate affected privileged evidence and select the corresponding gate.
+Targeted mode SHALL accept `--changed-since <git-ref>`, inspect changed paths, select affected validation groups from declarative configuration, and print changed paths, selected groups, skipped groups, and a reason for every selection decision. Documentation-only changes SHALL select no privileged gate. ETL/checkpoint changes SHALL select ETL/checkpoint validation without selecting the full eBPF gate. WAL/recovery/retention/quota changes SHALL select focused recovery and recorder checks. eBPF changes SHALL select decoder/build checks and a minimal privileged smoke check. Acceptance-script or build-tooling changes SHALL invalidate affected privileged evidence and select the corresponding gate.
 
 #### Scenario: Documentation-only change
 
@@ -45,7 +45,7 @@ Targeted mode SHALL accept `--changed-since <git-ref>`, inspect changed paths, s
 #### Scenario: WAL recovery change
 
 - **WHEN** WAL recovery, retention, or quota paths change
-- **THEN** focused WAL/P2 groups are selected
+- **THEN** focused WAL/recorder groups are selected
 
 #### Scenario: eBPF source change
 
@@ -54,7 +54,7 @@ Targeted mode SHALL accept `--changed-since <git-ref>`, inspect changed paths, s
 
 ### Requirement: Fingerprinted evidence reuse
 
-Each P1/P2 acceptance profile SHALL compute a deterministic acceptance-sensitive fingerprint from gate-owned source/build inputs, Cargo.lock, toolchain inputs, acceptance runner and scenario definitions, evidence schema/version behavior, and validation configuration. Environment identity (OS, Ubuntu version, architecture, kernel, BTF/cgroup capabilities, compiler, and executor) SHALL be stored and compared separately, never used as source fingerprint alone. Evidence identity SHALL consist of matching validation fingerprint and validation-relevant source/configuration, compatible evidence schema, unchanged required scenario set, compatible privileged environment, valid complete artifact manifest, and successful completion of every required check without `not_checked`, timeout, or incomplete state. Evidence SHALL record fingerprint, source provenance including commit/tree SHA and dirty state, creation date, environment, profile scenario coverage, and executed/reused status. Git commit SHA SHALL remain provenance metadata and SHALL NOT serve as reuse, cache, or release eligibility identity or by itself invalidate otherwise compatible evidence. `scripts/acceptance.sh` SHALL reuse only compatible successful evidence by default; `--no-reuse` SHALL force a fresh run. Acceptance-sensitive source or validation-contract changes SHALL prevent reuse; unrelated documentation, OpenSpec archive housekeeping, rebases, equivalent recommits, and commit-history-only changes SHALL not.
+Each live-capture/recorder acceptance profile SHALL compute a deterministic acceptance-sensitive fingerprint from gate-owned source/build inputs, Cargo.lock, toolchain inputs, acceptance runner and scenario definitions, evidence schema/version behavior, and validation configuration. Environment identity (OS, Ubuntu version, architecture, kernel, BTF/cgroup capabilities, compiler, and executor) SHALL be stored and compared separately, never used as source fingerprint alone. Evidence identity SHALL consist of matching validation fingerprint and validation-relevant source/configuration, compatible evidence schema, unchanged required scenario set, compatible privileged environment, valid complete artifact manifest, and successful completion of every required check without `not_checked`, timeout, or incomplete state. Evidence SHALL record fingerprint, source provenance including commit/tree SHA and dirty state, creation date, environment, profile scenario coverage, and executed/reused status. Git commit SHA SHALL remain provenance metadata and SHALL NOT serve as reuse, cache, or release eligibility identity or by itself invalidate otherwise compatible evidence. `scripts/acceptance.sh` SHALL reuse only compatible successful evidence by default; `--no-reuse` SHALL force a fresh run. Acceptance-sensitive source or validation-contract changes SHALL prevent reuse; unrelated documentation, OpenSpec archive housekeeping, rebases, equivalent recommits, and commit-history-only changes SHALL not.
 
 #### Scenario: Unchanged gate reuse
 
@@ -127,7 +127,7 @@ Privileged validation SHALL reuse an existing Multipass Ubuntu instance when ava
 
 ### Requirement: Privileged recorder readiness
 
-P2 privileged acceptance SHALL consume an explicit machine-readable recorder state distinguishing `starting`, `recovering`, `loading_ebpf`, `ready`, `degraded`, and `failed`. Workload admission SHALL wait for `ready`, which SHALL imply recovery complete, writable WAL, reachable status control plane, initialized capture, required eBPF attachment, and no fatal startup error. Polling SHALL use configurable timeout and interval, print state transitions, tolerate temporary status unavailability, stop on terminal failure, reject status older than latest systemd activation, and retain bounded diagnostics on timeout or failure. General acceptance convergence helpers SHALL compose with this contract and SHALL NOT replace or weaken its freshness, stale-owner, lifecycle, or terminal-state semantics.
+Recorder privileged acceptance SHALL consume an explicit machine-readable recorder state distinguishing `starting`, `recovering`, `loading_ebpf`, `ready`, `degraded`, and `failed`. Workload admission SHALL wait for `ready`, which SHALL imply recovery complete, writable WAL, reachable status control plane, initialized capture, required eBPF attachment, and no fatal startup error. Polling SHALL use configurable timeout and interval, print state transitions, tolerate temporary status unavailability, stop on terminal failure, reject status older than latest systemd activation, and retain bounded diagnostics on timeout or failure. General acceptance convergence helpers SHALL compose with this contract and SHALL NOT replace or weaken its freshness, stale-owner, lifecycle, or terminal-state semantics.
 
 #### Scenario: Startup transition
 
@@ -179,7 +179,7 @@ CI and validation documentation SHALL specify no upload or 1-3 day retention for
 
 ### Requirement: Canonical acceptance entrypoint
 
-Acceptance SHALL expose exactly one user-facing entrypoint, `scripts/acceptance.sh`, accepting `--profile p1|p2|all` and `--executor local|multipass`. Compatibility wrappers SHALL NOT exist without a concrete external caller or documented compatibility obligation; a self-referential test asserting that a wrapper delegates to canonical tooling does not constitute such an obligation. Development-only deprecated aliases and compatibility-named test runners that only forward to canonical tooling SHALL be removed, and documentation and CI SHALL reference only the canonical entrypoint.
+Acceptance SHALL expose exactly one user-facing entrypoint, `scripts/acceptance.sh`, accepting `--profile live-capture|recorder|all` and `--executor local|multipass`. Compatibility wrappers SHALL NOT exist without a concrete external caller or documented compatibility obligation; a self-referential test asserting that a wrapper delegates to canonical tooling does not constitute such an obligation. Development-only deprecated aliases and compatibility-named test runners that only forward to canonical tooling SHALL be removed, and documentation and CI SHALL reference only the canonical entrypoint.
 
 #### Scenario: Single entrypoint
 
@@ -197,12 +197,12 @@ Every acceptance scenario SHALL have exactly one implementation owner resolved b
 
 #### Scenario: Shared behavior scenario
 
-- **WHEN** a scenario executes identical behavior under P1 and P2
+- **WHEN** a scenario executes identical behavior under live-capture and recorder
 - **THEN** a single shared implementation runs in both profiles with no per-profile extension files
 
 #### Scenario: Profile-specific scenario
 
-- **WHEN** P1 and P2 runtimes require different scenario assertions
+- **WHEN** live-capture and recorder runtimes require different scenario assertions
 - **THEN** the profile directory provides the implementation and the dispatcher resolves it without a shared stub
 
 #### Scenario: Missing implementation fails loudly
@@ -212,16 +212,16 @@ Every acceptance scenario SHALL have exactly one implementation owner resolved b
 
 ### Requirement: Documentation and installation command truthfulness
 
-Portable validation SHALL run a rootless documentation-command contract that exercises the built binary's documented public surface: `--version`, `--help` (five public commands, internal mechanics hidden), `doctor` (non-destructive with actionable output), `list` empty contract, public record-syntax preflight failure with no mutation on a non-feature build, and fixture-recorded public inspect/replay forms where rootless-compatible. The contract SHALL execute commands and assert contracts; it SHALL NOT match README prose. The contract SHALL run in the `cli_docs` targeted group and in CI; README relative links SHALL resolve. Privileged P1/P2 acceptance SHALL include a quick-start scenario executing the exact documented command-mode forms (`chronicle doctor`, `chronicle record --name checkout -- ./my-app`, `chronicle list`, `chronicle inspect checkout`, `chronicle replay checkout -- ./my-app`) against a release-built `linux-ebpf` binary, asserting the published recording, catalog entry, inspectable session, replay verification, and no recorded-destination contact. Documentation-only changes SHALL still select no privileged gate.
+Portable validation SHALL run a rootless documentation-command contract that exercises the built binary's documented public surface: `--version`, `--help` (five public commands, internal mechanics hidden), `doctor` (non-destructive with actionable output), `list` empty contract, public record-syntax preflight failure with no mutation when live capture cannot operate (rootless Linux host or non-Linux build), and fixture-recorded public inspect/replay forms where rootless-compatible. The contract SHALL execute commands and assert contracts; it SHALL NOT match README prose. The contract SHALL run in the `cli_docs` targeted group and in CI; README relative links SHALL resolve. Privileged live-capture/recorder acceptance SHALL include a quick-start scenario executing the exact documented command-mode forms (`chronicle doctor`, `chronicle record --name checkout -- ./my-app`, `chronicle list`, `chronicle inspect checkout`, `chronicle replay checkout -- ./my-app`) against a release-built Linux binary, asserting the published recording, catalog entry, inspectable session, replay verification, and no recorded-destination contact. Documentation-only changes SHALL still select no privileged gate.
 
 #### Scenario: Rootless documentation contract
 
 - **WHEN** the portable layer runs the documentation-command contract
-- **THEN** version/help/doctor/list contracts pass, record-syntax preflight fails safely with typed error and no mutation on a non-feature build, and README relative links resolve
+- **THEN** version/help/doctor/list contracts pass, record-syntax preflight fails safely with a typed error and no mutation when live capture cannot operate, and README relative links resolve
 
 #### Scenario: Privileged quick-start scenario
 
-- **WHEN** the P1 or P2 gate runs the quick-start scenario on supported Linux with a release-built binary
+- **WHEN** the live-capture or recorder gate runs the quick-start scenario on supported Linux with a release-built binary
 - **THEN** the documented record -> list -> inspect -> replay forms succeed and produce retained machine-readable evidence
 
 #### Scenario: Docs-only change stays portable

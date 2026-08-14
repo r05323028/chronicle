@@ -705,7 +705,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             recording_id: recording_id.0,
             epoch_ordinal,
             config_digest: self.active_metadata.config_digest.clone(),
-            pipeline_version: ETL_PIPELINE_VERSION.into(),
+            pipeline_version: ETL_PIPELINE_VERSION.to_string(),
             canonical_schema_version: chronicle_canonical::CANONICAL_SCHEMA_VERSION,
             marker: MarkerLineage {
                 sequence: marker_sequence,
@@ -1234,7 +1234,7 @@ fn validate_checkpoint_before_capture(
         .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
     if checkpoint.config_digest != config_digest
         || checkpoint.canonical_schema_version != chronicle_canonical::CANONICAL_SCHEMA_VERSION
-        || checkpoint.pipeline_version != ETL_PIPELINE_VERSION
+        || checkpoint.pipeline_version != ETL_PIPELINE_VERSION.to_string()
     {
         return Err(ContinuousRecorderError::Incremental(format!(
             "checkpoint configuration or pipeline contradiction: config={} expected={} schema={} pipeline={}",
@@ -1309,7 +1309,7 @@ fn validate_checkpoint_before_capture(
                 last_sequence: segment.last_sequence,
             })
             .collect(),
-        pipeline_version: ETL_PIPELINE_VERSION.into(),
+        pipeline_version: ETL_PIPELINE_VERSION.to_string(),
     };
     checkpoint
         .validate_against(&authoritative)

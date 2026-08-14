@@ -90,10 +90,10 @@ jobs:
             --manifest-path ebpf/Cargo.toml \
             --target bpfel-unknown-none --release --locked
 
-      - name: Build chronicle release binary with linux-ebpf
+      - name: Build chronicle release binary
+        # Linux targets include live eBPF capture automatically.
         run: >-
-          cargo build -p chronicle-cli --release
-          --features linux-ebpf --locked
+          cargo build -p chronicle-cli --release --locked
 
       - name: Validate release binary
         run: |

@@ -384,7 +384,7 @@ mod tests {
             recording_id,
             epoch_ordinal: 1,
             config_digest: "a".repeat(64),
-            pipeline_version: "p2".into(),
+            pipeline_version: "1".into(),
             canonical_schema_version: 1,
             marker: MarkerLineage {
                 sequence: 4,

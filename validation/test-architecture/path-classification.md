@@ -1,6 +1,6 @@
-# P1/P2 path classification (task 5.4) + privileged E2E definition (task 5.3)
+# Privileged scenario path classification (task 5.4) + privileged E2E definition (task 5.3)
 
-Every existing full P1/P2 scenario is classified as privileged capture
+Every existing full privileged scenario is classified as privileged capture
 integration, privileged acceptance, privileged E2E, or split coverage.
 Classification confirms the 5.4 acceptance: real eBPF attach/capture, cgroup
 filtering, process attribution, bpftool cleanup, supported Ubuntu

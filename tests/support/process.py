@@ -192,16 +192,20 @@ def temp_root(prefix: str) -> Path:
 
 
 def require_rootless_record_failure(binary: Path, root: Path, marker: Path) -> None:
-    """Public record on an unsupported (non-Linux-eBPF) build fails fast and
-    never touches the target. Proves the portable record failure contract."""
+    """Public record fails fast and never touches the target when live capture
+    cannot operate: on Linux the live-capture binary fails host preflight
+    (exit 3, rootless host lacks eBPF privileges); elsewhere the portable
+    build rejects live capture (exit 4). Proves the record preflight
+    contract on every supported platform."""
     result = run(
         binary,
         ["record", "--", "/usr/bin/touch", str(marker)],
         data_dir=root,
     )
-    if result.returncode != 4:
+    expected = 3 if sys.platform.startswith("linux") else 4
+    if result.returncode != expected:
         raise CommandError(
-            f"record expected exit 4, got {result.returncode}: {result.stderr!r:.300}"
+            f"record expected exit {expected}, got {result.returncode}: {result.stderr!r:.300}"
         )
     if result.stdout:
         raise CommandError(

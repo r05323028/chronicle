@@ -11,7 +11,7 @@
 //! (and the scope) so no recording or target survives an attach hang.
 
 use crate::{ApplicationError, ChildExitResult, RecordingId, RecordingStatus};
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 use crate::{DomainLockGuard, FilesystemSessionStore, RecordingMetadata};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -60,7 +60,7 @@ pub struct CommandRecordResult {
 
 /// Non-mutating preflight: every predictable denial happens before the domain
 /// lock, scope, ID, sidecar, WAL, catalog entry, or target exists.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn preflight_command_record(options: &CommandRecordOptions) -> Result<(), ApplicationError> {
     use crate::preflight_embedded_ebpf;
     use crate::supervised_scope::{discover_delegated_root, preflight_scope_access};
@@ -80,20 +80,17 @@ fn preflight_command_record(options: &CommandRecordOptions) -> Result<(), Applic
     Ok(())
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg(not(target_os = "linux"))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn preflight_command_record(_options: &CommandRecordOptions) -> Result<(), ApplicationError> {
     Err(ApplicationError::UnsupportedLivePreflight(
-        "command-mode recording requires the Linux eBPF build",
+        "command-mode recording requires a Linux build with live capture",
     ))
 }
 
 /// Run one command-mode recording end to end. The domain lock is acquired
 /// before any durable allocation and released last.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_lines)] // Linear capture/scope lifecycle keeps cleanup order explicit.
 pub fn record_command(
     options: CommandRecordOptions,
@@ -290,7 +287,7 @@ pub fn record_command(
 /// Never starts a target or capture and never creates a duplicate session
 /// (publication is idempotent). Only recovery-authoritative `recoverable`
 /// entries may be retried; everything else fails safely.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub fn retry_recording(
     data_dir: &Path,
     domain_lock_root: Option<&Path>,
@@ -340,7 +337,7 @@ pub fn retry_recording(
     Ok(recording_id)
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 pub fn retry_recording(
     _data_dir: &Path,
     _domain_lock_root: Option<&Path>,
@@ -351,12 +348,12 @@ pub fn retry_recording(
     ))
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 pub fn record_command(
     _options: CommandRecordOptions,
 ) -> Result<CommandRecordResult, ApplicationError> {
     Err(ApplicationError::UnsupportedLivePreflight(
-        "command-mode recording requires the Linux eBPF build",
+        "command-mode recording requires a Linux build with live capture",
     ))
 }
 
@@ -365,7 +362,7 @@ pub fn record_command(
 /// internal WAL -> ETL -> publish -> catalog workflow as command mode while
 /// holding the exact data-domain lock for the whole transaction. The workload
 /// is never terminated.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub fn record_selector(
     selector: crate::CgroupSelector,
     allow_shared_cgroup: bool,
@@ -442,19 +439,19 @@ pub fn record_selector(
     })
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 pub fn record_selector(
     _selector: crate::CgroupSelector,
     _allow_shared_cgroup: bool,
     _options: CommandRecordOptions,
 ) -> Result<CommandRecordResult, ApplicationError> {
     Err(ApplicationError::UnsupportedLivePreflight(
-        "record --pid/--cgroup requires the Linux eBPF build",
+        "record --pid/--cgroup requires a Linux build with live capture",
     ))
 }
 
 /// ETL, canonical publication, and catalog update under the held domain lock.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn finalize_and_publish(
     guard: &DomainLockGuard,
     options: &CommandRecordOptions,
@@ -500,7 +497,7 @@ fn finalize_and_publish(
 }
 
 /// Publish an empty canonical session for a zero-traffic recording.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn publish_empty_session(
     data_dir: &Path,
     recording_id: RecordingId,

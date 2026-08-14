@@ -10,7 +10,7 @@ Doctor SHALL mark each probe required or optional and represent it as `supported
 
 #### Scenario: Fully supported environment
 
-- **WHEN** every required P1 probe passes without warning
+- **WHEN** every required doctor probe passes without warning
 - **THEN** doctor reports supported and exits success
 
 #### Scenario: Warning-only environment
@@ -110,7 +110,7 @@ Doctor SHALL check supplied WAL/output path creation/writability, private permis
 
 ### Requirement: Protocol and replay policy probes
 
-Doctor SHALL report registered protocol capability availability and validate configured replay safety shape without making network connections. It SHALL confirm P1 plaintext HTTP/1.1 capability, loopback-only explicit target policy, timeout, and no-redirect behavior; missing target SHALL not be an error because replay target must be supplied per command.
+Doctor SHALL report registered protocol capability availability and validate configured replay safety shape without making network connections. It SHALL confirm plaintext HTTP/1.1 capability, loopback-only explicit target policy, timeout, and no-redirect behavior; missing target SHALL not be an error because replay target must be supplied per command.
 
 #### Scenario: HTTP capability available
 
@@ -152,11 +152,11 @@ Doctor SHALL not create recording metadata, start capture, mutate WAL/session da
 
 ### Requirement: Recorder daemon preflight diagnostics
 
-Doctor SHALL add P2 probes for recorder configuration version/semantics, exclusive filesystem-domain ownership/state-root lease availability, persisted metadata/manifest/checkpoint readability and version, filesystem private modes/ownership, file/data/directory sync, same-filesystem rename/trash behavior, segment-age timer support, global quota/minimum-free-space reservation, retention eligibility policy, bounded lifecycle-index limits/compaction, filesystem RecordingStore conformance, and recorder-outside-selected-subtree placement. Probes SHALL be non-destructive or use private temporary artifacts removed best-effort; doctor SHALL not repair state, acquire long-lived ownership, delete retained artifacts, attach persistent eBPF programs, run ETL, or start recorder.
+Doctor SHALL add recorder-operation probes for recorder configuration version/semantics, exclusive filesystem-domain ownership/state-root lease availability, persisted metadata/manifest/checkpoint readability and version, filesystem private modes/ownership, file/data/directory sync, same-filesystem rename/trash behavior, segment-age timer support, global quota/minimum-free-space reservation, retention eligibility policy, bounded lifecycle-index limits/compaction, filesystem RecordingStore conformance, and recorder-outside-selected-subtree placement. Probes SHALL be non-destructive or use private temporary artifacts removed best-effort; doctor SHALL not repair state, acquire long-lived ownership, delete retained artifacts, attach persistent eBPF programs, run ETL, or start recorder.
 
 #### Scenario: Ready production state root
 
-- **WHEN** supported host/config/state/store pass every required P2 probe
+- **WHEN** supported host/config/state/store pass every required recorder-operation probe
 - **THEN** doctor reports recorder foundation supported with effective non-sensitive bounds
 
 #### Scenario: Active owner
@@ -173,7 +173,6 @@ Doctor SHALL add P2 probes for recorder configuration version/semantics, exclusi
 
 - **WHEN** recorder identity resolves inside selected subtree
 - **THEN** doctor reports unsupported placement before any attach probe
-
 
 ### Requirement: Safe runtime lifecycle health report
 
@@ -196,14 +195,13 @@ Report SHALL be read from atomically persisted state and direct safe probes. It 
 - **WHEN** no live owner exists and last state says running
 - **THEN** status reports stale/crash-recovery-required rather than healthy
 
+### Requirement: Recorder diagnostics retain existing status semantics
 
-### Requirement: P2 diagnostics retain existing status semantics
-
-New P2 probes SHALL use existing required/optional `supported`, `supported_with_warnings`, `unsupported`, and `not_checked` model and aggregate precedence. Required uncertainty about state-root durability, ownership, quota safety, retention proof, checkpoint lineage, filesystem store semantics, or recorder placement SHALL be `unsupported` or `not_checked`, never supported by assumption. Existing P1 platform/eBPF/WAL/output/protocol/replay probes and no-side-effects guarantee SHALL remain.
+New recorder-operation probes SHALL use existing required/optional `supported`, `supported_with_warnings`, `unsupported`, and `not_checked` model and aggregate precedence. Required uncertainty about state-root durability, ownership, quota safety, retention proof, checkpoint lineage, filesystem store semantics, or recorder placement SHALL be `unsupported` or `not_checked`, never supported by assumption. Existing platform/eBPF/WAL/output/protocol/replay probes and the no-side-effects guarantee SHALL remain.
 
 #### Scenario: Optional remote backend absent
 
-- **WHEN** no remote store is configured in P2
+- **WHEN** no remote store is configured for the recorder
 - **THEN** filesystem backend may be supported and S3-compatible backend is reported unsupported/not implemented without failing local required capability
 
 #### Scenario: Required probe blocked by permission
@@ -212,7 +210,6 @@ New P2 probes SHALL use existing required/optional `supported`, `supported_with_
 - **THEN** required probe is not-checked and aggregate exits 4
 
 ### Requirement: Doctor data-directory probing and actionable remediation
-
 
 Doctor SHALL resolve the public data directory per `recording-identity`, report its source, and non-destructively assess existing-directory access or prospective creation/private-mode support from the nearest existing ancestor. Results SHALL be `supported`, `unsupported`, or `not_checked`; doctor SHALL NOT claim conclusive writability/private-mode support when metadata alone cannot prove it. Every probe SHALL carry a stable code, status, safe message, and an actionable remediation string that states what the user can do — for example installing capabilities, mounting cgroup v2, enabling BTF, fixing directory permissions, or adjusting replay configuration. Doctor SHALL remain strictly non-destructive: it SHALL NOT start capture, create recording metadata, repair state, send replay traffic, mutate WAL/session data, or change system configuration; a probe failure SHALL NOT prevent independent probes from running.
 

@@ -32,7 +32,7 @@ Arrows point from dependent crate to its compile-time dependencies. No crate dep
 
 Thirteen crates consolidate real protocol modules into `chronicle-protocol-builtins`; one empty crate per protocol would add coupling and maintenance without behavior. Modules remain independent registration boundaries. Future independently distributed plugins require a versioned ABI/process boundary, not Rust trait objects across dynamic libraries.
 
-## P1 vertical slice
+## One-shot recording pipeline
 
 Fixture and eBPF sources emit same `CaptureEvent` v1 model. `SocketConnected` carries stable socket identity, local/remote IP endpoints, and active/passive role before endpoint-free payload fragments. Capture adapter caches complete evidence by socket identity and rejects conflicting tuple or role.
 

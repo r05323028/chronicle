@@ -4,7 +4,7 @@ compatibility_version = 1
 
 # Scenario IDs are the acceptance contract. Executors run these through one
 # profile runtime; profiles only select capability coverage.
-[profiles.p1]
+[profiles.live-capture]
 scenarios = [
   "capture-basic",
   "wal-recovery",
@@ -24,7 +24,7 @@ execution_order = [
   "resource-cleanup",
 ]
 
-[profiles.p2]
+[profiles.recorder]
 scenarios = [
   "capture-basic",
   "wal-recovery",
@@ -62,16 +62,16 @@ execution_order = [
 timeout_seconds = 900
 capabilities = ["privileged", "ebpf"]
 phases = ["environment", "capture"]
-legacy_p1_checks = ["privileged_acceptance"]
-legacy_p2_checks = ["systemd_type_simple", "three_epochs"]
+legacy_live_capture_checks = ["privileged_acceptance"]
+legacy_recorder_checks = ["systemd_type_simple", "three_epochs"]
 
 [scenarios.wal-recovery]
 timeout_seconds = 300
 capabilities = ["privileged", "wal"]
 phases = ["capture", "recovery"]
-legacy_p1_checks = [
+legacy_live_capture_checks = [
 ] # portable WAL/ingest matrices are separate gate prerequisites (8.1)
-legacy_p2_checks = [
+legacy_recorder_checks = [
   "checkpoint_output_committed_checkpoint_missing",
   "checkpoint_committed_status_missing",
 ]
@@ -80,21 +80,21 @@ legacy_p2_checks = [
 timeout_seconds = 300
 capabilities = ["privileged", "replay"]
 phases = ["replay"]
-legacy_p1_checks = [
+legacy_live_capture_checks = [
 ] # portable replay matrix is a separate gate prerequisite (8.1)
-legacy_p2_checks = ["inspect_replay", "one_shot_equivalence"]
+legacy_recorder_checks = ["inspect_replay", "one_shot_equivalence"]
 
 [scenarios.user-intent-lifecycle]
 timeout_seconds = 600
 capabilities = ["privileged", "ebpf", "cgroup-v2", "replay"]
 phases = ["record", "retry", "selectors", "replay", "cleanup"]
-legacy_p1_checks = ["user_intent_lifecycle"]
+legacy_live_capture_checks = ["user_intent_lifecycle"]
 
 [scenarios.cli-compatibility]
 timeout_seconds = 300
 capabilities = ["privileged", "ebpf", "compatibility"]
 phases = ["cli_compatibility"]
-legacy_p1_checks = ["cli_compatibility"]
+legacy_live_capture_checks = ["cli_compatibility"]
 
 [scenarios.documented-quickstart]
 timeout_seconds = 600
@@ -105,22 +105,22 @@ phases = ["doctor", "record", "list", "inspect", "replay"]
 timeout_seconds = 900
 capabilities = ["privileged", "cleanup"]
 phases = ["cleanup"]
-legacy_p1_checks = [
+legacy_live_capture_checks = [
   "privileged_signal",
 ] # portable cgroup/fmt/workspace are separate gate prerequisites (8.1)
-legacy_p2_checks = ["resource_cleanup", "signal_shutdown"]
+legacy_recorder_checks = ["resource_cleanup", "signal_shutdown"]
 
 [scenarios.recorder-readiness]
 timeout_seconds = 300
 capabilities = ["privileged", "systemd", "cgroup-v2", "btf"]
 phases = ["readiness"]
-legacy_p2_checks = ["incremental_worker", "process_restart_readiness"]
+legacy_recorder_checks = ["incremental_worker", "process_restart_readiness"]
 
 [scenarios.incremental-etl]
 timeout_seconds = 300
 capabilities = ["privileged", "etl"]
 phases = ["incremental", "finalization"]
-legacy_p2_checks = [
+legacy_recorder_checks = [
   "incremental_worker",
   "standalone_etl_live_rejection",
   "one_shot_equivalence",
@@ -130,7 +130,7 @@ legacy_p2_checks = [
 timeout_seconds = 300
 capabilities = ["privileged", "crash-recovery"]
 phases = ["checkpoint_crash_matrix"]
-legacy_p2_checks = [
+legacy_recorder_checks = [
   "checkpoint_output_committed_checkpoint_missing",
   "checkpoint_committed_status_missing",
 ]
@@ -139,7 +139,7 @@ legacy_p2_checks = [
 timeout_seconds = 600
 capabilities = ["privileged", "quota"]
 phases = ["quota_pressure"]
-legacy_p2_checks = [
+legacy_recorder_checks = [
   "quota_exhaustion_admission",
   "quota_restart_accounting",
   "quota_recovery_after_space",
@@ -151,7 +151,7 @@ legacy_p2_checks = [
 timeout_seconds = 600
 capabilities = ["privileged", "retention", "crash-recovery"]
 phases = ["cleanup_recovery"]
-legacy_p2_checks = [
+legacy_recorder_checks = [
   "cleanup_interrupted_recovery",
   "cleanup_protected_lineage",
   "cleanup_restart_consistency",
@@ -161,7 +161,7 @@ legacy_p2_checks = [
 timeout_seconds = 300
 capabilities = ["privileged", "corruption"]
 phases = ["corruption"]
-legacy_p2_checks = [
+legacy_recorder_checks = [
   "corruption_fail_closed",
   "corruption_evidence_preservation",
 ]
@@ -170,4 +170,4 @@ legacy_p2_checks = [
 timeout_seconds = 300
 capabilities = ["privileged", "reboot", "persistent-state"]
 phases = ["pre_reboot", "post_reboot"]
-legacy_p2_checks = ["pre_reboot_persistence", "host_reboot_recovery"]
+legacy_recorder_checks = ["pre_reboot_persistence", "host_reboot_recovery"]

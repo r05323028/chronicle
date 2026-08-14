@@ -41,17 +41,11 @@ impl EbpfPreflight {
     }
 }
 
-#[cfg(any(
-    test,
-    all(target_os = "linux", feature = "linux-ebpf", target_endian = "little")
-))]
+#[cfg(any(test, all(target_os = "linux", target_endian = "little")))]
 const CAP_NET_ADMIN: u32 = 12;
-#[cfg(any(
-    test,
-    all(target_os = "linux", feature = "linux-ebpf", target_endian = "little")
-))]
+#[cfg(any(test, all(target_os = "linux", target_endian = "little")))]
 const CAP_BPF: u32 = 39;
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 const REQUIRED_PROGRAMS: &[&str] = &[
     "connect4",
     "connect6",
@@ -62,7 +56,7 @@ const REQUIRED_PROGRAMS: &[&str] = &[
 
 /// Checks static host and embedded-object prerequisites without loading or attaching programs.
 pub fn probe_embedded() -> EbpfPreflight {
-    #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
     {
         let (embedded_object, required_programs) = embedded_object_checks();
         let capabilities = effective_capabilities();
@@ -84,17 +78,17 @@ pub fn probe_embedded() -> EbpfPreflight {
             ),
         }
     }
-    #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "big"))]
+    #[cfg(all(target_os = "linux", target_endian = "big"))]
     {
         unavailable_preflight("big-endian embedded eBPF object unsupported")
     }
-    #[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+    #[cfg(not(target_os = "linux"))]
     {
-        unavailable_preflight("Linux eBPF capture unavailable")
+        unavailable_preflight("live capture is unavailable on this platform")
     }
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little")))]
+#[cfg(not(all(target_os = "linux", target_endian = "little")))]
 const fn unavailable_preflight(reason: &'static str) -> EbpfPreflight {
     EbpfPreflight {
         platform: PreflightCheck::Unavailable(reason),
@@ -109,11 +103,11 @@ const fn unavailable_preflight(reason: &'static str) -> EbpfPreflight {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 const EMBEDDED_OBJECT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/chronicle-ebpf-capture-bpfel.o"));
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 fn embedded_object_checks() -> (PreflightCheck, PreflightCheck) {
     let Ok(object) = aya_obj::Object::parse(EMBEDDED_OBJECT) else {
         return (
@@ -134,7 +128,7 @@ fn embedded_object_checks() -> (PreflightCheck, PreflightCheck) {
     )
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 fn required_file(path: &str, reason: &'static str) -> PreflightCheck {
     if std::path::Path::new(path).is_file() {
         PreflightCheck::Available
@@ -143,14 +137,14 @@ fn required_file(path: &str, reason: &'static str) -> PreflightCheck {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 fn supported_architecture() -> PreflightCheck {
     matches!(std::env::consts::ARCH, "aarch64" | "x86_64")
         .then_some(PreflightCheck::Available)
         .unwrap_or(PreflightCheck::Unavailable("host architecture unsupported"))
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 fn effective_capabilities() -> Option<u64> {
     std::fs::read_to_string("/proc/self/status")
         .ok()?
@@ -159,10 +153,7 @@ fn effective_capabilities() -> Option<u64> {
         .and_then(|value| u64::from_str_radix(value, 16).ok())
 }
 
-#[cfg(any(
-    test,
-    all(target_os = "linux", feature = "linux-ebpf", target_endian = "little")
-))]
+#[cfg(any(test, all(target_os = "linux", target_endian = "little")))]
 fn capability_check(
     capabilities: Option<u64>,
     capability: u32,
@@ -195,7 +186,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
     #[test]
     fn embedded_object_contains_required_programs() {
         assert_eq!(

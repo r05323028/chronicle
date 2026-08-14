@@ -942,7 +942,7 @@ fn doctor_prospective_data_dir_is_non_mutating_and_actionable() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn rootless_public_record_fails_before_target_on_unsupported_build() {
     let root = std::env::temp_dir().join(format!("chronicle-cli-record-{}", uuid::Uuid::new_v4()));

@@ -8,7 +8,7 @@ Define local durable spool and immutable RecordingStore boundaries, lifecycle, i
 
 ### Requirement: Active WAL remains on local durable spool
 
-P2 SHALL require active recorder state, active WAL segment, writer lease, recovery repair, and mutable ETL checkpoint workspace on one local filesystem that supports private files, advisory locks, file/data sync, directory sync, and atomic same-filesystem rename. `RecordingStore` SHALL NOT pretend object storage can satisfy append, `fdatasync`, lock, or verified-tail-repair semantics. No remote backend SHALL be used as commit authority or required for capture acknowledgement.
+The recorder SHALL require active recorder state, active WAL segment, writer lease, recovery repair, and mutable ETL checkpoint workspace on one local filesystem that supports private files, advisory locks, file/data sync, directory sync, and atomic same-filesystem rename. `RecordingStore` SHALL NOT pretend object storage can satisfy append, `fdatasync`, lock, or verified-tail-repair semantics. No remote backend SHALL be used as commit authority or required for capture acknowledgement.
 
 #### Scenario: Local spool supports required semantics
 
@@ -22,7 +22,7 @@ P2 SHALL require active recorder state, active WAL segment, writer lease, recove
 
 ### Requirement: RecordingStore publishes immutable artifacts
 
-`RecordingStore` boundary SHALL begin after artifact bytes and identity are immutable. P2 MAY expose sealed WAL segment copies as future-compatible immutable artifacts, but they are optional and not required for retention correctness. Canonical incremental batches, recovery reports, and bounded provenance indexes remain supported immutable kinds. Final Canonical Session v1 and its multi-file manifest/payload publication SHALL remain solely owned by existing `FilesystemSessionStore`; `RecordingStore` SHALL NOT replace or wrap that authority in P2. Mutable recorder state, active segment, lock, checkpoint, final session staging, and in-progress bytes SHALL remain outside upload boundary.
+`RecordingStore` boundary SHALL begin after artifact bytes and identity are immutable. The recorder MAY expose sealed WAL segment copies as future-compatible immutable artifacts, but they are optional and not required for retention correctness. Canonical incremental batches, recovery reports, and bounded provenance indexes remain supported immutable kinds. Final Canonical Session v1 and its multi-file manifest/payload publication SHALL remain solely owned by existing `FilesystemSessionStore`; `RecordingStore` SHALL NOT replace or wrap that authority in the recorder. Mutable recorder state, active segment, lock, checkpoint, final session staging, and in-progress bytes SHALL remain outside upload boundary.
 
 Store contract SHALL provide typed operations equivalent to put-if-absent with expected length/SHA-256/schema/provenance, get/read with integrity verification, metadata/head, explicitly bounded prefix/list for diagnostics only, and delete with exact identity/digest precondition. Store SHALL return stable created/already-exists-matching/conflict/not-found/unsupported/transient/permanent outcomes. Generic overwrite of immutable key SHALL not exist.
 
@@ -78,14 +78,14 @@ Future eventually consistent listing SHALL not affect correctness. Orphan immuta
 
 ### Requirement: Filesystem backend preserves local compatibility
 
-P2 SHALL ship one filesystem RecordingStore backend. It SHALL preserve private mode expectations, checksum validation, staging under destination filesystem, file/directory sync, atomic no-replace behavior, path confinement, deterministic layout, and safe recovery of stale private staging. Existing `FilesystemSessionStore` remains separate owner of manifest-last canonical session publication; its readers and P1 stopped-recording outputs SHALL remain usable without cloud configuration.
+The recorder SHALL ship one filesystem RecordingStore backend. It SHALL preserve private mode expectations, checksum validation, staging under destination filesystem, file/directory sync, atomic no-replace behavior, path confinement, deterministic layout, and safe recovery of stale private staging. Existing `FilesystemSessionStore` remains separate owner of manifest-last canonical session publication; its readers and stopped-recording outputs SHALL remain usable without cloud configuration.
 
 Filesystem backend SHALL reject traversal, symlink escape, cross-filesystem publication requiring non-atomic copy, non-v1 metadata, checksum mismatch, and existing conflicting final path. It SHALL not weaken existing Canonical Session publication semantics to fit future backends.
 
 #### Scenario: Existing filesystem session
 
-- **WHEN** P1 canonical session is read/inspected through existing local root
-- **THEN** P2 storage changes do not require migration or republish
+- **WHEN** an existing canonical session is read/inspected through the existing local root
+- **THEN** recorder storage changes do not require migration or republish
 
 #### Scenario: Cross-filesystem staging
 
@@ -113,20 +113,20 @@ Source WAL and derived canonical artifacts SHALL have independent retention clas
 - **WHEN** key content differs from expected digest at deletion
 - **THEN** store preserves/reports conflict and does not delete
 
-### Requirement: P2 upload boundary stops at sealed immutable artifacts
+### Requirement: Recorder upload boundary stops at sealed immutable artifacts
 
-P2 SHALL expose only locally sealed/digested immutable artifacts to `RecordingStore`. Local commit/acknowledgement and ETL input authority SHALL not wait on or derive from any upload concept. Active segment, lease, recovery repair, mutable checkpoint, and canonical session transaction SHALL remain local-owned boundaries. Sealed WAL copies, if exposed, are optional future-compatible artifacts; P2 retention correctness SHALL not depend on copying them into `RecordingStore`.
+The recorder SHALL expose only locally sealed/digested immutable artifacts to `RecordingStore`. Local commit/acknowledgement and ETL input authority SHALL not wait on or derive from any upload concept. Active segment, lease, recovery repair, mutable checkpoint, and canonical session transaction SHALL remain local-owned boundaries. Sealed WAL copies, if exposed, are optional future-compatible artifacts; Recorder retention correctness SHALL not depend on copying them into `RecordingStore`.
 
-P2 SHALL implement filesystem backend only. It SHALL NOT add S3 client, bucket credentials, multipart upload, network retry engine, cloud configuration, remote durability claim, or normative remote-backend behavior.
+The recorder SHALL implement filesystem backend only. It SHALL NOT add S3 client, bucket credentials, multipart upload, network retry engine, cloud configuration, remote durability claim, or normative remote-backend behavior.
 
 #### Scenario: Optional sealed WAL copy disabled
 
-- **WHEN** P2 retains sealed WAL only on its local durable spool
+- **WHEN** the recorder retains sealed WAL only on its local durable spool
 - **THEN** retention eligibility still uses validated local WAL/manifest/checkpoint/final-session proof and does not require a `RecordingStore` copy
 
 #### Scenario: Remote backend requested
 
-- **WHEN** configuration requests S3-compatible backend in P2
+- **WHEN** configuration requests an S3-compatible backend from the recorder
 - **THEN** recorder returns stable unsupported-backend result and local filesystem behavior remains available
 
 ### Requirement: Store failures are typed and bounded
@@ -145,7 +145,7 @@ Store operation SHALL classify permission, space/quota, integrity conflict, unsu
 
 ### Requirement: Backend conformance is executable
 
-P2 filesystem RecordingStore backend SHALL pass conformance suite for put-if-absent, matching retry, conflicting retry, integrity read, bounded list, preconditioned delete, path/key safety, crash staging, durability uncertainty, lifecycle behavior, and ownership-boundary rejection. Conformance SHALL prove RecordingStore cannot bypass WAL authority, advance incremental checkpoints, or publish final sessions. Conformance SHALL use rootless fault injection and SHALL not claim any remote backend support.
+The recorder filesystem RecordingStore backend SHALL pass the conformance suite for put-if-absent, matching retry, conflicting retry, integrity read, bounded list, preconditioned delete, path/key safety, crash staging, durability uncertainty, lifecycle behavior, and ownership-boundary rejection. Conformance SHALL prove RecordingStore cannot bypass WAL authority, advance incremental checkpoints, or publish final sessions. Conformance SHALL use rootless fault injection and SHALL not claim any remote backend support.
 
 #### Scenario: Filesystem conformance
 

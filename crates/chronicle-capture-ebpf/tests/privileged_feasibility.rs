@@ -1,4 +1,4 @@
-#![cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#![cfg(target_os = "linux")]
 #![allow(unsafe_code)] // Feasibility-only ABI decoding and euid probe.
 
 use aya::{
@@ -464,7 +464,10 @@ fn privileged_feasibility() -> Result<(), Box<dyn Error>> {
     }
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
     validate_report_contract(&report)?;
-    println!("Gate A feasibility report: {}", report_path.display());
+    println!(
+        "Kernel capture feasibility report: {}",
+        report_path.display()
+    );
     println!("events={emitted} ring_reservation_failures={lost}");
 
     let _ = server.0.wait();
@@ -740,8 +743,9 @@ for listener, response_size in ((v4, 8), (v4, 32768), (v6, 8), (v4, 8)):
 
 fn exchange(address: SocketAddr) -> io::Result<()> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))?;
-    stream
-        .write_all(b"GET /gate-a HTTP/1.1\r\nHost: chronicle.test\r\nConnection: close\r\n\r\n")?;
+    stream.write_all(
+        b"GET /capture-feasibility HTTP/1.1\r\nHost: chronicle.test\r\nConnection: close\r\n\r\n",
+    )?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
     if !response.starts_with(b"HTTP/1.1 200 OK") || !response.ends_with(b"chronicle") {
@@ -756,7 +760,7 @@ fn exchange_large(address: SocketAddr) -> io::Result<()> {
     let body = vec![b'Q'; 32 * 1024];
     write!(
         stream,
-        "POST /gate-a-gso HTTP/1.1\r\nHost: chronicle.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /capture-feasibility-gso HTTP/1.1\r\nHost: chronicle.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
     stream.flush()?;
@@ -1221,7 +1225,10 @@ fn validate_report_contract(report: &FeasibilityReport) -> Result<(), Box<dyn Er
         || report.continuation_bytes != 16 * 1024
         || report.max_continuations_per_skb != 4
     {
-        return Err(io::Error::other("report constants differ from Gate A spec bounds").into());
+        return Err(io::Error::other(
+            "report constants differ from kernel capture feasibility spec bounds",
+        )
+        .into());
     }
     if !matches!(report.architecture.as_str(), "aarch64" | "x86_64")
         || !report.cgroup_v2
@@ -1243,7 +1250,10 @@ fn validate_report_contract(report: &FeasibilityReport) -> Result<(), Box<dyn Er
         || report.loss_model_scenarios.len() != 9
         || !report.mandatory_final_sample
     {
-        return Err(io::Error::other("Gate A report omitted required feasibility evidence").into());
+        return Err(io::Error::other(
+            "Kernel capture feasibility report omitted required evidence",
+        )
+        .into());
     }
     let version = report
         .kernel
@@ -1443,7 +1453,7 @@ fn report_path() -> PathBuf {
     std::env::var_os("CHRONICLE_FEASIBILITY_REPORT").map_or_else(
         || {
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/gate-a/feasibility-report.json")
+                .join("../../target/capture-feasibility/feasibility-report.json")
         },
         PathBuf::from,
     )

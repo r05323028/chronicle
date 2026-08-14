@@ -76,14 +76,14 @@ class LayeredValidationTests(unittest.TestCase):
         self.assertNotIn("ebpf", result["selected"])
 
     def test_fingerprint_ignores_docs_and_invalidates_acceptance(self):
-        first = validation.fingerprint(self.temp, "p1", self.cfg)["fingerprint"]
+        first = validation.fingerprint(self.temp, "live-capture", self.cfg)["fingerprint"]
         (self.temp / "docs/change.md").write_text("unrelated\n")
         self.assertEqual(
-            first, validation.fingerprint(self.temp, "p1", self.cfg)["fingerprint"]
+            first, validation.fingerprint(self.temp, "live-capture", self.cfg)["fingerprint"]
         )
         (self.temp / "scripts/acceptance/scenarios.toml").write_text("changed\n")
         self.assertNotEqual(
-            first, validation.fingerprint(self.temp, "p1", self.cfg)["fingerprint"]
+            first, validation.fingerprint(self.temp, "live-capture", self.cfg)["fingerprint"]
         )
 
     def test_fingerprint_keeps_environment_out_of_source_identity(self):
@@ -97,19 +97,19 @@ class LayeredValidationTests(unittest.TestCase):
             "btf": True,
             "cgroup_v2": True,
         }
-        first = validation.fingerprint(self.temp, "p1", self.cfg, vm_environment)[
+        first = validation.fingerprint(self.temp, "live-capture", self.cfg, vm_environment)[
             "fingerprint"
         ]
         vm_environment["kernel"] = "6.8.1"
         self.assertEqual(
             first,
-            validation.fingerprint(self.temp, "p1", self.cfg, vm_environment)[
+            validation.fingerprint(self.temp, "live-capture", self.cfg, vm_environment)[
                 "fingerprint"
             ],
         )
         self.assertEqual(
             "6.8.1",
-            validation.fingerprint(self.temp, "p1", self.cfg, vm_environment)[
+            validation.fingerprint(self.temp, "live-capture", self.cfg, vm_environment)[
                 "environment"
             ]["kernel"],
         )
@@ -122,11 +122,11 @@ class LayeredValidationTests(unittest.TestCase):
             argparse.Namespace(
                 source=source,
                 dest=dest,
-                gate="p1",
+                gate="live-capture",
                 status="passed",
                 fingerprint="fp",
                 commit="sha",
-                checks="P1",
+                checks="live-capture",
                 artifact_mode="no-artifact",
             )
         )
@@ -144,11 +144,11 @@ class LayeredValidationTests(unittest.TestCase):
         args = argparse.Namespace(
             source=source,
             dest=dest,
-            gate="p1",
+            gate="live-capture",
             status="passed",
             fingerprint="fp",
             commit="sha",
-            checks="P1",
+            checks="live-capture",
             environment=environment_file,
             artifact_mode="artifact-on-failure",
         )
@@ -178,11 +178,11 @@ class LayeredValidationTests(unittest.TestCase):
             argparse.Namespace(
                 source=source,
                 dest=dest,
-                gate="p1",
+                gate="live-capture",
                 status="passed",
                 fingerprint="fp",
                 commit="sha",
-                checks="P1",
+                checks="live-capture",
                 artifact_mode="release",
             )
         )
@@ -197,12 +197,12 @@ class LayeredValidationTests(unittest.TestCase):
         evidence = self.temp / "evidence"
         evidence.mkdir()
         (self.temp / "outside").write_text("outside\n")
-        (evidence / "p1").mkdir()
-        (evidence / "p1" / "manifest.json").write_text('{"status":"passed"}\n')
-        (evidence / "p1" / "checksums.txt").write_text("bad  ../outside\n")
+        (evidence / "live-capture").mkdir()
+        (evidence / "live-capture" / "manifest.json").write_text('{"status":"passed"}\n')
+        (evidence / "live-capture" / "checksums.txt").write_text("bad  ../outside\n")
         self.assertEqual(
             validation.reuse(
-                argparse.Namespace(evidence_root=evidence, gate="p1", fingerprint="fp")
+                argparse.Namespace(evidence_root=evidence, gate="live-capture", fingerprint="fp")
             ),
             1,
         )
@@ -227,7 +227,7 @@ class LayeredValidationTests(unittest.TestCase):
             self.cfg,
         )
         self.assertIn("etl", result["selected"])
-        self.assertIn("p2", self.cfg["groups"]["etl"]["gates"])
+        self.assertIn("recorder", self.cfg["groups"]["etl"]["gates"])
 
     def test_matching_evidence_reuses_and_mismatch_does_not(self):
         source = self.temp / "source"
@@ -235,24 +235,24 @@ class LayeredValidationTests(unittest.TestCase):
         source.mkdir()
         args = argparse.Namespace(
             source=source,
-            dest=evidence / "p1",
-            gate="p1",
+            dest=evidence / "live-capture",
+            gate="live-capture",
             status="passed",
             fingerprint="fp",
             commit="sha",
-            checks="P1",
+            checks="live-capture",
             artifact_mode="artifact-on-failure",
         )
         validation.compact(args)
         reuse_args = argparse.Namespace(
-            evidence_root=evidence, gate="p1", fingerprint="fp", commit="sha"
+            evidence_root=evidence, gate="live-capture", fingerprint="fp", commit="sha"
         )
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(validation.reuse(reuse_args), 0)
         self.assertEqual(
             validation.reuse(
                 argparse.Namespace(
-                    evidence_root=evidence, gate="p1", fingerprint="changed"
+                    evidence_root=evidence, gate="live-capture", fingerprint="changed"
                 )
             ),
             1,
@@ -261,9 +261,9 @@ class LayeredValidationTests(unittest.TestCase):
             validation.reuse(
                 argparse.Namespace(
                     evidence_root=evidence,
-                    gate="p1",
+                    gate="live-capture",
                     fingerprint="fp",
-                    checks="P2",
+                    checks="recorder",
                     commit="sha",
                 )
             ),
@@ -273,7 +273,7 @@ class LayeredValidationTests(unittest.TestCase):
             validation.reuse(
                 argparse.Namespace(
                     evidence_root=evidence,
-                    gate="p1",
+                    gate="live-capture",
                     fingerprint="fp",
                     commit="new-sha",
                     release=True,
@@ -287,19 +287,19 @@ class LayeredValidationTests(unittest.TestCase):
         validation.compact(
             argparse.Namespace(
                 source=source,
-                dest=evidence / "p2",
-                gate="p2",
+                dest=evidence / "recorder",
+                gate="recorder",
                 status="passed",
                 fingerprint="fp",
                 commit="sha",
-                checks="P2",
+                checks="recorder",
                 environment=environment_file,
                 artifact_mode="artifact-on-failure",
             )
         )
         self.assertEqual(
             validation.reuse(
-                argparse.Namespace(evidence_root=evidence, gate="p2", fingerprint="fp")
+                argparse.Namespace(evidence_root=evidence, gate="recorder", fingerprint="fp")
             ),
             1,
         )
@@ -316,11 +316,11 @@ class LayeredValidationTests(unittest.TestCase):
         args = argparse.Namespace(
             source=source,
             dest=dest,
-            gate="p2",
+            gate="recorder",
             status="failed",
             fingerprint="fp",
             commit="sha",
-            checks="P2",
+            checks="recorder",
             artifact_mode="artifact-on-failure",
         )
         validation.compact(args)

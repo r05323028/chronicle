@@ -151,7 +151,7 @@ ETL SHALL detect protocol from reconstructed streams, invoke registered decoder/
 
 ### Requirement: Deterministic one-session publication
 
-P1 ETL SHALL group one stopped recording into one canonical session. Session, connection, and operation identifiers SHALL derive deterministically from recording ID, pipeline version, stable connection provenance, and message order. Publication SHALL use existing filesystem store atomic no-replace boundary.
+Recording ETL SHALL group one stopped recording into one canonical session. Session, connection, and operation identifiers SHALL derive deterministically from recording ID, pipeline version, stable connection provenance, and message order. Publication SHALL use existing filesystem store atomic no-replace boundary.
 
 #### Scenario: First successful run
 
@@ -232,7 +232,7 @@ Canonical session and ETL summary SHALL include source recording ID/status/shutd
 
 ### Requirement: Incremental ETL consumes recovery-authoritative snapshots
 
-Recorder-owned P2 incremental ETL worker/API SHALL consume committed WAL while recorder is running. Existing standalone `etl --wal-dir --output` SHALL retain P1 stopped-recording ownership and SHALL continue to reject a live writer; it MAY process a finalized P2 epoch. Processing input for recorder-owned incremental ETL SHALL be an immutable snapshot descriptor containing recording epoch ID, segment ordinal/digest where sealed, final marker segment/offset/sequence/digest, exact ordered input-byte digest through marker, and capture/clock lineage. ETL SHALL independently validate segment/header/envelope/marker conditions through descriptor boundary before processing. Manifest, metadata, file length, or writer acknowledgement alone SHALL NOT promote input.
+Recorder-owned incremental ETL worker/API SHALL consume committed WAL while recorder is running. Existing standalone `etl --wal-dir --output` SHALL retain stopped-recording ownership and SHALL continue to reject a live writer; it MAY process a finalized recorder epoch. Processing input for recorder-owned incremental ETL SHALL be an immutable snapshot descriptor containing recording epoch ID, segment ordinal/digest where sealed, final marker segment/offset/sequence/digest, exact ordered input-byte digest through marker, and capture/clock lineage. ETL SHALL independently validate segment/header/envelope/marker conditions through descriptor boundary before processing. Manifest, metadata, file length, or writer acknowledgement alone SHALL NOT promote input.
 
 Live ETL SHALL use read-only snapshot semantics and SHALL never repair, truncate, reopen, delete, or classify concurrently growing suffix as committed corruption. If active segment changes while snapshot is established, ETL SHALL retry from prior checkpoint or process only stable validated marker. Startup exclusive recovery retains existing repair authority.
 
@@ -244,7 +244,7 @@ Live ETL SHALL use read-only snapshot semantics and SHALL never repair, truncate
 #### Scenario: Standalone ETL sees live writer
 
 - **WHEN** operator runs existing standalone ETL against recording held by live writer
-- **THEN** standalone command retains P1 behavior and rejects without reading live state or publishing
+- **THEN** standalone command retains existing behavior and rejects without reading live state or publishing
 
 #### Scenario: No new marker
 
@@ -258,9 +258,9 @@ Live ETL SHALL use read-only snapshot semantics and SHALL never repair, truncate
 
 ### Requirement: FinalSessionCheckpoint v1 and IncrementalEtlCheckpoint v1 are distinct
 
-`FinalSessionCheckpoint v1` SHALL remain the existing P1 stopped-recording checkpoint artifact and SHALL not be extended to represent live incremental state. It owns final-session ETL/publication lifecycle and existing P1 finalization behavior.
+`FinalSessionCheckpoint v1` SHALL remain the existing stopped-recording checkpoint artifact and SHALL not be extended to represent live incremental state. It owns final-session ETL/publication lifecycle and existing finalization behavior.
 
-`IncrementalEtlCheckpoint v1` SHALL be a separate P2 artifact with a different discriminator, owner, and lifecycle. It SHALL persist enough bounded state to resume without rereading deleted input or changing semantic output. It SHALL include WAL marker lineage; segment digest lineage; decoder reconstruction state; TCP direction state; HTTP correlation state; loss-window state; emitted delta batch references; deterministic ID counters; recorder/epoch/configuration/pipeline/canonical versions; prior checkpoint digest; exact input marker and WAL snapshot digest; sealed segment identities/digests; active connection generation map; directional TCP ranges/chunks/provenance; lifecycle/loss-window state; protocol detector/decoder state including pending request/response correlation; deterministic ID derivation inputs; emitted immutable output identities/digests; source status; bounds/counters; and checkpoint checksum.
+`IncrementalEtlCheckpoint v1` SHALL be a separate artifact with a different discriminator, owner, and lifecycle. It SHALL persist enough bounded state to resume without rereading deleted input or changing semantic output. It SHALL include WAL marker lineage; segment digest lineage; decoder reconstruction state; TCP direction state; HTTP correlation state; loss-window state; emitted delta batch references; deterministic ID counters; recorder/epoch/configuration/pipeline/canonical versions; prior checkpoint digest; exact input marker and WAL snapshot digest; sealed segment identities/digests; active connection generation map; directional TCP ranges/chunks/provenance; lifecycle/loss-window state; protocol detector/decoder state including pending request/response correlation; deterministic ID derivation inputs; emitted immutable output identities/digests; source status; bounds/counters; and checkpoint checksum.
 
 `IncrementalEtlCheckpoint v1` SHALL reject unknown/non-v1 before allocation. No version SHALL have dual interpretation. State SHALL obey existing 1024 connections, 65,536 chunks/connection, 8 MiB/connection, five-minute event-time idle, 8 MiB operation body, 10,000 operations/epoch, 1024 issues, and 4096-record read-batch bounds. It MAY contain pending captured bytes and SHALL use private permissions and payload-safe output.
 
@@ -283,7 +283,7 @@ Live ETL SHALL use read-only snapshot semantics and SHALL never repair, truncate
 
 ### Requirement: Deterministic immutable incremental publication
 
-ETL SHALL publish completed canonical operations/evidence as immutable bounded batches keyed deterministically by recording epoch, pipeline version, exact source WAL provenance, and canonical content. Batch ordering SHALL derive from capture/WAL provenance, not poll interval, worker timing, checkpoint grouping, or restart count. Existing canonical types and completeness/provenance semantics SHALL be reused; P2 SHALL NOT redefine HTTP protocol meaning or weaken Canonical Session v1 validation.
+ETL SHALL publish completed canonical operations/evidence as immutable bounded batches keyed deterministically by recording epoch, pipeline version, exact source WAL provenance, and canonical content. Batch ordering SHALL derive from capture/WAL provenance, not poll interval, worker timing, checkpoint grouping, or restart count. Existing canonical types and completeness/provenance semantics SHALL be reused; Incremental ETL SHALL NOT redefine HTTP protocol meaning or weaken Canonical Session v1 validation.
 
 Publication SHALL use `RecordingStore` put-if-absent semantics. Existing same key SHALL be accepted only after size/digest/schema/provenance verification; mismatch SHALL fail without overwrite. Epoch finalization SHALL materialize existing deterministic Canonical Session v1 equivalent to one-shot ETL over same final committed WAL and source status, then use existing atomic session publication semantics.
 
@@ -343,7 +343,7 @@ Checkpoint lineage SHALL form one unambiguous chain. Forked checkpoints, predece
 
 Incremental outputs and final session SHALL preserve recorder ID, recording epoch ID/ordinal, boot/clock identity, connection generation, capture time range, WAL segment/offset/sequence/marker/digest ranges, loss windows, source lifecycle status/reason, ETL checkpoint/output identities, and recovery warnings. Restart time, process-attempt ID, polling cadence, and publication time SHALL be observational metadata only and SHALL NOT affect deterministic canonical identity/order.
 
-Long-lived connection crossing segment snapshots SHALL retain one connection generation and complete only from trusted evidence. Connection crossing recording-epoch boundary SHALL finalize old epoch incomplete unless explicit complete lifecycle evidence precedes boundary; P2 SHALL not carry protocol state across recording IDs or invent cross-epoch session identity.
+Long-lived connection crossing segment snapshots SHALL retain one connection generation and complete only from trusted evidence. Connection crossing recording-epoch boundary SHALL finalize old epoch incomplete unless explicit complete lifecycle evidence precedes boundary; Incremental ETL SHALL not carry protocol state across recording IDs or invent cross-epoch session identity.
 
 #### Scenario: Recorder restart in same epoch
 
@@ -373,7 +373,7 @@ Health/status SHALL expose committed marker, checkpoint marker, lag records/byte
 
 ### Requirement: Incremental and one-shot ETL remain equivalent
 
-P1 standalone ETL SHALL remain supported for stopped recordings. For one final committed epoch snapshot, incremental execution and clean one-shot execution SHALL produce same deterministic Canonical Session v1, session/connection/operation IDs, timeline order, payload digests, completeness, replayability, provenance, and issue ordering. Incremental-only batch/checkpoint metadata SHALL not change replay semantics.
+Standalone ETL SHALL remain supported for stopped recordings. For one final committed epoch snapshot, incremental execution and clean one-shot execution SHALL produce same deterministic Canonical Session v1, session/connection/operation IDs, timeline order, payload digests, completeness, replayability, provenance, and issue ordering. Incremental-only batch/checkpoint metadata SHALL not change replay semantics.
 
 #### Scenario: Equivalence fixture
 

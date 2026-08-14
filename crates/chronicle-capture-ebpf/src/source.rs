@@ -1,21 +1,21 @@
 use crate::{adapter::CaptureAdapter, error::EbpfCaptureError};
 use chronicle_capture::{CaptureError, CaptureSource};
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 use sha2::{Digest, Sha256};
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 use std::fmt::Write as _;
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 use crate::abi::{RawKernelObservation, RawLossCounters, decode_raw_kernel_observation};
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 use chronicle_capture::{CaptureEvent, CaptureSourceState, CaptureSourceSummary};
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 const EMBEDDED_OBJECT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/chronicle-ebpf-capture-bpfel.o"));
 
 /// SHA-256 identity for metadata; unavailable on unsupported object targets.
-#[cfg(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little"))]
+#[cfg(all(target_os = "linux", target_endian = "little"))]
 pub fn embedded_object_sha256() -> Option<String> {
     let mut output = String::with_capacity(EMBEDDED_OBJECT.len() * 2);
     for byte in Sha256::digest(EMBEDDED_OBJECT) {
@@ -24,30 +24,21 @@ pub fn embedded_object_sha256() -> Option<String> {
     Some(output)
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf", target_endian = "little")))]
+#[cfg(not(all(target_os = "linux", target_endian = "little")))]
 pub fn embedded_object_sha256() -> Option<String> {
     None
 }
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const LOSS_SAMPLE_INTERVAL_NS: u64 = 100_000_000;
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct LossSampleSchedule {
     next_due_ns: u64,
 }
 
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "linux-ebpf")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl LossSampleSchedule {
     const fn new(attached_at_ns: u64) -> Self {
         Self {
@@ -64,7 +55,7 @@ impl LossSampleSchedule {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 pub struct EbpfCaptureSource {
     // Dropping this object detaches producer links while independently owned maps stay drainable.
     ebpf: Option<aya::Ebpf>,
@@ -80,10 +71,10 @@ pub struct EbpfCaptureSource {
     summary: CaptureSourceSummary,
 }
 
-#[cfg(any(not(target_os = "linux"), not(feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 pub struct EbpfCaptureSource;
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 impl EbpfCaptureSource {
     #[cfg(target_endian = "little")]
     pub fn load_embedded(
@@ -173,21 +164,18 @@ impl EbpfCaptureSource {
     }
 }
 
-#[cfg(any(not(target_os = "linux"), not(feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 impl EbpfCaptureSource {
     pub fn load(
         _object: &[u8],
         _cgroup: &std::fs::File,
         _adapter: CaptureAdapter,
     ) -> Result<Self, EbpfCaptureError> {
-        if cfg!(target_os = "linux") {
-            return Err(EbpfCaptureError::FeatureDisabled);
-        }
         Err(EbpfCaptureError::UnsupportedPlatform)
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn attach_all(ebpf: &mut aya::Ebpf, cgroup: &std::fs::File) -> Result<(), EbpfCaptureError> {
     use aya::programs::{
         CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, SockOps,
@@ -266,7 +254,7 @@ fn attach_all(ebpf: &mut aya::Ebpf, cgroup: &std::fs::File) -> Result<(), EbpfCa
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 impl EbpfCaptureSource {
     fn source_error(error: &EbpfCaptureError) -> CaptureError {
         CaptureError::Source(error.to_string())
@@ -325,7 +313,7 @@ impl EbpfCaptureSource {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 impl CaptureSource for EbpfCaptureSource {
     fn start(&mut self) -> Result<(), CaptureError> {
         match self.state {
@@ -450,7 +438,7 @@ impl CaptureSource for EbpfCaptureSource {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)] // libc exposes Linux CLOCK_MONOTONIC only as an unsafe FFI call.
 fn monotonic_nanoseconds() -> Result<u64, EbpfCaptureError> {
     let mut value = libc::timespec {
@@ -467,7 +455,7 @@ fn monotonic_nanoseconds() -> Result<u64, EbpfCaptureError> {
         .ok_or(EbpfCaptureError::RingLoss("monotonic clock out of range"))
 }
 
-#[cfg(any(not(target_os = "linux"), not(feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 impl CaptureSource for EbpfCaptureSource {
     fn next_event(&mut self) -> Result<Option<chronicle_capture::CaptureEvent>, CaptureError> {
         Err(CaptureError::Source(

@@ -58,7 +58,9 @@ def bounded_profile_command(command: list[str], timeout: int) -> list[str]:
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Run Chronicle acceptance scenarios")
-    value.add_argument("--profile", choices=("p1", "p2", "all"), required=True)
+    value.add_argument(
+        "--profile", choices=("live-capture", "recorder", "all"), required=True
+    )
     value.add_argument("--executor", choices=("local", "multipass"), default="local")
     value.add_argument(
         "--release", action="store_true", help="require release-grade complete evidence"
@@ -398,8 +400,8 @@ def run_profile(
             "CHRONICLE_ACCEPTANCE_SCENARIOS": ",".join(
                 report.dispatch_scenarios(definition, profile)
             ),
-            "CHRONICLE_ACCEPTANCE_P1_SCENARIOS": ",".join(
-                report.dispatch_scenarios(definition, "p1")
+            "CHRONICLE_ACCEPTANCE_LIVE_CAPTURE_SCENARIOS": ",".join(
+                report.dispatch_scenarios(definition, "live-capture")
             ),
             "CHRONICLE_TIMEOUT_EVIDENCE_FILE": str(runtime_root / "gate-timeout.json"),
             "CHRONICLE_TIMEOUT_PHASE_FILE": str(assertions_root / "current-phase.txt"),
@@ -455,23 +457,32 @@ def run_profile(
                 legacy = value
         except (OSError, json.JSONDecodeError):
             legacy = None
-    p1_legacy: dict[str, Any] | None = None
-    if profile == "p2" and legacy:
-        p1_legacy = {"status": legacy.get("status"), "checks": legacy.get("checks", {})}
+    live_capture_legacy: dict[str, Any] | None = None
+    if profile == "recorder" and legacy:
+        live_capture_legacy = {
+            "status": legacy.get("status"),
+            "checks": legacy.get("checks", {}),
+        }
     status, completed, failed, not_checked = report.normalize_legacy_report(
         definition, profile, legacy, selected, return_code
     )
-    if profile == "p2":
-        p1_selected = report.profile_scenarios(definition, "p1")
-        _, p1_completed, p1_failed, p1_not_checked = report.normalize_legacy_report(
-            definition, "p1", p1_legacy, p1_selected, return_code
+    if profile == "recorder":
+        live_capture_selected = report.profile_scenarios(definition, "live-capture")
+        _, live_capture_completed, live_capture_failed, live_capture_not_checked = (
+            report.normalize_legacy_report(
+                definition,
+                "live-capture",
+                live_capture_legacy,
+                live_capture_selected,
+                return_code,
+            )
         )
-        for scenario in p1_selected:
-            if scenario in p1_completed:
+        for scenario in live_capture_selected:
+            if scenario in live_capture_completed:
                 continue
             if scenario in completed:
                 completed.remove(scenario)
-            if scenario in p1_failed:
+            if scenario in live_capture_failed:
                 if scenario not in failed:
                     failed.append(scenario)
             elif scenario not in not_checked:
@@ -498,7 +509,7 @@ def run_profile(
     preflight_result = None
     preflight_paths = sorted(assertions_root.rglob("preflight.json"))
     if preflight_paths:
-        # P2 writes one preflight.json per phase (pre-reboot, post-reboot);
+        # The recorder writes one preflight.json per phase (pre-reboot, post-reboot);
         # the last phase is the binding environment for the completed run.
         preflight_path = preflight_paths[-1]
         try:
@@ -574,7 +585,11 @@ def run_profile(
         source=source,
         environment_value=final_environment,
         return_code=return_code if status != "passed" else 0,
-        legacy=({"p1": p1_legacy, "p2": legacy} if profile == "p2" else legacy),
+        legacy=(
+            {"live-capture": live_capture_legacy, "recorder": legacy}
+            if profile == "recorder"
+            else legacy
+        ),
         release_requested=args.release,
         source_stable=source_stable,
         reuse_requested=not args.no_reuse,
@@ -617,9 +632,11 @@ def run_profile(
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     definition = report.load_scenarios(ROOT / "scripts/acceptance/scenarios.toml")
-    profiles = ("p2",) if args.profile == "all" else (args.profile,)
+    profiles = ("recorder",) if args.profile == "all" else (args.profile,)
     if args.profile == "all":
-        print("Profile all: executing P2 superset once; P1 scenarios are included.")
+        print(
+            "Profile all: executing the recorder superset once; live-capture scenarios are included."
+        )
     statuses = [run_profile(args, profile, definition) for profile in profiles]
     if any(status not in {0} for status in statuses):
         return next(status for status in statuses if status != 0)

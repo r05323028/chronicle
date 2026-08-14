@@ -6,7 +6,7 @@ The README is the primary developer onboarding entry point for Chronicle: produc
 
 ### Requirement: README role and information hierarchy
 
-`README.md` SHALL be organized as a product/developer onboarding document with the ordering What -> Install -> Quick Start -> Architecture -> Details: banner, positioning statement, What is Chronicle?, Current capabilities / status, Installation, Requirements, Quick Start, How It Works, Architecture, Supported Protocols, Safety, Current Limitations, CLI, Development, Documentation, License (exact headings may be refined but the ordering principle and the "no internal implementation detail before the first working example" rule SHALL hold). The README SHALL NOT read like a P1 implementation report: hidden compatibility entrypoints, deprecated syntax as a primary interface, WAL-format and schema-version policy, sidecar/catalog mechanics, recording bounds, and P1-specific machinery SHALL live in the appropriate detailed documents and SHALL NOT appear in the primary onboarding path unless necessary for installation, architecture understanding, or safety.
+`README.md` SHALL be organized as a product/developer onboarding document with the ordering What -> Install -> Quick Start -> Architecture -> Details: banner, positioning statement, What is Chronicle?, Current capabilities / status, Installation, Requirements, Quick Start, How It Works, Architecture, Supported Protocols, Safety, Current Limitations, CLI, Development, Documentation, License (exact headings may be refined but the ordering principle and the "no internal implementation detail before the first working example" rule SHALL hold). The README SHALL NOT read like an implementation report: hidden compatibility entrypoints, deprecated syntax as a primary interface, WAL-format and schema-version policy, sidecar/catalog mechanics, recording bounds, and implementation-specific machinery SHALL live in the appropriate detailed documents and SHALL NOT appear in the primary onboarding path unless necessary for installation, architecture understanding, or safety.
 
 #### Scenario: Ordering for a new developer
 
@@ -38,7 +38,7 @@ The README SHALL state current supported behavior truthfully: five public comman
 
 ### Requirement: Installation contract
 
-The README SHALL present installation through an installed `chronicle` binary as the primary user experience, referencing actual release artifacts and checksums produced by the repository's release workflow; the README SHALL NOT invent download URLs or artifacts that do not exist. A build-from-source path SHALL be documented for developers with every live-recording command enabling the required feature path explicitly: on Linux, `cargo build --release --features linux-ebpf` (or an equivalent contributor form) SHALL be the documented build, and the prerequisites SHALL be stated. The bare `cargo run -p chronicle-cli -- record ...` contributor examples without the feature SHALL NOT appear as the primary installation or live-recording experience.
+The README SHALL present installation through an installed `chronicle` binary as the primary user experience, referencing actual release artifacts and checksums produced by the repository's release workflow; the README SHALL NOT invent download URLs or artifacts that do not exist. A build-from-source path SHALL be documented for developers with one canonical command, `cargo build --release --locked`, that works on every supported platform: on Linux the build SHALL include live capture automatically (selected from the compilation target, never through a user-facing feature flag), and on other platforms it SHALL build the portable surface without live capture. The platform prerequisites SHALL be stated, and `chronicle doctor` SHALL be presented as the runtime readiness check. Regenerating the embedded eBPF object from `ebpf/` SHALL be documented only as an advanced developer path, separate from the normal source build.
 
 #### Scenario: Binary installation path
 
@@ -47,8 +47,8 @@ The README SHALL present installation through an installed `chronicle` binary as
 
 #### Scenario: Build from source with capture
 
-- **WHEN** a developer builds from source for live capture
-- **THEN** the documented command enables `linux-ebpf` and states the Linux/kernel/cgroup/BTF/architecture/privilege prerequisites and the eBPF object embedding mechanism
+- **WHEN** a developer builds from source on Linux for live capture
+- **THEN** the documented canonical command (`cargo build --release --locked`) includes live capture automatically without any feature flag, and the README states the Linux/kernel/cgroup/BTF/architecture/privilege prerequisites; the advanced eBPF-object regeneration path stays separate from the normal build
 
 ### Requirement: Quick Start contract
 
@@ -120,12 +120,12 @@ The README SHALL keep contributor instructions separate from installation: pinne
 
 ### Requirement: Documented command validation
 
-Documented installation and Quick Start commands SHALL be validated rather than untested. A rootless documentation-command contract test SHALL exercise the built binary: `--version`, `--help` (five public commands, internal mechanics hidden), `doctor` (non-destructive, actionable, capture probes unsupported on a non-feature build), `list` empty contract, public record-syntax preflight failure with no mutation on a non-feature build, and fixture-recorded public inspect/replay forms where rootless-compatible. The test SHALL NOT match README prose. Privileged P1/P2 acceptance SHALL include a quick-start scenario executing the exact documented command-mode forms against a release-built `linux-ebpf` binary and asserting the published recording, catalog entry, inspectable session, replay verification, and no recorded-destination contact.
+Documented installation and Quick Start commands SHALL be validated rather than untested. A rootless documentation-command contract test SHALL exercise the built binary: `--version`, `--help` (five public commands, internal mechanics hidden), `doctor` (non-destructive, actionable; capture probes report unavailable when live capture cannot operate), `list` empty contract, public record-syntax preflight failure with no mutation when live capture cannot operate (rootless Linux host or non-Linux build), and fixture-recorded public inspect/replay forms where rootless-compatible. The test SHALL NOT match README prose. Privileged live-capture/recorder acceptance SHALL include a quick-start scenario executing the exact documented command-mode forms against a release-built Linux binary and asserting the published recording, catalog entry, inspectable session, replay verification, and no recorded-destination contact.
 
 #### Scenario: Rootless contract passes
 
-- **WHEN** the documentation-command contract test runs on a non-Linux or non-feature build
-- **THEN** version/help/doctor/list contracts pass, record-syntax preflight fails safely with typed error and no mutation, and README links resolve
+- **WHEN** the documentation-command contract test runs where live capture cannot operate (rootless Linux host or non-Linux build)
+- **THEN** version/help/doctor/list contracts pass, record-syntax preflight fails safely with a typed error and no mutation, and README links resolve
 
 #### Scenario: Privileged quick start passes
 

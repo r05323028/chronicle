@@ -20,7 +20,7 @@ Repository SHALL provide `scripts/run-with-timeout.sh <seconds> <command> [argum
 
 ### Requirement: Validation uses hierarchical deadlines
 
-Validation SHALL enforce distinct configurable command, readiness/poll, scenario, and gate deadlines. Defaults SHALL keep readiness shorter than scenario and scenario shorter than gate. A command within a bounded poll SHALL have its own deadline so blocked command cannot defeat poll deadline. Gate timeout SHALL remain final safety boundary for `gate p1`, `gate p2`, and release acceptance.
+Validation SHALL enforce distinct configurable command, readiness/poll, scenario, and gate deadlines. Defaults SHALL keep readiness shorter than scenario and scenario shorter than gate. A command within a bounded poll SHALL have its own deadline so blocked command cannot defeat poll deadline. Gate timeout SHALL remain final safety boundary for `live-capture`, `recorder`, and release acceptance.
 
 #### Scenario: Inner readiness fails first
 
@@ -57,7 +57,7 @@ Timeout evidence SHALL identify timeout layer, configured duration, command or s
 
 #### Scenario: Scenario timeout report
 
-- **WHEN** `p2/checkpoint-kill-restart` exceeds scenario deadline
+- **WHEN** `recorder/checkpoint-kill-restart` exceeds scenario deadline
 - **THEN** output names scenario and duration, report contains scenario timeout entry, and readiness/service/process evidence remains available
 
 #### Scenario: Successful evidence reuse

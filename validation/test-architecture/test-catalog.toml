@@ -1,7 +1,7 @@
 # Chronicle classified test catalog (version 1)
 #
 # Machine-readable representation of the responsibility-based test architecture.
-# Validation tooling selects and orchestrates these tests; P1/P2/release are
+# Validation tooling selects and orchestrates these tests; live-capture/recorder/release are
 # selectors over required coverage, not test categories.
 #
 # Functional layers (exclusive): unit | integration | smoke | acceptance | e2e.
@@ -12,13 +12,13 @@
 version = 1
 layers = ["unit", "integration", "smoke", "acceptance", "e2e"]
 environments = ["portable", "privileged"]
-selectors = ["p1", "p2", "release"]
+selectors = ["live-capture", "recorder", "release"]
 
 # ---------------------------------------------------------------------------
 # Required gate coverage (selectors over catalog test ids)
 # ---------------------------------------------------------------------------
 
-[required.p1]
+[required.live-capture]
 tests = [
   "unit:chronicle-common",
   "unit:chronicle-canonical",
@@ -64,9 +64,9 @@ tests = [
   "acceptance:documented-quickstart-privileged",
 ]
 
-[required.p2]
+[required.recorder]
 tests = [
-  # P2 is a superset of P1 required coverage (subset check enforced).
+  # recorder is a superset of live-capture required coverage (subset check enforced).
   "unit:chronicle-common",
   "unit:chronicle-canonical",
   "unit:chronicle-capture",
@@ -178,7 +178,7 @@ environment = "portable"
 owner = "chronicle-common"
 command = "cargo test -p chronicle-common"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-canonical"
@@ -187,7 +187,7 @@ environment = "portable"
 owner = "chronicle-canonical"
 command = "cargo test -p chronicle-canonical"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-capture"
@@ -196,7 +196,7 @@ environment = "portable"
 owner = "chronicle-capture"
 command = "cargo test -p chronicle-capture"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-capture-ebpf"
@@ -205,7 +205,7 @@ environment = "portable"
 owner = "chronicle-capture-ebpf"
 command = "cargo test -p chronicle-capture-ebpf"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-wal"
@@ -214,7 +214,7 @@ environment = "portable"
 owner = "chronicle-wal"
 command = "cargo test -p chronicle-wal"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-session"
@@ -223,7 +223,7 @@ environment = "portable"
 owner = "chronicle-session"
 command = "cargo test -p chronicle-session"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-protocol"
@@ -232,7 +232,7 @@ environment = "portable"
 owner = "chronicle-protocol"
 command = "cargo test -p chronicle-protocol"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-protocol-builtins"
@@ -241,7 +241,7 @@ environment = "portable"
 owner = "chronicle-protocol-builtins"
 command = "cargo test -p chronicle-protocol-builtins"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-etl"
@@ -250,7 +250,7 @@ environment = "portable"
 owner = "chronicle-etl"
 command = "cargo test -p chronicle-etl"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-storage"
@@ -259,7 +259,7 @@ environment = "portable"
 owner = "chronicle-storage"
 command = "cargo test -p chronicle-storage"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-replay"
@@ -268,7 +268,7 @@ environment = "portable"
 owner = "chronicle-replay"
 command = "cargo test -p chronicle-replay"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-application"
@@ -277,7 +277,7 @@ environment = "portable"
 owner = "chronicle-application"
 command = "cargo test -p chronicle-application"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "unit:chronicle-cli"
@@ -286,7 +286,7 @@ environment = "portable"
 owner = "chronicle-cli"
 command = "cargo test -p chronicle-cli"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:application-vertical-fake"
@@ -295,7 +295,7 @@ environment = "portable"
 owner = "chronicle-application"
 command = "cargo test -p chronicle-application --test fake_vertical"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:application-vertical-http"
@@ -304,7 +304,7 @@ environment = "portable"
 owner = "chronicle-application"
 command = "cargo test -p chronicle-application --test fixtures_http_vertical"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:etl-contract"
@@ -313,7 +313,7 @@ environment = "portable"
 owner = "chronicle-application"
 command = "cargo test -p chronicle-application --test etl_contract"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:capture-loss-window-model"
@@ -322,7 +322,7 @@ environment = "portable"
 owner = "chronicle-capture"
 command = "cargo test -p chronicle-capture --test loss_window_model"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:chronicle-wal-matrix"
@@ -331,7 +331,7 @@ environment = "portable"
 owner = "chronicle-wal"
 command = "cargo test -p chronicle-wal --test wal_matrix"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:cli-contract"
@@ -340,7 +340,7 @@ environment = "portable"
 owner = "chronicle-cli"
 command = "cargo test -p chronicle-cli --test cli_contract"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:capture-ebpf-privileged-adapter"
@@ -349,7 +349,7 @@ environment = "privileged"
 owner = "chronicle-capture-ebpf"
 command = "cargo test -p chronicle-capture-ebpf --test privileged_adapter -- --ignored"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:capture-ebpf-privileged-feasibility"
@@ -358,7 +358,7 @@ environment = "privileged"
 owner = "chronicle-capture-ebpf"
 command = "cargo test -p chronicle-capture-ebpf --test privileged_feasibility -- --ignored"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:cli-privileged-signal"
@@ -367,7 +367,7 @@ environment = "privileged"
 owner = "chronicle-cli"
 command = "cargo test -p chronicle-cli --test privileged_signal -- --ignored"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "tooling:validation-tests"
@@ -376,7 +376,7 @@ environment = "portable"
 owner = "validation-tooling"
 command = "python3 scripts/tests/validation/test_layered_validation.py ; python3 scripts/tests/validation/test_architecture_boundaries.py ; python3 scripts/tests/validation/test_validation_architecture.py ; python3 scripts/tests/validation/test_sleep_policy.py ; python3 scripts/tests/validation/test_lifecycle_cleanup.py ; python3 scripts/tests/validation/test_select_fixtures.py ; python3 scripts/tests/validation/test_evidence_reuse.py ; python3 scripts/tests/validation/test_release_workflow.py"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "tooling:privileged-preflight"
@@ -385,16 +385,16 @@ environment = "portable"
 owner = "validation"
 command = "python3 scripts/tests/validation/test_preflight.py"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "tooling:acceptance-tests"
 layer = "integration"
 environment = "portable"
 owner = "acceptance-tooling"
-command = "python3 scripts/tests/acceptance/test_runner.py ; bash scripts/tests/acceptance/test-p2-readiness.sh ; bash scripts/tests/acceptance/test-wait.sh"
+command = "python3 scripts/tests/acceptance/test_runner.py ; bash scripts/tests/acceptance/test-recorder-readiness.sh ; bash scripts/tests/acceptance/test-wait.sh"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "tooling:timeout-wrapper"
@@ -403,7 +403,7 @@ environment = "portable"
 owner = "validation-tooling"
 command = "bash scripts/tests/test-run-with-timeout.sh"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "tooling:cli-rollback"
@@ -412,7 +412,7 @@ environment = "portable"
 owner = "chronicle-cli"
 command = "bash scripts/tests/test-user-intent-cli-rollback.sh"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "smoke:cli-help"
@@ -421,7 +421,7 @@ environment = "portable"
 owner = "chronicle-cli"
 command = "tests/smoke suite: chronicle --help"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "smoke:list-empty"
@@ -430,7 +430,7 @@ environment = "portable"
 owner = "chronicle-cli"
 command = "tests/smoke suite: list on empty data-dir; --version reports the workspace version"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "smoke:cli-invalid-config"
@@ -439,7 +439,7 @@ environment = "portable"
 owner = "chronicle-cli"
 command = "tests/smoke suite: usage errors and missing fixture return sane errors"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "smoke:replay-minimal-fixture"
@@ -448,7 +448,7 @@ environment = "portable"
 owner = "chronicle-replay"
 command = "tests/smoke suite: replay dry-run on minimal fixture"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "smoke:inspect-minimal-recording"
@@ -457,16 +457,16 @@ environment = "portable"
 owner = "chronicle-application"
 command = "tests/smoke suite: inspect on minimal fixture recording"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "smoke:recorder-basic-startup"
 layer = "smoke"
 environment = "portable"
 owner = "chronicle-application"
-command = "tests/smoke suite: public record fails fast on unsupported build before touching target"
+command = "tests/smoke suite: public record fails fast before touching target when live capture cannot operate (rootless Linux preflight or non-Linux build)"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "smoke:documented-commands"
@@ -475,16 +475,16 @@ environment = "portable"
 owner = "chronicle-cli"
 command = "tests/smoke/test_documented_commands.py: --version, --help surface, doctor contract, public record preflight, empty list, README relative links"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "acceptance:documented-quickstart-privileged"
 layer = "acceptance"
 environment = "privileged"
 owner = "chronicle-application"
-command = "privileged acceptance scenario documented-quickstart (documented quick start forms doctor/record/list/inspect/replay on a release-built linux-ebpf binary)"
+command = "privileged acceptance scenario documented-quickstart (documented quick start forms doctor/record/list/inspect/replay on a release-built Linux binary with live capture)"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "acceptance:record-basic"
@@ -493,7 +493,7 @@ environment = "portable"
 owner = "chronicle-application"
 command = "tests/acceptance/test_record.py: fixture record publishes session+WAL; malformed fixture and unsupported-build contracts"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "acceptance:inspect-display"
@@ -502,7 +502,7 @@ environment = "portable"
 owner = "chronicle-application"
 command = "tests/acceptance/test_inspect.py: user-visible inspect information, no payload leak"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "acceptance:replay-report"
@@ -511,7 +511,7 @@ environment = "portable"
 owner = "chronicle-replay"
 command = "tests/acceptance/test_replay.py: dry-run default, read gating, verification, mismatch exit"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "acceptance:recorder-readiness"
@@ -520,7 +520,7 @@ environment = "privileged"
 owner = "chronicle-application"
 command = "privileged acceptance scenario recorder-readiness (real systemd)"
 status = "existing"
-gates = ["p2", "release"]
+gates = ["recorder", "release"]
 
 [[test]]
 id = "acceptance:checkpoint-kill-restart"
@@ -529,7 +529,7 @@ environment = "privileged"
 owner = "chronicle-etl"
 command = "privileged acceptance scenario checkpoint-kill-restart (real process interruption)"
 status = "existing"
-gates = ["p2", "release"]
+gates = ["recorder", "release"]
 
 [[test]]
 id = "acceptance:quota-pressure"
@@ -538,7 +538,7 @@ environment = "privileged"
 owner = "chronicle-application"
 command = "privileged acceptance scenario quota-pressure (real loop/mount/systemd)"
 status = "existing"
-gates = ["p2", "release"]
+gates = ["recorder", "release"]
 
 [[test]]
 id = "acceptance:retention-interruption"
@@ -547,7 +547,7 @@ environment = "privileged"
 owner = "chronicle-wal"
 command = "privileged acceptance scenario retention-interruption (real systemd cleanup interruption)"
 status = "existing"
-gates = ["p2", "release"]
+gates = ["recorder", "release"]
 
 [[test]]
 id = "acceptance:reboot-recovery"
@@ -556,7 +556,7 @@ environment = "privileged"
 owner = "chronicle-application"
 command = "privileged acceptance scenario reboot-recovery (real VM reboot)"
 status = "existing"
-gates = ["p2", "release"]
+gates = ["recorder", "release"]
 
 [[test]]
 id = "e2e:rootless-synthetic-pipeline"
@@ -565,7 +565,7 @@ environment = "portable"
 owner = "root-e2e"
 command = "tests/e2e/test_rootless_pipeline.py: record-fixture -> inspect -> replay dry-run -> execute verification"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "e2e:privileged-capture-pipeline"
@@ -574,7 +574,7 @@ environment = "privileged"
 owner = "root-e2e"
 command = "privileged acceptance scenario capture-basic (real workload -> real eBPF capture -> WAL -> ETL -> canonical -> inspect -> replay -> verification; kernel/process/cgroup cleanup)"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "acceptance:user-intent-lifecycle-privileged"
@@ -583,7 +583,7 @@ environment = "privileged"
 owner = "chronicle-application"
 command = "privileged acceptance scenario user-intent-lifecycle (real cgroup selection + eBPF cleanup + process attribution)"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "acceptance:cli-compat-privileged-sample"
@@ -592,7 +592,7 @@ environment = "privileged"
 owner = "chronicle-cli"
 command = "privileged acceptance sample: real capture output consumed by cli-compatibility forms"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 # ---------------------------------------------------------------------------
 # Scenario obligations: every scenario id in scripts/acceptance/scenarios.toml

@@ -76,8 +76,8 @@ Decisions:
   the CLI-owned Integration contract, never as Smoke/Acceptance proof. Public
   `record`, `inspect`, `replay` drive user acceptance. Real
   capture/catalog flows remain privileged on supported Linux.
-- **Catalog status.** All 47 classified catalog tests are `existing`; P1
-  requires 42 and P2/release require 47.
+- **Catalog status.** All 47 classified catalog tests are `existing`; live-capture
+  requires 42 and recorder/release require 47.
 
 ## Selection reporting + evidence reuse policy
 

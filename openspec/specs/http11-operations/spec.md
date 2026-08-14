@@ -25,7 +25,7 @@ Built-in HTTP detector SHALL inspect bounded assembled socket bytes and report H
 
 ### Requirement: Stateful fixed-length HTTP decoding
 
-HTTP connection decoder SHALL consume reconstructed directional bytes plus deterministic cross-direction completion order, userspace-derived termination, and source-integrity state. Capture-level lifecycle SHALL remain raw (`established`, `state_changed`, `closed`, `reset`, `unknown`); decoder SHALL use `clean_close`/`half_close` only when userspace can derive it from feasibility-proven evidence. It SHALL parse request/status lines, ordered headers, no-body messages, exact `Content-Length` bodies, chunked response transfer coding, and valid response-to-close bodies across arbitrary capture/TCP chunk boundaries. Chunked requests SHALL be unsupported/non-replayable in P1. Decoder SHALL process persistent keep-alive and multiple sequential exchanges under fixed memory/header/body limits without assuming one capture event equals one message.
+HTTP connection decoder SHALL consume reconstructed directional bytes plus deterministic cross-direction completion order, userspace-derived termination, and source-integrity state. Capture-level lifecycle SHALL remain raw (`established`, `state_changed`, `closed`, `reset`, `unknown`); decoder SHALL use `clean_close`/`half_close` only when userspace can derive it from feasibility-proven evidence. It SHALL parse request/status lines, ordered headers, no-body messages, exact `Content-Length` bodies, chunked response transfer coding, and valid response-to-close bodies across arbitrary capture/TCP chunk boundaries. Chunked requests SHALL be unsupported/non-replayable. Decoder SHALL process persistent keep-alive and multiple sequential exchanges under fixed memory/header/body limits without assuming one capture event equals one message.
 
 #### Scenario: Fragmented request head and body
 
@@ -225,7 +225,7 @@ Writer SHALL emit sole mutable Canonical Session v1 with backend-neutral Artifac
 
 #### Scenario: Write production HTTP session
 
-- **WHEN** P1 ETL publishes production session
+- **WHEN** the recording ETL publishes a production session
 - **THEN** session uses canonical MVP v1 and typed HTTP/provenance structures
 
 #### Scenario: Non-MVP canonical version

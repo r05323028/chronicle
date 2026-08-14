@@ -1,10 +1,10 @@
-# P1 Operations Guide
+# Operations Guide
 
 ## Safety and scope
 
-WAL and published sessions can contain production headers and bodies, including credentials and personal data. Chronicle uses private Unix modes and safe default output, but P1 does **not** provide encryption at rest, secret discovery, comprehensive redaction, or tenant isolation. Inspect and reports omit bodies and arbitrary header values.
+WAL and published sessions can contain production headers and bodies, including credentials and personal data. Chronicle uses private Unix modes and safe default output, but does **not** provide encryption at rest, secret discovery, comprehensive redaction, or tenant isolation. Inspect and reports omit bodies and arbitrary header values.
 
-P1 live recording is bounded plaintext TCP capture, not always-on capture. It supports Linux 6.1+, cgroup v2, readable BTF, x86_64/aarch64, and required eBPF hooks/capabilities. macOS and ordinary CI use rootless fixtures, ETL, inspect, replay, and eBPF compile checks. Runtime evidence comes only from the opt-in privileged profile.
+Live recording is bounded plaintext TCP capture, not always-on capture. It supports Linux 6.1+, cgroup v2, readable BTF, x86_64/aarch64, and required eBPF hooks/capabilities. macOS and ordinary CI use rootless fixtures, ETL, inspect, replay, and eBPF compile checks. Runtime evidence comes only from the opt-in privileged profile.
 
 ## Quick start
 
@@ -107,15 +107,15 @@ Validation entry point:
 ```bash
 ./scripts/validate.sh fast
 ./scripts/validate.sh targeted --changed-since origin/main
-./scripts/acceptance.sh --profile p1 --executor multipass
-./scripts/acceptance.sh --profile p2 --executor multipass
+./scripts/acceptance.sh --profile live-capture --executor multipass
+./scripts/acceptance.sh --profile recorder --executor multipass
 ./scripts/acceptance.sh --profile all --executor multipass
-./scripts/acceptance.sh --profile p2 --executor multipass --release
-./scripts/acceptance.sh --profile p2 --executor multipass --no-reuse
+./scripts/acceptance.sh --profile recorder --executor multipass --release
+./scripts/acceptance.sh --profile recorder --executor multipass --no-reuse
 ./scripts/validate.sh release --reuse-evidence
 ```
 
-`validation/groups.toml` maps paths to focused groups. Targeted output lists every selected/skipped group and reason. Documentation-only changes select no privileged gate; ETL changes select ETL/checkpoint checks; WAL/recovery changes select focused WAL/P2 checks; eBPF changes select build/decoder checks and a minimal privileged smoke. Explicit gates and release retain all existing P1/P2 checks.
+`validation/groups.toml` maps paths to focused groups. Targeted output lists every selected/skipped group and reason. Documentation-only changes select no privileged gate; ETL changes select ETL/checkpoint checks; WAL/recovery changes select focused WAL/recorder checks; eBPF changes select build/decoder checks and a minimal privileged smoke. Explicit gates and release retain all existing live-capture/recorder checks.
 
 Fast and targeted modes use local checks and default to failure-only artifacts. Recorder changes should use `fast`, targeted changed-path/recorder tests, then a bounded lifecycle scenario before a complete privileged gate. Agents must not start an unbounded foreground recorder.
 
@@ -125,11 +125,11 @@ Successful gate artifacts contain only `summary.json`, `environment.json`, `mani
 
 Privileged caches stay in reused Multipass VM paths `/home/ubuntu/chronicle-target`, `/home/ubuntu/chronicle-ebpf-target`, and `/home/ubuntu/.cargo`; the unified executor transfers an immutable source snapshot so dirty development changes are tested, not discarded. Evidence lives under `target/validation-evidence/acceptance/<profile>/<fingerprint>/<run-id>/`. Reuse matches acceptance-sensitive source fingerprint, scenario coverage, report schema, manifest integrity, and compatible executor/environment. Commit/tree SHA is provenance only, never evidence identity; release mode additionally requires a clean, identifiable current checkout that remains unchanged through validation.
 
-`scripts/acceptance.sh` is the only user-facing acceptance entrypoint; no compatibility wrappers are retained. `scripts/acceptance/scenarios.toml` defines scenario/profile coverage; `--profile all` runs the P2 superset once because it includes P1 scenarios. `runner.py` owns selection/fingerprint/report/reuse, and `lib/multipass.sh` owns VM lifecycle, snapshot transfer, reboot, and artifacts. `lib/scenario-dispatch.sh` loads ordered scenario modules from `lib/scenarios/`; profile scripts provide runtime setup/cleanup only. Scenario implementations have one owner: `lib/scenarios/shared/<scenario>.sh` provides `scenario_<name>()` when behavior is identical across profiles, otherwise `lib/scenarios/p1/<scenario>.sh` or `lib/scenarios/p2/<scenario>.sh` provides `scenario_p1_<name>()`/`scenario_p2_<name>()`. Run `python3 scripts/tests/acceptance/test_runner.py`, `python3 scripts/tests/validation/test_layered_validation.py`, and `bash scripts/tests/acceptance/test-p2-readiness.sh` for tooling coverage.
+`scripts/acceptance.sh` is the only user-facing acceptance entrypoint; no compatibility wrappers are retained. `scripts/acceptance/scenarios.toml` defines scenario/profile coverage; `--profile all` runs the recorder superset once because it includes the live-capture scenarios. `runner.py` owns selection/fingerprint/report/reuse, and `lib/multipass.sh` owns VM lifecycle, snapshot transfer, reboot, and artifacts. `lib/scenario-dispatch.sh` loads ordered scenario modules from `lib/scenarios/`; profile scripts provide runtime setup/cleanup only. Scenario implementations have one owner: `lib/scenarios/shared/<scenario>.sh` provides `scenario_<name>()` when behavior is identical across profiles, otherwise `lib/scenarios/live-capture/<scenario>.sh` or `lib/scenarios/recorder/<scenario>.sh` provides `scenario_live_capture_<name>()`/`scenario_recorder_<name>()`. Run `python3 scripts/tests/acceptance/test_runner.py`, `python3 scripts/tests/validation/test_layered_validation.py`, and `bash scripts/tests/acceptance/test-recorder-readiness.sh` for tooling coverage.
 
-P2 readiness contract: `chronicle internal recorder-status` reports machine-readable `state` values (`starting`, `recovering`, `loading_ebpf`, `ready`, `degraded`, `failed`) alongside liveness, lifecycle, capture readiness, processing readiness, and health. Workload admission waits for `state=ready`; systemd `active` alone is insufficient. Polling prints state transitions, tolerates temporary status-command failures, stops immediately on terminal failure, and uses configurable timeout/interval values (`CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_READINESS_INTERVAL_SECONDS`).
+Recorder readiness contract: `chronicle internal recorder-status` reports machine-readable `state` values (`starting`, `recovering`, `loading_ebpf`, `ready`, `degraded`, `failed`) alongside liveness, lifecycle, capture readiness, processing readiness, and health. Workload admission waits for `state=ready`; systemd `active` alone is insufficient. Polling prints state transitions, tolerates temporary status-command failures, stops immediately on terminal failure, and uses configurable timeout/interval values (`CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS`, `CHRONICLE_ACCEPTANCE_READINESS_INTERVAL_SECONDS`).
 
-Previous blocker root cause: P2 treated `processing_readiness=not_ready` as capture-not-ready and waited forever even though capture was safe to admit workload; status-command errors were also suppressed and startup/recovery, stale-owner, and terminal failure collapsed into one generic timeout. Recovery can spend longer than the old 60-second loop validating a large incremental checkpoint. Failure diagnostics now retain status/service/journal, kernel/BTF/cgroup/eBPF, WAL listing, checkpoint metadata, process, and disk evidence without Cargo caches or VM data. Multipass stops stale P2 units and fixes artifact ownership before transfer.
+Previous blocker root cause: the recorder treated `processing_readiness=not_ready` as capture-not-ready and waited forever even though capture was safe to admit workload; status-command errors were also suppressed and startup/recovery, stale-owner, and terminal failure collapsed into one generic timeout. Recovery can spend longer than the old 60-second loop validating a large incremental checkpoint. Failure diagnostics now retain status/service/journal, kernel/BTF/cgroup/eBPF, WAL listing, checkpoint metadata, process, and disk evidence without Cargo caches or VM data. Multipass stops stale recorder units and fixes artifact ownership before transfer.
 
 The profile uses local upstream/replay targets and dedicated/shared cgroups. It verifies capture, sampling, one-marker/one-sync WAL behavior, crash/recovery authority, hard-cap queue discard, ETL idempotency across roots, cgroup safety, signal/limit finalization, mixed replay, and original-destination isolation. Unsupported hosts must report skipped/not-checked rather than passing runtime coverage.
 

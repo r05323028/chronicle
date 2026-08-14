@@ -61,7 +61,7 @@ jobs:
         run: |
           python3 scripts/tests/validation/test_layered_validation.py
           python3 scripts/tests/acceptance/test_runner.py
-          bash scripts/tests/acceptance/test-p2-readiness.sh
+          bash scripts/tests/acceptance/test-recorder-readiness.sh
 
       - name: Upload failure-only validation evidence
         if: failure()

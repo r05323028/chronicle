@@ -55,7 +55,9 @@ use uuid::Uuid;
 
 pub const DEFAULT_MAX_ISSUES: usize = 1_024;
 pub const ENVELOPE_BATCH_SIZE: usize = 4_096;
-pub const ETL_PIPELINE_VERSION: &str = "p1";
+/// ETL pipeline format version. Serialized as its decimal string into
+/// checkpoints and session provenance; only self-consistency matters.
+pub const ETL_PIPELINE_VERSION: u16 = 1;
 pub const MAX_CANONICAL_OPERATIONS: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,7 +157,7 @@ fn recording_snapshot(
 ) -> Result<[u8; 32], EtlError> {
     let mut digest = Sha256::new();
     digest.update(b"chronicle/etl/snapshot\0");
-    digest.update(ETL_PIPELINE_VERSION.as_bytes());
+    digest.update(ETL_PIPELINE_VERSION.to_string().as_bytes());
     digest.update(recording_id.0.as_bytes());
     for envelope in envelopes {
         digest.update(encode_envelope(envelope)?);
@@ -166,7 +168,7 @@ fn recording_snapshot(
 fn deterministic_uuid(domain: &str, snapshot: &[u8; 32], first: u64, second: u64) -> Uuid {
     let mut digest = Sha256::new();
     digest.update(b"chronicle/etl/id\0");
-    digest.update(ETL_PIPELINE_VERSION.as_bytes());
+    digest.update(ETL_PIPELINE_VERSION.to_string().as_bytes());
     digest.update(domain.as_bytes());
     digest.update(snapshot);
     digest.update(first.to_le_bytes());

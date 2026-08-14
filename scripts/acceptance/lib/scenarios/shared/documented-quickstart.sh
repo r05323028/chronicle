@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034 # result globals are consumed by profile summary
 # Privileged quick-start scenario: executes the exact command forms documented
-# in the README Quick Start against a release-built linux-ebpf binary:
+# in the README Quick Start against a release-built Linux binary:
 #   chronicle doctor
 #   chronicle record --name checkout -- ./my-app
 #   chronicle list
 #   chronicle inspect checkout
 #   chronicle replay checkout -- ./my-app
 # Self-contained (own data dir, cgroup subtree owned by the supervisor), so a
-# single shared owner runs it under both P1 and P2.
+# single shared owner runs it under both live-capture and recorder.
 documented_quickstart_impl() {
 	phase documented_quickstart 'execute documented quick start forms: doctor, record, list, inspect, replay'
 	local root="$ARTIFACT_ROOT/documented-quickstart"

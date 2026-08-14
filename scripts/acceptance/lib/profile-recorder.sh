@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034 # runtime variables are consumed by sourced scenario modules
-# P2 runtime setup/cleanup. Assertions run through scenario-dispatch.sh.
+# recorder runtime setup/cleanup. Assertions run through scenario-dispatch.sh.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
@@ -16,7 +16,7 @@ if [[ ${CHRONICLE_ACCEPTANCE_GATE_WRAPPED:-0} != 1 ]]; then
 		printf '%s\n' 'CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS must be a positive integer' >&2
 		exit 2
 	}
-	timeout_env=(CHRONICLE_ACCEPTANCE_GATE_WRAPPED=1 CHRONICLE_TIMEOUT_LAYER=acceptance_gate CHRONICLE_TIMEOUT_NAME=p2 CHRONICLE_TIMEOUT_GRACE_SECONDS="$cleanup_grace")
+	timeout_env=(CHRONICLE_ACCEPTANCE_GATE_WRAPPED=1 CHRONICLE_TIMEOUT_LAYER=acceptance_gate CHRONICLE_TIMEOUT_NAME=recorder CHRONICLE_TIMEOUT_GRACE_SECONDS="$cleanup_grace")
 	if [[ -n ${CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT:-} ]]; then
 		timeout_env+=(
 			CHRONICLE_TIMEOUT_EVIDENCE_FILE="$CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT/gate-timeout.json"
@@ -34,11 +34,11 @@ CRASH_MODE=${CHRONICLE_ACCEPTANCE_CRASH_MODE:-0}
 PRE_REBOOT=${CHRONICLE_ACCEPTANCE_PRE_REBOOT:-0}
 SHA=$(git -C "$ROOT" rev-parse HEAD)
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-ARTIFACT_ROOT=${CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT:-"$ROOT/target/p2-acceptance/$RUN_ID"}
+ARTIFACT_ROOT=${CHRONICLE_ACCEPTANCE_ARTIFACT_ROOT:-"$ROOT/target/recorder-acceptance/$RUN_ID"}
 TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT/target"}
 CHRONICLE="$TARGET_DIR/debug/chronicle"
 DRIVER="$ROOT/tests/support/http_driver.py"
-UNIT="chronicle-p2-${RANDOM}-$$"
+UNIT="chronicle-recorder-${RANDOM}-$$"
 CGROUP="/sys/fs/cgroup/$UNIT"
 STATE_ROOT=${CHRONICLE_ACCEPTANCE_STATE_ROOT:-"$ARTIFACT_ROOT/state"}
 STORE_ROOT=${CHRONICLE_ACCEPTANCE_STORE_ROOT:-"$ARTIFACT_ROOT/store"}
@@ -89,7 +89,7 @@ source "$ROOT/scripts/acceptance/lib/wait.sh"
 
 mkdir -p "$ARTIFACT_ROOT"
 rm -f "$CHECKPOINT_PAUSE_FILE" "$CHECKPOINT_READY_FILE"
-printf '%s\n' 'chronicle-p2-acceptance-root-v1' >"$ARTIFACT_ROOT/.chronicle-acceptance-root"
+printf '%s\n' 'chronicle-recorder-acceptance-root-v1' >"$ARTIFACT_ROOT/.chronicle-acceptance-root"
 printf '%s\n' "$UNIT" >"$ARTIFACT_ROOT/active-units.txt"
 printf '%s\n' "$CURRENT_PHASE" >"$ARTIFACT_ROOT/current-phase.txt"
 exec > >(tee -a "$COMMAND_LOG") 2>&1
@@ -194,7 +194,7 @@ run_compat_command() {
 	local name=$1
 	shift
 	set +e
-	"$@" >"$ARTIFACT_ROOT/p1-$name.log" 2>&1
+	"$@" >"$ARTIFACT_ROOT/compat-$name.log" 2>&1
 	local status=$?
 	set -e
 	return "$status"
@@ -250,8 +250,8 @@ identity_ok = release != "1" or (end_commit == commit and not dirty and expected
 report_status = "passed" if status == "0" and identity_ok and not not_checked and not failed else ("not_checked" if status in {"0", "77"} and identity_ok and not failed else "failed")
 summary.write_text(json.dumps({
     "version": 1,
-    "gate": "p2",
-    "task": "8.4",
+    "gate": "recorder",
+    "task": "recorder privileged acceptance",
     "git_commit_sha": commit,
     "end_git_commit_sha": end_commit,
     "expected_git_commit_sha": expected or None,
@@ -337,7 +337,7 @@ skip() {
 	exit 77
 }
 
-[[ "$MODE" == full ]] || skip 'P2 privileged acceptance requires full mode'
+[[ "$MODE" == full ]] || skip 'recorder privileged acceptance requires full mode'
 [[ "$(uname -s)" == Linux ]] || skip 'requires Linux'
 [[ "$(id -u)" == 0 ]] || skip 'requires root'
 type -P systemctl >/dev/null || skip 'requires systemd'
@@ -359,15 +359,15 @@ TMP_DIR=$(mktemp -d)
 # Invoke the profile's on_exit from this final trap so it actually runs
 # (re-registering it via eval never fires it again on EXIT). Preserve the
 # script's real exit status for on_exit, which reads \$?.
-p2_final() {
+recorder_final() {
 	local rc=$?
 	rm -rf -- "$TMP_DIR"
 	trap - EXIT
 	(exit "$rc")
 	on_exit
 }
-trap p2_final EXIT
+trap recorder_final EXIT
 
 # shellcheck source=scripts/acceptance/lib/scenario-dispatch.sh
 source "$ROOT/scripts/acceptance/lib/scenario-dispatch.sh"
-run_scenario_plan p2
+run_scenario_plan recorder

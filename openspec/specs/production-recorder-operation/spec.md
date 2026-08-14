@@ -8,9 +8,9 @@ Define supported production recorder placement, readiness, operations, failure c
 
 ### Requirement: Supported production placement is systemd-managed node recorder
 
-P2 operations documentation SHALL recommend one foreground Chronicle recorder process managed by systemd for each configured cgroup scope/state root on supported Linux node. Service SHALL be placed outside selected capture subtree. Systemd SHALL own startup, restart, stop timeout, logs, service identity, state directory, and resource controls. Chronicle SHALL not self-fork, write authoritative PID file, or implement supervisor loop.
+Operations documentation SHALL recommend one foreground Chronicle recorder process managed by systemd for each configured cgroup scope/state root on supported Linux node. Service SHALL be placed outside selected capture subtree. Systemd SHALL own startup, restart, stop timeout, logs, service identity, state directory, and resource controls. Chronicle SHALL not self-fork, write authoritative PID file, or implement supervisor loop.
 
-Application sidecar SHALL be documented as evaluated but not supported P2 default because pod/container churn, duplicate eBPF privilege, ephemeral local storage, recorder-in-selected-subtree risk, and lifecycle coupling conflict with continuous capture. Kubernetes operator/manifests and node-wide multi-tenant agent SHALL remain out of scope.
+Application sidecar SHALL be documented as evaluated but not supported default because pod/container churn, duplicate eBPF privilege, ephemeral local storage, recorder-in-selected-subtree risk, and lifecycle coupling conflict with continuous capture. Kubernetes operator/manifests and node-wide multi-tenant agent SHALL remain out of scope.
 
 #### Scenario: Supported service start
 
@@ -24,9 +24,9 @@ Application sidecar SHALL be documented as evaluated but not supported P2 defaul
 
 ### Requirement: Production configuration is versioned and file-based
 
-Recorder SHALL load one private versioned configuration file identifying canonical cgroup selector, state root, canonical filesystem-domain identity and deterministic domain-lock root, epoch duration/size, segment size/age, synchronized quota/minimum-free reserve for each filesystem domain, retention mode/age/bytes, ETL bounds/retry/lag policy, filesystem store root, shutdown timeout, and safe logging level. P2 supports one active Chronicle mutating owner per filesystem domain; recorder lease ownership covers the domain, not only the process. Multiple recorder instances sharing a WAL/store filesystem are unsupported; independent cgroup scopes require isolated filesystem domains. Secrets SHALL not be accepted on command line. Unknown fields/version, contradictory bounds, unsafe paths, selector containing recorder, or missing required quota/retention choice SHALL fail before capture.
+Recorder SHALL load one private versioned configuration file identifying canonical cgroup selector, state root, canonical filesystem-domain identity and deterministic domain-lock root, epoch duration/size, segment size/age, synchronized quota/minimum-free reserve for each filesystem domain, retention mode/age/bytes, ETL bounds/retry/lag policy, filesystem store root, shutdown timeout, and safe logging level. The recorder supports one active Chronicle mutating owner per filesystem domain; recorder lease ownership covers the domain, not only the process. Multiple recorder instances sharing a WAL/store filesystem are unsupported; independent cgroup scopes require isolated filesystem domains. Secrets SHALL not be accepted on command line. Unknown fields/version, contradictory bounds, unsafe paths, selector containing recorder, or missing required quota/retention choice SHALL fail before capture.
 
-Environment MAY supply non-secret deployment-specific path to configuration but SHALL not silently override persisted durability/retention values. P2 SHALL not support hot reload. Effective normalized configuration digest SHALL be recorded per process attempt/epoch and shown without sensitive values.
+Environment MAY supply non-secret deployment-specific path to configuration but SHALL not silently override persisted durability/retention values. The recorder SHALL not support hot reload. Effective normalized configuration digest SHALL be recorded per process attempt/epoch and shown without sensitive values.
 
 #### Scenario: Valid configuration
 
@@ -42,7 +42,7 @@ Environment MAY supply non-secret deployment-specific path to configuration but 
 
 Supported unit SHALL run under dedicated service identity with least capabilities required by verified eBPF environment, private state/store ownership, state directories mode `0700`, regular artifacts mode no broader than `0600`, restrictive umask, no command-line secrets, and recorder process outside selected cgroup subtree. Capability configuration SHALL be documented and doctor-verified; broad root fallback SHALL be labeled elevated risk rather than implied normal.
 
-WAL, checkpoints, and canonical artifacts SHALL be documented as potentially containing plaintext credentials, bodies, and personal data. Logs, health, metrics/status, journal messages, and default commands SHALL remain payload/header-value safe. P2 SHALL explicitly state no encryption at rest, comprehensive redaction, tenant isolation, or compliance guarantee.
+WAL, checkpoints, and canonical artifacts SHALL be documented as potentially containing plaintext credentials, bodies, and personal data. Logs, health, metrics/status, journal messages, and default commands SHALL remain payload/header-value safe. The recorder SHALL explicitly state no encryption at rest, comprehensive redaction, tenant isolation, or compliance guarantee.
 
 #### Scenario: Unsafe permissions
 
@@ -74,7 +74,7 @@ Recorder failure SHALL affect only configured scope/state root. It SHALL not kil
 
 Process liveness SHALL mean recorder process is executing. Capture readiness SHALL be true only when filesystem-domain lease, WAL recovery, appendable epoch, quota reservation, and capture attachment succeed. Processing readiness SHALL be reported separately and SHALL require checkpoint consistency, output-store availability, and incremental processing health. Overall health SHALL be policy-derived `healthy`, `degraded`, or `failed`; ETL lag/retry or retention backlog MAY degrade processing/overall health while durable capture remains safe and capture readiness remains true. Failed capture SHALL include lost WAL appendability, unrecoverable corruption, unsafe quota, or capture attachment loss. Failed processing SHALL include checkpoint lineage contradiction or unavailable output store.
 
-Status SHALL expose recorder/attempt/epoch/segment IDs, lifecycle/capture-readiness/processing-readiness/overall-health, configuration digest, final committed marker, `IncrementalEtlCheckpoint v1` boundary and lag, retained/quota/free bytes, segment state counts, loss counters, last recovery/cleanup/publication, and stable failure/remediation code. P2 systemd unit SHALL use `Type=simple`; systemd active state proves liveness only. Readiness consumers SHALL poll local `recorder-status`/atomic state and SHALL NOT infer readiness from process start. No unauthenticated network metrics/HTTP server or `sd_notify` integration SHALL be added in P2.
+Status SHALL expose recorder/attempt/epoch/segment IDs, lifecycle/capture-readiness/processing-readiness/overall-health, configuration digest, final committed marker, `IncrementalEtlCheckpoint v1` boundary and lag, retained/quota/free bytes, segment state counts, loss counters, last recovery/cleanup/publication, and stable failure/remediation code. The recorder systemd unit SHALL use `Type=simple`; systemd active state proves liveness only. Readiness consumers SHALL poll local `recorder-status`/atomic state and SHALL NOT infer readiness from process start. No unauthenticated network metrics/HTTP server or `sd_notify` integration SHALL be added in the recorder.
 
 #### Scenario: Recovery in progress
 
@@ -104,7 +104,7 @@ Persistent startup failure from corruption/configuration/permission/quota SHALL 
 
 ### Requirement: Operational ownership and runbook are complete
 
-P2 documentation SHALL identify platform/operator owner for host prerequisites/capabilities/cgroup/state disk, application owner for selected workload scope and sensitive-data authorization, and Chronicle operator for configuration, health, retention, upgrades, evidence, and incident response. Runbook SHALL cover install/preflight/start/readiness/status/stop/restart, disk/ETL lag, corruption evidence preservation, forced termination, retention review, upgrade/rollback, evidence export, and leak checks.
+Operations documentation SHALL identify platform/operator owner for host prerequisites/capabilities/cgroup/state disk, application owner for selected workload scope and sensitive-data authorization, and Chronicle operator for configuration, health, retention, upgrades, evidence, and incident response. Runbook SHALL cover install/preflight/start/readiness/status/stop/restart, disk/ETL lag, corruption evidence preservation, forced termination, retention review, upgrade/rollback, evidence export, and leak checks.
 
 Documentation SHALL compare node daemon and sidecar trade-offs, name node daemon recommendation, list unsupported deployment models, and state failure impact/resource expectations. It SHALL not include Kubernetes manifests unless later OpenSpec change adds supported orchestration.
 

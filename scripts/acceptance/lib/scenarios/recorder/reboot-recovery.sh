@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: reboot-recovery.
-scenario_p2_reboot_recovery() {
+scenario_recorder_reboot_recovery() {
 	if [[ "$PRE_REBOOT" == 1 ]]; then
 		phase pre_reboot 'retain live recorder state for VM reboot'
 		"$CHRONICLE" --format json internal recorder-status --state-root "$STATE_ROOT" >"$ARTIFACT_ROOT/pre-reboot-status.json"

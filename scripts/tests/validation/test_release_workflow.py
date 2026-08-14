@@ -275,8 +275,11 @@ class DryRunModeTests(unittest.TestCase):
         shape = WorkflowShape(workflow_text())
         release_run = shape.jobs["release"]["run_text"]
         self.assertIn("dist/chronicle-${VERSION}-${TARGET}.tar.gz", release_run)
-        self.assertIn("cargo build -p chronicle-cli --release", release_run)
-        self.assertIn("linux-ebpf", release_run)
+        self.assertIn("cargo build -p chronicle-cli --release --locked", release_run)
+        # Live capture is included automatically on Linux targets: the build
+        # must not require (or mention) an implementation feature flag.
+        self.assertNotIn("--features", release_run)
+        self.assertNotIn("linux-ebpf", release_run)
 
     def test_binary_validation_tolerates_doctor_environment_exit(self):
         # doctor exits nonzero when the runner lacks kernel/privilege

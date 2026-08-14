@@ -4,8 +4,6 @@ use thiserror::Error;
 pub enum EbpfCaptureError {
     #[error("eBPF capture requires Linux")]
     UnsupportedPlatform,
-    #[error("eBPF capture requires chronicle-capture-ebpf `linux-ebpf` feature")]
-    FeatureDisabled,
     #[error("unsupported eBPF capability: {0}")]
     UnsupportedCapability(&'static str),
     #[error("eBPF attach failed for {hook}: {reason}")]

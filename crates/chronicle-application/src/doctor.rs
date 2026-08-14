@@ -455,7 +455,7 @@ fn probe_no_replace_publication(_directory: &Path, _temporary: &Path) -> bool {
     false
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn capture_doctor_probes() -> Vec<DoctorProbe> {
     let checks = chronicle_capture_ebpf::probe_embedded();
     [
@@ -493,7 +493,7 @@ fn capture_doctor_probes() -> Vec<DoctorProbe> {
     .collect()
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-ebpf"))]
+#[cfg(target_os = "linux")]
 fn capture_probe_remediation(code: &str, status: DoctorStatus) -> &'static str {
     if status == DoctorStatus::Supported {
         return "none";
@@ -504,7 +504,7 @@ fn capture_probe_remediation(code: &str, status: DoctorStatus) -> &'static str {
         "capture.cgroup_v2" => "enable and mount the unified cgroup v2 hierarchy",
         "capture.btf" => "install a kernel with BTF enabled and /sys/kernel/btf/vmlinux available",
         "capture.object" | "capture.programs" => {
-            "rebuild Chronicle with the linux-ebpf feature and embedded capture programs"
+            "rebuild Chronicle on a supported little-endian Linux target so the embedded capture programs are included"
         }
         "capture.cap_bpf" => "grant CAP_BPF to the Chronicle supervisor",
         "capture.cap_net_admin" => "grant CAP_NET_ADMIN to the Chronicle supervisor",
@@ -515,14 +515,14 @@ fn capture_probe_remediation(code: &str, status: DoctorStatus) -> &'static str {
     }
 }
 
-#[cfg(not(all(target_os = "linux", feature = "linux-ebpf")))]
+#[cfg(not(target_os = "linux"))]
 fn capture_doctor_probes() -> Vec<DoctorProbe> {
     vec![DoctorProbe {
         required: true,
         status: DoctorStatus::Unsupported,
         code: "capture.platform".into(),
-        message: "Linux eBPF capture is unavailable in this build".into(),
-        remediation: "run a Linux build with --features linux-ebpf".into(),
+        message: "Linux eBPF live capture is unavailable on this platform".into(),
+        remediation: "build and run Chronicle on a supported Linux host".into(),
     }]
 }
 

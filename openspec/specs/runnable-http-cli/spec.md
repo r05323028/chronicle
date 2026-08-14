@@ -6,7 +6,6 @@ Minimal record, inspect, and replay command contracts plus end-to-end runnable H
 
 ### Requirement: Minimal record command
 
-
 CLI SHALL retain the legacy record forms as hidden deprecated 0.1.x compatibility entrypoints (see `user-intent-cli`): fixture form `record --source fixture --input FILE --root ROOT` and production form `record --source ebpf (--pid PID | --cgroup PATH [--allow-shared-cgroup]) --wal-dir DIR [--segment-bytes N] [--duration-seconds N] [--max-wal-bytes N]`. Shared acknowledgement SHALL be invalid with `--pid`, fixture source, or no explicit `--cgroup`. Duration SHALL default 600 seconds/max 3600; total WAL SHALL default/hard-cap 4 GiB and be at least segment size. Source-specific/conflicting options SHALL be validated. The compatibility production form SHALL show effective cgroup path/ID/direct TGID count/descendant cgroup count/selected-subtree scope/acknowledgement before attach, perform preflight, create/finalize metadata, run eBPF plus bounded in-WAL-marker group commit, handle limits/signals, and print safe categorized summary; it SHALL NOT run ETL implicitly — the public `record` command runs ETL/finalization automatically per `user-intent-cli`. CLI help and diagnostics SHALL use **direct cgroup TGID set** for distinct host-visible TGIDs resolved from numeric PIDs listed directly in selected node's `cgroup.procs`; they SHALL NOT call it a POSIX process group, thread count, container ID, or descendant union.
 
 #### Scenario: Fixture record uses current artifacts
@@ -61,7 +60,6 @@ CLI SHALL retain the legacy record forms as hidden deprecated 0.1.x compatibilit
 
 ### Requirement: Minimal inspect command
 
-
 CLI SHALL retain legacy `inspect SESSION_ID --root ROOT` as a hidden deprecated 0.1.x compatibility entrypoint. The public `inspect <RECORDING>` and `inspect latest` SHALL resolve recordings from default or configured storage per `recording-identity` and SHALL NOT require `--root`. It SHALL support global `--format human|json`, default human, and delegate to application/storage service.
 
 #### Scenario: Inspect happy path
@@ -80,7 +78,6 @@ CLI SHALL retain legacy `inspect SESSION_ID --root ROOT` as a hidden deprecated 
 - **THEN** command exits 3 without path access outside the data directory
 
 ### Requirement: Minimal replay command
-
 
 CLI SHALL retain legacy `replay SESSION_ID --root ROOT --target ORIGIN --allow-host IP [--allow-read] [--allow-write] [--timing asap] [--execute]` as a hidden deprecated 0.1.x compatibility entrypoint whose defaults SHALL remain human output, immediate timing, dry-run, no effect authorization, no target default, and no network. The public forms SHALL be `replay <RECORDING> -- COMMAND...` (spawned target with inferred local target and authorization per `safe-local-http-replay`) and `replay <RECORDING> --target URL` (explicit target requiring full authorization), mutually exclusive per `user-intent-cli`. Human/JSON output SHALL include exact replay outcome, fully/partially/not replayable classification, aggregate executable/non-executable counts, and one result per operation.
 
@@ -115,7 +112,6 @@ CLI SHALL retain legacy `replay SESSION_ID --root ROOT --target ORIGIN --allow-h
 - **THEN** JSON/human report retains all completed/failed/unattempted entries and exit is 5
 
 ### Requirement: Stable CLI exit and output contract
-
 
 CLI SHALL use exit 0 for successful completed record (including handled SIGINT/SIGTERM and clean limits), ETL/inspect/list, doctor supported/warnings, replay dry-run, `completed`, or `completed_with_skips`; 2 for Clap usage; 3 for recording/WAL/ETL/session/storage/serialization/finalization data errors and recording-resolution failures for inspect/replay/record-retry references; 4 for replay target/effect/no-executable invalid-session denial, unsupported live preflight, or doctor required unsupported/not-checked; 5 for replay transport stop; and 6 for executed verification failure. Unsupported/inconclusive siblings in successful mixed replay SHALL NOT force exit 6. Target application exit after successful exec is factual and not forwarded; bootstrap/hardening/exec failure is a typed Chronicle 3/4 failure. Human success uses stdout and errors stderr; JSON-mode child output is redirected away from Chronicle protocol streams. Deprecated warnings use stderr while success stdout stays atomic. All JSON uses shared atomic rendering.
 
@@ -237,7 +233,7 @@ Implementation SHALL include WAL framing/rotation/group-commit threshold/time/sh
 
 ### Requirement: Documentation and validation gates
 
-README, architecture, canonical, replay safety, WAL format, capability matrix, and new P1 operations guide SHALL document supported platform/kernel/privileges, record/WAL/recovery/ETL/inspect/replay workflow, JSON schemas, limits, known exclusions, sensitive-data warning, local demo, CI versus privileged tests, and doctor remediation. OpenSpec and Rust gates SHALL pass without overstating eBPF or production scale.
+README, architecture, canonical, replay safety, WAL format, capability matrix, and the operations guide SHALL document supported platform/kernel/privileges, record/WAL/recovery/ETL/inspect/replay workflow, JSON schemas, limits, known exclusions, sensitive-data warning, local demo, CI versus privileged tests, and doctor remediation. OpenSpec and Rust gates SHALL pass without overstating eBPF or production scale.
 
 #### Scenario: Runnable local documentation
 
@@ -255,7 +251,6 @@ README, architecture, canonical, replay safety, WAL format, capability matrix, a
 - **THEN** `openspec validate add-production-http-recording-pipeline --strict` passes and checkboxes reflect reality
 
 ### Requirement: Shared atomic JSON rendering
-
 
 Application SHALL serialize complete bounded v1 results before stdout for public record/list/inspect/replay/doctor and hidden compatibility reports. CLI SHALL write bytes through one checked boundary. Serialization failure is typed before stdout; write/flush failure is CLI I/O error. Replay never retries traffic because rendering failed. In JSON mode spawned target stdout/stderr SHALL be connected to the platform null sink before exec and SHALL NOT share Chronicle stdout/stderr or create output files/buffers.
 
@@ -305,7 +300,6 @@ CLI SHALL provide `etl --wal-dir DIR --output ROOT` with global human/JSON forma
 
 ### Requirement: Operational doctor command
 
-
 Public `doctor` SHALL use resolved data directory and expose no required WAL/output mechanics on its happy-path help. Hidden compatibility/advanced path probes may retain `--wal-dir`/`--output`. For a nonexistent data directory, doctor SHALL inspect the nearest existing ancestor and report prospective creation/private-mode status as supported, unsupported, or `not_checked`; it SHALL NOT claim a conclusive write/private-mode probe without performing one. Platform/protocol/replay-policy probes continue independently. Doctor SHALL create no directory, recording metadata, repair, capture, replay traffic, or persistent probe artifact.
 
 #### Scenario: Prospective path cannot be proved
@@ -329,7 +323,6 @@ Public `doctor` SHALL use resolved data directory and expose no required WAL/out
 - **THEN** command emits full report/remediation and exits 4 while independent probes still run
 
 ### Requirement: Versioned command JSON contracts
-
 
 Until compatibility freeze, each public or hidden command report contract SHALL remain version 1 per `mvp-schema-versioning`; this change introduces no v2 or version dispatch. New public record/list/recording-oriented-inspect contracts are documented v1 objects. Existing hidden legacy success JSON remains byte-compatible through 0.1.x as its documented v1 contract. Any future version increase requires explicit compatibility-freeze change.
 
@@ -388,13 +381,13 @@ CLI SHALL provide `recorder-status --state-root DIR` with global human/JSON form
 - **WHEN** user requests JSON
 - **THEN** stdout is one valid bounded versioned object through existing atomic renderer
 
-### Requirement: P1 one-shot commands remain available
+### Requirement: One-shot commands remain available
 
-Existing fixture/production `record`, standalone `etl`, `doctor`, `inspect`, and `replay` commands and their safety/exit contracts SHALL remain supported. `record` and standalone `etl` SHALL reject mutation against a WAL/store filesystem domain owned by a live recorder; read-only `doctor`, `inspect`, and `replay` may continue. `record` SHALL remain bounded and SHALL NOT silently become daemon mode. `etl` SHALL continue to process stopped P1/P2 epochs; incremental ETL lifecycle belongs to recorder application service. Replay defaults and authorization SHALL remain unchanged.
+Existing fixture/production `record`, standalone `etl`, `doctor`, `inspect`, and `replay` commands and their safety/exit contracts SHALL remain supported. `record` and standalone `etl` SHALL reject mutation against a WAL/store filesystem domain owned by a live recorder; read-only `doctor`, `inspect`, and `replay` may continue. `record` SHALL remain bounded and SHALL NOT silently become daemon mode. `etl` SHALL continue to process stopped recording epochs; incremental ETL lifecycle belongs to recorder application service. Replay defaults and authorization SHALL remain unchanged.
 
 #### Scenario: Existing production record
 
-- **WHEN** operator invokes bounded P1 production record syntax
+- **WHEN** operator invokes bounded production record syntax
 - **THEN** command retains current duration/WAL limits, signal behavior, summary, and no implicit daemon/incremental ETL
 
 #### Scenario: Existing standalone ETL
@@ -402,9 +395,9 @@ Existing fixture/production `record`, standalone `etl`, `doctor`, `inspect`, and
 - **WHEN** stopped epoch is passed to `etl`
 - **THEN** one-shot deterministic publication remains available and equivalent to finalized incremental result
 
-### Requirement: P2 CLI and documentation acceptance
+### Requirement: Recorder CLI and documentation acceptance
 
-CLI contract tests SHALL cover recorder/status grammar, atomic startup/status JSON, signal exits, stale ownership, failure mapping, safe output, and unchanged P1 commands. Operations docs SHALL include systemd foreground invocation, private configuration, status, stop/restart, recovery, quota/retention, and supported-host example. Privileged acceptance SHALL invoke recorder under recommended service placement and retain acceptance fingerprint, source provenance, exact command/config digest/output/evidence, and environment compatibility; fixture tests SHALL not claim daemon eBPF acceptance. Exact commit/tree identity is release-only.
+CLI contract tests SHALL cover recorder/status grammar, atomic startup/status JSON, signal exits, stale ownership, failure mapping, safe output, and unchanged one-shot commands. Operations docs SHALL include systemd foreground invocation, private configuration, status, stop/restart, recovery, quota/retention, and supported-host example. Privileged acceptance SHALL invoke recorder under recommended service placement and retain acceptance fingerprint, source provenance, exact command/config digest/output/evidence, and environment compatibility; fixture tests SHALL not claim daemon eBPF acceptance. Exact commit/tree identity is release-only.
 
 #### Scenario: CLI regression suite
 

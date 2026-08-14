@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: resource-cleanup.
-scenario_p2_resource_cleanup() {
+scenario_recorder_resource_cleanup() {
 	# Portable cgroup decision matrix, fmt, and workspace checks are
 	# separately selected gate prerequisites (task 8.1); the privileged
 	# scenario keeps only the real signal/cleanup invariants.

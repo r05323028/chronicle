@@ -34,7 +34,6 @@ The primary responsibilities SHALL be:
 - **WHEN** documented responsibility is compared with Cargo manifests and public source APIs
 - **THEN** documentation reflects actual responsibilities, including ETL load/publication and WAL recovery/retention ownership
 
-
 ### Requirement: Domain and evidence boundaries remain infrastructure-independent
 
 `chronicle-common` SHALL remain a workspace dependency leaf and MUST NOT depend on WAL, ETL, storage, replay, protocol implementations, application, or CLI. `chronicle-canonical` SHALL depend only on common primitives among Chronicle crates and MUST NOT know capture implementation, WAL implementation, storage backend implementation, application, or CLI.
@@ -58,7 +57,6 @@ The primary responsibilities SHALL be:
 - **WHEN** eBPF adapter output is exposed to another Chronicle crate
 - **THEN** output is a normalized capture event and contains no Aya handle or private kernel ABI type
 
-
 ### Requirement: Interpretation dependencies point toward neutral evidence and interfaces
 
 `chronicle-session` SHALL depend only on capture/common among Chronicle crates. Its reconstruction inputs MAY carry transport-neutral persistence ordering, placement, and loss evidence but MUST NOT import or expose concrete `chronicle-wal` types.
@@ -81,7 +79,6 @@ The primary responsibilities SHALL be:
 
 - **WHEN** PostgreSQL, MySQL, MariaDB, MongoDB, or another planned registration lacks a detector/decoder/canonicalizer/replay/verifier implementation
 - **THEN** capability metadata remains honest and no architecture cleanup claims new protocol behavior
-
 
 ### Requirement: ETL remains a complete Extract-Transform-Load pipeline
 
@@ -107,7 +104,6 @@ Current one-shot final session publication and recording-local checkpoint sequen
 - **WHEN** architecture cleanup proposes returning transformed values while application takes over publication/checkpoint ordering
 - **THEN** proposal is rejected as outside this change and ETL remains complete Extract-Transform-Load
 
-
 ### Requirement: Storage and replay hide upstream implementation details
 
 `chronicle-storage` MAY depend on canonical/common and SHALL hide filesystem, future object-store, and database-client mechanics behind storage-owned APIs. It MUST NOT depend on capture, eBPF, WAL append/recovery, session, protocol implementations, ETL, replay, application, or CLI. Existing canonical-session and immutable-artifact storage APIs MAY remain distinct where their durability authorities differ; this change SHALL NOT introduce another crate or speculative abstraction.
@@ -123,7 +119,6 @@ Current one-shot final session publication and recording-local checkpoint sequen
 
 - **WHEN** filesystem/object/database persistence details are needed by another layer
 - **THEN** they are accessed through storage-owned APIs rather than reimplemented or imported from backend clients directly
-
 
 ### Requirement: Application owns use-case composition without becoming a dumping ground
 
@@ -146,7 +141,6 @@ Application SHALL expose curated request/result/error APIs for outer adapters. I
 - **WHEN** internal organization can solve ownership ambiguity
 - **THEN** implementation refactors modules in `chronicle-application` and creates no new crate
 
-
 ### Requirement: CLI communicates through application APIs only
 
 For all normal, dev, and build Chronicle dependencies, `chronicle-cli` SHALL depend only on `chronicle-application`. CLI production code SHALL parse arguments into application-owned requests, invoke application APIs, render or write application-owned results, and map application-owned outcome/error classifications to exit codes.
@@ -167,7 +161,6 @@ CLI MUST NOT directly import protocol/built-in/replay/WAL/ETL/capture/storage/se
 
 - **WHEN** any CLI Cargo dependency kind adds another Chronicle crate besides application
 - **THEN** architecture validation fails with source, target, and dependency kind
-
 
 ### Requirement: Machine-readable architecture policy rejects dependency leakage
 
@@ -200,12 +193,11 @@ Deleting an allowed dependency SHALL remain valid without first changing policy;
 - **WHEN** root workspace membership gains a Chronicle crate without ownership/policy entry
 - **THEN** validation fails until responsibility and allowed direction are documented
 
-
 ### Requirement: Architecture validation is portable, bounded, and part of CI
 
 Architecture validation SHALL use existing repository-standard bounded command execution and standard-library tooling plus Cargo metadata; it SHALL add no external package solely for graph enforcement. `scripts/validate.sh fast` and release validation SHALL execute it, making existing CI fail on architecture violations. Focused standard-library tests SHALL cover accepted graph, forbidden normal/dev/build edges, target-specific optional edges, package identity/rename handling, unknown members, and cycles.
 
-OpenSpec validation SHALL prove specification structure only and MUST NOT be reported as runtime or architecture-check success. Architecture check is portable repository validation and MUST NOT be placed in privileged P1/P2 acceptance.
+OpenSpec validation SHALL prove specification structure only and MUST NOT be reported as runtime or architecture-check success. Architecture check is portable repository validation and MUST NOT be placed in privileged live-capture/recorder acceptance.
 
 #### Scenario: Fast CI validation
 
@@ -222,7 +214,6 @@ OpenSpec validation SHALL prove specification structure only and MUST NOT be rep
 - **WHEN** only architecture policy/docs/helper change and no production runtime behavior changes
 - **THEN** portable validation runs and no privileged acceptance claim is required
 
-
 ### Requirement: Architecture guidance is durable for future agents
 
 `AGENTS.md` SHALL contain a mandatory crate architecture section with primary ownership, allowed dependency direction, forbidden dependency patterns, application/CLI rules, ETL complete-pipeline rule, eBPF privacy rule, and instruction to update architecture policy/docs when dependencies change. `docs/architecture/crate-boundaries.md` SHALL provide detailed current/target graph and rationale and SHALL be linked from existing architecture documentation.
@@ -238,7 +229,6 @@ OpenSpec validation SHALL prove specification structure only and MUST NOT be rep
 
 - **WHEN** `AGENTS.md` allows an edge that machine policy rejects or vice versa
 - **THEN** change is incomplete until both express same rule
-
 
 ### Requirement: Architecture migration preserves behavior and formats
 

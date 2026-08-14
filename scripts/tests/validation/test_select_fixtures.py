@@ -31,12 +31,12 @@ FIXTURES = {
     "cli": (["crates/chronicle-cli/src/main.rs"], ["cli_docs", "portable"]),
     "helper": (["tests/support/process.py"], ["portable"]),
     "acceptance": (
-        ["scripts/acceptance/lib/scenarios/p2/quota-pressure.sh"],
+        ["scripts/acceptance/lib/scenarios/recorder/quota-pressure.sh"],
         ["acceptance", "build_tooling"],
     ),
     "e2e": (["tests/e2e/test_rootless_pipeline.py"], ["portable"]),
     "privileged": (
-        ["scripts/acceptance/lib/scenarios/p1/capture-basic.sh"],
+        ["scripts/acceptance/lib/scenarios/live-capture/capture-basic.sh"],
         ["acceptance", "build_tooling"],
     ),
     "unknown": (["mystery/path.txt"], ALL_GROUPS),

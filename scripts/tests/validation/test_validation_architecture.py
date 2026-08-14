@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standard-library tests for the responsibility-based test architecture.
 
-Covers the classified test catalog and gate/selector semantics (P1/P2 as
+Covers the classified test catalog and gate/selector semantics (live-capture/recorder as
 selectors, not categories; privilege as an environment dimension; no-coverage-
 loss obligations), static prevention of portable Cargo/repository commands
 embedded in privileged orchestration, and dev-edge architecture checks for
@@ -30,12 +30,12 @@ _spec.loader.exec_module(validation)
 MINIMAL_CATALOG = """version = 1
 layers = ["unit", "integration", "smoke", "acceptance", "e2e"]
 environments = ["portable", "privileged"]
-selectors = ["p1", "p2", "release"]
+selectors = ["live-capture", "recorder", "release"]
 
-[required.p1]
+[required.live-capture]
 tests = ["unit:a"]
 
-[required.p2]
+[required.recorder]
 tests = ["unit:a", "integration:b"]
 
 [required.release]
@@ -48,7 +48,7 @@ environment = "portable"
 owner = "chronicle-a"
 command = "cargo test -p chronicle-a"
 status = "existing"
-gates = ["p1", "p2", "release"]
+gates = ["live-capture", "recorder", "release"]
 
 [[test]]
 id = "integration:b"
@@ -57,7 +57,7 @@ environment = "portable"
 owner = "chronicle-b"
 command = "cargo test -p chronicle-b"
 status = "existing"
-gates = ["p2", "release"]
+gates = ["recorder", "release"]
 
 [scenario_tests]
 s1 = ["unit:a"]
@@ -68,8 +68,8 @@ c1 = ["unit:a"]
 
 MINIMAL_SCENARIOS = """[scenarios.s1]
 capabilities = []
-legacy_p1_checks = ["c1"]
-legacy_p2_checks = ["c1"]
+legacy_live_capture_checks = ["c1"]
+legacy_recorder_checks = ["c1"]
 """
 
 # Embedded-command detection: an optional `if`/`then`, an optional
@@ -105,8 +105,8 @@ def portable_repo_commands(
 # until it is added here with a privileged justification.
 PRIVILEGED_EMBEDDED_CARGO_ALLOWLIST = {
     "cargo build --release --locked",
-    'CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build --release -p chronicle-cli --features linux-ebpf --locked >>"$ARTIFACT_ROOT/build.log" 2>&1',
-    'CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build -p chronicle-cli --features linux-ebpf --locked',
+    'CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build --release -p chronicle-cli --locked >>"$ARTIFACT_ROOT/build.log" 2>&1',
+    'CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build -p chronicle-cli --locked',
     'cargo +nightly build -Z build-std=core --manifest-path "$ROOT/ebpf/Cargo.toml" --target bpfel-unknown-none --release --locked',
     'cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture >"$ARTIFACT_ROOT/privileged-feasibility.log" 2>&1',
     'cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture >"$ARTIFACT_ROOT/signal-tests.log" 2>&1',
@@ -140,11 +140,11 @@ class CatalogSemanticsTests(unittest.TestCase):
     def test_duplicate_id_fails(self):
         broken = (
             MINIMAL_CATALOG.replace(
-                'gates = ["p1", "p2", "release"]\n',
-                'gates = ["p1", "p2", "release"]\n',
+                'gates = ["live-capture", "recorder", "release"]\n',
+                'gates = ["live-capture", "recorder", "release"]\n',
                 1,
             )
-            + '\n[[test]]\nid = "unit:a"\nlayer = "unit"\nenvironment = "portable"\nowner = "x"\ncommand = "cargo test"\nstatus = "existing"\ngates = ["p1"]\n'
+            + '\n[[test]]\nid = "unit:a"\nlayer = "unit"\nenvironment = "portable"\nowner = "x"\ncommand = "cargo test"\nstatus = "existing"\ngates = ["live-capture"]\n'
         )
         self.assertIn("duplicate test id: unit:a", self.issues(broken))
 
@@ -153,7 +153,7 @@ class CatalogSemanticsTests(unittest.TestCase):
             'tests = ["unit:a"]', 'tests = ["unit:a", "unit:missing"]', 1
         )
         self.assertIn(
-            "selector p1: required test unit:missing is undefined",
+            "selector live-capture: required test unit:missing is undefined",
             self.issues(broken),
         )
 
@@ -178,10 +178,12 @@ class CatalogSemanticsTests(unittest.TestCase):
 
     def test_selector_membership_inconsistent_fails(self):
         broken = MINIMAL_CATALOG.replace(
-            'gates = ["p1", "p2", "release"]', 'gates = ["p2", "release"]', 1
+            'gates = ["live-capture", "recorder", "release"]',
+            'gates = ["recorder", "release"]',
+            1,
         )
         self.assertIn(
-            "selector p1: required test unit:a does not declare gate p1",
+            "selector live-capture: required test unit:a does not declare gate live-capture",
             self.issues(broken),
         )
 
@@ -190,7 +192,7 @@ class CatalogSemanticsTests(unittest.TestCase):
             'tests = ["unit:a", "integration:b"]', 'tests = ["integration:b"]', 1
         )
         self.assertIn(
-            "selector p1 required coverage missing from superset: ['unit:a']",
+            "selector live-capture required coverage missing from superset: ['unit:a']",
             self.issues(broken),
         )
 
@@ -223,7 +225,7 @@ class CatalogSemanticsTests(unittest.TestCase):
 
     def test_gate_is_not_a_layer(self):
         broken = MINIMAL_CATALOG.replace(
-            'id = "unit:a"\nlayer = "unit"', 'id = "unit:a"\nlayer = "p1"'
+            'id = "unit:a"\nlayer = "unit"', 'id = "unit:a"\nlayer = "live-capture"'
         )
         self.assertTrue(any("invalid layer" in i for i in self.issues(broken)))
 
@@ -231,12 +233,12 @@ class CatalogSemanticsTests(unittest.TestCase):
         value = validation.catalog_check(ROOT)
         self.assertEqual(value["issues"], [])
         self.assertEqual(value["scenarios"], 14)
-        self.assertGreater(value["p2_required"], value["p1_required"])
+        self.assertGreater(value["recorder_required"], value["live_capture_required"])
 
     def test_planned_required_is_reported_not_silent(self):
         catalog = MINIMAL_CATALOG.replace(
-            'status = "existing"\ngates = ["p1", "p2", "release"]\n',
-            'status = "planned"\ngates = ["p1", "p2", "release"]\n',
+            'status = "existing"\ngates = ["live-capture", "recorder", "release"]\n',
+            'status = "planned"\ngates = ["live-capture", "recorder", "release"]\n',
             1,
         )
         value = self.check(catalog)
@@ -245,12 +247,12 @@ class CatalogSemanticsTests(unittest.TestCase):
 
     def test_required_planned_test_deletion_still_fails(self):
         catalog = MINIMAL_CATALOG.replace(
-            'status = "existing"\ngates = ["p1", "p2", "release"]\n',
-            'status = "planned"\ngates = ["p1", "p2", "release"]\n',
+            'status = "existing"\ngates = ["live-capture", "recorder", "release"]\n',
+            'status = "planned"\ngates = ["live-capture", "recorder", "release"]\n',
             1,
         ).replace('[[test]]\nid = "unit:a"\n', '[[test]]\nid = "unit:renamed"\n', 1)
         self.assertIn(
-            "selector p1: required test unit:a is undefined",
+            "selector live-capture: required test unit:a is undefined",
             self.issues(catalog),
         )
 

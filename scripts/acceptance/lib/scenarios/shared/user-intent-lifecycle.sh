@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034 # result globals are consumed by profile summary after scenario returns
 # Shared privileged public record/replay lifecycle scenario. The implementation
 # is self-contained (own data dir, cgroup subtree, targets), so a single shared
-# owner runs it under both P1 and P2; all evidence is self-contained under
+# owner runs it under both live-capture and recorder; all evidence is self-contained under
 # $ARTIFACT_ROOT/user-intent-lifecycle.
 user_intent_lifecycle_impl() {
 	phase user_intent_lifecycle 'exercise supervised record/replay, retry, selectors, and cleanup'
@@ -16,7 +16,7 @@ user_intent_lifecycle_impl() {
 	install -d -o "$target_uid" -g "$target_gid" -m 0700 "$runtime"
 
 	# The shared upstream destination log accumulates requests across every
-	# profile scenario that ran before this one (3 in P1, many more in P2).
+	# profile scenario that ran before this one (3 in live-capture, many more in recorder).
 	# Snapshot it now; the scenario must never add a line to it.
 	local upstream_lines=-1
 	if [[ -f "$ARTIFACT_ROOT/upstream-requests.jsonl" ]]; then

@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-18
+# Normative specs are updated in place; no delta spec copies are carried.
+skip_specs: true

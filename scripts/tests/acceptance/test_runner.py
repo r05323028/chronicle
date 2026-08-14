@@ -62,23 +62,25 @@ class AcceptanceRunnerTests(unittest.TestCase):
         except (OSError, json.JSONDecodeError) as exc:
             self.fail(f"cannot read report {path}: {exc}")
 
-    def test_p2_includes_p1(self):
-        p1 = set(report.profile_scenarios(self.definition, "p1"))
-        p2 = set(report.profile_scenarios(self.definition, "p2"))
-        self.assertTrue(p1 < p2)
+    def test_recorder_includes_live_capture(self):
+        live_capture = set(report.profile_scenarios(self.definition, "live-capture"))
+        recorder = set(report.profile_scenarios(self.definition, "recorder"))
+        self.assertTrue(live_capture < recorder)
 
     def test_dispatcher_honors_configured_order(self):
         sandbox = self.temp / "dispatcher"
-        (sandbox / "scripts/acceptance/lib/scenarios/p1").mkdir(parents=True)
+        (sandbox / "scripts/acceptance/lib/scenarios/live-capture").mkdir(parents=True)
         shutil.copy2(
             ROOT / "scripts/acceptance/lib/scenario-dispatch.sh",
             sandbox / "dispatcher.sh",
         )
         scenarios = ["capture-basic", "wal-recovery", "replay", "resource-cleanup"]
         for scenario in scenarios:
-            function = f"scenario_p1_{scenario.replace('-', '_')}"
+            function = f"scenario_live_capture_{scenario.replace('-', '_')}"
             (
-                sandbox / "scripts/acceptance/lib/scenarios/p1" / f"{scenario}.sh"
+                sandbox
+                / "scripts/acceptance/lib/scenarios/live-capture"
+                / f"{scenario}.sh"
             ).write_text(f"{function}() {{ printf '%s\\n' '{scenario}'; }}\n")
         command = sandbox / "run-dispatcher.sh"
         command.write_text(
@@ -88,7 +90,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             f"source {sandbox}/dispatcher.sh\n"
             "die() { exit 1; }\n"
             "CHRONICLE_ACCEPTANCE_SCENARIOS='replay,capture-basic,wal-recovery,resource-cleanup'\n"
-            "run_scenario_plan p1\n"
+            "run_scenario_plan live-capture\n"
         )
         output = subprocess.check_output(["bash", str(command)], text=True, timeout=10)
         actual = [
@@ -110,14 +112,14 @@ class AcceptanceRunnerTests(unittest.TestCase):
 
     def test_dispatcher_bounds_scenarios_and_runs_cleanup(self):
         sandbox = self.temp / "scenario-timeout"
-        scenario_root = sandbox / "scripts/acceptance/lib/scenarios/p1"
+        scenario_root = sandbox / "scripts/acceptance/lib/scenarios/live-capture"
         scenario_root.mkdir(parents=True)
         shutil.copy2(
             ROOT / "scripts/acceptance/lib/scenario-dispatch.sh",
             sandbox / "dispatcher.sh",
         )
         (scenario_root / "hang.sh").write_text(
-            "scenario_p1_hang() { case $SCENARIO_TEST_MODE in "
+            "scenario_live_capture_hang() { case $SCENARIO_TEST_MODE in "
             "pass) return 0 ;; fail) return 9 ;; "
             'hang) sh -c \'trap "" TERM; echo $$ >"$1"; '
             'while :; do sleep 1; done\' sh "$ARTIFACT_ROOT/child.pid" ;; '
@@ -139,7 +141,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             f"source {sandbox}/dispatcher.sh\n"
             "die() { exit 1; }\n"
             "CHRONICLE_ACCEPTANCE_SCENARIOS=hang\n"
-            "run_scenario_plan p1\n"
+            "run_scenario_plan live-capture\n"
         )
         wrapper = ROOT / "scripts/run-with-timeout.sh"
         for mode, expected in (("pass", 0), ("fail", 9)):
@@ -175,7 +177,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         timeout = self._read_report(artifact / "scenario-timeout.json")
         self.assertEqual(timeout["scenario"], "hang")
         self.assertEqual(timeout["timeout_layer"], "scenario")
-        self.assertEqual(timeout["phase"], "scenario:p1/hang")
+        self.assertEqual(timeout["phase"], "scenario:live-capture/hang")
         child = int((artifact / "child.pid").read_text())
         for _ in range(30):
             try:
@@ -198,7 +200,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             300,
         )
         scenario_root = ROOT / "scripts/acceptance/lib/scenarios"
-        for profile in ("p1", "p2"):
+        for profile in ("live-capture", "recorder"):
             selected = report.profile_scenarios(self.definition, profile)
             ordered = report.dispatch_scenarios(self.definition, profile)
             self.assertEqual(set(selected), set(ordered))
@@ -212,34 +214,42 @@ class AcceptanceRunnerTests(unittest.TestCase):
             )
         # Single-owner convention: every scenario has exactly one implementation
         # (shared XOR profile), and the owner matches profile membership.
-        p1_selected = report.profile_scenarios(self.definition, "p1")
-        p2_selected = report.profile_scenarios(self.definition, "p2")
-        for scenario in sorted(set(p1_selected) | set(p2_selected)):
+        live_capture_selected = report.profile_scenarios(
+            self.definition, "live-capture"
+        )
+        recorder_selected = report.profile_scenarios(self.definition, "recorder")
+        for scenario in sorted(set(live_capture_selected) | set(recorder_selected)):
             shared = scenario_root / "shared" / f"{scenario}.sh"
-            p1_impl = scenario_root / "p1" / f"{scenario}.sh"
-            p2_impl = scenario_root / "p2" / f"{scenario}.sh"
+            live_capture_impl = scenario_root / "live-capture" / f"{scenario}.sh"
+            recorder_impl = scenario_root / "recorder" / f"{scenario}.sh"
             # One owner per scenario: a shared implementation XOR profile
             # implementations matching profile membership.
             self.assertEqual(
-                shared.is_file() + (p1_impl.is_file() or p2_impl.is_file()),
+                shared.is_file()
+                + (live_capture_impl.is_file() or recorder_impl.is_file()),
                 1,
                 f"scenario {scenario} must have one implementation owner",
             )
             if shared.is_file():
-                self.assertFalse(p1_impl.is_file())
-                self.assertFalse(p2_impl.is_file())
+                self.assertFalse(live_capture_impl.is_file())
+                self.assertFalse(recorder_impl.is_file())
             else:
-                self.assertEqual(p1_impl.is_file(), scenario in p1_selected)
-                self.assertEqual(p2_impl.is_file(), scenario in p2_selected)
-        p1 = report.dispatch_scenarios(self.definition, "p1")
-        p2 = report.dispatch_scenarios(self.definition, "p2")
-        self.assertEqual([scenario for scenario in p2 if scenario in p1], p1)
+                self.assertEqual(
+                    live_capture_impl.is_file(), scenario in live_capture_selected
+                )
+                self.assertEqual(recorder_impl.is_file(), scenario in recorder_selected)
+        live_capture = report.dispatch_scenarios(self.definition, "live-capture")
+        recorder = report.dispatch_scenarios(self.definition, "recorder")
+        self.assertEqual(
+            [scenario for scenario in recorder if scenario in live_capture],
+            live_capture,
+        )
         dispatcher = (ROOT / "scripts/acceptance/lib/scenario-dispatch.sh").read_text()
-        self.assertNotIn("profile-p1.sh", dispatcher)
-        self.assertNotIn("profile-p2.sh", dispatcher)
+        self.assertNotIn("profile-live-capture.sh", dispatcher)
+        self.assertNotIn("profile-recorder.sh", dispatcher)
         self.assertNotIn("extensions", dispatcher)
         multipass = (ROOT / "scripts/acceptance/lib/multipass.sh").read_text()
-        self.assertNotIn("run_remote p1", multipass.split("else", 1)[1])
+        self.assertNotIn("run_remote live-capture", multipass.split("else", 1)[1])
         self.assertIn('status = value.get("status", "not_checked")', multipass)
         self.assertIn("GUEST_GATE_TIMEOUT", multipass)
         self.assertIn("MULTIPASS_REMOTE_TIMEOUT < HOST_PROFILE_TIMEOUT", multipass)
@@ -249,20 +259,25 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertIn("reboot-boot-ids.json", multipass)
         self.assertIn("GUEST_GATE_TIMEOUT + ACCEPTANCE_CLEANUP_GRACE", multipass)
         self.assertNotIn(
-            "p1_artifact_root", (ROOT / "scripts/acceptance/runner.py").read_text()
+            "live_capture_artifact_root",
+            (ROOT / "scripts/acceptance/runner.py").read_text(),
         )
 
     def test_dispatcher_rejects_missing_implementation(self):
         sandbox = self.temp / "missing-impl"
-        (sandbox / "scripts/acceptance/lib/scenarios/p1").mkdir(parents=True)
+        (sandbox / "scripts/acceptance/lib/scenarios/live-capture").mkdir(parents=True)
         (sandbox / "scripts/acceptance/lib/scenarios/shared").mkdir(parents=True)
         shutil.copy2(
             ROOT / "scripts/acceptance/lib/scenario-dispatch.sh",
             sandbox / "dispatcher.sh",
         )
         (
-            sandbox / "scripts/acceptance/lib/scenarios/p1" / "capture-basic.sh"
-        ).write_text("scenario_p1_capture_basic() { printf 'ran-capture-basic\n'; }\n")
+            sandbox
+            / "scripts/acceptance/lib/scenarios/live-capture"
+            / "capture-basic.sh"
+        ).write_text(
+            "scenario_live_capture_capture_basic() { printf 'ran-capture-basic\n'; }\n"
+        )
         command = sandbox / "run-dispatcher.sh"
         command.write_text(
             "#!/usr/bin/env bash\n"
@@ -271,7 +286,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             f"source {sandbox}/dispatcher.sh\n"
             "die() { printf 'DIE: %s\n' \"$*\" >&2; exit 1; }\n"
             "CHRONICLE_ACCEPTANCE_SCENARIOS=capture-basic\n"
-            "run_scenario_plan p1\n"
+            "run_scenario_plan live-capture\n"
         )
         output = subprocess.check_output(["bash", str(command)], text=True, timeout=10)
         self.assertIn("ran-capture-basic", output)
@@ -297,14 +312,14 @@ class AcceptanceRunnerTests(unittest.TestCase):
         sandbox = self.temp / "report-scenarios"
         root = sandbox / "scripts/acceptance"
         (root / "lib/scenarios/shared").mkdir(parents=True)
-        (root / "lib/scenarios/p1").mkdir(parents=True)
-        (root / "lib/scenarios/p2").mkdir(parents=True)
+        (root / "lib/scenarios/live-capture").mkdir(parents=True)
+        (root / "lib/scenarios/recorder").mkdir(parents=True)
         config = root / "scenarios.toml"
         config.write_text(
             "schema_version = 1\n"
-            "[profiles.p1]\n"
+            "[profiles.live-capture]\n"
             'scenarios = ["present", "ghost"]\n'
-            "[profiles.p2]\n"
+            "[profiles.recorder]\n"
             'scenarios = ["present", "ghost"]\n'
             "[scenarios.present]\n"
             "timeout_seconds = 300\n"
@@ -317,10 +332,12 @@ class AcceptanceRunnerTests(unittest.TestCase):
         # A shared implementation resolves without any profile extension file.
         (root / "lib/scenarios/shared/ghost.sh").write_text("")
         loaded = report.load_scenarios(config)
-        self.assertEqual(loaded["profiles"]["p1"]["scenarios"], ["present", "ghost"])
+        self.assertEqual(
+            loaded["profiles"]["live-capture"]["scenarios"], ["present", "ghost"]
+        )
 
-    def test_p2_profile_owns_failure_cleanup_resources(self):
-        profile = (ROOT / "scripts/acceptance/lib/profile-p2.sh").read_text()
+    def test_recorder_profile_owns_failure_cleanup_resources(self):
+        profile = (ROOT / "scripts/acceptance/lib/profile-recorder.sh").read_text()
         for contract in (
             'QUOTA_UNIT=""',
             'QUOTA_CGROUP=""',
@@ -336,27 +353,27 @@ class AcceptanceRunnerTests(unittest.TestCase):
         ):
             self.assertIn(contract, profile)
         reboot = (
-            ROOT / "scripts/acceptance/lib/scenarios/p2/reboot-recovery.sh"
+            ROOT / "scripts/acceptance/lib/scenarios/recorder/reboot-recovery.sh"
         ).read_text()
         self.assertIn("pre-reboot-handoff.txt", reboot)
         self.assertIn('wait_for_unit_inactive "$UNIT"', reboot)
 
-    def test_all_deduplicates_to_p2_superset(self):
+    def test_all_deduplicates_to_recorder_superset(self):
         with mock.patch.object(runner, "run_profile", return_value=0) as run:
             self.assertEqual(runner.main(["--profile", "all", "--no-reuse"]), 0)
         run.assert_called_once()
-        self.assertEqual(run.call_args.args[1], "p2")
+        self.assertEqual(run.call_args.args[1], "recorder")
 
     def test_parser_selects_executor_and_no_reuse(self):
         args = runner.parser().parse_args(
-            ["--profile", "p2", "--executor", "multipass", "--no-reuse"]
+            ["--profile", "recorder", "--executor", "multipass", "--no-reuse"]
         )
         self.assertEqual(args.executor, "multipass")
         self.assertTrue(args.no_reuse)
         self.assertEqual(args.gate_timeout_seconds, 3600)
         with self.assertRaises(SystemExit):
             runner.parser().parse_args(
-                ["--profile", "p1", "--gate-timeout-seconds", "0"]
+                ["--profile", "live-capture", "--gate-timeout-seconds", "0"]
             )
 
     def test_gate_command_has_outer_timeout_and_evidence(self):
@@ -371,7 +388,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             "CHRONICLE_TIMEOUT_PHASE_FILE": str(phase),
             "CHRONICLE_TIMEOUT_DIAGNOSTICS": "process-list.txt:missing.log",
             "CHRONICLE_TIMEOUT_LAYER": "acceptance_gate",
-            "CHRONICLE_TIMEOUT_NAME": "p2",
+            "CHRONICLE_TIMEOUT_NAME": "recorder",
         }
         command = runner.bounded_profile_command(["sh", "-c", "sleep 30"], 1)
         result = subprocess.run(command, env=env, check=False, timeout=5)
@@ -384,7 +401,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
 
     def test_runner_timeout_finishes_central_report_and_manifest(self):
         sandbox = self.temp / "runner-timeout"
-        profile = sandbox / "scripts/acceptance/lib/profile-p1.sh"
+        profile = sandbox / "scripts/acceptance/lib/profile-live-capture.sh"
         profile.parent.mkdir(parents=True)
         profile.write_text("#!/usr/bin/env bash\nexec sleep 30\n")
         wrapper = sandbox / "scripts/run-with-timeout.sh"
@@ -393,7 +410,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         args = runner.parser().parse_args(
             [
                 "--profile",
-                "p1",
+                "live-capture",
                 "--executor",
                 "local",
                 "--no-reuse",
@@ -415,9 +432,13 @@ class AcceptanceRunnerTests(unittest.TestCase):
             ),
             mock.patch.object(report, "source_provenance", return_value=self.source),
         ):
-            self.assertEqual(runner.run_profile(args, "p1", self.definition), 124)
+            self.assertEqual(
+                runner.run_profile(args, "live-capture", self.definition), 124
+            )
         report_path = next(
-            (self.temp / "timeout-evidence").glob("p1/fp-a/*/acceptance-report.json")
+            (self.temp / "timeout-evidence").glob(
+                "live-capture/fp-a/*/acceptance-report.json"
+            )
         )
         value = self._read_report(report_path)
         self.assertEqual(value["status"], "failed")
@@ -438,7 +459,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertEqual(timeouts[0]["scenario"], "hang")
         value = report.make_report(
             run_id="timeout",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=["hang"],
             completed=["hang"],
@@ -476,7 +497,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             json.dumps(
                 {
                     "version": 1,
-                    "profile": "p1",
+                    "profile": "live-capture",
                     "selected": selected,
                     "current": "wal-recovery",
                     "completed": ["capture-basic"],
@@ -491,7 +512,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             )
         )
         self.assertEqual(
-            report.load_scenario_state(runtime, selected, "p1"),
+            report.load_scenario_state(runtime, selected, "live-capture"),
             (["capture-basic"], ["wal-recovery"], ["replay", "resource-cleanup"]),
         )
 
@@ -505,7 +526,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             json.dumps(
                 {
                     "version": 1,
-                    "profile": "p2",
+                    "profile": "recorder",
                     "selected": selected,
                     "current": "wal-recovery",
                     "completed": ["capture-basic"],
@@ -523,7 +544,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             json.dumps(
                 {
                     "version": 1,
-                    "profile": "p2",
+                    "profile": "recorder",
                     "selected": selected,
                     "current": None,
                     "completed": ["wal-recovery", "replay", "resource-cleanup"],
@@ -540,7 +561,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         # Lexicographic rglob order must not matter: the union of both phase
         # ledgers attributes every executed scenario, not just the last file.
         self.assertEqual(
-            report.load_scenario_state(runtime, selected, "p2"),
+            report.load_scenario_state(runtime, selected, "recorder"),
             (selected, [], []),
         )
 
@@ -552,7 +573,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             json.dumps(
                 {
                     "version": 1,
-                    "profile": "p1",
+                    "profile": "live-capture",
                     "selected": selected,
                     "current": "wal-recovery",
                     "completed": ["capture-basic"],
@@ -575,22 +596,22 @@ class AcceptanceRunnerTests(unittest.TestCase):
             )
         )
         completed, failed, not_checked = report.load_scenario_state(
-            runtime, selected, "p1"
+            runtime, selected, "live-capture"
         )
         # Scenario timeout classification remains execution-ledger based even
         # when a legacy profile report has coarse failed status.
         legacy_status, _, legacy_failed, _ = report.normalize_legacy_report(
             self.definition,
-            "p1",
+            "live-capture",
             {"status": "failed", "checks": {}},
-            report.profile_scenarios(self.definition, "p1"),
+            report.profile_scenarios(self.definition, "live-capture"),
             124,
         )
         self.assertEqual(legacy_status, "failed")
         self.assertEqual(legacy_failed, [])
         value = report.make_report(
             run_id="scenario-timeout",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=selected,
             completed=completed,
@@ -613,7 +634,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         runtime.mkdir()
         (runtime / "scenario-state.json").write_text("{not-json")
         with self.assertRaises(ValueError):
-            report.load_scenario_state(runtime, ["capture-basic"], "p1")
+            report.load_scenario_state(runtime, ["capture-basic"], "live-capture")
 
     def test_scenarios_use_explicit_wait_convention(self):
         scenario_root = ROOT / "scripts/acceptance/lib/scenarios"
@@ -640,7 +661,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertIn("recorder_metadata_epoch", readiness)
 
     def test_destructive_scenarios_have_postcondition_barriers(self):
-        root = ROOT / "scripts/acceptance/lib/scenarios/p2"
+        root = ROOT / "scripts/acceptance/lib/scenarios/recorder"
         checkpoint = (root / "checkpoint-kill-restart.sh").read_text()
         self.assertIn('wait_for_path_absent "$CHECKPOINT_PAUSE_FILE"', checkpoint)
         self.assertIn('wait_for_path_absent "$CHECKPOINT_READY_FILE"', checkpoint)
@@ -670,11 +691,11 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertEqual(runner.release_source_errors(self.source), [])
 
     def test_source_mutation_during_release_run_fails(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         args = runner.parser().parse_args(
             [
                 "--profile",
-                "p1",
+                "live-capture",
                 "--executor",
                 "local",
                 "--release",
@@ -711,9 +732,13 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 side_effect=[self.source, source_end],
             ),
         ):
-            self.assertEqual(runner.run_profile(args, "p1", self.definition), 1)
+            self.assertEqual(
+                runner.run_profile(args, "live-capture", self.definition), 1
+            )
         report_path = next(
-            (self.temp / "mutation-evidence").glob("p1/fp-a/*/acceptance-report.json")
+            (self.temp / "mutation-evidence").glob(
+                "live-capture/fp-a/*/acceptance-report.json"
+            )
         )
         value = self._read_report(report_path)
         self.assertEqual(value["status"], "failed")
@@ -721,11 +746,11 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertFalse(value["source"]["stable"])
 
     def test_fingerprint_mutation_during_fresh_release_run_fails(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         args = runner.parser().parse_args(
             [
                 "--profile",
-                "p1",
+                "live-capture",
                 "--executor",
                 "local",
                 "--release",
@@ -760,10 +785,12 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 side_effect=[self.source, self.source],
             ),
         ):
-            self.assertEqual(runner.run_profile(args, "p1", self.definition), 1)
+            self.assertEqual(
+                runner.run_profile(args, "live-capture", self.definition), 1
+            )
         report_path = next(
             (self.temp / "fingerprint-mutation-evidence").glob(
-                "p1/fp-a/*/acceptance-report.json"
+                "live-capture/fp-a/*/acceptance-report.json"
             )
         )
         value = self._read_report(report_path)
@@ -772,10 +799,10 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertFalse(value["source"]["stable"])
 
     def test_report_completeness_and_release_identity(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         value = report.make_report(
             run_id="run-a",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=selected,
             completed=selected,
@@ -793,7 +820,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertEqual(value["not_checked_scenarios"], [])
         value = report.make_report(
             run_id="run-no-reuse",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=selected,
             completed=selected,
@@ -809,7 +836,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertFalse(value["reuse"]["requested"])
 
     def test_report_records_preflight_outcome(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         preflight = {
             "schema_version": 1,
             "outcome": "supported",
@@ -818,7 +845,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         }
         value = report.make_report(
             run_id="preflight-a",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=selected,
             completed=selected,
@@ -835,7 +862,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertEqual(value["preflight"]["outcome"], "supported")
         value = report.make_report(
             run_id="preflight-unsupported",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=selected,
             completed=[],
@@ -874,29 +901,29 @@ class AcceptanceRunnerTests(unittest.TestCase):
         runner.write_evidence(root, value)
         return root
 
-    def test_p2_evidence_satisfies_p1_but_p1_does_not_satisfy_p2(self):
-        p1 = report.profile_scenarios(self.definition, "p1")
-        p2 = report.profile_scenarios(self.definition, "p2")
-        root = self._write_evidence("p2", p2, p2)
+    def test_recorder_evidence_satisfies_live_capture_but_not_reverse(self):
+        live_capture = report.profile_scenarios(self.definition, "live-capture")
+        recorder = report.profile_scenarios(self.definition, "recorder")
+        root = self._write_evidence("recorder", recorder, recorder)
         candidate = self._read_report(root / "acceptance-report.json")
         self.assertTrue(
             report.report_is_compatible(
                 candidate,
                 fingerprint="fp-a",
-                required=p1,
+                required=live_capture,
                 environment_value=self.environment,
                 release=False,
                 source=self.source,
                 root=root,
             )
         )
-        root = self._write_evidence("p1", p1, p1)
+        root = self._write_evidence("live-capture", live_capture, live_capture)
         candidate = self._read_report(root / "acceptance-report.json")
         self.assertFalse(
             report.report_is_compatible(
                 candidate,
                 fingerprint="fp-a",
-                required=p2,
+                required=recorder,
                 environment_value=self.environment,
                 release=False,
                 source=self.source,
@@ -905,9 +932,11 @@ class AcceptanceRunnerTests(unittest.TestCase):
         )
 
     def test_dirty_historical_evidence_reuses_across_commit_sha(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         evidence_source = {**self.source, "working_tree_dirty": True}
-        root = self._write_evidence("p1", selected, selected, source=evidence_source)
+        root = self._write_evidence(
+            "live-capture", selected, selected, source=evidence_source
+        )
         candidate = self._read_report(root / "acceptance-report.json")
         self.assertFalse(candidate["release_eligible"])
         current_source = {
@@ -939,13 +968,13 @@ class AcceptanceRunnerTests(unittest.TestCase):
         )
 
     def test_release_run_reuses_cross_sha_evidence_and_detects_mutation(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         evidence_source = {**self.source, "working_tree_dirty": True}
-        self._write_evidence("p1", selected, selected, source=evidence_source)
+        self._write_evidence("live-capture", selected, selected, source=evidence_source)
         args = runner.parser().parse_args(
             [
                 "--profile",
-                "p1",
+                "live-capture",
                 "--executor",
                 "local",
                 "--release",
@@ -974,11 +1003,13 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 runner.report, "source_provenance", side_effect=[current, current]
             ),
         ):
-            self.assertEqual(runner.run_profile(args, "p1", self.definition), 0)
+            self.assertEqual(
+                runner.run_profile(args, "live-capture", self.definition), 0
+            )
         receipt = next(
             value
             for path in (self.temp / "evidence").glob(
-                "p1/fp-a/*/acceptance-report.json"
+                "live-capture/fp-a/*/acceptance-report.json"
             )
             if (value := self._read_report(path))["reuse"]["reused"]
         )
@@ -988,7 +1019,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertEqual(receipt["source"]["tree_sha"], "tree-b")
         self.assertEqual(
             receipt["reuse"]["from"],
-            str((self.temp / "evidence" / "p1" / "fp-a" / "run-a").resolve()),
+            str((self.temp / "evidence" / "live-capture" / "fp-a" / "run-a").resolve()),
         )
         self.assertTrue(receipt["reuse"]["origin"]["manifest_sha256"])
 
@@ -1011,7 +1042,9 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 side_effect=[current, mutated],
             ),
         ):
-            self.assertEqual(runner.run_profile(args, "p1", self.definition), 2)
+            self.assertEqual(
+                runner.run_profile(args, "live-capture", self.definition), 2
+            )
 
         with (
             mock.patch.object(
@@ -1031,15 +1064,17 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 side_effect=[current, current],
             ),
         ):
-            self.assertEqual(runner.run_profile(args, "p1", self.definition), 2)
+            self.assertEqual(
+                runner.run_profile(args, "live-capture", self.definition), 2
+            )
 
     def test_release_run_rejects_dirty_current_source_before_reuse(self):
-        selected = report.profile_scenarios(self.definition, "p1")
-        self._write_evidence("p1", selected, selected)
+        selected = report.profile_scenarios(self.definition, "live-capture")
+        self._write_evidence("live-capture", selected, selected)
         args = runner.parser().parse_args(
             [
                 "--profile",
-                "p1",
+                "live-capture",
                 "--executor",
                 "local",
                 "--release",
@@ -1066,22 +1101,24 @@ class AcceptanceRunnerTests(unittest.TestCase):
                 runner.report, "source_provenance", return_value=dirty_current
             ),
         ):
-            self.assertEqual(runner.run_profile(args, "p1", self.definition), 2)
+            self.assertEqual(
+                runner.run_profile(args, "live-capture", self.definition), 2
+            )
         collect_environment.assert_not_called()
         reports = [
             self._read_report(path)
             for path in (self.temp / "evidence").glob(
-                "p1/fp-a/*/acceptance-report.json"
+                "live-capture/fp-a/*/acceptance-report.json"
             )
         ]
         self.assertEqual(len(reports), 1)
         self.assertFalse(any(value["reuse"]["reused"] for value in reports))
 
     def test_empty_phase_evidence_cannot_pass_or_reuse(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         value = report.make_report(
             run_id="empty-phases",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=selected,
             completed=selected,
@@ -1111,15 +1148,15 @@ class AcceptanceRunnerTests(unittest.TestCase):
         )
 
     def test_environment_mismatch_and_manifest_corruption_reject_reuse(self):
-        p1 = report.profile_scenarios(self.definition, "p1")
-        root = self._write_evidence("p1", p1, p1)
+        live_capture = report.profile_scenarios(self.definition, "live-capture")
+        root = self._write_evidence("live-capture", live_capture, live_capture)
         candidate = self._read_report(root / "acceptance-report.json")
         changed = {**self.environment, "kernel": "6.8.1"}
         self.assertFalse(
             report.report_is_compatible(
                 candidate,
                 fingerprint="fp-a",
-                required=p1,
+                required=live_capture,
                 environment_value=changed,
                 release=False,
                 source=self.source,
@@ -1134,7 +1171,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             report.report_is_compatible(
                 candidate,
                 fingerprint="fp-a",
-                required=p1,
+                required=live_capture,
                 environment_value=self.environment,
                 release=False,
                 source=self.source,
@@ -1145,10 +1182,10 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertFalse(report.verify_manifest(root))
 
     def test_incompatible_or_incomplete_evidence_rejects_reuse(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         base = report.make_report(
             run_id="invalid",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=selected,
             completed=selected,
@@ -1231,12 +1268,12 @@ class AcceptanceRunnerTests(unittest.TestCase):
             ],
         )
 
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         root = self.temp / "malformed-guest"
         root.mkdir()
         value = report.make_report(
             run_id="malformed-guest",
-            profile="p1",
+            profile="live-capture",
             executor="multipass",
             selected=selected,
             completed=selected,
@@ -1266,7 +1303,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         root.mkdir()
         value = report.make_report(
             run_id="mismatched-guest",
-            profile="p1",
+            profile="live-capture",
             executor="multipass",
             selected=selected,
             completed=selected,
@@ -1302,12 +1339,12 @@ class AcceptanceRunnerTests(unittest.TestCase):
             )
         )
 
-    def test_reuse_receipt_records_p2_to_p1_source(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+    def test_reuse_receipt_records_recorder_to_live_capture_source(self):
+        selected = report.profile_scenarios(self.definition, "live-capture")
         args = runner.parser().parse_args(
             [
                 "--profile",
-                "p1",
+                "live-capture",
                 "--executor",
                 "multipass",
                 "--no-reuse",
@@ -1319,7 +1356,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         candidate.mkdir()
         candidate_value = report.make_report(
             run_id="source",
-            profile="p2",
+            profile="recorder",
             executor="multipass",
             selected=selected,
             completed=selected,
@@ -1347,7 +1384,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         report.write_manifest(candidate)
         receipt_status = runner.write_reuse_receipt(
             args,
-            "p1",
+            "live-capture",
             selected,
             "fp-a",
             self.source,
@@ -1357,7 +1394,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         )
         self.assertEqual(receipt_status, 0)
         receipt = next(
-            (self.temp / "receipts").glob("p1/fp-a/*/acceptance-report.json")
+            (self.temp / "receipts").glob("live-capture/fp-a/*/acceptance-report.json")
         )
         value = self._read_report(receipt)
         self.assertTrue(value["reuse"]["reused"])
@@ -1388,12 +1425,12 @@ class AcceptanceRunnerTests(unittest.TestCase):
         )
 
     def test_reuse_chain_binds_fingerprint_environment_and_scenarios(self):
-        selected = report.profile_scenarios(self.definition, "p1")
+        selected = report.profile_scenarios(self.definition, "live-capture")
         origin = self.temp / "chain-origin"
         origin.mkdir()
         origin_value = report.make_report(
             run_id="origin",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=selected,
             completed=selected,
@@ -1411,7 +1448,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         receipt_root.mkdir()
         receipt_value = report.make_report(
             run_id="receipt",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=selected,
             completed=selected,
@@ -1448,7 +1485,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertTrue(source["identity_error"])
         value = report.make_report(
             run_id="unknown-source",
-            profile="p1",
+            profile="live-capture",
             executor="local",
             selected=["capture-basic"],
             completed=["capture-basic"],
@@ -1516,20 +1553,24 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertIn("--exclude='./.pi'", snapshot)
 
     def test_legacy_profile_failure_does_not_fail_every_scenario(self):
-        p1 = report.profile_scenarios(self.definition, "p1")
+        live_capture = report.profile_scenarios(self.definition, "live-capture")
         status, completed, failed, not_checked = report.normalize_legacy_report(
-            self.definition, "p1", {"status": "failed", "checks": {}}, p1, 1
+            self.definition,
+            "live-capture",
+            {"status": "failed", "checks": {}},
+            live_capture,
+            1,
         )
         self.assertEqual(status, "failed")
         self.assertEqual(completed, [])
         self.assertEqual(failed, [])
-        self.assertEqual(set(not_checked), set(p1))
+        self.assertEqual(set(not_checked), set(live_capture))
 
     def test_reboot_phases_are_single_run(self):
-        selected = report.profile_scenarios(self.definition, "p2")
+        selected = report.profile_scenarios(self.definition, "recorder")
         value = report.make_report(
             run_id="run-reboot",
-            profile="p2",
+            profile="recorder",
             executor="multipass",
             selected=selected,
             completed=selected,
@@ -1550,7 +1591,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
             [phase["name"] for phase in value["phases"]], ["pre_reboot", "post_reboot"]
         )
         reboot = (
-            ROOT / "scripts/acceptance/lib/scenarios/p2/reboot-recovery.sh"
+            ROOT / "scripts/acceptance/lib/scenarios/recorder/reboot-recovery.sh"
         ).read_text()
         self.assertIn("incremental-etl-checkpoint.json", reboot)
         self.assertIn("committed(post)", reboot)
@@ -1558,8 +1599,8 @@ class AcceptanceRunnerTests(unittest.TestCase):
 
     def test_profiles_share_acceptance_fingerprint(self):
         self.assertEqual(
-            runner.source_fingerprint("p1", "local")[0],
-            runner.source_fingerprint("p2", "multipass")[0],
+            runner.source_fingerprint("live-capture", "local")[0],
+            runner.source_fingerprint("recorder", "multipass")[0],
         )
 
     def test_openspec_archive_does_not_change_fingerprint_but_scenarios_do(self):
@@ -1607,14 +1648,14 @@ class AcceptanceRunnerTests(unittest.TestCase):
             path.write_text(name + "\n")
         cfg = validation.config(self.temp)
         first = validation.fingerprint(
-            self.temp, "p1", cfg, profile="p1", executor="local"
+            self.temp, "live-capture", cfg, profile="live-capture", executor="local"
         )["fingerprint"]
         (self.temp / "docs").mkdir()
         (self.temp / "docs/change.md").write_text("docs only\n")
         self.assertEqual(
             first,
             validation.fingerprint(
-                self.temp, "p1", cfg, profile="p1", executor="local"
+                self.temp, "live-capture", cfg, profile="live-capture", executor="local"
             )["fingerprint"],
         )
         (self.temp / "scripts/run-with-timeout.sh").write_text(
@@ -1623,18 +1664,18 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertNotEqual(
             first,
             validation.fingerprint(
-                self.temp, "p1", cfg, profile="p1", executor="local"
+                self.temp, "live-capture", cfg, profile="live-capture", executor="local"
             )["fingerprint"],
         )
 
     def test_obsolete_wrappers_absent_and_unreferenced(self):
         removed = (
-            "scripts/acceptance/p1-privileged.sh",
-            "scripts/acceptance/p2-privileged.sh",
-            "scripts/acceptance/p1-multipass.sh",
-            "scripts/acceptance/p2-multipass.sh",
-            "scripts/tests/acceptance/test-p1-privileged-runner.sh",
-            "scripts/tests/acceptance/test-p2-privileged-runner.sh",
+            "scripts/acceptance/live-capture-privileged.sh",
+            "scripts/acceptance/recorder-privileged.sh",
+            "scripts/acceptance/live-capture-multipass.sh",
+            "scripts/acceptance/recorder-multipass.sh",
+            "scripts/tests/acceptance/test-live-capture-privileged-runner.sh",
+            "scripts/tests/acceptance/test-recorder-privileged-runner.sh",
         )
         for path in removed:
             self.assertFalse(

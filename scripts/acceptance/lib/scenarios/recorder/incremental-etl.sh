@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Central-dispatch scenario: incremental-etl.
-scenario_p2_incremental_etl() {
+scenario_recorder_incremental_etl() {
 	phase size_rotation 'force deterministic segment and epoch byte rollover'
 	SIZE_SEGMENTS_BEFORE=$(find "$STATE_ROOT/wal" -type f -name '*.chwal' | wc -l)
 	SIZE_BYTES_BEFORE=$(du -sb "$STATE_ROOT/wal" | awk '{print $1}')

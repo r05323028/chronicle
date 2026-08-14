@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh
   | CHRONICLE_INSTALL_DIR=/some/path sh
 ```
 
-Release binaries are built with `--features linux-ebpf`, so live capture works out of the box on a supported Linux host. Prefer releases over building from source unless you are developing Chronicle itself.
+Release binaries are built on Linux with live capture included automatically, so it works out of the box on a supported Linux host. Prefer releases over building from source unless you are developing Chronicle itself.
 
 ### Manual installation (advanced/fallback)
 
@@ -82,15 +82,19 @@ For environments where the installer is not usable, Linux binaries are also publ
 
 Prerequisites: the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml). Live capture additionally requires the [platform prerequisites](#requirements) below.
 
-**Linux (live capture):**
-
 ```bash
 git clone https://github.com/r05323028/chronicle
 cd chronicle
-cargo build --release --features linux-ebpf --locked
+cargo build --release --locked
 ```
 
-The `linux-ebpf` feature embeds the eBPF capture programs into the `chronicle` binary. The checked-in capture object under `crates/chronicle-capture-ebpf/objects/` makes this build work with the pinned stable toolchain — no nightly install is required. If you change the capture programs in `ebpf/`, rebuild the object and commit it together with the source (CI enforces this):
+The same command works on every supported platform. On Linux the build automatically includes live capture, embedding the capture programs from the checked-in object under `crates/chronicle-capture-ebpf/objects/` — no nightly Rust install is required. On other platforms the build produces the portable surface: `list`, `inspect`, replay planning and verification, `doctor`, and fixture recording, without live capture.
+
+Run `chronicle doctor` to check whether live capture can actually operate on your host: it probes platform, kernel, cgroup v2, BTF, the embedded capture programs, and the required privileges, and reports remediation for anything missing.
+
+#### Advanced: rebuilding the eBPF capture programs
+
+Normal builds embed the checked-in capture object with the pinned stable toolchain. Only touch `ebpf/` if you are developing the capture pipeline itself; rebuild the object and commit it together with the source (CI enforces this):
 
 ```bash
 rustup toolchain install nightly --profile minimal --component rust-src
@@ -102,15 +106,7 @@ cp ebpf/target/bpfel-unknown-none/release/chronicle-ebpf-capture \
   crates/chronicle-capture-ebpf/objects/chronicle-ebpf-capture-bpfel.o
 ```
 
-**Other platforms (macOS and others):**
-
-```bash
-cargo build --release --locked
-```
-
-This builds the portable surface: `list`, `inspect`, replay planning and verification, `doctor`, and fixture recording. Live capture is unavailable; `record -- COMMAND...` fails preflight with actionable remediation (see `chronicle doctor`).
-
-Contributor demos on Linux can run the CLI directly with the feature enabled: `cargo run --features linux-ebpf -p chronicle-cli -- ...`.
+Contributor demos on Linux can run the CLI directly: `cargo run -p chronicle-cli -- ...`.
 
 ## Requirements
 
@@ -119,7 +115,7 @@ Live capture on Linux requires:
 - a supported OS and kernel: Linux 6.1+ with cgroup v2 enabled and BTF available (`/sys/kernel/btf/vmlinux`);
 - a supported architecture: little-endian x86_64 or aarch64;
 - eBPF capabilities for the recording process: `CAP_BPF` and `CAP_NET_ADMIN`;
-- the capture programs embedded in the binary (release binaries and `--features linux-ebpf` builds have them).
+- the capture programs embedded in the binary (every Linux build has them; non-Linux builds omit live capture).
 
 Run `chronicle doctor` to check all of this before recording. `doctor` is non-destructive: it probes platform, architecture, cgroup v2, BTF, the embedded capture object and programs, attachment, and capabilities, and reports remediation for anything missing. Non-Linux hosts support the portable surface without live capture.
 
@@ -273,7 +269,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-Targeted and release validation: `./scripts/validate.sh targeted --changed-since origin/main`, `gate p1|p2`, and `release`. Real eBPF runtime coverage is opt-in privileged acceptance on supported Linux: `./scripts/acceptance.sh --profile p1|p2 --executor local|multipass`. Live-capture development on Linux requires the [platform prerequisites](#requirements); change the capture programs in `ebpf/` only by regenerating and committing the object as described in [Build from source](#build-from-source).
+Targeted and release validation: `./scripts/validate.sh targeted --changed-since origin/main`, `live-capture|recorder`, and `release`. Real eBPF runtime coverage is opt-in privileged acceptance on supported Linux: `./scripts/acceptance.sh --profile live-capture|recorder --executor local|multipass`. Live-capture development on Linux requires the [platform prerequisites](#requirements); change the capture programs in `ebpf/` only by regenerating and committing the object as described in [Advanced: rebuilding the eBPF capture programs](#advanced-rebuilding-the-ebpf-capture-programs).
 
 No checked-in configuration contains secrets: `postgres.connection_url_env` names an environment variable rather than storing credentials. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
 

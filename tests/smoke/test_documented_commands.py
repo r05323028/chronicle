@@ -17,6 +17,7 @@ import importlib.util
 import json
 import re
 import shutil
+import sys
 import unittest
 from pathlib import Path
 
@@ -115,6 +116,9 @@ class DocumentedCommandsTests(unittest.TestCase):
         )
 
     def test_public_record_preflight_fails_before_mutation(self):
+        # Exit 3: Linux live-capture binary fails host preflight rootlessly.
+        # Exit 4: portable (non-Linux) build rejects live capture. Both fail
+        # before the data dir is mutated or the target is started.
         data_dir = self.root / "record-data"
         marker = self.root / "target-started"
         result = process.run(
@@ -122,10 +126,11 @@ class DocumentedCommandsTests(unittest.TestCase):
             ["record", "--name", "checkout", "--", "/usr/bin/touch", str(marker)],
             data_dir=data_dir,
         )
-        self.assertEqual(result.returncode, 4)
+        expected = 3 if sys.platform.startswith("linux") else 4
+        self.assertEqual(result.returncode, expected)
         self.assertEqual(result.stdout, b"")
         payload = self.parse_json(result.stderr, "record preflight")
-        self.assertEqual(payload["code"], 4)
+        self.assertEqual(payload["code"], expected)
         self.assertFalse(marker.exists(), "record must fail before starting the target")
         self.assertFalse((data_dir / "catalog.json").exists())
         self.assertFalse((data_dir / "recordings").exists())

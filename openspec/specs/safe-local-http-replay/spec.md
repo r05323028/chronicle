@@ -6,7 +6,6 @@ Default-deny loopback target planning, safe HTTP execution, header and credentia
 
 ### Requirement: Dry-run default and complete plan visibility
 
-
 Replay SHALL load the canonical session, build one deterministic plan, and perform no network unless authorization preflight passes. Explicit-target and hidden legacy modes remain dry-run unless `--execute`; command mode infers execution intent from `-- COMMAND...`. Before command-mode scope/target creation, Chronicle SHALL evaluate target-independent integrity, replayability, and effect gates; predictable denial returns the complete report with zero traffic and does not run target code. Planner SHALL represent every operation once as executable candidate or non-executable with stable reason. Non-executable operations SHALL NOT block executable siblings. Any target/effect denial for executable candidates SHALL block all requests. Executor SHALL return one ordered result per planned operation and explicit outcome through shared atomic JSON.
 
 #### Scenario: Explicit mode default dry-run
@@ -51,7 +50,6 @@ Replay SHALL load the canonical session, build one deterministic plan, and perfo
 
 ### Requirement: Explicit loopback target authorization
 
-
 Execution SHALL require explicit target origin, repeated exact allow-host, and loopback IP literal, OR in command mode one uniquely discovered supervised-scope listener. Explicit grammar remains `chronicle replay REC --target http://127.0.0.1:8080 --execute --allow-host 127.0.0.1 --allow-read`, adding independent `--allow-write` when needed. Target grammar permits only `http://<loopback-ip>:<port>` with optional trailing slash and rejects userinfo, DNS, wildcard/unspecified/non-loopback/multicast hosts, path/query/fragment, HTTPS, or missing port before DNS/network. Recorded destination is never fallback.
 
 Command discovery SHALL join stable process-start/FD/socket-inode ownership evidence from scope members against `/proc/net/tcp{,6}`, never `/proc/<pid>/net/tcp*` alone, and require one loopback endpoint matching recorded protocol/port evidence. It SHALL revalidate membership/FD/inode/endpoint before connection and preserve exact family/address (`127.0.0.1` vs bracketed `::1`); one family never authorizes the other. Mutation, ambiguity, or absence fails with zero traffic. Explicit target and command modes are mutually exclusive.
@@ -77,7 +75,6 @@ Command discovery SHALL join stable process-start/FD/socket-inode ownership evid
 - **THEN** execution is denied before DNS/network activity and error redacts userinfo
 
 ### Requirement: Separate effect authorization
-
 
 Executable Read candidates SHALL require `--allow-read` and executable Write candidates SHALL require `--allow-write` in explicit mode; flags SHALL be independent and any missing required effect SHALL block all executable candidates with `stopped_policy`/zero traffic. Command mode SHALL infer Read only; Write remains explicit. All-or-nothing SHALL apply across executable Read/Write candidates, not unsupported/incomplete siblings: non-executable operations retain blockers and authorized executable siblings may still yield `completed_with_skips`. Existing config SHALL NOT supply missing CLI gates. Authentication, Publish, Unknown, unsupported, incomplete, and truncated operations SHALL remain non-executable. Spawned scope is not a sandbox; inference SHALL apply only to revalidated exact loopback listener of current command replay.
 
@@ -122,7 +119,6 @@ Executable Read candidates SHALL require `--allow-read` and executable Write can
 - **THEN** execution remains denied and config does not supply missing authorization
 
 ### Requirement: Origin mapping and request preservation
-
 
 Replay SHALL replace recorded origin with the authorized explicit target or exact inferred command-mode listener while preserving supported origin-form path/query bytes, method, safe ordered headers, and exact body. It SHALL never access fixture/WAL/eBPF data or contact recorded production destination during execution.
 
@@ -326,11 +322,10 @@ Every planned operation SHALL have exactly one result with operation ID, executa
 
 #### Scenario: Continued execution mode absent
 
-- **WHEN** one operation fails in P1
+- **WHEN** one operation fails during a recording
 - **THEN** Chronicle stops sequential execution and marks all later operations unattempted; it does not claim failure continuation support
 
 ### Requirement: Session replayability classification
-
 
 Inspect/planner SHALL classify `fully_replayable` when every operation is executable, `partially_replayable` when executable and non-executable operations coexist, and `not_replayable` when none is executable or integrity/capability invalidates session. Classification does not authorize traffic: explicit mode still requires explicit target/allow-host/effects/execute; command mode requires the inferred execution/target/host/read gates plus explicit Write.
 
@@ -345,7 +340,6 @@ Inspect/planner SHALL classify `fully_replayable` when every operation is execut
 - **THEN** inspect/planner reports not replayable and command mode does not spawn a target
 
 ### Requirement: Replay authorization remains loopback-only
-
 
 Replay SHALL preserve explicit loopback target, exact repeated allow-host, independent effect authorization, dry-run default, and execute gate in explicit mode. Command mode infers only execution intent, exact revalidated scope-listener target/host, and Read; Write remains explicit and Authentication/Publish/Unknown denied. Predictable target-independent denial occurs before spawn. Spawned targets use dropped invoking-user credentials and bounded cleanup on every normal path; abrupt supervisor kill is reported as an orphan risk, not guaranteed cleanup. Pre-existing `--target` workloads are never terminated. Runtime Authorization replacement SHALL come only from configured environment-variable name and SHALL never expose its value. Captured Host, Authorization, Cookie, forwarding, hop-by-hop, Connection-token, and Transfer-Encoding headers SHALL NOT affect target/policy; replay SHALL rebuild target Host/Content-Length. It SHALL use one request per connection and SHALL never default to recorded destination, follow redirects, perform DNS target expansion, retry, proxy, TLS, or authorize incomplete/ambiguous operations. The existing planner, executor, and verification SHALL remain the sole execution model; no duplicate execution path SHALL be introduced.
 
@@ -381,7 +375,7 @@ Replay SHALL preserve explicit loopback target, exact repeated allow-host, indep
 
 ### Requirement: Deterministic verification policy
 
-HTTP verification SHALL retain existing exact status, exact body size/SHA-256, and ordered header comparison excluding fixed documented ignore set. P1 SHALL not add heuristic, secret-bearing, or user-defined comparison. Missing expected response, transport failure, and incomplete expected operation SHALL map to specified result/outcome rather than silent pass.
+HTTP verification SHALL retain existing exact status, exact body size/SHA-256, and ordered header comparison excluding fixed documented ignore set. Verification SHALL not add heuristic, secret-bearing, or user-defined comparison. Missing expected response, transport failure, and incomplete expected operation SHALL map to specified result/outcome rather than silent pass.
 
 #### Scenario: Exact verification pass
 

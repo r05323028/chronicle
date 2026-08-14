@@ -99,8 +99,8 @@ transfer_source() {
 run_remote() {
 	local profile=$1 artifact_root=$2 extra=$3
 	local scenarios=${CHRONICLE_ACCEPTANCE_SCENARIOS:-}
-	if [[ "$profile" == p1 ]]; then
-		scenarios=${CHRONICLE_ACCEPTANCE_P1_SCENARIOS:-$scenarios}
+	if [[ "$profile" == live-capture ]]; then
+		scenarios=${CHRONICLE_ACCEPTANCE_LIVE_CAPTURE_SCENARIOS:-$scenarios}
 	fi
 	MULTIPASS_TIMEOUT=$MULTIPASS_REMOTE_TIMEOUT multipass exec "$VM" -- bash -lc "
 		set +e
@@ -180,9 +180,9 @@ bootstrap_vm
 multipass exec "$VM" -- sudo mkdir -p "$(dirname "$VM_SOURCE_ROOT")" "$(dirname "$VM_RUN_ROOT")"
 transfer_source
 
-if [[ "$PROFILE" == p1 ]]; then
+if [[ "$PROFILE" == live-capture ]]; then
 	set +e
-	run_remote p1 "$VM_ARTIFACTS" ""
+	run_remote live-capture "$VM_ARTIFACTS" ""
 	REMOTE_STATUS=$?
 	set -e
 	transfer_artifacts || true
@@ -203,11 +203,11 @@ except (OSError, json.JSONDecodeError):
 path.write_text(json.dumps([{"name": "run", "status": status}], indent=2) + "\n", encoding="utf-8")
 PY
 else
-	PRE_ROOT="$VM_ARTIFACTS/p2/pre-reboot"
-	POST_ROOT="$VM_ARTIFACTS/p2/post-reboot"
+	PRE_ROOT="$VM_ARTIFACTS/recorder/pre-reboot"
+	POST_ROOT="$VM_ARTIFACTS/recorder/post-reboot"
 	DOMAIN_ROOT="$VM_RUN_ROOT/domain"
 	set +e
-	run_remote p2 "$PRE_ROOT" "CHRONICLE_ACCEPTANCE_PRE_REBOOT=1 CHRONICLE_ACCEPTANCE_DOMAIN_ROOT='$DOMAIN_ROOT' CHRONICLE_ACCEPTANCE_STATE_ROOT='$DOMAIN_ROOT/state' CHRONICLE_ACCEPTANCE_STORE_ROOT='$DOMAIN_ROOT/store'"
+	run_remote recorder "$PRE_ROOT" "CHRONICLE_ACCEPTANCE_PRE_REBOOT=1 CHRONICLE_ACCEPTANCE_DOMAIN_ROOT='$DOMAIN_ROOT' CHRONICLE_ACCEPTANCE_STATE_ROOT='$DOMAIN_ROOT/state' CHRONICLE_ACCEPTANCE_STORE_ROOT='$DOMAIN_ROOT/store'"
 	PRE_STATUS=$?
 	set -e
 	if [[ "$PRE_STATUS" -ne 0 && "$PRE_STATUS" -ne 77 ]]; then
@@ -234,16 +234,16 @@ Path(sys.argv[1]).write_text(json.dumps({
 PY
 		transfer_source
 		set +e
-		run_remote p2 "$POST_ROOT" "CHRONICLE_ACCEPTANCE_REBOOT_RESUME=1 CHRONICLE_ACCEPTANCE_CRASH_MODE=1 CHRONICLE_ACCEPTANCE_DOMAIN_ROOT='$DOMAIN_ROOT' CHRONICLE_ACCEPTANCE_STATE_ROOT='$DOMAIN_ROOT/state' CHRONICLE_ACCEPTANCE_STORE_ROOT='$DOMAIN_ROOT/store'"
+		run_remote recorder "$POST_ROOT" "CHRONICLE_ACCEPTANCE_REBOOT_RESUME=1 CHRONICLE_ACCEPTANCE_CRASH_MODE=1 CHRONICLE_ACCEPTANCE_DOMAIN_ROOT='$DOMAIN_ROOT' CHRONICLE_ACCEPTANCE_STATE_ROOT='$DOMAIN_ROOT/state' CHRONICLE_ACCEPTANCE_STORE_ROOT='$DOMAIN_ROOT/store'"
 		POST_STATUS=$?
 		set -e
 		REMOTE_STATUS=$POST_STATUS
 	fi
 	transfer_artifacts || true
-	if [[ -f "$DEST/assertions/p2/post-reboot/acceptance-report.json" ]]; then
-		cp "$DEST/assertions/p2/post-reboot/acceptance-report.json" "$DEST/acceptance-report.json"
+	if [[ -f "$DEST/assertions/recorder/post-reboot/acceptance-report.json" ]]; then
+		cp "$DEST/assertions/recorder/post-reboot/acceptance-report.json" "$DEST/acceptance-report.json"
 	fi
-	python3 - "$DEST/phases.json" "$DEST/assertions/p2/pre-reboot/acceptance-report.json" "$DEST/assertions/p2/post-reboot/acceptance-report.json" <<'PY'
+	python3 - "$DEST/phases.json" "$DEST/assertions/recorder/pre-reboot/acceptance-report.json" "$DEST/assertions/recorder/post-reboot/acceptance-report.json" <<'PY'
 import json
 import sys
 from pathlib import Path
