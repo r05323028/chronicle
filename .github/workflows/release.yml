@@ -103,13 +103,16 @@ jobs:
             grep -E 'record|replay|list|inspect|doctor' >/dev/null
           python3 - <<'PY'
           import json, subprocess, sys
-          report = json.loads(
-              subprocess.check_output(
-                  ["./target/release/chronicle", "--format", "json",
-                   "doctor"],
-                  text=True,
-              )
+          proc = subprocess.run(
+              ["./target/release/chronicle", "--format", "json",
+               "doctor"],
+              capture_output=True,
+              text=True,
           )
+          # doctor's exit code reflects the runner's kernel/privilege
+          # environment (BTF, cgroup v2, CAP_BPF), not artifact health.
+          # The embedded capture object probes below are the artifact gate.
+          report = json.loads(proc.stdout)
           probes = {p["code"]: p["status"] for p in report["probes"]}
           for code in ("capture.object", "capture.programs"):
               status = probes.get(code)
@@ -118,7 +121,10 @@ jobs:
                       f"release artifact missing embedded eBPF object: "
                       f"{code}={status}"
                   )
-          print("release binary: version, help, eBPF object validated")
+          print(
+              "release binary: version, help, eBPF object validated "
+              f"(doctor exit {proc.returncode})"
+          )
           PY
 
       - name: Package archive

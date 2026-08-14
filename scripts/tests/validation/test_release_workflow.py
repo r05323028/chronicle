@@ -243,6 +243,18 @@ class DryRunModeTests(unittest.TestCase):
         self.assertIn("cargo build -p chronicle-cli --release", release_run)
         self.assertIn("linux-ebpf", release_run)
 
+    def test_binary_validation_tolerates_doctor_environment_exit(self):
+        # doctor exits nonzero when the runner lacks kernel/privilege
+        # prerequisites (BTF, cgroup v2, CAP_BPF). The release step must
+        # parse the JSON report instead of dying on check_output so the
+        # embedded-capture-object probes can gate the artifact.
+        shape = WorkflowShape(workflow_text())
+        validate_run = shape.jobs["release"]["run_text"]
+        self.assertIn("subprocess.run(", validate_run)
+        self.assertNotIn("check_output", validate_run)
+        self.assertIn("capture.object", validate_run)
+        self.assertIn("capture.programs", validate_run)
+
 
 class GhContextTests(unittest.TestCase):
     def test_every_gh_job_has_explicit_auth_and_repo(self):
