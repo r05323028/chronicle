@@ -226,7 +226,7 @@ class CatalogSemanticsTests(unittest.TestCase):
     def test_real_catalog_and_scenarios_valid(self):
         value = validation.catalog_check(ROOT)
         self.assertEqual(value["issues"], [])
-        self.assertEqual(value["scenarios"], 13)
+        self.assertEqual(value["scenarios"], 14)
         self.assertGreater(value["p2_required"], value["p1_required"])
 
     def test_planned_required_is_reported_not_silent(self):

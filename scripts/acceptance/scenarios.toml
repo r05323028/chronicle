@@ -11,6 +11,7 @@ scenarios = [
   "replay",
   "user-intent-lifecycle",
   "cli-compatibility",
+  "documented-quickstart",
   "resource-cleanup",
 ]
 execution_order = [
@@ -19,6 +20,7 @@ execution_order = [
   "replay",
   "user-intent-lifecycle",
   "cli-compatibility",
+  "documented-quickstart",
   "resource-cleanup",
 ]
 
@@ -37,6 +39,7 @@ scenarios = [
   "reboot-recovery",
   "user-intent-lifecycle",
   "cli-compatibility",
+  "documented-quickstart",
 ]
 execution_order = [
   "capture-basic",
@@ -51,6 +54,7 @@ execution_order = [
   "retention-interruption",
   "user-intent-lifecycle",
   "cli-compatibility",
+  "documented-quickstart",
   "resource-cleanup",
 ]
 
@@ -65,7 +69,8 @@ legacy_p2_checks = ["systemd_type_simple", "three_epochs"]
 timeout_seconds = 300
 capabilities = ["privileged", "wal"]
 phases = ["capture", "recovery"]
-legacy_p1_checks = [] # portable WAL/ingest matrices are separate gate prerequisites (8.1)
+legacy_p1_checks = [
+] # portable WAL/ingest matrices are separate gate prerequisites (8.1)
 legacy_p2_checks = [
   "checkpoint_output_committed_checkpoint_missing",
   "checkpoint_committed_status_missing",
@@ -75,7 +80,8 @@ legacy_p2_checks = [
 timeout_seconds = 300
 capabilities = ["privileged", "replay"]
 phases = ["replay"]
-legacy_p1_checks = [] # portable replay matrix is a separate gate prerequisite (8.1)
+legacy_p1_checks = [
+] # portable replay matrix is a separate gate prerequisite (8.1)
 legacy_p2_checks = ["inspect_replay", "one_shot_equivalence"]
 
 [scenarios.user-intent-lifecycle]
@@ -90,11 +96,18 @@ capabilities = ["privileged", "ebpf", "compatibility"]
 phases = ["cli_compatibility"]
 legacy_p1_checks = ["cli_compatibility"]
 
+[scenarios.documented-quickstart]
+timeout_seconds = 600
+capabilities = ["privileged", "ebpf", "cgroup-v2", "replay"]
+phases = ["doctor", "record", "list", "inspect", "replay"]
+
 [scenarios.resource-cleanup]
 timeout_seconds = 900
 capabilities = ["privileged", "cleanup"]
 phases = ["cleanup"]
-legacy_p1_checks = ["privileged_signal"] # portable cgroup/fmt/workspace are separate gate prerequisites (8.1)
+legacy_p1_checks = [
+  "privileged_signal",
+] # portable cgroup/fmt/workspace are separate gate prerequisites (8.1)
 legacy_p2_checks = ["resource_cleanup", "signal_shutdown"]
 
 [scenarios.recorder-readiness]

@@ -60,6 +60,8 @@ tests = [
   "tooling:privileged-preflight",
   "acceptance:user-intent-lifecycle-privileged",
   "acceptance:cli-compat-privileged-sample",
+  "smoke:documented-commands",
+  "acceptance:documented-quickstart-privileged",
 ]
 
 [required.p2]
@@ -110,6 +112,8 @@ tests = [
   "tooling:privileged-preflight",
   "acceptance:user-intent-lifecycle-privileged",
   "acceptance:cli-compat-privileged-sample",
+  "smoke:documented-commands",
+  "acceptance:documented-quickstart-privileged",
 ]
 
 [required.release]
@@ -159,6 +163,8 @@ tests = [
   "tooling:privileged-preflight",
   "acceptance:user-intent-lifecycle-privileged",
   "acceptance:cli-compat-privileged-sample",
+  "smoke:documented-commands",
+  "acceptance:documented-quickstart-privileged",
 ]
 
 # ---------------------------------------------------------------------------
@@ -422,7 +428,7 @@ id = "smoke:list-empty"
 layer = "smoke"
 environment = "portable"
 owner = "chronicle-cli"
-command = "tests/smoke suite: list on empty data-dir; the binary exposes no --version flag, --help is the liveness probe"
+command = "tests/smoke suite: list on empty data-dir; --version reports the workspace version"
 status = "existing"
 gates = ["p1", "p2", "release"]
 
@@ -459,6 +465,24 @@ layer = "smoke"
 environment = "portable"
 owner = "chronicle-application"
 command = "tests/smoke suite: public record fails fast on unsupported build before touching target"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "smoke:documented-commands"
+layer = "smoke"
+environment = "portable"
+owner = "chronicle-cli"
+command = "tests/smoke/test_documented_commands.py: --version, --help surface, doctor contract, public record preflight, empty list, README relative links"
+status = "existing"
+gates = ["p1", "p2", "release"]
+
+[[test]]
+id = "acceptance:documented-quickstart-privileged"
+layer = "acceptance"
+environment = "privileged"
+owner = "chronicle-application"
+command = "privileged acceptance scenario documented-quickstart (documented quick start forms doctor/record/list/inspect/replay on a release-built linux-ebpf binary)"
 status = "existing"
 gates = ["p1", "p2", "release"]
 
@@ -645,6 +669,11 @@ corruption-quarantine = [
 reboot-recovery = [
   "acceptance:reboot-recovery",
   "e2e:privileged-capture-pipeline",
+]
+documented-quickstart = [
+  "smoke:documented-commands",
+  "acceptance:record-basic",
+  "acceptance:documented-quickstart-privileged",
 ]
 
 # ---------------------------------------------------------------------------

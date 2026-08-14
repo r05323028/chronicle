@@ -31,6 +31,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(
     name = "chronicle",
+    version,
     about = "Record, inspect, and safely replay local application behavior",
     long_about = "Record production-like HTTP behavior as portable regression tests.\n\nQuick start:\n  chronicle record -- COMMAND...\n  chronicle list\n  chronicle inspect latest\n  chronicle replay latest -- COMMAND..."
 )]

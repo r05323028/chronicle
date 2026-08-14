@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish chronicle-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install eBPF build toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal \
+            --component rust-src
+          cargo +nightly install bpf-linker --locked
+
+      - name: Compile eBPF capture from source
+        run: |
+          cargo +nightly build -Z build-std=core \
+            --manifest-path ebpf/Cargo.toml \
+            --target bpfel-unknown-none --release --locked
+
+      - name: Build chronicle release binary with linux-ebpf
+        run: >-
+          cargo build -p chronicle-cli --release
+          --features linux-ebpf --locked
+
+      - name: Validate release binary
+        run: |
+          set -euo pipefail
+          ./target/release/chronicle --version
+          ./target/release/chronicle --help |
+            grep -E 'record|replay|list|inspect|doctor' >/dev/null
+          python3 - <<'PY'
+          import json, subprocess, sys
+          report = json.loads(
+              subprocess.check_output(
+                  ["./target/release/chronicle", "--format", "json",
+                   "doctor"],
+                  text=True,
+              )
+          )
+          probes = {p["code"]: p["status"] for p in report["probes"]}
+          for code in ("capture.object", "capture.programs"):
+              status = probes.get(code)
+              if status != "supported":
+                  sys.exit(
+                      f"release artifact missing embedded eBPF object: "
+                      f"{code}={status}"
+                  )
+          print("release binary: version, help, eBPF object validated")
+          PY
+
+      - name: Package archive and checksums
+        run: |
+          set -euo pipefail
+          VERSION=$(
+            grep -m1 '^version' Cargo.toml |
+            sed -E 's/version *= *"([^"]+)".*/\1/'
+          )
+          mkdir -p dist
+          cp target/release/chronicle dist/chronicle
+          cp LICENSE dist/LICENSE
+          cp README.md dist/README.md
+          tar -C dist -czf \
+            "dist/chronicle-${VERSION}-${TARGET}.tar.gz" \
+            chronicle LICENSE README.md
+          rm dist/chronicle dist/LICENSE dist/README.md
+          (cd dist && sha256sum chronicle-*.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+          sha256sum -c dist/SHA256SUMS
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Publish GitHub Release
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/chronicle-*.tar.gz dist/SHA256SUMS --generate-notes

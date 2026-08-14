@@ -46,6 +46,7 @@ jobs:
       - name: Portable smoke and rootless coverage
         run: |
           python3 tests/smoke/test_smoke.py
+          python3 tests/smoke/test_documented_commands.py
           python3 tests/acceptance/test_record.py
           python3 tests/acceptance/test_inspect.py
           python3 tests/acceptance/test_replay.py
@@ -73,6 +74,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          # Full history so the tracked-object freshness check can compare
+          # the last commit touching ebpf/ source with the object's commit.
+          fetch-depth: 0
 
       - name: Install eBPF build toolchain
         run: |
@@ -87,3 +92,30 @@ jobs:
             --target bpfel-unknown-none --release --locked
           echo "Compile success is unprivileged only;"
           echo "privileged runtime hook behavior is not checked."
+
+      - name: Assert tracked fallback eBPF object is current
+        run: |
+          set -euo pipefail
+          tracked=crates/chronicle-capture-ebpf/objects/chronicle-ebpf-capture-bpfel.o
+          tracked_last=$(git log -1 --format=%H -- "$tracked")
+          src_last=$(
+            git log -1 --format=%H -- ebpf/src ebpf/Cargo.toml \
+              ebpf/rust-toolchain.toml ebpf/.cargo
+          )
+          if [[ -z "$src_last" ]] ||
+            git merge-base --is-ancestor "$src_last" "$tracked_last"; then
+            echo "Tracked fallback eBPF object is current with ebpf/ source"
+          else
+            echo "Tracked fallback eBPF object drifts from ebpf/ source."
+            echo "Regenerate it from the current source and commit together:"
+            echo "  cargo +nightly build -Z build-std=core \\"
+            echo "    --manifest-path ebpf/Cargo.toml \\"
+            echo "    --target bpfel-unknown-none --release --locked"
+            echo "  cp ebpf/target/bpfel-unknown-none/release/ \\"
+            echo "    chronicle-ebpf-capture \\"
+            echo "    crates/chronicle-capture-ebpf/objects/ \\"
+            echo "    chronicle-ebpf-capture-bpfel.o"
+            echo "Byte comparison is not used: the embedded object carries"
+            echo "absolute build paths and nightly codegen varies by toolchain."
+            exit 1
+          fi

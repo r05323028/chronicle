@@ -62,7 +62,7 @@ def changed_paths(root: Path, changed_since: str | None) -> list[str]:
 
 
 def matches(path: str, pattern: str) -> bool:
-    path = path.lstrip("./")
+    path = path.removeprefix("./")
     return fnmatch.fnmatchcase(path, pattern) or Path(path).match(pattern)
 
 

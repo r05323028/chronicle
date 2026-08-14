@@ -308,7 +308,10 @@ PY
 			run_shell checkpoint-focused 'cargo test -p chronicle-application --locked checkpoint'
 			;;
 		replay) run_shell replay-focused 'cargo test -p chronicle-replay --locked' ;;
-		cli_docs) run_shell openspec-targeted 'openspec validate --all --strict --no-interactive' ;;
+		cli_docs)
+			run_shell openspec-targeted 'openspec validate --all --strict --no-interactive'
+			run_shell doc-commands 'python3 tests/smoke/test_documented_commands.py'
+			;;
 		acceptance | build_tooling)
 			if [[ $ran_p1 == false ]]; then
 				run_gate p1
