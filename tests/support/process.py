@@ -217,8 +217,8 @@ def require_rootless_record_failure(binary: Path, root: Path, marker: Path) -> N
         raise CommandError(
             f"record failure stderr must be JSON: {result.stderr!r:.300}"
         ) from exc
-    if payload.get("code") != 4:
-        raise CommandError(f"record failure JSON code must be 4: {payload}")
+    if payload.get("code") != expected:
+        raise CommandError(f"record failure JSON code must be {expected}: {payload}")
     if marker.exists():
         raise CommandError("record must fail before touching the target")
 

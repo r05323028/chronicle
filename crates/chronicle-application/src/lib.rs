@@ -212,7 +212,7 @@ use chronicle_wal::{
     TERMINAL_WAL_LOSS_SCHEMA_VERSION, TerminalWalLoss, TerminalWalLossAmbiguity,
     TerminalWalLossInterval, TerminalWalLossReason, WalCheckpoint, WalError, WalRecordEnvelope,
     cleanup_finalized_segment_verified, encode_envelope, encode_terminal_wal_loss,
-    prepare_group_commit_reopen_from_scan, scan_wal, verified_snapshot_sha256,
+    prepare_group_commit_reopen_from_scan, verified_snapshot_sha256,
 };
 #[cfg(target_os = "linux")]
 use chronicle_wal::{prepare_group_commit_reopen, recover_cleanup};

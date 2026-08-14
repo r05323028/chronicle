@@ -582,10 +582,14 @@ pub fn production_wal_from_fixture(
         .flush(1)
         .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?
         .ok_or_else(|| ApplicationError::InvalidConfig("fixture WAL flush failed".into()))?;
+    // The committed writer authority is the recovery-authoritative boundary a
+    // fresh scan would find. Re-acquiring the recording lock after dropping
+    // the writer races with flock ownership on Linux (a second open of the
+    // same file in this process conflicts while any other fd on the inode is
+    // still alive, which concurrent test subprocesses can transiently
+    // provide), so reuse the writer's own validated authority instead.
+    let authority = writer.authority().clone();
     drop(writer);
-    let scan = scan_wal(directory, recording_id, DEFAULT_MAX_RECORD_BYTES)
-        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-    let authority = scan.authority;
     write_recording_metadata(
         directory,
         &RecordingMetadata {
