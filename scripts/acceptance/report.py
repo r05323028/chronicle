@@ -368,6 +368,7 @@ def make_report(
     guest_source: dict[str, Any] | None = None,
     guest_source_ok: bool = True,
     timeouts: list[dict[str, Any]] | None = None,
+    preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     timeouts = [] if timeouts is None else timeouts
     status = (
@@ -418,6 +419,7 @@ def make_report(
         "status": status,
         "exit_code": return_code,
         "timeouts": timeouts,
+        "preflight": preflight,
         "legacy_report": legacy,
         # Task 9.4: classified functional layers + environment qualification
         # for executed/reused coverage. Reports identify which layers and

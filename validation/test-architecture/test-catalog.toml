@@ -495,7 +495,7 @@ layer = "acceptance"
 environment = "privileged"
 owner = "chronicle-application"
 command = "privileged acceptance scenario recorder-readiness (real systemd)"
-status = "planned"
+status = "existing"
 gates = ["p2", "release"]
 
 [[test]]
@@ -504,7 +504,7 @@ layer = "acceptance"
 environment = "privileged"
 owner = "chronicle-etl"
 command = "privileged acceptance scenario checkpoint-kill-restart (real process interruption)"
-status = "planned"
+status = "existing"
 gates = ["p2", "release"]
 
 [[test]]
@@ -513,7 +513,7 @@ layer = "acceptance"
 environment = "privileged"
 owner = "chronicle-application"
 command = "privileged acceptance scenario quota-pressure (real loop/mount/systemd)"
-status = "planned"
+status = "existing"
 gates = ["p2", "release"]
 
 [[test]]
@@ -522,7 +522,7 @@ layer = "acceptance"
 environment = "privileged"
 owner = "chronicle-wal"
 command = "privileged acceptance scenario retention-interruption (real systemd cleanup interruption)"
-status = "planned"
+status = "existing"
 gates = ["p2", "release"]
 
 [[test]]
@@ -531,7 +531,7 @@ layer = "acceptance"
 environment = "privileged"
 owner = "chronicle-application"
 command = "privileged acceptance scenario reboot-recovery (real VM reboot)"
-status = "planned"
+status = "existing"
 gates = ["p2", "release"]
 
 [[test]]
@@ -558,7 +558,7 @@ layer = "acceptance"
 environment = "privileged"
 owner = "chronicle-application"
 command = "privileged acceptance scenario user-intent-lifecycle (real cgroup selection + eBPF cleanup + process attribution)"
-status = "planned"
+status = "existing"
 gates = ["p1", "p2", "release"]
 
 [[test]]
@@ -567,7 +567,7 @@ layer = "acceptance"
 environment = "privileged"
 owner = "chronicle-cli"
 command = "privileged acceptance sample: real capture output consumed by cli-compatibility forms"
-status = "planned"
+status = "existing"
 gates = ["p1", "p2", "release"]
 
 # ---------------------------------------------------------------------------

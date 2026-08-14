@@ -39,7 +39,7 @@ prerequisites) instead of re-running whole crate suites per scenario.
 - Every baseline embedded command has a ledger entry: covered (14/14); the
   blind-spot audit below accounts for every current-tree cargo invocation.
 - Required gate selectors reference classified tests: catalog_check issues = 0
-  (47 tests, 8 planned privileged; 40 p1 / 45 p2 / 45 release required, all
+  (45 tests, 0 planned privileged; 40 p1 / 45 p2 / 45 release required, all
   defined).
 - Portable checks now run outside the privileged executor: validate.sh gate
   selects portable prerequisites first (gate-fmt, gate-clippy,
@@ -88,5 +88,5 @@ already dispositioned under its baseline ledger entry:
 | p2 resource-cleanup.sh:20 (workspace) | cargo check --workspace (move) |
 
 Ledger entries stay baseline-scoped (14/14, uncovered = 0); the duplicate
-occurrences are removed by the scenario-body reduction in task 8.x (blocked
-on the concurrent change).
+occurrences are removed by the scenario-body reduction in task 8.x (14 -> 4
+embedded commands, landed with this change).

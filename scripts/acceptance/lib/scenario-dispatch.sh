@@ -10,6 +10,31 @@ SCENARIO_TIMEOUT_SECONDS=""
 SCENARIO_TIMED_OUT=0
 SCENARIO_STATE_FILE=""
 
+# Privileged environment classification before any scenario assertion runs
+# (tasks 7.2/7.3 wiring). Writes preflight.json into the evidence artifacts;
+# on an unsupported/infrastructure environment the profile exits 77
+# (not_checked) so the run never masquerades as a product failure. The
+# runner records the preflight outcome in the acceptance evidence.
+run_preflight() {
+	local tests=$1 outcome
+	if [[ ! -f "$ROOT/scripts/privileged/preflight.py" ]]; then
+		return 0
+	fi
+	python3 "$ROOT/scripts/privileged/preflight.py" --tests "$tests" \
+		>"$ARTIFACT_ROOT/preflight.json" 2>>"$ARTIFACT_ROOT/preflight.err" || true
+	outcome=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("outcome",""))' \
+		"$ARTIFACT_ROOT/preflight.json" 2>/dev/null || printf '%s' '')
+	case "$outcome" in
+		supported) return 0 ;;
+		unsupported_environment | not_checked | infrastructure_error)
+			log "PREFLIGHT: $outcome - privileged scenarios not run (see preflight.json)" >&2
+			return 1 ;;
+		*)
+			log "PREFLIGHT: unreadable or unknown outcome - treating as not_checked" >&2
+			return 1 ;;
+	esac
+}
+
 write_scenario_state() {
 	local action=$1 profile=$2 scenario=${3:-}
 	shift 3 || true
@@ -292,6 +317,9 @@ run_scenario_plan() {
 	unique_count=$(printf '%s\n' "${selected[@]}" | sort -u | wc -l | tr -d ' ')
 	[[ "$unique_count" == "${#selected[@]}" ]] || die "scenario selection is duplicated for $profile"
 	SCENARIO_STATE_FILE="${ARTIFACT_ROOT:-${TMPDIR:-/tmp}}/scenario-state.json"
+	if ! run_preflight "${selected[*]}"; then
+		exit 77
+	fi
 	write_scenario_state init "$profile" "" "${selected[@]}"
 	source_scenarios "$profile" "${selected[@]}"
 	for scenario in "${selected[@]}"; do

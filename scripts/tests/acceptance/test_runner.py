@@ -726,6 +726,49 @@ class AcceptanceRunnerTests(unittest.TestCase):
         )
         self.assertFalse(value["reuse"]["requested"])
 
+    def test_report_records_preflight_outcome(self):
+        selected = report.profile_scenarios(self.definition, "p1")
+        preflight = {
+            "schema_version": 1,
+            "outcome": "supported",
+            "exit_code": 0,
+            "selected_tests": selected,
+        }
+        value = report.make_report(
+            run_id="preflight-a",
+            profile="p1",
+            executor="local",
+            selected=selected,
+            completed=selected,
+            failed=[],
+            skipped=[],
+            not_checked=[],
+            phases=[{"name": "run", "status": "passed"}],
+            source=self.source,
+            environment_value=self.environment,
+            return_code=0,
+            source_stable=True,
+            preflight=preflight,
+        )
+        self.assertEqual(value["preflight"]["outcome"], "supported")
+        value = report.make_report(
+            run_id="preflight-unsupported",
+            profile="p1",
+            executor="local",
+            selected=selected,
+            completed=[],
+            failed=[],
+            skipped=[],
+            not_checked=selected,
+            phases=[{"name": "run", "status": "not_checked"}],
+            source=self.source,
+            environment_value=self.environment,
+            return_code=77,
+            preflight={"schema_version": 1, "outcome": "unsupported_environment"},
+        )
+        self.assertEqual(value["status"], "not_checked")
+        self.assertEqual(value["preflight"]["outcome"], "unsupported_environment")
+
     def _write_evidence(
         self, profile, selected, completed, environment=None, source=None
     ):

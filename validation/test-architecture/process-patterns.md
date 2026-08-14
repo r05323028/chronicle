@@ -35,7 +35,7 @@ readiness handoff, signal, deterministic reap on pass/fail/timeout.
 
 ### WorkloadServer lifecycle
 
-Consumers: `http_test_server.rs` (Rust loopback), `http_acceptance_driver.py`
+Consumers: `http_test_server.rs` (Rust loopback), `tests/support/http_driver.py`
 (Python serve), acceptance scenarios (upstream/replay targets). Justified
 (3 surfaces). Responsibility: bind ephemeral port, readiness via port-file or
 condition, terminate deterministically.

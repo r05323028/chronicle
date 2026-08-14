@@ -105,11 +105,14 @@ covers each state, precedence (unsupported > not_checked), remediation
 presence, selected-tests recording, and no-product-vocabulary contract.
 Catalog `tooling:privileged-preflight`.
 
-**Deferred (concurrent change owns the files):** VM ensure/start/readiness,
-bootstrap, transfer, reboot handoff (multipass.sh/profile scripts) and
-runner/report wiring of preflight outcomes into evidence
-(scripts/acceptance/runner.py, report.py). Tasks 7.2/7.3 stay open until
-those land; preflight contract itself is complete and rootless-tested.
+**Wired (this change, tasks 7.2/7.3 closed):** VM ensure/start/readiness,
+bootstrap, transfer, reboot handoff live in multipass.sh/profile scripts;
+preflight outcomes are now wired into evidence: scenario-dispatch.sh runs
+preflight.py before any scenario (writes preflight.json; unsupported/
+infrastructure environments exit 77 = not_checked, never product failure),
+and runner.py/report.py record the preflight result in the acceptance
+report (task 7.3 distinguishability). Rootless runner tests cover the
+report field; profile tests cover the exit path.
 
 ## Review verification (3.6/3.5/7.2-7.3)
 

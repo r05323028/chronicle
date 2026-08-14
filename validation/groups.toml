@@ -79,7 +79,6 @@ paths = [
   "scripts/run-with-timeout.sh",
   "scripts/tests/test-run-with-timeout.sh",
   "scripts/tests/acceptance/**",
-  "tests/e2e/http_acceptance_driver.py",
 ]
 commands = ["acceptance"]
 gates = ["p1", "p2"]

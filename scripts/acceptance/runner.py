@@ -495,6 +495,15 @@ def run_profile(
         if legacy_status == "failed":
             status = "failed"
     timeouts = report.timeout_records(runtime_root)
+    preflight_result = None
+    preflight_path = assertions_root / "preflight.json"
+    if preflight_path.is_file():
+        try:
+            preflight_value = json.loads(preflight_path.read_text(encoding="utf-8"))
+            if isinstance(preflight_value, dict):
+                preflight_result = preflight_value
+        except (OSError, json.JSONDecodeError):
+            preflight_result = {"error": "invalid preflight.json"}
     if return_code == 77 and not failed:
         status = "not_checked"
     if return_code not in {0, 77} or timeouts or scenario_state_error:
@@ -569,6 +578,7 @@ def run_profile(
         guest_source=guest_source,
         guest_source_ok=guest_source_ok if args.executor == "multipass" else True,
         timeouts=timeouts,
+        preflight=preflight_result,
     )
     # Normalize status from legacy report into the central result.
     final_report["status"] = status
