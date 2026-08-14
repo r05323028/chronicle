@@ -243,8 +243,11 @@ jobs:
       - name: Generate and verify SHA256SUMS
         run: |
           set -euo pipefail
-          (cd prepared-release && sha256sum chronicle-*.tar.gz > SHA256SUMS)
-          sha256sum -c prepared-release/SHA256SUMS
+          (
+            cd prepared-release
+            sha256sum chronicle-*.tar.gz > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
           echo "SHA256SUMS verified"
           cat prepared-release/SHA256SUMS
 

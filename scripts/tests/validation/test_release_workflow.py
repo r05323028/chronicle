@@ -214,10 +214,45 @@ class DryRunModeTests(unittest.TestCase):
         shape = WorkflowShape(workflow_text())
         prep = shape.jobs["prepare-release"]["run_text"]
         self.assertIn("sha256sum chronicle-*.tar.gz > SHA256SUMS", prep)
-        self.assertIn("sha256sum -c prepared-release/SHA256SUMS", prep)
+        # Verification must run inside the bundle directory: the manifest
+        # holds bare filenames, so `sha256sum -c` from the workspace root
+        # cannot find the archives.
+        self.assertIn("cd prepared-release", prep)
+        self.assertIn("sha256sum -c SHA256SUMS", prep)
+        self.assertNotIn("sha256sum -c prepared-release/SHA256SUMS", prep)
         pub = shape.jobs["publish"]["run_text"]
         self.assertNotIn("sha256sum -c", pub)
         self.assertIn("SHA256SUMS", pub)  # publish attaches the manifest
+
+    def test_checksum_generation_and_verification_succeed_in_bundle_dir(self):
+        # Functional replica of the prepare-release checksum step: the
+        # manifest must verify when checked inside the bundle directory.
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "prepared-release"
+            bundle.mkdir()
+            for name in (
+                "chronicle-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
+                "chronicle-0.1.0-aarch64-unknown-linux-gnu.tar.gz",
+            ):
+                (bundle / name).write_bytes(b"archive-content")
+            script = (
+                "set -euo pipefail\n"
+                "(\n"
+                "  cd prepared-release\n"
+                "  sha256sum chronicle-*.tar.gz > SHA256SUMS\n"
+                "  sha256sum -c SHA256SUMS\n"
+                ")\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            manifest = (bundle / "SHA256SUMS").read_text(encoding="utf-8")
+            self.assertIn("x86_64-unknown-linux-gnu.tar.gz", manifest)
+            self.assertIn("aarch64-unknown-linux-gnu.tar.gz", manifest)
 
     def test_prepare_release_asserts_expected_archives(self):
         shape = WorkflowShape(workflow_text())
