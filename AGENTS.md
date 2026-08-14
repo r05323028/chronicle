@@ -28,13 +28,15 @@ If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is 
 <!-- GRAPHIFY_START -->
 ## graphify
 
-This project has a graphify knowledge graph at graphify-out/.
+This project has a generated knowledge graph in `graphify-out/`.
 
 Rules:
 
-- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+- Before answering architecture or codebase questions, read `graphify-out/GRAPH_REPORT.md`, then run `graphify query "<question>"`; use graph results to target source reads and verify exact behavior in current code.
+- Use `graphify path "<source>" "<target>"` for connection chains and `graphify explain "<node>"` for one symbol or concept.
+- Treat root `graphify-out/graph.json` and `graphify-out/GRAPH_REPORT.md` as current canonical outputs. `manifest.json` tracks extraction state, `cost.json` tracks extraction cost, and `cache/` is generated cache. Date-named directories are historical snapshots; use them only for explicit historical comparison.
+- If `graphify-out/wiki/index.md` exists, navigate it before reading raw files.
+- After modifying code files in this session, run `graphify update .` to re-extract changed code and refresh graph outputs (AST-only, no API cost).
 <!-- GRAPHIFY_END -->
 
 ## Bounded Command Execution
