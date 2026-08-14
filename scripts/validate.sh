@@ -311,6 +311,7 @@ PY
 		cli_docs)
 			run_shell openspec-targeted 'openspec validate --all --strict --no-interactive'
 			run_shell doc-commands 'python3 tests/smoke/test_documented_commands.py'
+			run_shell installer-test 'python3 tests/smoke/test_installer.py'
 			;;
 		acceptance | build_tooling)
 			if [[ $ran_p1 == false ]]; then

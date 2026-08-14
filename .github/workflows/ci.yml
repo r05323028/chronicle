@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Cache Cargo dependencies and build output
-        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry
@@ -47,6 +47,7 @@ jobs:
         run: |
           python3 tests/smoke/test_smoke.py
           python3 tests/smoke/test_documented_commands.py
+          python3 tests/smoke/test_installer.py
           python3 tests/acceptance/test_record.py
           python3 tests/acceptance/test_inspect.py
           python3 tests/acceptance/test_replay.py
@@ -81,9 +82,19 @@ jobs:
 
       - name: Install eBPF build toolchain
         run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) bpf_arch=x86_64 ;;
+            aarch64 | arm64) bpf_arch=aarch64 ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
           rustup toolchain install nightly --profile minimal \
             --component rust-src
-          cargo +nightly install bpf-linker --locked
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-${bpf_arch}-unknown-linux-musl.tar.zst"
+          tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
+          sudo mv /tmp/bpf-linker /usr/local/bin/bpf-linker
+          bpf-linker --version
 
       - name: Compile eBPF capture
         run: |

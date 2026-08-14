@@ -38,14 +38,45 @@ Not implemented (planned or out of scope, not silently supported): PostgreSQL/S3
 
 ### Install a released binary (recommended)
 
-Linux binaries are published as GitHub Releases on version tags. Each release provides `chronicle-<version>-<target>.tar.gz` archives for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` together with a `SHA256SUMS` file:
+On a supported Linux host (`x86_64` or `aarch64`), install the latest release with a single command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh | sh
+```
+
+The installer detects the platform, resolves the latest stable release, downloads the matching `chronicle-<version>-<target>.tar.gz` archive, verifies it against the release's `SHA256SUMS`, and installs the `chronicle` binary into `$HOME/.local/bin` (created if missing). If that directory is not on your `PATH`, the installer prints the `export PATH` line to add. It requires only `sh`, `curl`, `tar`, and a SHA-256 utility; no Rust toolchain.
+
+Verify the install:
+
+```bash
+chronicle --version
+chronicle doctor
+```
+
+**Pin a specific release version:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh \
+  | CHRONICLE_VERSION=v0.1.0 sh
+```
+
+**Install to a custom directory:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh \
+  | CHRONICLE_INSTALL_DIR=/some/path sh
+```
+
+Release binaries are built with `--features linux-ebpf`, so live capture works out of the box on a supported Linux host. Prefer releases over building from source unless you are developing Chronicle itself.
+
+### Manual installation (advanced/fallback)
+
+For environments where the installer is not usable, Linux binaries are also published as GitHub Releases on version tags. Each release provides `chronicle-<version>-<target>.tar.gz` archives for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` together with a `SHA256SUMS` file:
 
 1. Download the archive for your platform and its `SHA256SUMS` from the latest GitHub Release.
 2. Verify the archive before extracting: `sha256sum -c SHA256SUMS` (or the equivalent on your system).
 3. Extract and put the `chronicle` binary on your `PATH`.
 4. Sanity-check the install: `chronicle --version` and `chronicle doctor`.
-
-Release binaries are built with `--features linux-ebpf`, so live capture works out of the box on a supported Linux host. Prefer releases over building from source unless you are developing Chronicle itself.
 
 ### Build from source
 

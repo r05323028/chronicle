@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
@@ -26,9 +26,19 @@ jobs:
 
       - name: Install eBPF build toolchain
         run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) bpf_arch=x86_64 ;;
+            aarch64 | arm64) bpf_arch=aarch64 ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
           rustup toolchain install nightly --profile minimal \
             --component rust-src
-          cargo +nightly install bpf-linker --locked
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-${bpf_arch}-unknown-linux-musl.tar.zst"
+          tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
+          sudo mv /tmp/bpf-linker /usr/local/bin/bpf-linker
+          bpf-linker --version
 
       - name: Compile eBPF capture from source
         run: |
@@ -67,7 +77,7 @@ jobs:
           print("release binary: version, help, eBPF object validated")
           PY
 
-      - name: Package archive and checksums
+      - name: Package archive
         run: |
           set -euo pipefail
           VERSION=$(
@@ -82,13 +92,58 @@ jobs:
             "dist/chronicle-${VERSION}-${TARGET}.tar.gz" \
             chronicle LICENSE README.md
           rm dist/chronicle dist/LICENSE dist/README.md
-          (cd dist && sha256sum chronicle-*.tar.gz > SHA256SUMS)
-          cat dist/SHA256SUMS
-          sha256sum -c dist/SHA256SUMS
         env:
           TARGET: ${{ matrix.target }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/chronicle-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Create GitHub Release
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Publish GitHub Release
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          dist/chronicle-*.tar.gz dist/SHA256SUMS --generate-notes
+          dist/chronicle-*.tar.gz --generate-notes
+
+  checksums:
+    name: Compose release checksums
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern 'chronicle-*.tar.gz' \
+            --dir dist
+
+      - name: Compose and verify SHA256SUMS
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum chronicle-*.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+          sha256sum -c dist/SHA256SUMS
+
+      - name: Upload checksums
+        run: >-
+          gh release upload "$GITHUB_REF_NAME"
+          dist/SHA256SUMS --clobber

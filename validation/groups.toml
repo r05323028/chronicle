@@ -61,7 +61,7 @@ commands = ["replay"]
 gates = ["p1"]
 
 [groups.cli_docs]
-description = "CLI, documentation, and OpenSpec checks"
+description = "CLI, documentation, OpenSpec checks, and shell installer"
 paths = [
   "crates/chronicle-cli/**",
   "docs/**",
@@ -69,6 +69,9 @@ paths = [
   "CONTRIBUTING.md",
   "AGENTS.md",
   "openspec/**",
+  "install.sh",
+  "tests/smoke/test_installer.py",
+  "tests/fixtures/installer/**",
 ]
 commands = ["cli_docs"]
 
