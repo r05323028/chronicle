@@ -1,20 +1,25 @@
 # Test architecture (validation/test-architecture/)
 
 Machine-readable and documentary artifacts for the responsibility-based test
-architecture change
-(`openspec/changes/reorganize-test-suite-by-responsibility-and-runtime-boundary`).
+architecture: functional layers, environment dimension, gate selectors, and
+no-coverage-loss obligations.
 
 | Artifact | Purpose |
 | --- | --- |
-| `inventory.py` | Regenerates `baseline.json` from the current checkout (standard library only) |
-| `baseline.json` | Before-state snapshot: Rust tests, root/script tests, acceptance scenarios, embedded commands, CI, groups, evidence fields |
-| `migration-ledger.toml` | Per-test/assertion classification: layer, environment, owner, gates, disposition, destination, rationale, verify |
-| `gate-coverage.toml` | Scenario, legacy-check, and milestone obligations mapped to classified coverage |
 | `test-catalog.toml` | Classified tests + P1/P2/release selectors + scenario/legacy obligations; validated by `scripts/validation.py catalog` |
-| `boundary-review.md` | Shared-helper ownership and dependency-direction review |
-| `decisions.md` | Deliberate per-suite migration decisions |
-| `process-patterns.md` | Lifecycle/process pattern inventory and shared-helper justification |
 | `privileged-preflight-schema.toml` | Versioned preflight contract: outcomes, exit codes, probes, remediation |
+| `path-classification.md` | P1/P2 scenario classification and privileged E2E definition |
+| `decisions.md` | Deliberate, still-applicable test-architecture decisions |
+
+Migration-era artifacts (baseline inventory, migration ledger, gate-coverage
+matrix, boundary review, process-pattern inventory, comparison report) were
+removed once the migration completed; their machine-checkable obligations now
+live in `test-catalog.toml` and are enforced by
+`scripts/validation.py catalog` and
+`scripts/tests/validation/test_test_architecture.py`.
+
+Local privileged-run evidence is retained (gitignored) under
+`validation/test-architecture/evidence/`.
 
 ## Validation
 
@@ -24,8 +29,8 @@ python3 scripts/tests/validation/test_test_architecture.py
 ```
 
 The `validation/test-architecture/**` path is owned by the `build_tooling`
-validation group, so catalog/ledger changes select tooling validation rather
-than privileged gates.
+validation group, so catalog changes select tooling validation rather than
+privileged gates.
 
 ## Rules (exact guidance)
 
@@ -55,19 +60,19 @@ Privileged execution runs bounded preflight first and emits machine-readable out
 
 ### Gate semantics
 
-P1/P2/release are selectors that map required milestone obligations to classified tests (`test-catalog.toml` `required.*` lists). Gates do NOT require tests to live under P1/P2 directories.
+P1/P2/release are selectors that map required milestone obligations to classified tests (`test-catalog.toml` `required.*` lists). P2 remains a superset of P1, and release of P2, per the current evidence contract (enforced by `scripts/validation.py catalog` and `scenarios.toml`). Gates do NOT require tests to live under P1/P2 directories.
 
 ### Helper ownership
 
 Repeated helpers are language-local and crate-local or root-suite-local (`tests/support/`), justified by at least two consumers; one-off support stays local. No new shared workspace crate without demonstrated multi-crate need + architecture/AGENTS/policy updates. Portable Cargo/repository checks and product field assertions stay out of selector/executor tooling.
 
+### Embedded portable commands in privileged orchestration
+
+Privileged scenario bodies may invoke cargo only for genuinely privileged work: building release/eBPF artifacts and executing the `--ignored` privileged test suites (kernel feasibility, signal handling). Deny-by-default — any other embedded cargo invocation fails the guard in `scripts/tests/validation/test_test_architecture.py` until it is added to the documented allowlist with a privileged justification.
+
 ### Crate-boundary constraints
 
 No forbidden workspace dev edges (see `validation/architecture.toml`); Aya/kernel ABI stays private to `chronicle-capture-ebpf`; CLI tests use application-owned test support/fixtures rather than new CLI dev dependencies.
-
-### Migration ledger
-
-Every move/split/delete records one disposition (`stay`, `move`, `split`, `delete_duplicate`, `deterministic_fixture`, `make_rootless`, `remain_privileged`, `shared_lifecycle_migration`) with responsibility reason, replacement test ID/destination, dependency impact, and verification command. Required gate coverage stays mapped throughout.
 
 ## Terminology
 

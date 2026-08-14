@@ -194,5 +194,6 @@ satisfy gate evidence. Validation scripts (`scripts/validate.sh`,
 no product test logic. Repeated helpers are language-local
 (crate-local or `tests/support/`); no new shared workspace crate without
 demonstrated multi-crate need plus architecture/policy updates. Crate-boundary
-constraints and migrations are tracked in `validation/test-architecture/`
-(catalog, ledger, gate coverage, decisions); see its README for exact rules.
+constraints live in `validation/architecture.toml`; test-architecture policy
+(catalog, preflight schema, path classification, decisions) lives in
+`validation/test-architecture/`; see its README for exact rules.

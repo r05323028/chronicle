@@ -11,7 +11,6 @@ shared test support.
 from __future__ import annotations
 
 import importlib.util
-import json
 import re
 import shutil
 import sys
@@ -73,9 +72,9 @@ legacy_p1_checks = ["c1"]
 legacy_p2_checks = ["c1"]
 """
 
-# Mirrors inventory.py embedded-command detection: an optional `if`/`then`, an
-# optional `run_compat_command <name>` prefix, and leading VAR=... assignments are
-# stripped before matching a cargo command, so scanner and baseline agree.
+# Embedded-command detection: an optional `if`/`then`, an optional
+# `run_compat_command <name>` prefix, and leading VAR=... assignments are
+# stripped before matching a cargo command.
 EMBEDDED_CARGO_COMMAND = re.compile(
     r"^(?:(?:if|then)\s+)?(?:run_compat_command\s+\S+\s+)?"
     r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*cargo\b"
@@ -99,16 +98,21 @@ def portable_repo_commands(
     return findings
 
 
-def baseline_embedded_allowlist() -> set[str]:
-    baseline = json.loads(
-        (ROOT / "validation/test-architecture/baseline.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    return {
-        entry["command"]
-        for entry in baseline["acceptance"]["embedded_cargo_repo_commands"]
-    }
+# Privileged scenario orchestration may invoke cargo only for genuinely
+# privileged work: building release/eBPF artifacts and executing the
+# `--ignored` privileged test suites (kernel feasibility, signal handling).
+# Deny-by-default: any other embedded cargo invocation fails the guard below
+# until it is added here with a privileged justification.
+PRIVILEGED_EMBEDDED_CARGO_ALLOWLIST = {
+    "cargo build --release --locked",
+    'CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build --release -p chronicle-cli --features linux-ebpf --locked >>"$ARTIFACT_ROOT/build.log" 2>&1',
+    'CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build -p chronicle-cli --features linux-ebpf --locked',
+    'cargo +nightly build -Z build-std=core --manifest-path "$ROOT/ebpf/Cargo.toml" --target bpfel-unknown-none --release --locked',
+    'cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture >"$ARTIFACT_ROOT/privileged-feasibility.log" 2>&1',
+    'cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture >"$ARTIFACT_ROOT/signal-tests.log" 2>&1',
+    "if run_compat_command signal cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture; then",
+    "run_compat_command wal-feasibility cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture || set_check privileged_feasibility failed",
+}
 
 
 class CatalogSemanticsTests(unittest.TestCase):
@@ -251,63 +255,9 @@ class CatalogSemanticsTests(unittest.TestCase):
         )
 
 
-class LedgerLinkageTests(unittest.TestCase):
-    """Every allowlisted embedded portable command in privileged scenarios must
-    have a migration-ledger entry so it is owned by a migration decision."""
-
-    def test_every_allowlisted_embedded_command_has_ledger_owner(self):
-        import tomllib
-
-        ledger = tomllib.loads(
-            (ROOT / "validation/test-architecture/migration-ledger.toml").read_text(
-                encoding="utf-8"
-            )
-        )
-        ledger_ids = {entry["id"] for entry in ledger["entries"]}
-        baseline = json.loads(
-            (ROOT / "validation/test-architecture/baseline.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        for entry in baseline["acceptance"]["embedded_cargo_repo_commands"]:
-            # Profile-directory prefix only; a reintroduced extensions/ path
-            # must fail loudly instead of normalizing into the allowed set.
-            relative = entry["file"].removeprefix("scripts/acceptance/lib/scenarios/")
-            expected_id = f"embedded:{relative}:{entry['line']}"
-            self.assertIn(
-                expected_id,
-                ledger_ids,
-                f"no ledger entry owns embedded command {entry['file']}:{entry['line']}",
-            )
-
-    def test_ledger_embedded_entries_match_baseline(self):
-        import tomllib
-
-        ledger = tomllib.loads(
-            (ROOT / "validation/test-architecture/migration-ledger.toml").read_text(
-                encoding="utf-8"
-            )
-        )
-        embedded = {
-            entry["id"]
-            for entry in ledger["entries"]
-            if entry["id"].startswith("embedded:")
-        }
-        baseline = json.loads(
-            (ROOT / "validation/test-architecture/baseline.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        expected = {
-            f"embedded:{entry['file'].removeprefix('scripts/acceptance/lib/scenarios/')}:{entry['line']}"
-            for entry in baseline["acceptance"]["embedded_cargo_repo_commands"]
-        }
-        self.assertEqual(embedded, expected)
-
-
 class OrchestrationEmbeddingTests(unittest.TestCase):
-    """Task 2.3: no new portable Cargo/repository commands inside privileged
-    orchestration beyond the documented migration baseline."""
+    """No portable Cargo/repository commands inside privileged orchestration
+    beyond the documented privileged-only allowlist."""
 
     def setUp(self):
         self.temp = Path(tempfile.mkdtemp(prefix="chronicle-orchestration-"))
@@ -315,16 +265,14 @@ class OrchestrationEmbeddingTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp)
 
-    def test_documented_baseline_commands_are_not_flagged(self):
-        allowlist = baseline_embedded_allowlist()
-        self.assertTrue(allowlist)
+    def test_documented_privileged_commands_are_not_flagged(self):
         findings = portable_repo_commands(
-            ROOT / "scripts/acceptance/lib/scenarios", allowlist
+            ROOT / "scripts/acceptance/lib/scenarios",
+            PRIVILEGED_EMBEDDED_CARGO_ALLOWLIST,
         )
         self.assertEqual(findings, [])
 
-    def test_scanner_matches_documented_baseline(self):
-        allowlist = baseline_embedded_allowlist()
+    def test_scanner_matches_privileged_allowlist(self):
         found = set()
         for path in sorted((ROOT / "scripts/acceptance/lib/scenarios").rglob("*.sh")):
             for line in path.read_text(errors="replace").splitlines():
@@ -333,7 +281,7 @@ class OrchestrationEmbeddingTests(unittest.TestCase):
                     continue
                 if EMBEDDED_CARGO_COMMAND.match(stripped):
                     found.add(stripped)
-        self.assertEqual(found, allowlist)
+        self.assertEqual(found, PRIVILEGED_EMBEDDED_CARGO_ALLOWLIST)
 
     def test_new_embedded_portable_command_fails(self):
         scenario = self.temp / "s.sh"
