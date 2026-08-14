@@ -511,3 +511,59 @@ No speculative directory or file creation is required to reach this target; real
 ## Open Questions
 
 None blocking specification. Implementation must decide exact helper language/location and exact gate membership from completed ledger, measured runtime, and current milestone contract; those are constrained choices, not architecture reinterpretation.
+
+## Verification addendum (council review, 2026-08-14)
+
+Independent 4-role review of the final tree (HEAD ad296f6) returned
+APPROVE-WITH-FIXES: core migration real, P2 release evidence genuine and
+fingerprint-exact (clean tree effe94d, Ubuntu 24.04, kernel 6.8, BTF,
+cgroup v2, 13/13 scenarios, release_eligible). Zero reject votes. Verified
+findings and dispositions recorded here; all are records/documentation, none
+required evidence regeneration.
+
+- **report.py formatting drift** — post-commit ruff line-wrap only
+  (AST-identical); reverted so the retained release fingerprint (6317947…)
+  stays valid for the current tree.
+- **production delta in 5684a0f** — crates/chronicle-etl/src/publication.rs
+  +132/−17 (recover_pending_checkpoint strict-successor validation;
+  interrupted in-process ETL recovery fails closed). Commit message claims
+  it as "fix(application): release WAL lock before final in-process ETL
+  (etl_contract)"; NOT documented in the archived
+  eliminate-time-based-acceptance-assertions change tasks. Disposition:
+  deliberate enabling scope for integration:etl-contract (task 4.4);
+  recorded here to satisfy task 10.7's documentation rule. WAL-lock API
+  (release_recording_lock/release_wal_lock) attribution to the archived
+  change is correct.
+- **groups.toml:82 dead path** — "tests/e2e/http_acceptance_driver.py" still
+  listed in [groups.acceptance] paths after file deletion (11.4). It
+  resolves to nothing (existing files only). groups.toml is hashed into the
+  acceptance fingerprint, so removal would invalidate the retained release
+  evidence; kept with this disclosure (no-dead-infrastructure residual).
+- **baseline.json embedded_command_count: 14 vs 4 entries** — count field
+  stale after the 14→4 embedded-command trim (8.x). Full mapping preserved
+  in coverage-comparison.md and git history; JSON not rewritten (11.9).
+- **process-patterns.md:38** — still lists deleted http_acceptance_driver.py
+  as a WorkloadServer consumer; consumers now
+  http_test_server.rs + tests/support/http_driver.py. Doc-only; file is
+  inside the validation fingerprint, so left in place with this record.
+- **P1 evidence (7766a42a…) recorded working_tree_dirty:1 at 5e80f10** —
+  superseded by the clean P2 release run (6317947…) whose scenario superset
+  covers all P1 obligations. P1 run stands as an honest pre-cleanup record,
+  not as the qualifying evidence.
+- **7 catalog IDs still status="planned"** — they describe privileged
+  scenarios (recorder-readiness, checkpoint-kill-restart,
+  user-intent-lifecycle, cli-compatibility sample, etc.) that exist and ran
+  in the release evidence; status field stale, catalog is fingerprinted so
+  not rewritten. No planned behavior is missing.
+- **preflight (scripts/privileged/preflight.py) not wired into the
+  acceptance runner/report** — spec states privileged execution runs bounded
+  preflight first; the runner currently invokes the VM flow directly and the
+  acceptance report has no preflight field. Recorded as a follow-up, not a
+  regression in this change (tasks 7.2/7.3 boxes document the preflight
+  contract + meta-tests; wiring it into the runner is out of this change's
+  physical-removal scope).
+
+Claims rejected during verification (council noise): decisions.md contains no
+"tasks 7.2/7.3 stay open" text; no untracked .pyc/.ruff_cache in working
+tree; task 5.4 requires no tests/privileged/ directory (it is a
+classification/decision task, satisfied via the migration ledger).
