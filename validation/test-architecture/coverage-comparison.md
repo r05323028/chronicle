@@ -34,16 +34,32 @@ scenario obligations reference single classified tests
 (`integration:chronicle-wal-matrix`, `unit:chronicle-replay`, plus unit
 prerequisites) instead of re-running whole crate suites per scenario.
 
-## Coverage-loss check
+## Coverage-loss check (final, task 10.3)
 
-- Every baseline embedded command has a ledger entry: covered (14/14); the blind-spot audit below accounts for every current-tree cargo invocation.
+- Every baseline embedded command has a ledger entry: covered (14/14); the
+  blind-spot audit below accounts for every current-tree cargo invocation.
 - Required gate selectors reference classified tests: catalog_check issues = 0
-  (47 tests, 8 planned privileged).
-- Portable checks now run outside the privileged executor: validate.sh fast
-  (fmt/clippy/workspace/catalog/tooling) + CI hosted runner smoke/rootless
-  suites + crate matrices; privileged scenario bodies keep only
-  kernel/environment-dependent proof (removal of remaining duplicate steps is
-task 8.x, blocked on the concurrent change).
+  (47 tests, 8 planned privileged; 40 p1 / 45 p2 / 45 release required, all
+  defined).
+- Portable checks now run outside the privileged executor: validate.sh gate
+  selects portable prerequisites first (gate-fmt, gate-clippy,
+  gate-workspace-tests, gate-openspec, gate-source-ownership,
+  gate-architecture, gate-catalog, gate-tooling-tests — task 8.1), then the
+  privileged acceptance profile; fast mode runs the same portable hierarchy;
+  CI hosted runner covers smoke/rootless suites.
+- Final embedded command set: 14 -> 4 (only privileged_feasibility,
+  privileged_signal, and the two eBPF/CLI builds remain in scenario bodies;
+  every portable WAL/ingest/replay/cgroup/fmt/workspace invocation removed).
+- Replacement proof is equal or stronger: rootless crate matrices add
+  deterministic real-file coverage (wal_matrix 8, etl_contract 4,
+  loss_window_model 1) beyond the re-invoked unit tests; gate portable
+  prerequisites run the full workspace suite once per gate and record
+  evidence separately.
+- Retained comparison evidence (task 10.3): this file, baseline.json
+  (pre-change snapshot, 14 embedded commands), migration-ledger.toml
+  (dispositions + destinations), test-catalog.toml (final classified IDs),
+  and gate-coverage.toml (obligation -> classified coverage) are all retained
+  and are NOT modified by task 11.9 bookkeeping cleanup.
 - Replacement proof is equal or stronger: rootless crate matrices add
   deterministic real-file coverage (wal_matrix 8, etl_contract 4,
   loss_window_model 1) beyond the re-invoked unit tests.

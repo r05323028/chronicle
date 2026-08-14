@@ -81,13 +81,7 @@ CURRENT_PHASE="initializing"
 SUMMARY="$ARTIFACT_ROOT/acceptance-report.json"
 TOTAL_PHASES=29
 EBPF_OBJECT_SHA256="not_checked"
-WAL_MATRIX_RESULT="not_checked"
-INGEST_MATRIX_RESULT="not_checked"
-REPLAY_MATRIX_RESULT="not_checked"
-CGROUP_MATRIX_RESULT="not_checked"
 SIGNAL_RESULT="not_checked"
-FMT_RESULT="not_checked"
-WORKSPACE_CHECK_RESULT="not_checked"
 F2_8_RESULT="not_checked"
 F2_9_RESULT="not_checked"
 F2_10_RESULT="not_checked"
@@ -191,7 +185,7 @@ write_summary() {
 	if [[ -f "$EBPF_OBJECT" ]]; then
 		EBPF_OBJECT_SHA256=$(sha256sum "$EBPF_OBJECT" | awk '{print $1}')
 	fi
-	python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$working_tree_dirty" "$COMMAND_LOG" "$ACCEPTANCE_MODE" "$WAL_MATRIX_RESULT" "$INGEST_MATRIX_RESULT" "$REPLAY_MATRIX_RESULT" "$CGROUP_MATRIX_RESULT" "$SIGNAL_RESULT" "$FMT_RESULT" "$WORKSPACE_CHECK_RESULT" "$USER_INTENT_RESULT" "$CLI_COMPATIBILITY_RESULT" "$RELEASE_MODE" "$EXPECTED_SHA" "$START_SHA" "$END_SHA" "$TREE_CLEAN" "$F2_8_RESULT" "$F2_9_RESULT" "$F2_10_RESULT" "$F2_11_RESULT" <<'PY'
+	python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$working_tree_dirty" "$COMMAND_LOG" "$ACCEPTANCE_MODE" "$SIGNAL_RESULT" "$USER_INTENT_RESULT" "$CLI_COMPATIBILITY_RESULT" "$RELEASE_MODE" "$EXPECTED_SHA" "$START_SHA" "$END_SHA" "$TREE_CLEAN" "$F2_8_RESULT" "$F2_9_RESULT" "$F2_10_RESULT" "$F2_11_RESULT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -199,10 +193,10 @@ from pathlib import Path
 summary = Path(sys.argv[1])
 status, phase = sys.argv[2:4]
 commit, kernel, architecture, cgroup, btf, cap_eff, object_sha, dirty, command_log = sys.argv[4:13]
-mode, wal_matrix, ingest_matrix, replay_matrix, cgroup_matrix, signal, fmt, workspace_check = sys.argv[13:21]
-user_intent, cli_compatibility = sys.argv[21:23]
-release, expected, start_sha, end_sha, tree_clean = sys.argv[23:28]
-f2_8, f2_9, f2_10, f2_11 = sys.argv[28:32]
+mode, signal = sys.argv[13:15]
+user_intent, cli_compatibility = sys.argv[15:17]
+release, expected, start_sha, end_sha, tree_clean = sys.argv[17:22]
+f2_8, f2_9, f2_10, f2_11 = sys.argv[22:26]
 summary.parent.mkdir(parents=True, exist_ok=True)
 result = "passed" if status == "0" else ("not_checked" if status == "77" else "failed")
 commands = []
@@ -221,14 +215,11 @@ retained = (
     and cli_compatibility == "passed"
     and all(value == "passed" for value in scenarios.values())
 )
+# Portable WAL/ingest/replay/cgroup/fmt/workspace matrices are separately
+# selected gate prerequisites (task 8.1); the privileged scenario gates only
+# on its own privileged invariants.
 required_matrix = {
-    "wal_fault_matrix": wal_matrix,
-    "ingest_limit_matrix": ingest_matrix,
-    "replay_matrix": replay_matrix,
-    "cgroup_matrix": cgroup_matrix,
     "privileged_signal": signal,
-    "format_check": fmt,
-    "workspace_check": workspace_check,
     "user_intent_lifecycle": user_intent,
     "cli_compatibility": cli_compatibility,
 }
@@ -260,13 +251,7 @@ summary.write_text(json.dumps({
         "privileged_acceptance": result,
         "p1_retained_acceptance": "complete" if retained else "not_checked",
         "privileged_scenarios": scenarios,
-        "wal_fault_matrix": wal_matrix,
-        "ingest_limit_matrix": ingest_matrix,
-        "replay_matrix": replay_matrix,
-        "cgroup_matrix": cgroup_matrix,
         "privileged_signal": signal,
-        "format_check": fmt,
-        "workspace_check": workspace_check,
         "user_intent_lifecycle": user_intent,
         "cli_compatibility": cli_compatibility,
     },
@@ -340,7 +325,7 @@ on_exit() {
 			TREE_CLEAN=false
 			status=1
 		fi
-		if [[ $status -eq 0 && $SIGNAL_RESULT == passed && $CGROUP_MATRIX_RESULT == passed && $SHARED_RUNTIME_RESULT == passed ]]; then
+		if [[ $status -eq 0 && $SIGNAL_RESULT == passed && $SHARED_RUNTIME_RESULT == passed ]]; then
 			F2_11_RESULT=passed
 		fi
 	fi

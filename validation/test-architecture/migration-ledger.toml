@@ -40,6 +40,7 @@ dependency_impact = "none"
 rationale = "rootless component composition contract; direct crate API use is legitimate integration, not black-box acceptance; binary-level rootless E2E is added separately by task 5.1 without removing this coverage"
 verify = "cargo test -p chronicle-application --test fake_vertical"
 
+
 [[entries]]
 id = "integration:crates/chronicle-application/tests/fixtures_http_vertical.rs"
 path = "crates/chronicle-application/tests/fixtures_http_vertical.rs"
@@ -55,6 +56,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "rootless deterministic composition contract; kept as crate integration while task 5.1 builds binary-level E2E"
 verify = "cargo test -p chronicle-application --test fixtures_http_vertical"
+
 
 [[entries]]
 id = "integration:crates/chronicle-application/tests/http_test_server.rs"
@@ -72,6 +74,7 @@ dependency_impact = "none"
 rationale = "crate-local test-support self-test; stays with owning crate"
 verify = "cargo test -p chronicle-application --test http_test_server"
 
+
 [[entries]]
 id = "integration:crates/chronicle-application/tests/support/mod.rs"
 path = "crates/chronicle-application/tests/support/mod.rs"
@@ -87,6 +90,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "one consumer crate; stays local per shared-helper rule (no new cross-crate support crate)"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "integration:crates/chronicle-capture-ebpf/tests/privileged_adapter.rs"
@@ -104,6 +108,7 @@ dependency_impact = "none"
 rationale = "assertion depends on real kernel/BTF/cgroup v2/capabilities; may stay crate-owned because it tests that crate's real kernel contract; gate selects it as privileged capture integration"
 verify = "cargo test -p chronicle-capture-ebpf --test privileged_adapter -- --ignored (supported Linux only)"
 
+
 [[entries]]
 id = "integration:crates/chronicle-capture-ebpf/tests/privileged_feasibility.rs"
 path = "crates/chronicle-capture-ebpf/tests/privileged_feasibility.rs"
@@ -120,6 +125,7 @@ dependency_impact = "none"
 rationale = "task 3.6 splits loss_sampling_state_machine_covers_all_gate_a_boundaries into rootless unit coverage; privileged_feasibility kernel assertion remains privileged; no claim of privileged proof for the state machine"
 verify = "cargo test -p chronicle-capture --test loss_window_model (portable, any host) ; cargo test -p chronicle-capture-ebpf --test privileged_feasibility -- --ignored (privileged)"
 
+
 [[entries]]
 id = "integration:crates/chronicle-cli/tests/cli_contract.rs"
 path = "crates/chronicle-cli/tests/cli_contract.rs"
@@ -135,6 +141,7 @@ destination = "integration stays; smoke (4.1), acceptance (4.2), E2E (5.1) are a
 dependency_impact = "none"
 rationale = "task 3.5 audits assertion-by-assertion: argument/rendering/exit mapping remain CLI-owned integration; executable liveness becomes smoke; public feature behavior becomes acceptance; record-to-replay composition becomes E2E; cgroup/signal behavior already split into privileged_signal.rs; must not add lower Chronicle dev dependencies; task 4.3 added cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch as the CLI-owned Integration home for the internal ETL seam after removing tests/acceptance/test_etl.py and the smoke internal-etl liveness case"
 verify = "cargo test -p chronicle-cli --test cli_contract"
+
 
 [[entries]]
 id = "integration:crates/chronicle-cli/tests/privileged_signal.rs"
@@ -156,6 +163,7 @@ verify = "cargo test -p chronicle-cli --test privileged_signal -- --ignored (sup
 # Root tests
 # ---------------------------------------------------------------------------
 
+
 [[entries]]
 id = "root:tests/e2e/http_acceptance_driver.py"
 path = "tests/e2e/http_acceptance_driver.py"
@@ -171,6 +179,7 @@ destination = "tests/support/http_driver.py (task 4.4 cutover); legacy file rema
 dependency_impact = "none"
 rationale = "task 4.4 cutover: shared support must live under tests/support/ with one owner; root black-box layers never import another root functional layer for shared infrastructure; legacy file is obsolete with zero active callers, preserved for rollback until section 11 cleanup"
 verify = "python3 tests/support/test_http_driver.py"
+
 
 [[entries]]
 id = "root:tests/e2e/test_http_acceptance_driver.py"
@@ -192,6 +201,7 @@ verify = "python3 tests/support/test_http_driver.py"
 # Validation and acceptance tooling self-tests
 # ---------------------------------------------------------------------------
 
+
 [[entries]]
 id = "tooling:scripts/tests/validation/*"
 path = "scripts/tests/validation/"
@@ -207,6 +217,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "tooling self-tests prove selector/orchestrator contracts, never product correctness"
 verify = "python3 scripts/tests/validation/test_layered_validation.py ; python3 scripts/tests/validation/test_architecture_boundaries.py ; python3 scripts/tests/validation/test_test_architecture.py"
+
 
 [[entries]]
 id = "tooling:scripts/tests/acceptance/*"
@@ -224,6 +235,7 @@ dependency_impact = "none"
 rationale = "runner/readiness/wait contracts proven rootlessly; not product assertions"
 verify = "python3 scripts/tests/acceptance/test_runner.py ; bash scripts/tests/acceptance/test-p2-readiness.sh ; bash scripts/tests/acceptance/test-wait.sh"
 
+
 [[entries]]
 id = "tooling:scripts/tests/test-run-with-timeout.sh"
 path = "scripts/tests/test-run-with-timeout.sh"
@@ -239,6 +251,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "proves deadline/TERM/KILL/grace contract rootlessly"
 verify = "bash scripts/tests/test-run-with-timeout.sh"
+
 
 [[entries]]
 id = "tooling:scripts/tests/test-user-intent-cli-rollback.sh"
@@ -260,6 +273,7 @@ verify = "bash scripts/tests/test-user-intent-cli-rollback.sh"
 # Privileged acceptance scenarios (13) - split by functional purpose
 # ---------------------------------------------------------------------------
 
+
 [[entries]]
 id = "scenario:capture-basic"
 path = "scripts/acceptance/lib/scenarios/"
@@ -275,6 +289,7 @@ destination = "privileged capture integration (real eBPF attach/capture + cgroup
 dependency_impact = "none"
 rationale = "task 8.2: environment preflight, eBPF build, portable WAL/ingest matrices, and repository checks leave scenario body; remaining privileged assertion is real capture plus cgroup placement/filtering"
 verify = "privileged scenario on supported Linux; portable parts via cargo test -p chronicle-wal / chronicle-application"
+
 
 [[entries]]
 id = "scenario:wal-recovery"
@@ -292,6 +307,7 @@ dependency_impact = "none"
 rationale = "task 8.3: recovery/idempotence assertions run on deterministic WAL fixtures rootlessly; no real kernel dependency remains"
 verify = "cargo test -p chronicle-wal ; cargo test -p chronicle-etl"
 
+
 [[entries]]
 id = "scenario:replay"
 path = "scripts/acceptance/lib/scenarios/"
@@ -307,6 +323,7 @@ destination = "replay matrix -> chronicle-replay unit (3.4); user-facing inspect
 dependency_impact = "none"
 rationale = "task 8.3: replay planner/executor/verifier matrices are portable; only a sampled privileged capture-to-replay invariant stays"
 verify = "cargo test -p chronicle-replay ; acceptance/e2e suites"
+
 
 [[entries]]
 id = "scenario:user-intent-lifecycle"
@@ -324,6 +341,7 @@ dependency_impact = "none"
 rationale = "task 8.3: portable selector matrices move to unit tests; privileged remainder proves real cgroup/eBPF lifecycle and process attribution"
 verify = "cargo test -p chronicle-application cgroup_selection ; privileged scenario"
 
+
 [[entries]]
 id = "scenario:cli-compatibility"
 path = "scripts/acceptance/lib/scenarios/"
@@ -339,6 +357,7 @@ destination = "public CLI contract -> acceptance (4.2) + cli_contract.rs integra
 dependency_impact = "none"
 rationale = "task 8.3: most compatibility assertions are portable binary contracts; only real-capture consumption needs privilege"
 verify = "cargo test -p chronicle-cli --test cli_contract ; privileged scenario"
+
 
 [[entries]]
 id = "scenario:resource-cleanup"
@@ -356,6 +375,7 @@ dependency_impact = "none"
 rationale = "task 8.1: fmt/workspace repository checks and cgroup decision matrices are removed from the scenario; real cleanup and signals remain privileged"
 verify = "cargo test -p chronicle-application ; privileged scenario"
 
+
 [[entries]]
 id = "scenario:recorder-readiness"
 path = "scripts/acceptance/lib/scenarios/"
@@ -371,6 +391,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "fresh systemd activation, stale-owner, and terminal-state semantics require real systemd/kernel; readiness polling contract stays specialized"
 verify = "privileged scenario on supported Linux"
+
 
 [[entries]]
 id = "scenario:incremental-etl"
@@ -388,6 +409,7 @@ dependency_impact = "none"
 rationale = "task 8.4: delta/equivalence logic proves rootlessly on deterministic WAL; only a live-recorder sample (optional) would need privilege"
 verify = "cargo test -p chronicle-etl"
 
+
 [[entries]]
 id = "scenario:checkpoint-kill-restart"
 path = "scripts/acceptance/lib/scenarios/"
@@ -403,6 +425,7 @@ destination = "checkpoint transaction/fault matrix -> chronicle-etl integration 
 dependency_impact = "none"
 rationale = "task 8.4: exhaustive checkpoint correctness proves rootlessly; real process interruption and systemd restart remain privileged"
 verify = "cargo test -p chronicle-etl ; privileged scenario"
+
 
 [[entries]]
 id = "scenario:quota-pressure"
@@ -420,6 +443,7 @@ dependency_impact = "none"
 rationale = "loop/mount/systemd quota pressure cannot be simulated rootlessly; quota accounting unit logic stays portable in recorder_quota.rs"
 verify = "privileged scenario on supported Linux; cargo test -p chronicle-application recorder_quota (portable)"
 
+
 [[entries]]
 id = "scenario:retention-interruption"
 path = "scripts/acceptance/lib/scenarios/"
@@ -436,6 +460,7 @@ dependency_impact = "none"
 rationale = "task 8.4: retention logic proves rootlessly; systemd process interruption and kernel cleanup remain privileged"
 verify = "cargo test -p chronicle-wal ; privileged scenario"
 
+
 [[entries]]
 id = "scenario:corruption-quarantine"
 path = "scripts/acceptance/lib/scenarios/"
@@ -451,6 +476,7 @@ destination = "chronicle-etl integration corruption matrix (3.3)"
 dependency_impact = "none"
 rationale = "task 8.4: mutating a deterministic copied WAL and invoking ETL is rootless; no kernel dependency"
 verify = "cargo test -p chronicle-etl"
+
 
 [[entries]]
 id = "scenario:reboot-recovery"
@@ -472,6 +498,7 @@ verify = "privileged scenario on supported Linux"
 # Embedded portable/repository commands inside privileged scenarios
 # ---------------------------------------------------------------------------
 
+
 [[entries]]
 id = "embedded:p1/capture-basic.sh:14"
 path = "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh"
@@ -488,194 +515,6 @@ dependency_impact = "none"
 rationale = "task 8.1: build belongs to portable eBPF compile check, not scenario body"
 verify = "cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release --locked"
 
-[[entries]]
-id = "embedded:p1/capture-basic.sh:162"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh"
-purpose = "privileged feasibility suite (--ignored)"
-current_layer = "privileged-integration"
-target_layer = "privileged-integration"
-environment = "privileged"
-owner = "chronicle-capture-ebpf"
-surface = "crate-api"
-gates = ["p1"]
-disposition = "remain_privileged"
-destination = "selected privileged test"
-dependency_impact = "none"
-rationale = "task 8.1: becomes a gate-selected privileged test rather than a scenario body invocation"
-verify = "cargo test -p chronicle-capture-ebpf --test privileged_feasibility -- --ignored (supported Linux)"
-
-[[entries]]
-id = "embedded:p1/capture-basic.sh:164"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh"
-purpose = "broad WAL cargo suite"
-current_layer = "repository-check"
-target_layer = "unit"
-environment = "portable"
-owner = "chronicle-wal"
-surface = "internal"
-gates = ["p1"]
-disposition = "move"
-destination = "chronicle-wal unit/integration prerequisite (3.2)"
-dependency_impact = "none"
-rationale = "task 8.1: portable WAL matrix moves out of privileged scenario"
-verify = "cargo test -p chronicle-wal"
-
-[[entries]]
-id = "embedded:p1/capture-basic.sh:174"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh"
-purpose = "application ingest/WAL-limit matrix"
-current_layer = "repository-check"
-target_layer = "unit"
-environment = "portable"
-owner = "chronicle-application"
-surface = "internal"
-gates = ["p1"]
-disposition = "move"
-destination = "chronicle-application unit prerequisite (3.2)"
-dependency_impact = "none"
-rationale = "task 8.1: portable ingest matrix moves out of privileged scenario"
-verify = "cargo test -p chronicle-application ingest_discards_only_wal_limit_suffix_and_wal_limit_wins_duration_tie"
-
-[[entries]]
-id = "embedded:p1/capture-basic.sh:175"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh"
-purpose = "application production recording bounds"
-current_layer = "repository-check"
-target_layer = "unit"
-environment = "portable"
-owner = "chronicle-application"
-surface = "internal"
-gates = ["p1"]
-disposition = "move"
-destination = "chronicle-application unit prerequisite (3.2)"
-dependency_impact = "none"
-rationale = "task 8.1: portable bounds matrix moves out of privileged scenario"
-verify = "cargo test -p chronicle-application production_recording_bounds_enforce_duration_and_wal_limits"
-
-[[entries]]
-id = "embedded:p1/replay.sh:27"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh"
-purpose = "replay transport/verification matrix"
-current_layer = "repository-check"
-target_layer = "unit"
-environment = "portable"
-owner = "chronicle-replay"
-surface = "internal"
-gates = ["p1"]
-disposition = "move"
-destination = "chronicle-replay unit prerequisite (3.4)"
-dependency_impact = "none"
-rationale = "task 8.1: replay matrix moves out of privileged scenario"
-verify = "cargo test -p chronicle-replay execution_stops_on_transport_or_verification_and_accounts_for_skips"
-
-[[entries]]
-id = "embedded:p1/replay.sh:36"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh"
-purpose = "cgroup decision unit test: deduplicates_threads_and_safe_result_is_count_only"
-current_layer = "repository-check"
-target_layer = "unit"
-environment = "portable"
-owner = "chronicle-application"
-surface = "internal"
-gates = ["p1"]
-disposition = "move"
-destination = "cgroup_selection unit prerequisite (3.2)"
-dependency_impact = "none"
-rationale = "task 8.1: cgroup decision logic is portable; real cgroup placement remains privileged"
-verify = "cargo test -p chronicle-application deduplicates_threads_and_safe_result_is_count_only"
-[[entries]]
-id = "embedded:p1/replay.sh:37"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh"
-purpose = "cgroup decision unit test: shared_posix_group_and_descendants_need_acknowledgement"
-current_layer = "repository-check"
-target_layer = "unit"
-environment = "portable"
-owner = "chronicle-application"
-surface = "internal"
-gates = ["p1"]
-disposition = "move"
-destination = "cgroup_selection unit prerequisite (3.2)"
-dependency_impact = "none"
-rationale = "task 8.1: cgroup decision logic is portable; real cgroup placement remains privileged"
-verify = "cargo test -p chronicle-application shared_posix_group_and_descendants_need_acknowledgement"
-[[entries]]
-id = "embedded:p1/replay.sh:38"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh"
-purpose = "cgroup decision unit test: pid_requires_exact_direct_tgid_even_with_acknowledgement"
-current_layer = "repository-check"
-target_layer = "unit"
-environment = "portable"
-owner = "chronicle-application"
-surface = "internal"
-gates = ["p1"]
-disposition = "move"
-destination = "cgroup_selection unit prerequisite (3.2)"
-dependency_impact = "none"
-rationale = "task 8.1: cgroup decision logic is portable; real cgroup placement remains privileged"
-verify = "cargo test -p chronicle-application pid_requires_exact_direct_tgid_even_with_acknowledgement"
-[[entries]]
-id = "embedded:p1/replay.sh:39"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh"
-purpose = "cgroup decision unit test: recorder_descendant_race_namespace_and_forbidden_scope_fail_closed"
-current_layer = "repository-check"
-target_layer = "unit"
-environment = "portable"
-owner = "chronicle-application"
-surface = "internal"
-gates = ["p1"]
-disposition = "move"
-destination = "cgroup_selection unit prerequisite (3.2)"
-dependency_impact = "none"
-rationale = "task 8.1: cgroup decision logic is portable; real cgroup placement remains privileged"
-verify = "cargo test -p chronicle-application recorder_descendant_race_namespace_and_forbidden_scope_fail_closed"
-
-[[entries]]
-id = "embedded:p1/replay.sh:48"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh"
-purpose = "privileged signal suite (--ignored)"
-current_layer = "privileged-integration"
-target_layer = "privileged-integration"
-environment = "privileged"
-owner = "chronicle-cli"
-surface = "binary"
-gates = ["p1"]
-disposition = "remain_privileged"
-destination = "selected privileged test"
-dependency_impact = "none"
-rationale = "task 8.1: real cgroup/signal behavior; becomes gate-selected privileged test"
-verify = "cargo test -p chronicle-cli --test privileged_signal -- --ignored (supported Linux)"
-
-[[entries]]
-id = "embedded:p1/resource-cleanup.sh:23"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/resource-cleanup.sh"
-purpose = "cargo fmt --all --check"
-current_layer = "repository-check"
-target_layer = "repository-check"
-environment = "portable"
-owner = "validation-tooling"
-surface = "internal-tooling"
-gates = []
-disposition = "move"
-destination = "fast/release fmt step"
-dependency_impact = "none"
-rationale = "task 8.1: formatting is repository validation, not product assertion"
-verify = "cargo fmt --all --check"
-
-[[entries]]
-id = "embedded:p1/resource-cleanup.sh:25"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/resource-cleanup.sh"
-purpose = "cargo check --workspace --all-targets"
-current_layer = "repository-check"
-target_layer = "repository-check"
-environment = "portable"
-owner = "validation-tooling"
-surface = "internal-tooling"
-gates = []
-disposition = "move"
-destination = "fast/release workspace check"
-dependency_impact = "none"
-rationale = "task 8.1: workspace check is repository validation, not product assertion"
-verify = "cargo check --workspace --all-targets --locked"
 
 [[entries]]
 id = "embedded:p2/capture-basic.sh:14"
@@ -693,6 +532,7 @@ dependency_impact = "none"
 rationale = "task 8.1: build belongs to portable eBPF compile check"
 verify = "cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml --target bpfel-unknown-none --release --locked"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/cgroup_selection.rs"
 path = "crates/chronicle-application/src/cgroup_selection.rs"
@@ -708,6 +548,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/continuous_recorder.rs"
@@ -725,6 +566,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/data_dir.rs"
 path = "crates/chronicle-application/src/data_dir.rs"
@@ -740,6 +582,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/domain_lock.rs"
@@ -757,6 +600,7 @@ dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/epoch_catalog.rs"
 path = "crates/chronicle-application/src/epoch_catalog.rs"
@@ -772,6 +616,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/epoch_rollover.rs"
@@ -789,6 +634,7 @@ dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/etl.rs"
 path = "crates/chronicle-application/src/etl.rs"
@@ -804,6 +650,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/incremental_worker.rs"
@@ -821,6 +668,7 @@ dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/lib.rs"
 path = "crates/chronicle-application/src/lib.rs"
@@ -836,6 +684,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/listener_discovery.rs"
@@ -853,6 +702,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/recorder_config.rs"
 path = "crates/chronicle-application/src/recorder_config.rs"
@@ -868,6 +718,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/recorder_lease.rs"
@@ -885,6 +736,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/recorder_lifecycle.rs"
 path = "crates/chronicle-application/src/recorder_lifecycle.rs"
@@ -900,6 +752,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/recorder_metadata.rs"
@@ -917,6 +770,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/recorder_orchestration.rs"
 path = "crates/chronicle-application/src/recorder_orchestration.rs"
@@ -932,6 +786,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/recorder_quota.rs"
@@ -949,6 +804,7 @@ dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/recorder_startup.rs"
 path = "crates/chronicle-application/src/recorder_startup.rs"
@@ -964,6 +820,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/recorder_status.rs"
@@ -981,6 +838,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/recording_catalog.rs"
 path = "crates/chronicle-application/src/recording_catalog.rs"
@@ -996,6 +854,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-application/src/rollover_transition.rs"
@@ -1013,6 +872,7 @@ dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-application"
 
+
 [[entries]]
 id = "unit:crates/chronicle-application/src/supervised_scope.rs"
 path = "crates/chronicle-application/src/supervised_scope.rs"
@@ -1028,6 +888,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-application"
+
 
 [[entries]]
 id = "unit:crates/chronicle-canonical/src/lib.rs"
@@ -1045,6 +906,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-canonical"
 
+
 [[entries]]
 id = "unit:crates/chronicle-capture/src/lib.rs"
 path = "crates/chronicle-capture/src/lib.rs"
@@ -1060,6 +922,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-capture"
+
 
 [[entries]]
 id = "unit:crates/chronicle-capture-ebpf/src/abi.rs"
@@ -1077,6 +940,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-capture-ebpf"
 
+
 [[entries]]
 id = "unit:crates/chronicle-capture-ebpf/src/adapter.rs"
 path = "crates/chronicle-capture-ebpf/src/adapter.rs"
@@ -1092,6 +956,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-capture-ebpf"
+
 
 [[entries]]
 id = "unit:crates/chronicle-capture-ebpf/src/preflight.rs"
@@ -1109,6 +974,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-capture-ebpf"
 
+
 [[entries]]
 id = "unit:crates/chronicle-capture-ebpf/src/source.rs"
 path = "crates/chronicle-capture-ebpf/src/source.rs"
@@ -1124,6 +990,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-capture-ebpf"
+
 
 [[entries]]
 id = "unit:crates/chronicle-cli/src/main.rs"
@@ -1141,6 +1008,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-cli"
 
+
 [[entries]]
 id = "unit:crates/chronicle-common/src/lib.rs"
 path = "crates/chronicle-common/src/lib.rs"
@@ -1156,6 +1024,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-common"
+
 
 [[entries]]
 id = "unit:crates/chronicle-etl/src/checkpoint.rs"
@@ -1173,6 +1042,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-etl"
 
+
 [[entries]]
 id = "unit:crates/chronicle-etl/src/delta.rs"
 path = "crates/chronicle-etl/src/delta.rs"
@@ -1188,6 +1058,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-etl"
+
 
 [[entries]]
 id = "unit:crates/chronicle-etl/src/incremental.rs"
@@ -1205,6 +1076,7 @@ dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-etl"
 
+
 [[entries]]
 id = "unit:crates/chronicle-etl/src/lib.rs"
 path = "crates/chronicle-etl/src/lib.rs"
@@ -1220,6 +1092,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-etl"
+
 
 [[entries]]
 id = "unit:crates/chronicle-etl/src/publication.rs"
@@ -1237,6 +1110,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-etl"
 
+
 [[entries]]
 id = "unit:crates/chronicle-protocol-builtins/src/lib.rs"
 path = "crates/chronicle-protocol-builtins/src/lib.rs"
@@ -1252,6 +1126,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-protocol-builtins"
+
 
 [[entries]]
 id = "unit:crates/chronicle-replay/src/lib.rs"
@@ -1269,6 +1144,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-replay"
 
+
 [[entries]]
 id = "unit:crates/chronicle-session/src/lib.rs"
 path = "crates/chronicle-session/src/lib.rs"
@@ -1284,6 +1160,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-session"
+
 
 [[entries]]
 id = "unit:crates/chronicle-storage/src/lib.rs"
@@ -1301,6 +1178,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-storage"
 
+
 [[entries]]
 id = "unit:crates/chronicle-storage/src/recording_store.rs"
 path = "crates/chronicle-storage/src/recording_store.rs"
@@ -1316,6 +1194,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-storage"
+
 
 [[entries]]
 id = "unit:crates/chronicle-wal/src/lib.rs"
@@ -1333,6 +1212,7 @@ dependency_impact = "none"
 rationale = "reviewed; signal flags are fixture/production-code text matches, no daemon/subprocess lifecycle"
 verify = "cargo test -p chronicle-wal"
 
+
 [[entries]]
 id = "unit:crates/chronicle-wal/src/manifest.rs"
 path = "crates/chronicle-wal/src/manifest.rs"
@@ -1348,6 +1228,7 @@ destination = ""
 dependency_impact = "none"
 rationale = "local logic"
 verify = "cargo test -p chronicle-wal"
+
 
 [[entries]]
 id = "unit:crates/chronicle-wal/src/retention.rs"
@@ -1369,6 +1250,7 @@ verify = "cargo test -p chronicle-wal"
 # ---------------------------------------------------------------------------
 # Task 4.3: internal ETL CLI reclassification (removed wrappers)
 # ---------------------------------------------------------------------------
+
 [[entries]]
 id = "root:tests/acceptance/test_etl.py"
 path = "tests/acceptance/test_etl.py"
@@ -1385,6 +1267,7 @@ dependency_impact = "none"
 rationale = "task 4.3: internal command seams are Integration contracts, never Smoke/Acceptance; ETL has no documented public user surface; application ETL correctness stays separately in integration:etl-contract (chronicle-application)"
 verify = "cargo test -p chronicle-cli --test cli_contract cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch"
 
+
 [[entries]]
 id = "root:tests/smoke/test_smoke.py:test_etl_liveness_minimal_wal"
 path = "tests/smoke/test_smoke.py"
@@ -1400,3 +1283,35 @@ destination = "crates/chronicle-cli/tests/cli_contract.rs (integration:cli-contr
 dependency_impact = "none"
 rationale = "task 4.1/4.3: merely invoking an internal subprocess does not make a test Smoke; internal ETL seam belongs to the CLI-owned Integration contract"
 verify = "cargo test -p chronicle-cli --test cli_contract cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch"
+
+[[entries]]
+id = "embedded:p1/capture-basic.sh:165"
+path = "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh"
+purpose = "privileged feasibility suite (--ignored); portable WAL/ingest matrices removed to separate gate prerequisites (task 8.1)"
+current_layer = "privileged-integration"
+target_layer = "privileged-integration"
+environment = "privileged"
+owner = "chronicle-capture-ebpf"
+surface = "crate-api"
+gates = ["p1"]
+disposition = "remain_privileged"
+destination = "selected privileged test"
+dependency_impact = "none"
+rationale = "task 8.1: only the real capture/feasibility invariant stays in the scenario body"
+verify = "cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture"
+
+[[entries]]
+id = "embedded:p1/replay.sh:30"
+path = "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh"
+purpose = "privileged signal suite (--ignored); portable replay/cgroup matrices removed to separate gate prerequisites (task 8.1)"
+current_layer = "privileged-integration"
+target_layer = "privileged-integration"
+environment = "privileged"
+owner = "chronicle-cli"
+surface = "crate-api"
+gates = ["p1"]
+disposition = "remain_privileged"
+destination = "selected privileged test"
+dependency_impact = "none"
+rationale = "task 8.1: only the real signal/process invariant stays in the scenario body"
+verify = "cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture"

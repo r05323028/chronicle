@@ -166,8 +166,17 @@ replay matching, repository checks) MUST NOT be privileged proof merely
 because a Multipass profile can run them.
 
 Root black-box tests live under `tests/{smoke,acceptance,e2e}/`; acceptance
-and E2E tests MUST NOT import internal crate implementation details.
-Privileged execution runs bounded preflight first (`scripts/privileged/preflight.py`,
+and E2E tests MUST NOT import internal crate implementation details. Shared
+black-box infrastructure lives under `tests/support/` (including the HTTP
+workload/replay driver at `tests/support/http_driver.py`); root layers never
+import another root layer for shared helpers. Internal command/internal
+compatibility seams are Integration contracts owned by the appropriate
+application/CLI boundary, never Smoke or Acceptance: application ETL behavior
+is `integration:etl-contract` owned by chronicle-application, while the
+internal ETL CLI seam is covered by the CLI-owned `integration:cli-contract`
+(chronicle-cli); `chronicle internal etl` is not public ETL acceptance, and
+an internal command is never the sole evidence for a documented user-facing
+capability. Privileged execution runs bounded preflight first (`scripts/privileged/preflight.py`,
 schema in `validation/test-architecture/privileged-preflight-schema.toml`):
 `supported`, `unsupported_environment`, `infrastructure_error`, `not_checked`;
 unsupported/infrastructure never count as product regression and never

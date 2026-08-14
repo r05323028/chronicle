@@ -9,62 +9,12 @@
       {
         "command": "cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture >\"$ARTIFACT_ROOT/privileged-feasibility.log\" 2>&1",
         "file": "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh",
-        "line": 162
-      },
-      {
-        "command": "cargo test -p chronicle-wal --locked >\"$ARTIFACT_ROOT/wal-tests.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh",
-        "line": 164
-      },
-      {
-        "command": "cargo test -p chronicle-application --locked ingest_discards_only_wal_limit_suffix_and_wal_limit_wins_duration_tie >\"$ARTIFACT_ROOT/ingest-limit-tests.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh",
-        "line": 174
-      },
-      {
-        "command": "cargo test -p chronicle-application --locked production_recording_bounds_enforce_duration_and_wal_limits >>\"$ARTIFACT_ROOT/ingest-limit-tests.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh",
-        "line": 175
-      },
-      {
-        "command": "cargo test -p chronicle-replay --locked execution_stops_on_transport_or_verification_and_accounts_for_skips >\"$ARTIFACT_ROOT/replay-tests.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh",
-        "line": 27
-      },
-      {
-        "command": "cargo test -p chronicle-application --locked deduplicates_threads_and_safe_result_is_count_only >\"$ARTIFACT_ROOT/cgroup-tests.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh",
-        "line": 36
-      },
-      {
-        "command": "cargo test -p chronicle-application --locked shared_posix_group_and_descendants_need_acknowledgement >>\"$ARTIFACT_ROOT/cgroup-tests.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh",
-        "line": 37
-      },
-      {
-        "command": "cargo test -p chronicle-application --locked pid_requires_exact_direct_tgid_even_with_acknowledgement >>\"$ARTIFACT_ROOT/cgroup-tests.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh",
-        "line": 38
-      },
-      {
-        "command": "cargo test -p chronicle-application --locked recorder_descendant_race_namespace_and_forbidden_scope_fail_closed >>\"$ARTIFACT_ROOT/cgroup-tests.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh",
-        "line": 39
+        "line": 165
       },
       {
         "command": "cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture >\"$ARTIFACT_ROOT/signal-tests.log\" 2>&1",
         "file": "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh",
-        "line": 48
-      },
-      {
-        "command": "cargo fmt --all --check >\"$ARTIFACT_ROOT/fmt.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/resource-cleanup.sh",
-        "line": 23
-      },
-      {
-        "command": "cargo check --workspace --all-targets --locked >\"$ARTIFACT_ROOT/check.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/resource-cleanup.sh",
-        "line": 25
+        "line": 30
       },
       {
         "command": "cargo +nightly build -Z build-std=core --manifest-path \"$ROOT/ebpf/Cargo.toml\" --target bpfel-unknown-none --release --locked",

@@ -419,6 +419,65 @@ def make_report(
         "exit_code": return_code,
         "timeouts": timeouts,
         "legacy_report": legacy,
+        # Task 9.4: classified functional layers + environment qualification
+        # for executed/reused coverage. Reports identify which layers and
+        # environments were proven so gate/release reviewers never mistake
+        # portable proof for privileged proof (or vice versa).
+        "classified_coverage": _classified_coverage(completed, selected, legacy),
+    }
+
+
+def _classified_coverage(
+    completed: list[str], selected: list[str], legacy: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Map completed scenarios to functional layers/environments via the
+    classified catalog, and include legacy check outcomes that are
+    environment-qualified (privileged or preflight-derived)."""
+    catalog = None
+    try:
+        import tomllib
+
+        catalog_path = Path(__file__).resolve().parents[2] / "validation" / "test-architecture" / "test-catalog.toml"
+        if catalog_path.is_file():
+            with catalog_path.open("rb") as handle:
+                catalog = tomllib.load(handle)
+    except (OSError, ValueError):
+        catalog = None
+    by_id = {}
+    if catalog:
+        by_id = {entry.get("id"): entry for entry in catalog.get("test", [])}
+        scenario_map = catalog.get("scenario_tests", {})
+    else:
+        scenario_map = {}
+    executed = [name for name in completed if name in selected]
+    layers = set()
+    environments = set()
+    test_ids = []
+    for scenario in executed:
+        for test_id in scenario_map.get(scenario, []):
+            entry = by_id.get(test_id)
+            if not entry:
+                continue
+            if entry.get("layer"):
+                layers.add(entry["layer"])
+            if entry.get("environment"):
+                environments.add(entry["environment"])
+            test_ids.append(test_id)
+    checks = {}
+    if isinstance(legacy, dict):
+        checks = legacy.get("checks", {})
+    qualified = [
+        name
+        for name, value in checks.items()
+        if isinstance(value, str) and value == "passed"
+        and (name in {"privileged_acceptance", "privileged_signal", "privileged_feasibility"}
+             or "privileged" in name)
+    ]
+    return {
+        "functional_layers": sorted(layers),
+        "environments": sorted(environments),
+        "classified_test_ids": sorted(set(test_ids)),
+        "privileged_qualified_checks": sorted(qualified),
     }
 
 

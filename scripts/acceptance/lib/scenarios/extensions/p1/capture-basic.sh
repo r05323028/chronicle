@@ -158,25 +158,14 @@ PY
 	assert_json "$WAL_DIR/recording.json" 'value["version"] == 1 and value["status"] == "completed" and value["capture"]["scope"]["selected_subtree"] is True and value["capture"]["scope"]["direct_tgid_count"] >= 0 and value["capture"]["scope"]["descendant_cgroup_count"] == 0'
 
 	if full_mode; then
-		phase 15 "Run privileged capture feasibility and automated WAL fault matrix"
+		phase 15 "Run privileged capture feasibility"
+		# Portable WAL fault + ingest matrices are separately selected gate
+		# prerequisites (task 8.1); the privileged scenario proves only the
+		# real capture/feasibility invariant.
 		cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture >"$ARTIFACT_ROOT/privileged-feasibility.log" 2>&1
 		grep -q 'test result: ok' "$ARTIFACT_ROOT/privileged-feasibility.log"
-		cargo test -p chronicle-wal --locked >"$ARTIFACT_ROOT/wal-tests.log" 2>&1
-		assert_file "$ARTIFACT_ROOT/wal-tests.log"
-		grep -q 'test result: ok' "$ARTIFACT_ROOT/wal-tests.log"
-		WAL_MATRIX_RESULT="passed"
 	else
-		skip_phase 15 "Run privileged capture feasibility and automated WAL fault matrix" privileged-feasibility.log wal-tests.log
-	fi
-
-	if full_mode; then
-		phase 16 "Run bounded ingest and WAL-limit matrix"
-		cargo test -p chronicle-application --locked ingest_discards_only_wal_limit_suffix_and_wal_limit_wins_duration_tie >"$ARTIFACT_ROOT/ingest-limit-tests.log" 2>&1
-		cargo test -p chronicle-application --locked production_recording_bounds_enforce_duration_and_wal_limits >>"$ARTIFACT_ROOT/ingest-limit-tests.log" 2>&1
-		grep -q 'test result: ok' "$ARTIFACT_ROOT/ingest-limit-tests.log"
-		INGEST_MATRIX_RESULT="passed"
-	else
-		skip_phase 16 "Run bounded ingest and WAL-limit matrix" ingest-limit-tests.log
+		skip_phase 15 "Run privileged capture feasibility" privileged-feasibility.log
 	fi
 
 }

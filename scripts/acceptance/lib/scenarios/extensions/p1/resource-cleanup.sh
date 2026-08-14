@@ -19,21 +19,15 @@ for path in [root / "record.json", root / "etl.json", root / "etl-rerun.json", r
 PY
 
 if full_mode; then
-	phase 27 "Run final workspace checks"
-	cargo fmt --all --check >"$ARTIFACT_ROOT/fmt.log" 2>&1
-	FMT_RESULT="passed"
-	cargo check --workspace --all-targets --locked >"$ARTIFACT_ROOT/check.log" 2>&1
-	WORKSPACE_CHECK_RESULT="passed"
+	phase 27 "Collect artifacts"
+	for artifact in "$ARTIFACT_ROOT/record.log" "$ARTIFACT_ROOT/etl.log" "$ARTIFACT_ROOT/replay.log" "$ARTIFACT_ROOT/doctor.json" "$ARTIFACT_ROOT/record.json" "$ARTIFACT_ROOT/etl.json" "$ARTIFACT_ROOT/inspect.json" "$ARTIFACT_ROOT/replay.json" "$ARTIFACT_ROOT/privileged-feasibility.log" "$ARTIFACT_ROOT/signal-tests.log" "$WAL_DIR/recording.json"; do
+		assert_file "$artifact"
+	done
 else
-	skip_phase 27 "Run final workspace checks" fmt.log check.log
+	skip_phase 27 "Collect artifacts" record.log etl.log replay.log doctor.json record.json etl.json inspect.json replay.json privileged-feasibility.log signal-tests.log
 fi
 
-phase 28 "Collect artifacts"
-for artifact in "$ARTIFACT_ROOT/record.log" "$ARTIFACT_ROOT/etl.log" "$ARTIFACT_ROOT/replay.log" "$ARTIFACT_ROOT/doctor.json" "$ARTIFACT_ROOT/record.json" "$ARTIFACT_ROOT/etl.json" "$ARTIFACT_ROOT/inspect.json" "$ARTIFACT_ROOT/replay.json" "$ARTIFACT_ROOT/wal-tests.log" "$ARTIFACT_ROOT/privileged-feasibility.log" "$ARTIFACT_ROOT/signal-tests.log" "$WAL_DIR/recording.json"; do
-	assert_file "$artifact"
-done
-
-phase 29 "Cleanup processes, cgroups, and temporary files"
+phase 28 "Cleanup processes, cgroups, and temporary files"
 cleanup_resources
 log "PASS: privileged acceptance artifacts retained at $ARTIFACT_ROOT"
 

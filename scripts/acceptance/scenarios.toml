@@ -65,7 +65,7 @@ legacy_p2_checks = ["systemd_type_simple", "three_epochs"]
 timeout_seconds = 300
 capabilities = ["privileged", "wal"]
 phases = ["capture", "recovery"]
-legacy_p1_checks = ["wal_fault_matrix", "ingest_limit_matrix"]
+legacy_p1_checks = [] # portable WAL/ingest matrices are separate gate prerequisites (8.1)
 legacy_p2_checks = [
   "checkpoint_output_committed_checkpoint_missing",
   "checkpoint_committed_status_missing",
@@ -75,7 +75,7 @@ legacy_p2_checks = [
 timeout_seconds = 300
 capabilities = ["privileged", "replay"]
 phases = ["replay"]
-legacy_p1_checks = ["replay_matrix"]
+legacy_p1_checks = [] # portable replay matrix is a separate gate prerequisite (8.1)
 legacy_p2_checks = ["inspect_replay", "one_shot_equivalence"]
 
 [scenarios.user-intent-lifecycle]
@@ -94,12 +94,7 @@ legacy_p1_checks = ["cli_compatibility"]
 timeout_seconds = 900
 capabilities = ["privileged", "cleanup"]
 phases = ["cleanup"]
-legacy_p1_checks = [
-  "cgroup_matrix",
-  "privileged_signal",
-  "format_check",
-  "workspace_check",
-]
+legacy_p1_checks = ["privileged_signal"] # portable cgroup/fmt/workspace are separate gate prerequisites (8.1)
 legacy_p2_checks = ["resource_cleanup", "signal_shutdown"]
 
 [scenarios.recorder-readiness]

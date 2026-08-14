@@ -184,8 +184,27 @@ run_shell() {
 	fi
 }
 
+run_gate_portable_prerequisites() {
+	# Gate selects required lower-layer prerequisites as separate steps (task 8.1):
+	# portable correctness runs rootlessly here and its evidence is retained
+	# separately; privileged scenario bodies never rerun it.
+	local status=0
+	run_shell gate-fmt 'cargo fmt --all --check' || status=$?
+	run_shell gate-clippy "CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings" || status=$?
+	run_shell gate-workspace-tests "CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" cargo test --workspace --all-features --locked" || status=$?
+	run_shell gate-openspec 'openspec validate --all --strict --no-interactive' || status=$?
+	run_shell gate-source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'" || status=$?
+	run_shell gate-architecture "python3 '$HELPER' architecture --root '$ROOT' --config '$ROOT/validation/architecture.toml'" || status=$?
+	run_shell gate-catalog "python3 '$HELPER' catalog --root '$ROOT'" || status=$?
+	run_shell gate-tooling-tests 'python3 scripts/tests/validation/test_test_architecture.py && python3 scripts/tests/validation/test_sleep_policy.py && python3 scripts/tests/validation/test_preflight.py && python3 scripts/tests/validation/test_lifecycle_cleanup.py && python3 scripts/tests/validation/test_select_fixtures.py && python3 scripts/tests/validation/test_evidence_reuse.py && python3 scripts/tests/validation/test_layered_validation.py && python3 scripts/tests/validation/test_architecture_boundaries.py' || status=$?
+	return "$status"
+}
+
 run_gate() {
 	local gate=$1 status=0
+	# Portable prerequisites first (separately selected + evidenced), then the
+	# privileged acceptance profile proves only privileged invariants.
+	run_gate_portable_prerequisites || return $?
 	local -a command=("$ROOT/scripts/acceptance.sh" --profile "$gate" --executor multipass --vm "$VM" --evidence-root "$EVIDENCE_ROOT/acceptance" --gate-timeout-seconds "$ACCEPTANCE_PROFILE_TIMEOUT")
 	if [[ $MODE == release ]]; then
 		command+=(--release)

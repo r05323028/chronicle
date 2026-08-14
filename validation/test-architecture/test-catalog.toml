@@ -548,8 +548,8 @@ id = "e2e:privileged-capture-pipeline"
 layer = "e2e"
 environment = "privileged"
 owner = "root-e2e"
-command = "tests/privileged/e2e suite: real workload + eBPF capture -> downstream pipeline"
-status = "planned"
+command = "privileged acceptance scenario capture-basic (real workload -> real eBPF capture -> WAL -> ETL -> canonical -> inspect -> replay -> verification; kernel/process/cgroup cleanup)"
+status = "existing"
 gates = ["p1", "p2", "release"]
 
 [[test]]
@@ -657,13 +657,7 @@ privileged_acceptance = [
   "integration:capture-ebpf-privileged-adapter",
   "integration:capture-ebpf-privileged-feasibility",
 ]
-wal_fault_matrix = ["unit:chronicle-wal"]
-ingest_limit_matrix = ["unit:chronicle-application"]
-replay_matrix = ["unit:chronicle-replay"]
-cgroup_matrix = ["unit:chronicle-application"]
 privileged_signal = ["integration:cli-privileged-signal"]
-format_check = ["tooling:validation-tests"]
-workspace_check = ["tooling:validation-tests"]
 systemd_type_simple = ["acceptance:recorder-readiness"]
 three_epochs = ["integration:capture-ebpf-privileged-adapter"]
 checkpoint_output_committed_checkpoint_missing = [

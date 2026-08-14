@@ -209,13 +209,7 @@ summary = Path(sys.argv[1])
 status, phase, commit, expected, mode, release, checks_path = sys.argv[2:9]
 checks = {
     "privileged_acceptance": "not_checked",
-    "wal_fault_matrix": "not_checked",
-    "ingest_limit_matrix": "not_checked",
-    "replay_matrix": "not_checked",
-    "cgroup_matrix": "not_checked",
     "privileged_signal": "not_checked",
-    "format_check": "not_checked",
-    "workspace_check": "not_checked",
     "systemd_type_simple": "not_checked",
     "three_epochs": "not_checked",
     "segment_age_rotation": "not_checked",
