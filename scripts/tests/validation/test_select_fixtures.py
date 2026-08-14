@@ -36,7 +36,7 @@ FIXTURES = {
     ),
     "e2e": (["tests/e2e/test_rootless_pipeline.py"], ["portable"]),
     "privileged": (
-        ["scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh"],
+        ["scripts/acceptance/lib/scenarios/p1/capture-basic.sh"],
         ["acceptance", "build_tooling"],
     ),
     "unknown": (["mystery/path.txt"], ALL_GROUPS),

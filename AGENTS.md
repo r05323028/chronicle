@@ -71,6 +71,13 @@ Wrapper preserves command status/output; deadline returns 124 after process-tree
 
 Agent recorder workflow: run `validate.sh fast`, then targeted changed-path/recorder tooling, then bounded scenario or lifecycle validation. Run complete P1/P2 gate only when required. Never start foreground daemon without wrapper and deterministic cleanup.
 
+### Canonical validation and acceptance entrypoints
+
+- `scripts/validate.sh` is the layered validation entrypoint (`fast`, `targeted`, `gate p1|p2`, `release`); `scripts/validation.py` is its selection/orchestration/reporting helper and `scripts/run-with-timeout.sh` wraps every bounded step.
+- `scripts/acceptance.sh` is the ONLY user-facing acceptance entrypoint (`--profile p1|p2|all`, `--executor local|multipass`). No deprecated aliases or compatibility wrappers are retained; do not reintroduce one without a concrete external caller or documented compatibility obligation (a self-referential delegation test is not one).
+- Scenario implementations live under `scripts/acceptance/lib/scenarios/` with one owner per scenario: `shared/<scenario>.sh` provides `scenario_<name>()` when behavior is identical across profiles; otherwise `p1/<scenario>.sh` / `p2/<scenario>.sh` provide `scenario_p1_<name>()` / `scenario_p2_<name>()`. Never add per-profile extension forwards for identical behavior; `scenario-dispatch.sh` and `report.py` validate this convention, so a missing implementation fails before execution.
+- Runtime/environment setup stays in `scripts/acceptance/lib/profile-{p1,p2}.sh`, `lib/multipass.sh`, and `acceptance/recorder-readiness.sh`; scenario files hold assertions only. Scenario sets, order, and timeouts are owned by `scripts/acceptance/scenarios.toml` and must not change casually.
+
 Acceptance evidence is content-addressed, not commit-addressed. Acceptance-sensitive content, fingerprint, or compatibility changes invalidate evidence; commit SHA changes alone do not. Retain commit/tree SHA as provenance and preserve same-run source-mutation checks, but reuse compatible P1/P2 evidence across rebases, equivalent recommits, OpenSpec archives, documentation-only commits, and unrelated changes outside validation fingerprint. Every release request still requires a clean, identifiable current checkout that remains unchanged through validation; never compare current commit/tree with historical evidence identity.
 
 ## Linux-only validation on macOS

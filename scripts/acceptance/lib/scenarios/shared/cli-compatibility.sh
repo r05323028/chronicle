@@ -130,9 +130,5 @@ PY
 }
 
 scenario_cli_compatibility() {
-	case "$CHRONICLE_ACCEPTANCE_PROFILE" in
-	p1) scenario_p1_cli_compatibility ;;
-	p2) scenario_p2_cli_compatibility ;;
-	*) die "unsupported shared scenario profile: $CHRONICLE_ACCEPTANCE_PROFILE" ;;
-	esac
+	cli_compatibility_impl
 }

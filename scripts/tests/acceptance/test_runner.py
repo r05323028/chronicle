@@ -197,32 +197,47 @@ class AcceptanceRunnerTests(unittest.TestCase):
             self.definition["scenarios"]["checkpoint-kill-restart"]["timeout_seconds"],
             300,
         )
+        scenario_root = ROOT / "scripts/acceptance/lib/scenarios"
         for profile in ("p1", "p2"):
             selected = report.profile_scenarios(self.definition, profile)
             ordered = report.dispatch_scenarios(self.definition, profile)
             self.assertEqual(set(selected), set(ordered))
             self.assertEqual(len(selected), len(ordered))
-            scenario_root = ROOT / "scripts/acceptance/lib/scenarios"
             self.assertTrue(
                 all(
                     (scenario_root / "shared" / f"{scenario}.sh").is_file()
-                    and (
-                        scenario_root / "extensions" / profile / f"{scenario}.sh"
-                    ).is_file()
                     or (scenario_root / profile / f"{scenario}.sh").is_file()
                     for scenario in selected
                 )
             )
-        for scenario in report.profile_scenarios(self.definition, "p1"):
-            self.assertTrue((scenario_root / "shared" / f"{scenario}.sh").is_file())
-            self.assertFalse((scenario_root / "p1" / f"{scenario}.sh").exists())
-            self.assertFalse((scenario_root / "p2" / f"{scenario}.sh").exists())
+        # Single-owner convention: every scenario has exactly one implementation
+        # (shared XOR profile), and the owner matches profile membership.
+        p1_selected = report.profile_scenarios(self.definition, "p1")
+        p2_selected = report.profile_scenarios(self.definition, "p2")
+        for scenario in sorted(set(p1_selected) | set(p2_selected)):
+            shared = scenario_root / "shared" / f"{scenario}.sh"
+            p1_impl = scenario_root / "p1" / f"{scenario}.sh"
+            p2_impl = scenario_root / "p2" / f"{scenario}.sh"
+            # One owner per scenario: a shared implementation XOR profile
+            # implementations matching profile membership.
+            self.assertEqual(
+                shared.is_file() + (p1_impl.is_file() or p2_impl.is_file()),
+                1,
+                f"scenario {scenario} must have one implementation owner",
+            )
+            if shared.is_file():
+                self.assertFalse(p1_impl.is_file())
+                self.assertFalse(p2_impl.is_file())
+            else:
+                self.assertEqual(p1_impl.is_file(), scenario in p1_selected)
+                self.assertEqual(p2_impl.is_file(), scenario in p2_selected)
         p1 = report.dispatch_scenarios(self.definition, "p1")
         p2 = report.dispatch_scenarios(self.definition, "p2")
         self.assertEqual([scenario for scenario in p2 if scenario in p1], p1)
         dispatcher = (ROOT / "scripts/acceptance/lib/scenario-dispatch.sh").read_text()
         self.assertNotIn("profile-p1.sh", dispatcher)
         self.assertNotIn("profile-p2.sh", dispatcher)
+        self.assertNotIn("extensions", dispatcher)
         multipass = (ROOT / "scripts/acceptance/lib/multipass.sh").read_text()
         self.assertNotIn("run_remote p1", multipass.split("else", 1)[1])
         self.assertIn('status = value.get("status", "not_checked")', multipass)
@@ -236,6 +251,73 @@ class AcceptanceRunnerTests(unittest.TestCase):
         self.assertNotIn(
             "p1_artifact_root", (ROOT / "scripts/acceptance/runner.py").read_text()
         )
+
+    def test_dispatcher_rejects_missing_implementation(self):
+        sandbox = self.temp / "missing-impl"
+        (sandbox / "scripts/acceptance/lib/scenarios/p1").mkdir(parents=True)
+        (sandbox / "scripts/acceptance/lib/scenarios/shared").mkdir(parents=True)
+        shutil.copy2(
+            ROOT / "scripts/acceptance/lib/scenario-dispatch.sh",
+            sandbox / "dispatcher.sh",
+        )
+        (
+            sandbox / "scripts/acceptance/lib/scenarios/p1" / "capture-basic.sh"
+        ).write_text("scenario_p1_capture_basic() { printf 'ran-capture-basic\n'; }\n")
+        command = sandbox / "run-dispatcher.sh"
+        command.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"ROOT={sandbox}\n"
+            f"source {sandbox}/dispatcher.sh\n"
+            "die() { printf 'DIE: %s\n' \"$*\" >&2; exit 1; }\n"
+            "CHRONICLE_ACCEPTANCE_SCENARIOS=capture-basic\n"
+            "run_scenario_plan p1\n"
+        )
+        output = subprocess.check_output(["bash", str(command)], text=True, timeout=10)
+        self.assertIn("ran-capture-basic", output)
+        # A selected scenario with no shared and no profile implementation must
+        # fail loudly before running anything.
+        command.write_text(
+            command.read_text().replace(
+                "CHRONICLE_ACCEPTANCE_SCENARIOS=capture-basic",
+                "CHRONICLE_ACCEPTANCE_SCENARIOS=ghost",
+            )
+        )
+        result = subprocess.run(
+            ["bash", str(command)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not implemented", result.stderr)
+
+    def test_report_load_scenarios_rejects_missing_implementation(self):
+        sandbox = self.temp / "report-scenarios"
+        root = sandbox / "scripts/acceptance"
+        (root / "lib/scenarios/shared").mkdir(parents=True)
+        (root / "lib/scenarios/p1").mkdir(parents=True)
+        (root / "lib/scenarios/p2").mkdir(parents=True)
+        config = root / "scenarios.toml"
+        config.write_text(
+            "schema_version = 1\n"
+            "[profiles.p1]\n"
+            'scenarios = ["present", "ghost"]\n'
+            "[profiles.p2]\n"
+            'scenarios = ["present", "ghost"]\n'
+            "[scenarios.present]\n"
+            "timeout_seconds = 300\n"
+            "[scenarios.ghost]\n"
+            "timeout_seconds = 300\n"
+        )
+        (root / "lib/scenarios/shared/present.sh").write_text("")
+        with self.assertRaises(ValueError):
+            report.load_scenarios(config)
+        # A shared implementation resolves without any profile extension file.
+        (root / "lib/scenarios/shared/ghost.sh").write_text("")
+        loaded = report.load_scenarios(config)
+        self.assertEqual(loaded["profiles"]["p1"]["scenarios"], ["present", "ghost"])
 
     def test_p2_profile_owns_failure_cleanup_resources(self):
         profile = (ROOT / "scripts/acceptance/lib/profile-p2.sh").read_text()
@@ -1545,17 +1627,48 @@ class AcceptanceRunnerTests(unittest.TestCase):
             )["fingerprint"],
         )
 
-    def test_compatibility_wrappers_delegate(self):
-        for name, profile, executor in (
-            ("p1-privileged.sh", "p1", "local"),
-            ("p2-privileged.sh", "p2", "local"),
-            ("p1-multipass.sh", "p1", "multipass"),
-            ("p2-multipass.sh", "p2", "multipass"),
-        ):
-            text = (ROOT / "scripts/acceptance" / name).read_text()
-            self.assertIn("DEPRECATED", text)
-            self.assertIn(f"--profile {profile}", text)
-            self.assertIn(f"--executor {executor}", text)
+    def test_obsolete_wrappers_absent_and_unreferenced(self):
+        removed = (
+            "scripts/acceptance/p1-privileged.sh",
+            "scripts/acceptance/p2-privileged.sh",
+            "scripts/acceptance/p1-multipass.sh",
+            "scripts/acceptance/p2-multipass.sh",
+            "scripts/tests/acceptance/test-p1-privileged-runner.sh",
+            "scripts/tests/acceptance/test-p2-privileged-runner.sh",
+        )
+        for path in removed:
+            self.assertFalse(
+                (ROOT / path).exists(), f"removed wrapper still present: {path}"
+            )
+        # No living executable/documentation surface may reference the removed
+        # basenames. OpenSpec planning snapshots (openspec/) are historical
+        # records, not callers, so they are excluded from the scan.
+        scan_prefixes = (".github/", "scripts/", "tests/", "docs/", "validation/")
+        scan_roots = ("AGENTS.md", "README.md", "CONTRIBUTING.md")
+        tracked = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        basenames = tuple(path.rsplit("/", 1)[1] for path in removed)
+        for file in tracked:
+            if file == "scripts/tests/acceptance/test_runner.py":
+                # This test intentionally names the removed wrappers.
+                continue
+            if not (file.startswith(scan_prefixes) or file in scan_roots):
+                continue
+            path = ROOT / file
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(errors="ignore")
+            except OSError:
+                continue
+            for basename in basenames:
+                self.assertNotIn(
+                    basename, text, f"tracked file references removed wrapper: {file}"
+                )
 
 
 if __name__ == "__main__":

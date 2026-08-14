@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -72,13 +73,12 @@ legacy_p1_checks = ["c1"]
 legacy_p2_checks = ["c1"]
 """
 
-REPO_COMMAND_MARKERS = (
-    "cargo test",
-    "cargo fmt",
-    "cargo clippy",
-    "cargo check",
-    "cargo build",
-    "cargo +",
+# Mirrors inventory.py embedded-command detection: an optional `if`/`then`, an
+# optional `run_compat_command <name>` prefix, and leading VAR=... assignments are
+# stripped before matching a cargo command, so scanner and baseline agree.
+EMBEDDED_CARGO_COMMAND = re.compile(
+    r"^(?:(?:if|then)\s+)?(?:run_compat_command\s+\S+\s+)?"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*cargo\b"
 )
 
 
@@ -92,13 +92,10 @@ def portable_repo_commands(
             stripped = line.strip()
             if not stripped or stripped.startswith(("#", "echo", "printf")):
                 continue
-            for marker in REPO_COMMAND_MARKERS:
-                if stripped.startswith(marker):
-                    if stripped not in allowlist:
-                        findings.append(
-                            (path.relative_to(directory).as_posix(), number, stripped)
-                        )
-                    break
+            if EMBEDDED_CARGO_COMMAND.match(stripped) and stripped not in allowlist:
+                findings.append(
+                    (path.relative_to(directory).as_posix(), number, stripped)
+                )
     return findings
 
 
@@ -273,9 +270,9 @@ class LedgerLinkageTests(unittest.TestCase):
             )
         )
         for entry in baseline["acceptance"]["embedded_cargo_repo_commands"]:
-            relative = entry["file"].removeprefix(
-                "scripts/acceptance/lib/scenarios/extensions/"
-            )
+            # Profile-directory prefix only; a reintroduced extensions/ path
+            # must fail loudly instead of normalizing into the allowed set.
+            relative = entry["file"].removeprefix("scripts/acceptance/lib/scenarios/")
             expected_id = f"embedded:{relative}:{entry['line']}"
             self.assertIn(
                 expected_id,
@@ -302,7 +299,7 @@ class LedgerLinkageTests(unittest.TestCase):
             )
         )
         expected = {
-            f"embedded:{entry['file'].removeprefix('scripts/acceptance/lib/scenarios/extensions/')}:{entry['line']}"
+            f"embedded:{entry['file'].removeprefix('scripts/acceptance/lib/scenarios/')}:{entry['line']}"
             for entry in baseline["acceptance"]["embedded_cargo_repo_commands"]
         }
         self.assertEqual(embedded, expected)
@@ -332,7 +329,9 @@ class OrchestrationEmbeddingTests(unittest.TestCase):
         for path in sorted((ROOT / "scripts/acceptance/lib/scenarios").rglob("*.sh")):
             for line in path.read_text(errors="replace").splitlines():
                 stripped = line.strip()
-                if any(stripped.startswith(marker) for marker in REPO_COMMAND_MARKERS):
+                if not stripped or stripped.startswith(("#", "echo", "printf")):
+                    continue
+                if EMBEDDED_CARGO_COMMAND.match(stripped):
                     found.add(stripped)
         self.assertEqual(found, allowlist)
 

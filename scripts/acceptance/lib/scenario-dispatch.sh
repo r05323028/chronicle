@@ -25,13 +25,15 @@ run_preflight() {
 	outcome=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("outcome",""))' \
 		"$ARTIFACT_ROOT/preflight.json" 2>/dev/null || printf '%s' '')
 	case "$outcome" in
-		supported) return 0 ;;
-		unsupported_environment | not_checked | infrastructure_error)
-			log "PREFLIGHT: $outcome - privileged scenarios not run (see preflight.json)" >&2
-			return 1 ;;
-		*)
-			log "PREFLIGHT: unreadable or unknown outcome - treating as not_checked" >&2
-			return 1 ;;
+	supported) return 0 ;;
+	unsupported_environment | not_checked | infrastructure_error)
+		log "PREFLIGHT: $outcome - privileged scenarios not run (see preflight.json)" >&2
+		return 1
+		;;
+	*)
+		log "PREFLIGHT: unreadable or unknown outcome - treating as not_checked" >&2
+		return 1
+		;;
 	esac
 }
 
@@ -260,11 +262,9 @@ source_scenarios() {
 	shift
 	for scenario in "$@"; do
 		if [[ -f "$SCENARIO_ROOT/shared/$scenario.sh" ]]; then
+			# Single-owner convention: the shared implementation runs in every profile.
 			# shellcheck source=/dev/null
 			source "$SCENARIO_ROOT/shared/$scenario.sh"
-			[[ -f "$SCENARIO_ROOT/extensions/$profile/$scenario.sh" ]] || die "missing $profile extension for shared scenario $scenario"
-			# shellcheck source=/dev/null
-			source "$SCENARIO_ROOT/extensions/$profile/$scenario.sh"
 		else
 			[[ -f "$SCENARIO_ROOT/$profile/$scenario.sh" ]] || die "scenario $scenario is not implemented for $profile"
 			# shellcheck source=/dev/null

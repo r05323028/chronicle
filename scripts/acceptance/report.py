@@ -52,12 +52,10 @@ def load_scenarios(path: Path) -> dict[str, Any]:
         for scenario in selected:
             scenario_root = path.parent / "lib" / "scenarios"
             shared = scenario_root / "shared" / f"{scenario}.sh"
-            profile_impl = scenario_root / "extensions" / profile / f"{scenario}.sh"
             profile_only = scenario_root / profile / f"{scenario}.sh"
-            if shared.is_file():
-                implementation = profile_impl
-            else:
-                implementation = profile_only
+            # Single-owner convention: the shared implementation when present,
+            # else the profile implementation; extension forwards are obsolete.
+            implementation = shared if shared.is_file() else profile_only
             if not implementation.is_file():
                 raise ValueError(f"missing central implementation: {implementation}")
     return value
@@ -439,7 +437,12 @@ def _classified_coverage(
     try:
         import tomllib
 
-        catalog_path = Path(__file__).resolve().parents[2] / "validation" / "test-architecture" / "test-catalog.toml"
+        catalog_path = (
+            Path(__file__).resolve().parents[2]
+            / "validation"
+            / "test-architecture"
+            / "test-catalog.toml"
+        )
         if catalog_path.is_file():
             with catalog_path.open("rb") as handle:
                 catalog = tomllib.load(handle)
@@ -471,9 +474,13 @@ def _classified_coverage(
     qualified = [
         name
         for name, value in checks.items()
-        if isinstance(value, str) and value == "passed"
-        and (name in {"privileged_acceptance", "privileged_signal", "privileged_feasibility"}
-             or "privileged" in name)
+        if isinstance(value, str)
+        and value == "passed"
+        and (
+            name
+            in {"privileged_acceptance", "privileged_signal", "privileged_feasibility"}
+            or "privileged" in name
+        )
     ]
     return {
         "functional_layers": sorted(layers),

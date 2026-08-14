@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034 # result globals are consumed by profile summary after scenario returns
-# Shared privileged public record/replay lifecycle scenario. Profile extensions
-# dispatch with profile-local cgroup/summary wiring; all evidence is
-# self-contained under $ARTIFACT_ROOT/user-intent-lifecycle.
+# Shared privileged public record/replay lifecycle scenario. The implementation
+# is self-contained (own data dir, cgroup subtree, targets), so a single shared
+# owner runs it under both P1 and P2; all evidence is self-contained under
+# $ARTIFACT_ROOT/user-intent-lifecycle.
 user_intent_lifecycle_impl() {
 	phase user_intent_lifecycle 'exercise supervised record/replay, retry, selectors, and cleanup'
 	local root="$ARTIFACT_ROOT/user-intent-lifecycle"
@@ -222,9 +223,5 @@ PY
 }
 
 scenario_user_intent_lifecycle() {
-	case "$CHRONICLE_ACCEPTANCE_PROFILE" in
-	p1) scenario_p1_user_intent_lifecycle ;;
-	p2) scenario_p2_user_intent_lifecycle ;;
-	*) die "unsupported shared scenario profile: $CHRONICLE_ACCEPTANCE_PROFILE" ;;
-	esac
+	user_intent_lifecycle_impl
 }

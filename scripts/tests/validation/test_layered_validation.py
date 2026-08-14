@@ -34,7 +34,7 @@ class LayeredValidationTests(unittest.TestCase):
             "crates/chronicle-etl/src/lib.rs",
             "crates/chronicle-wal/src/lib.rs",
             "ebpf/src/main.rs",
-            "scripts/acceptance/p1-privileged.sh",
+            "scripts/acceptance/scenarios.toml",
         ):
             target = self.temp / path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +81,7 @@ class LayeredValidationTests(unittest.TestCase):
         self.assertEqual(
             first, validation.fingerprint(self.temp, "p1", self.cfg)["fingerprint"]
         )
-        (self.temp / "scripts/acceptance/p1-privileged.sh").write_text("changed\n")
+        (self.temp / "scripts/acceptance/scenarios.toml").write_text("changed\n")
         self.assertNotEqual(
             first, validation.fingerprint(self.temp, "p1", self.cfg)["fingerprint"]
         )

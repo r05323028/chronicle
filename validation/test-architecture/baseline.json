@@ -3,26 +3,46 @@
     "embedded_cargo_repo_commands": [
       {
         "command": "cargo build --release --locked",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh",
+        "file": "scripts/acceptance/lib/scenarios/p1/capture-basic.sh",
         "line": 14
       },
       {
+        "command": "CHRONICLE_EBPF_TARGET_DIR=\"$EBPF_TARGET_DIR\" cargo build --release -p chronicle-cli --features linux-ebpf --locked >>\"$ARTIFACT_ROOT/build.log\" 2>&1",
+        "file": "scripts/acceptance/lib/scenarios/p1/capture-basic.sh",
+        "line": 19
+      },
+      {
         "command": "cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture >\"$ARTIFACT_ROOT/privileged-feasibility.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh",
+        "file": "scripts/acceptance/lib/scenarios/p1/capture-basic.sh",
         "line": 165
       },
       {
         "command": "cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture >\"$ARTIFACT_ROOT/signal-tests.log\" 2>&1",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh",
+        "file": "scripts/acceptance/lib/scenarios/p1/replay.sh",
         "line": 30
       },
       {
         "command": "cargo +nightly build -Z build-std=core --manifest-path \"$ROOT/ebpf/Cargo.toml\" --target bpfel-unknown-none --release --locked",
-        "file": "scripts/acceptance/lib/scenarios/extensions/p2/capture-basic.sh",
+        "file": "scripts/acceptance/lib/scenarios/p2/capture-basic.sh",
         "line": 14
+      },
+      {
+        "command": "CHRONICLE_EBPF_TARGET_DIR=\"$EBPF_TARGET_DIR\" cargo build -p chronicle-cli --features linux-ebpf --locked",
+        "file": "scripts/acceptance/lib/scenarios/p2/capture-basic.sh",
+        "line": 15
+      },
+      {
+        "command": "if run_compat_command signal cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture; then",
+        "file": "scripts/acceptance/lib/scenarios/p2/resource-cleanup.sh",
+        "line": 7
+      },
+      {
+        "command": "run_compat_command wal-feasibility cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture || set_check privileged_feasibility failed",
+        "file": "scripts/acceptance/lib/scenarios/p2/wal-recovery.sh",
+        "line": 200
       }
     ],
-    "embedded_command_count": 4,
+    "embedded_command_count": 8,
     "profiles": {
       "p1": {
         "execution_order": [
@@ -222,9 +242,7 @@
           "replay"
         ],
         "id": "replay",
-        "legacy_p1_checks": [
-          "replay_matrix"
-        ],
+        "legacy_p1_checks": [],
         "legacy_p2_checks": [
           "inspect_replay",
           "one_shot_equivalence"
@@ -241,10 +259,7 @@
         ],
         "id": "resource-cleanup",
         "legacy_p1_checks": [
-          "cgroup_matrix",
-          "format_check",
-          "privileged_signal",
-          "workspace_check"
+          "privileged_signal"
         ],
         "legacy_p2_checks": [
           "resource_cleanup",
@@ -300,10 +315,7 @@
           "wal"
         ],
         "id": "wal-recovery",
-        "legacy_p1_checks": [
-          "ingest_limit_matrix",
-          "wal_fault_matrix"
-        ],
+        "legacy_p1_checks": [],
         "legacy_p2_checks": [
           "checkpoint_committed_status_missing",
           "checkpoint_output_committed_checkpoint_missing"
@@ -317,7 +329,7 @@
     ],
     "scenario_id_count": 13
   },
-  "captured_at_utc": "2026-08-13T14:05:56.943436+00:00",
+  "captured_at_utc": "2026-08-14T11:32:21.821913+00:00",
   "ci": {
     "invocations": [
       {
@@ -349,37 +361,65 @@
         "text": "run: ./scripts/validate.sh fast"
       },
       {
-        "line": 43,
-        "text": "- name: Validate layered tooling"
+        "line": 44,
+        "text": "run: cargo build -p chronicle-cli --locked"
       },
       {
         "line": 46,
+        "text": "- name: Portable smoke and rootless coverage"
+      },
+      {
+        "line": 48,
+        "text": "python3 tests/smoke/test_smoke.py"
+      },
+      {
+        "line": 49,
+        "text": "python3 tests/acceptance/test_record.py"
+      },
+      {
+        "line": 50,
+        "text": "python3 tests/acceptance/test_inspect.py"
+      },
+      {
+        "line": 51,
+        "text": "python3 tests/acceptance/test_replay.py"
+      },
+      {
+        "line": 52,
+        "text": "python3 tests/e2e/test_rootless_pipeline.py"
+      },
+      {
+        "line": 55,
+        "text": "- name: Validate layered tooling"
+      },
+      {
+        "line": 58,
         "text": "python3 scripts/tests/acceptance/test_runner.py"
       },
       {
-        "line": 47,
+        "line": 59,
         "text": "bash scripts/tests/acceptance/test-p2-readiness.sh"
       },
       {
-        "line": 69,
+        "line": 81,
         "text": "cargo +nightly install bpf-linker --locked"
       },
       {
-        "line": 73,
+        "line": 85,
         "text": "cargo +nightly build -Z build-std=core \\"
       },
       {
-        "line": 74,
+        "line": 86,
         "text": "--manifest-path ebpf/Cargo.toml \\"
       },
       {
-        "line": 75,
+        "line": 87,
         "text": "--target bpfel-unknown-none --release --locked"
       }
     ],
     "workflow": ".github/workflows/ci.yml"
   },
-  "commit": "c326cc6",
+  "commit": "11e570f",
   "evidence_report_fields": [
     "__main__",
     "all",
@@ -387,6 +427,8 @@
     "btf",
     "capabilities",
     "checks",
+    "classified_coverage",
+    "classified_test_ids",
     "commit_sha",
     "compatibility_version",
     "complete",
@@ -394,6 +436,8 @@
     "created_at",
     "end",
     "environment",
+    "environments",
+    "error",
     "evidence_file",
     "executor",
     "exit_code",
@@ -403,6 +447,7 @@
     "final",
     "fingerprint",
     "from",
+    "functional_layers",
     "guest_source",
     "identity_error",
     "kernel",
@@ -415,6 +460,8 @@
     "os",
     "passed",
     "phases",
+    "preflight",
+    "privileged_qualified_checks",
     "profile",
     "records",
     "release_eligible",
@@ -443,17 +490,49 @@
   ],
   "root_tests": [
     {
-      "lines": 222,
-      "path": "tests/e2e/http_acceptance_driver.py"
+      "lines": 0,
+      "path": "tests/__init__.py"
     },
     {
-      "lines": 40,
-      "path": "tests/e2e/test_http_acceptance_driver.py"
+      "lines": 68,
+      "path": "tests/acceptance/test_inspect.py"
+    },
+    {
+      "lines": 71,
+      "path": "tests/acceptance/test_record.py"
+    },
+    {
+      "lines": 95,
+      "path": "tests/acceptance/test_replay.py"
+    },
+    {
+      "lines": 98,
+      "path": "tests/e2e/test_rootless_pipeline.py"
+    },
+    {
+      "lines": 104,
+      "path": "tests/smoke/test_smoke.py"
+    },
+    {
+      "lines": 0,
+      "path": "tests/support/__init__.py"
+    },
+    {
+      "lines": 222,
+      "path": "tests/support/http_driver.py"
+    },
+    {
+      "lines": 320,
+      "path": "tests/support/process.py"
+    },
+    {
+      "lines": 63,
+      "path": "tests/support/test_http_driver.py"
     }
   ],
   "rust": {
     "colocated_count": 42,
-    "file_count": 50,
+    "file_count": 53,
     "files": [
       {
         "cfg_test_modules": 0,
@@ -1079,16 +1158,20 @@
       {
         "cfg_test_modules": 1,
         "kind": "unit_colocated",
-        "lines": 174,
+        "lines": 192,
         "path": "crates/chronicle-application/src/recorder_lease.rs",
         "signals": [
           "privilege"
         ],
-        "test_attributes": 1,
+        "test_attributes": 2,
         "test_names": [
           [
             "",
             "domain_lease_is_exclusive_and_released_on_drop"
+          ],
+          [
+            "",
+            "state_lease_reported_while_held_and_released_on_drop"
           ]
         ]
       },
@@ -1520,6 +1603,34 @@
       {
         "cfg_test_modules": 0,
         "kind": "integration",
+        "lines": 133,
+        "path": "crates/chronicle-application/tests/etl_contract.rs",
+        "signals": [
+          "privilege"
+        ],
+        "test_attributes": 4,
+        "test_names": [
+          [
+            "",
+            "etl_publishes_and_rerun_is_idempotent"
+          ],
+          [
+            "",
+            "etl_equivalence_across_output_roots"
+          ],
+          [
+            "",
+            "etl_rejects_corrupted_segment_fail_closed"
+          ],
+          [
+            "",
+            "etl_repairs_missing_checkpoint"
+          ]
+        ]
+      },
+      {
+        "cfg_test_modules": 0,
+        "kind": "integration",
         "lines": 160,
         "path": "crates/chronicle-application/tests/fake_vertical.rs",
         "signals": [
@@ -1685,6 +1796,22 @@
           [
             "",
             "checked_in_http_fixtures_are_valid_and_credential_free"
+          ]
+        ]
+      },
+      {
+        "cfg_test_modules": 0,
+        "kind": "integration",
+        "lines": 149,
+        "path": "crates/chronicle-capture/tests/loss_window_model.rs",
+        "signals": [
+          "privilege"
+        ],
+        "test_attributes": 1,
+        "test_names": [
+          [
+            "",
+            "loss_sampling_state_machine_covers_all_gate_a_boundaries"
           ]
         ]
       },
@@ -1886,7 +2013,7 @@
       {
         "cfg_test_modules": 0,
         "kind": "integration",
-        "lines": 1631,
+        "lines": 1489,
         "path": "crates/chronicle-capture-ebpf/tests/privileged_feasibility.rs",
         "signals": [
           "network",
@@ -1894,15 +2021,11 @@
           "sleep",
           "subprocess"
         ],
-        "test_attributes": 2,
+        "test_attributes": 1,
         "test_names": [
           [
             "",
             "privileged_feasibility"
-          ],
-          [
-            "",
-            "loss_sampling_state_machine_covers_all_gate_a_boundaries"
           ]
         ]
       },
@@ -2000,7 +2123,7 @@
       {
         "cfg_test_modules": 0,
         "kind": "integration",
-        "lines": 1131,
+        "lines": 1211,
         "path": "crates/chronicle-cli/tests/cli_contract.rs",
         "signals": [
           "network",
@@ -2009,7 +2132,7 @@
           "sleep",
           "subprocess"
         ],
-        "test_attributes": 17,
+        "test_attributes": 18,
         "test_names": [
           [
             "",
@@ -2034,6 +2157,10 @@
           [
             "",
             "cli_etl_publishes_repairs_checkpoint_and_rejects_corruption"
+          ],
+          [
+            "",
+            "cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch"
           ],
           [
             "",
@@ -3022,10 +3149,54 @@
             "lifecycle_is_monotonic_and_delete_is_enabled_after_proof"
           ]
         ]
+      },
+      {
+        "cfg_test_modules": 0,
+        "kind": "integration",
+        "lines": 288,
+        "path": "crates/chronicle-wal/tests/wal_matrix.rs",
+        "signals": [
+          "privilege"
+        ],
+        "test_attributes": 8,
+        "test_names": [
+          [
+            "",
+            "encode_decode_round_trip"
+          ],
+          [
+            "",
+            "write_scan_recover_is_deterministic"
+          ],
+          [
+            "",
+            "envelope_corruption_fails_closed"
+          ],
+          [
+            "",
+            "segment_header_corruption_fails_closed"
+          ],
+          [
+            "",
+            "truncated_segment_never_counts_as_durable"
+          ],
+          [
+            "",
+            "writer_lock_fault_is_detected"
+          ],
+          [
+            "",
+            "retention_cleanup_fault_matrix"
+          ],
+          [
+            "",
+            "retention_digest_mismatch_is_rejected"
+          ]
+        ]
       }
     ],
-    "integration_count": 8,
-    "test_attribute_count": 493
+    "integration_count": 11,
+    "test_attribute_count": 507
   },
   "script_tests": [
     {
@@ -3033,20 +3204,12 @@
       "path": "scripts/tests/acceptance/.ruff_cache/.gitignore"
     },
     {
-      "lines": 1,
+      "lines": 2,
       "path": "scripts/tests/acceptance/.ruff_cache/0.8.1/11164930839584544361"
     },
     {
       "lines": 1,
       "path": "scripts/tests/acceptance/.ruff_cache/CACHEDIR.TAG"
-    },
-    {
-      "lines": 5,
-      "path": "scripts/tests/acceptance/test-p1-privileged-runner.sh"
-    },
-    {
-      "lines": 5,
-      "path": "scripts/tests/acceptance/test-p2-privileged-runner.sh"
     },
     {
       "lines": 175,
@@ -3057,7 +3220,7 @@
       "path": "scripts/tests/acceptance/test-wait.sh"
     },
     {
-      "lines": 1519,
+      "lines": 1669,
       "path": "scripts/tests/acceptance/test_runner.py"
     },
     {
@@ -3073,7 +3236,7 @@
       "path": "scripts/tests/validation/.ruff_cache/.gitignore"
     },
     {
-      "lines": 1,
+      "lines": 2,
       "path": "scripts/tests/validation/.ruff_cache/0.8.1/7851810818908901493"
     },
     {
@@ -3085,8 +3248,32 @@
       "path": "scripts/tests/validation/test_architecture_boundaries.py"
     },
     {
+      "lines": 119,
+      "path": "scripts/tests/validation/test_evidence_reuse.py"
+    },
+    {
       "lines": 333,
       "path": "scripts/tests/validation/test_layered_validation.py"
+    },
+    {
+      "lines": 150,
+      "path": "scripts/tests/validation/test_lifecycle_cleanup.py"
+    },
+    {
+      "lines": 164,
+      "path": "scripts/tests/validation/test_preflight.py"
+    },
+    {
+      "lines": 92,
+      "path": "scripts/tests/validation/test_select_fixtures.py"
+    },
+    {
+      "lines": 173,
+      "path": "scripts/tests/validation/test_sleep_policy.py"
+    },
+    {
+      "lines": 470,
+      "path": "scripts/tests/validation/test_test_architecture.py"
     }
   ],
   "validation_groups": {
@@ -3131,8 +3318,7 @@
           "scripts/acceptance/**",
           "scripts/run-with-timeout.sh",
           "scripts/tests/test-run-with-timeout.sh",
-          "scripts/tests/acceptance/**",
-          "tests/e2e/http_acceptance_driver.py"
+          "scripts/tests/acceptance/**"
         ]
       },
       "build_tooling": {
@@ -3147,7 +3333,8 @@
           "scripts/**",
           "validation/**",
           ".github/**",
-          "deny.toml"
+          "deny.toml",
+          "validation/test-architecture/**"
         ]
       },
       "cli_docs": {

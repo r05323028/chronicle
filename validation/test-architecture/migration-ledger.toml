@@ -501,7 +501,7 @@ verify = "privileged scenario on supported Linux"
 
 [[entries]]
 id = "embedded:p1/capture-basic.sh:14"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh"
+path = "scripts/acceptance/lib/scenarios/p1/capture-basic.sh"
 purpose = "eBPF object build (cargo build --release --locked)"
 current_layer = "repository-check"
 target_layer = "portable-build"
@@ -518,7 +518,7 @@ verify = "cargo +nightly build -Z build-std=core --manifest-path ebpf/Cargo.toml
 
 [[entries]]
 id = "embedded:p2/capture-basic.sh:14"
-path = "scripts/acceptance/lib/scenarios/extensions/p2/capture-basic.sh"
+path = "scripts/acceptance/lib/scenarios/p2/capture-basic.sh"
 purpose = "eBPF object build (nightly build-std)"
 current_layer = "repository-check"
 target_layer = "portable-build"
@@ -1286,7 +1286,7 @@ verify = "cargo test -p chronicle-cli --test cli_contract cli_internal_etl_rejec
 
 [[entries]]
 id = "embedded:p1/capture-basic.sh:165"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/capture-basic.sh"
+path = "scripts/acceptance/lib/scenarios/p1/capture-basic.sh"
 purpose = "privileged feasibility suite (--ignored); portable WAL/ingest matrices removed to separate gate prerequisites (task 8.1)"
 current_layer = "privileged-integration"
 target_layer = "privileged-integration"
@@ -1302,7 +1302,7 @@ verify = "cargo test -p chronicle-capture-ebpf --test privileged_feasibility --l
 
 [[entries]]
 id = "embedded:p1/replay.sh:30"
-path = "scripts/acceptance/lib/scenarios/extensions/p1/replay.sh"
+path = "scripts/acceptance/lib/scenarios/p1/replay.sh"
 purpose = "privileged signal suite (--ignored); portable replay/cgroup matrices removed to separate gate prerequisites (task 8.1)"
 current_layer = "privileged-integration"
 target_layer = "privileged-integration"
@@ -1315,3 +1315,67 @@ destination = "selected privileged test"
 dependency_impact = "none"
 rationale = "task 8.1: only the real signal/process invariant stays in the scenario body"
 verify = "cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture"
+
+[[entries]]
+id = "embedded:p1/capture-basic.sh:19"
+path = "scripts/acceptance/lib/scenarios/p1/capture-basic.sh"
+purpose = "Linux eBPF-featured CLI release build (cargo build --release -p chronicle-cli --features linux-ebpf --locked)"
+current_layer = "repository-check"
+target_layer = "portable-build"
+environment = "portable"
+owner = "chronicle-cli"
+surface = "internal-tooling"
+gates = ["p1"]
+disposition = "move"
+destination = "groups.ebpf / CI unprivileged build"
+dependency_impact = "none"
+rationale = "task 8.1: feature build belongs to portable build checks, not scenario body"
+verify = "cargo build --release -p chronicle-cli --features linux-ebpf --locked"
+
+[[entries]]
+id = "embedded:p2/capture-basic.sh:15"
+path = "scripts/acceptance/lib/scenarios/p2/capture-basic.sh"
+purpose = "Linux eBPF-featured CLI build (cargo build -p chronicle-cli --features linux-ebpf --locked)"
+current_layer = "repository-check"
+target_layer = "portable-build"
+environment = "portable"
+owner = "chronicle-cli"
+surface = "internal-tooling"
+gates = ["p2"]
+disposition = "move"
+destination = "groups.ebpf / CI unprivileged build"
+dependency_impact = "none"
+rationale = "task 8.1: feature build belongs to portable build checks, not scenario body"
+verify = "cargo build -p chronicle-cli --features linux-ebpf --locked"
+
+[[entries]]
+id = "embedded:p2/resource-cleanup.sh:7"
+path = "scripts/acceptance/lib/scenarios/p2/resource-cleanup.sh"
+purpose = "privileged signal suite (--ignored) executed through run_compat_command"
+current_layer = "privileged-integration"
+target_layer = "privileged-integration"
+environment = "privileged"
+owner = "chronicle-cli"
+surface = "crate-api"
+gates = ["p2"]
+disposition = "remain_privileged"
+destination = "selected privileged test"
+dependency_impact = "none"
+rationale = "task 8.1: only the real signal/process invariant stays in the scenario body"
+verify = "cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture"
+
+[[entries]]
+id = "embedded:p2/wal-recovery.sh:200"
+path = "scripts/acceptance/lib/scenarios/p2/wal-recovery.sh"
+purpose = "privileged feasibility suite (--ignored) executed through run_compat_command"
+current_layer = "privileged-integration"
+target_layer = "privileged-integration"
+environment = "privileged"
+owner = "chronicle-capture-ebpf"
+surface = "crate-api"
+gates = ["p2"]
+disposition = "remain_privileged"
+destination = "selected privileged test"
+dependency_impact = "none"
+rationale = "task 8.1: only the real capture/feasibility invariant stays in the scenario body"
+verify = "cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture"
