@@ -42,7 +42,7 @@ Every portable WAL/ETL/replay/CLI/fmt/workspace cargo invocation was removed
 from scenario bodies into portable prerequisites and repository checks. The
 only embedded cargo that remains is genuinely privileged: building release and
 eBPF artifacts and executing the `--ignored` privileged test suites (kernel
-feasibility, signal handling). `scripts/tests/validation/test_test_architecture.py`
+feasibility, signal handling). `scripts/tests/validation/test_validation_architecture.py`
 enforces this deny-by-default via a documented allowlist.
 
 ## New root black-box suites (tasks 4.1/4.2/5.1/6.2)

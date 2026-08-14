@@ -196,7 +196,7 @@ run_gate_portable_prerequisites() {
 	run_shell gate-source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'" || status=$?
 	run_shell gate-architecture "python3 '$HELPER' architecture --root '$ROOT' --config '$ROOT/validation/architecture.toml'" || status=$?
 	run_shell gate-catalog "python3 '$HELPER' catalog --root '$ROOT'" || status=$?
-	run_shell gate-tooling-tests 'python3 scripts/tests/validation/test_test_architecture.py && python3 scripts/tests/validation/test_sleep_policy.py && python3 scripts/tests/validation/test_preflight.py && python3 scripts/tests/validation/test_lifecycle_cleanup.py && python3 scripts/tests/validation/test_select_fixtures.py && python3 scripts/tests/validation/test_evidence_reuse.py && python3 scripts/tests/validation/test_layered_validation.py && python3 scripts/tests/validation/test_architecture_boundaries.py' || status=$?
+	run_shell gate-tooling-tests 'python3 scripts/tests/validation/test_validation_architecture.py && python3 scripts/tests/validation/test_sleep_policy.py && python3 scripts/tests/validation/test_preflight.py && python3 scripts/tests/validation/test_lifecycle_cleanup.py && python3 scripts/tests/validation/test_select_fixtures.py && python3 scripts/tests/validation/test_evidence_reuse.py && python3 scripts/tests/validation/test_layered_validation.py && python3 scripts/tests/validation/test_architecture_boundaries.py && python3 scripts/tests/validation/test_release_workflow.py' || status=$?
 	return "$status"
 }
 
@@ -232,7 +232,7 @@ run_fast() {
 	run_shell source-ownership "python3 '$HELPER' ownership --root '$ROOT' --config '$CONFIG'"
 	run_shell architecture "python3 '$HELPER' architecture --root '$ROOT' --config '$ROOT/validation/architecture.toml'"
 	run_shell catalog "python3 '$HELPER' catalog --root '$ROOT'"
-	run_shell tooling-tests 'python3 scripts/tests/validation/test_test_architecture.py && python3 scripts/tests/validation/test_sleep_policy.py && python3 scripts/tests/validation/test_preflight.py && python3 scripts/tests/validation/test_lifecycle_cleanup.py && python3 scripts/tests/validation/test_select_fixtures.py && python3 scripts/tests/validation/test_evidence_reuse.py && python3 scripts/tests/validation/test_layered_validation.py && python3 scripts/tests/validation/test_architecture_boundaries.py'
+	run_shell tooling-tests 'python3 scripts/tests/validation/test_validation_architecture.py && python3 scripts/tests/validation/test_sleep_policy.py && python3 scripts/tests/validation/test_preflight.py && python3 scripts/tests/validation/test_lifecycle_cleanup.py && python3 scripts/tests/validation/test_select_fixtures.py && python3 scripts/tests/validation/test_evidence_reuse.py && python3 scripts/tests/validation/test_layered_validation.py && python3 scripts/tests/validation/test_architecture_boundaries.py && python3 scripts/tests/validation/test_release_workflow.py'
 	printf '\nUnit + integration: workspace test invocation. Cheap integration: catalog + tooling meta-tests above.\n'
 }
 

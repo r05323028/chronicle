@@ -4,13 +4,57 @@ on:
   push:
     tags:
       - "v*"
+  # Manual trigger = release dry run: exercises the full preparation path
+  # (build, notes, archives, checksums, bundle) but never publishes.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  # Release-note generation (Pi + OpenCode Go). Non-secret values live here so
+  # the jobs reference them without duplicating literals. The API key is NOT a
+  # workflow env: it stays in the OPENCODE_GO_API_KEY secret and is injected
+  # only into the step that talks to the provider.
+  OPENCODE_GO_BASE_URL: https://opencode.ai/zen/go/v1
+  RELEASE_NOTES_MODEL: deepseek-v4-flash
+  RELEASE_NOTES_THINKING_LEVEL: off
+
 jobs:
+  resolve-context:
+    name: Resolve release context
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.resolve.outputs.mode }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      is-release: ${{ steps.resolve.outputs.is-release }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Resolve mode, version and intended tag
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              MODE=release
+              TAG="$GITHUB_REF_NAME"
+            else
+              MODE=dry-run
+              TAG=""
+            fi
+          else
+            MODE=dry-run
+            TAG=""
+          fi
+          ./scripts/release/resolve-release-context.sh \
+            "$MODE" Cargo.toml "$TAG" >> "$GITHUB_OUTPUT"
+
   release:
-    name: Build and publish chronicle-${{ matrix.target }}
+    name: Build chronicle-${{ matrix.target }}
+    needs: resolve-context
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -103,47 +147,173 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  release-notes:
+    name: Generate release notes with Pi
+    needs: [resolve-context, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository with full history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          # Full history so the agent can resolve the current and previous
+          # release tags itself from the checked-out repository.
+          fetch-depth: 0
+
+      - name: Configure OpenCode Go provider
+        run: python3 scripts/release/write-opencode-go-models-json.py
+
+      - name: Load release-note prompt
+        id: prompt
+        run: |
+          {
+            echo "prompt<<CHRONICLE_PROMPT_EOF"
+            cat .github/prompts/release-notes.md
+            echo "CHRONICLE_PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes with Pi
+        id: generate
+        uses: shaftoe/pi-coding-agent-action@v2.27.0
+        env:
+          OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+        with:
+          github_token: ${{ github.token }}
+          provider: opencode-go
+          model: ${{ env.RELEASE_NOTES_MODEL }}
+          thinking_level: ${{ env.RELEASE_NOTES_THINKING_LEVEL }}
+          load_builtin_extensions: false
+          prompt: ${{ steps.prompt.outputs.prompt }}
+
+      - name: Save generated release notes
+        run: |
+          cat > release-notes.md <<'CHRONICLE_NOTES_EOF'
+          ${{ steps.generate.outputs.response }}
+          CHRONICLE_NOTES_EOF
+          test -s release-notes.md
+
+      - name: Upload release notes artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  prepare-release:
+    name: Prepare release artifacts
+    needs: [resolve-context, release, release-notes]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: prepared-release
+          merge-multiple: true
+
+      - name: Download release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-notes
+          path: prepared-release
+
+      - name: Verify expected artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.resolve-context.outputs.version }}"
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            archive="prepared-release/chronicle-${VERSION}-${target}.tar.gz"
+            [[ -f "$archive" ]] || {
+              echo "missing expected archive: $archive" >&2
+              exit 1
+            }
+          done
+          [[ -f prepared-release/release-notes.md ]] || {
+            echo "missing release-notes.md" >&2
+            exit 1
+          }
+          echo "expected artifacts present:"
+          ls -1 prepared-release/
+
+      - name: Generate and verify SHA256SUMS
+        run: |
+          set -euo pipefail
+          (cd prepared-release && sha256sum chronicle-*.tar.gz > SHA256SUMS)
+          sha256sum -c prepared-release/SHA256SUMS
+          echo "SHA256SUMS verified"
+          cat prepared-release/SHA256SUMS
+
+      - name: Write release preparation summary
+        run: |
+          set -euo pipefail
+          MODE="${{ needs.resolve-context.outputs.mode }}"
+          VERSION="${{ needs.resolve-context.outputs.version }}"
+          TAG="${{ needs.resolve-context.outputs.tag }}"
+          ARCHIVES=$(basename -a prepared-release/chronicle-*.tar.gz \
+            | tr '\n' ' ')
+          {
+            echo "## Release preparation summary"
+            echo ""
+            echo "- Mode: ${MODE}"
+            echo "- Resolved workspace version: ${VERSION}"
+            echo "- Intended release tag: ${TAG}"
+            echo "- Generated archives: ${ARCHIVES}"
+            echo "- release-notes.md: present"
+            echo "- SHA256SUMS: present and verified"
+            if [[ "$MODE" == "dry-run" ]]; then
+              echo "- Publication: SKIPPED (dry run)"
+              echo ""
+              echo "Dry run completed successfully."
+              echo "No GitHub Release was created."
+            else
+              echo "- Publication: deferred to publish job (tag push)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload prepared release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: prepared-release
+          path: prepared-release
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Create GitHub Release
-    needs: release
+    # Real-release boundary: publication happens only for a pushed v* tag.
+    # A workflow_dispatch run is a dry run: gh release create is unreachable.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [resolve-context, prepare-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - name: Download build artifacts
+      - name: Download prepared release bundle
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          path: dist
-          merge-multiple: true
+          name: prepared-release
+          path: .
 
       - name: Publish GitHub Release
         run: >-
-          gh release create "$GITHUB_REF_NAME"
-          dist/chronicle-*.tar.gz --generate-notes
+          gh release create "${{ needs.resolve-context.outputs.tag }}"
+          chronicle-*.tar.gz SHA256SUMS
+          --notes-file release-notes.md
+          --verify-tag
 
-  checksums:
-    name: Compose release checksums
-    needs: publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download release archives
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          gh release download "$GITHUB_REF_NAME" \
-            --pattern 'chronicle-*.tar.gz' \
-            --dir dist
-
-      - name: Compose and verify SHA256SUMS
-        run: |
-          set -euo pipefail
-          (cd dist && sha256sum chronicle-*.tar.gz > SHA256SUMS)
-          cat dist/SHA256SUMS
-          sha256sum -c dist/SHA256SUMS
-
-      - name: Upload checksums
+      - name: Assert SHA256SUMS is attached to the release
         run: >-
-          gh release upload "$GITHUB_REF_NAME"
-          dist/SHA256SUMS --clobber
+          gh release view "${{ needs.resolve-context.outputs.tag }}"
+          --json assets --jq '.assets[].name'
+          | grep -qx SHA256SUMS
+
+      - name: Write publication summary
+        run: |
+          {
+            echo "## Release published"
+            echo ""
+            echo "- Tag: ${{ needs.resolve-context.outputs.tag }}"
+            echo "- Version: ${{ needs.resolve-context.outputs.version }}"
+          } >> "$GITHUB_STEP_SUMMARY"

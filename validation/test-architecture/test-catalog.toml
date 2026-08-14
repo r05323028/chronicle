@@ -374,7 +374,7 @@ id = "tooling:validation-tests"
 layer = "integration"
 environment = "portable"
 owner = "validation-tooling"
-command = "python3 scripts/tests/validation/test_layered_validation.py ; python3 scripts/tests/validation/test_architecture_boundaries.py ; python3 scripts/tests/validation/test_test_architecture.py ; python3 scripts/tests/validation/test_sleep_policy.py ; python3 scripts/tests/validation/test_lifecycle_cleanup.py ; python3 scripts/tests/validation/test_select_fixtures.py ; python3 scripts/tests/validation/test_evidence_reuse.py"
+command = "python3 scripts/tests/validation/test_layered_validation.py ; python3 scripts/tests/validation/test_architecture_boundaries.py ; python3 scripts/tests/validation/test_validation_architecture.py ; python3 scripts/tests/validation/test_sleep_policy.py ; python3 scripts/tests/validation/test_lifecycle_cleanup.py ; python3 scripts/tests/validation/test_select_fixtures.py ; python3 scripts/tests/validation/test_evidence_reuse.py ; python3 scripts/tests/validation/test_release_workflow.py"
 status = "existing"
 gates = ["p1", "p2", "release"]
 

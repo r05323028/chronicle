@@ -16,7 +16,7 @@ matrix, boundary review, process-pattern inventory, comparison report) were
 removed once the migration completed; their machine-checkable obligations now
 live in `test-catalog.toml` and are enforced by
 `scripts/validation.py catalog` and
-`scripts/tests/validation/test_test_architecture.py`.
+`scripts/tests/validation/test_validation_architecture.py`.
 
 Local privileged-run evidence is retained (gitignored) under
 `validation/test-architecture/evidence/`.
@@ -25,7 +25,7 @@ Local privileged-run evidence is retained (gitignored) under
 
 ```bash
 python3 scripts/validation.py catalog --root .
-python3 scripts/tests/validation/test_test_architecture.py
+python3 scripts/tests/validation/test_validation_architecture.py
 ```
 
 The `validation/test-architecture/**` path is owned by the `build_tooling`
@@ -68,7 +68,7 @@ Repeated helpers are language-local and crate-local or root-suite-local (`tests/
 
 ### Embedded portable commands in privileged orchestration
 
-Privileged scenario bodies may invoke cargo only for genuinely privileged work: building release/eBPF artifacts and executing the `--ignored` privileged test suites (kernel feasibility, signal handling). Deny-by-default — any other embedded cargo invocation fails the guard in `scripts/tests/validation/test_test_architecture.py` until it is added to the documented allowlist with a privileged justification.
+Privileged scenario bodies may invoke cargo only for genuinely privileged work: building release/eBPF artifacts and executing the `--ignored` privileged test suites (kernel feasibility, signal handling). Deny-by-default — any other embedded cargo invocation fails the guard in `scripts/tests/validation/test_validation_architecture.py` until it is added to the documented allowlist with a privileged justification.
 
 ### Crate-boundary constraints
 
