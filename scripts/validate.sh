@@ -173,7 +173,7 @@ run_shell() {
 		return 0
 	fi
 	if CHRONICLE_TIMEOUT_EVIDENCE_FILE="$WORKDIR/$name-timeout.json" CHRONICLE_TIMEOUT_LAYER=command CHRONICLE_TIMEOUT_NAME="$name" CHRONICLE_TIMEOUT_PHASE="$name" \
-		"$ROOT/scripts/run-with-timeout.sh" "$COMMAND_TIMEOUT" bash -lc "cd '$ROOT' && $command" >"$log" 2>&1; then
+		"$ROOT/scripts/run-with-timeout.sh" "$COMMAND_TIMEOUT" bash -c "cd '$ROOT' && $command" >"$log" 2>&1; then
 		cat "$log"
 	else
 		status=$?
