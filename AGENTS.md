@@ -70,6 +70,32 @@ Rules:
   never product correctness. OpenSpec is the SDD workflow for requirements, design, scope,
   acceptance criteria, validation, and archiving (see `openspec/`).
 
+## Documentation contract
+
+Documentation is part of product contract. Before completing any change, review whether it affects:
+
+- user-facing behavior, CLI commands/flags/defaults/output, or configuration;
+- installation, deployment, or operations;
+- supported capabilities;
+- architecture, crate/service/module boundaries, dependency direction, or cross-crate contracts;
+- durable engineering invariants or conventions.
+
+If affected, update relevant documentation in same change. Targets include:
+
+- `README.md` for repository usage and entry-point information;
+- `docs/` for canonical product, architecture, operations, and runbook guidance;
+- `website/` for user-facing product documentation;
+- `AGENTS.md` for durable agent-facing rules and conventions;
+- `openspec/` for behavior and contract specifications.
+
+Record only durable, repository-wide guidance in `AGENTS.md`; do not add temporary implementation details or one-off decisions.
+
+For architecture or boundary changes, review `AGENTS.md`, canonical `docs/architecture/crate-boundaries.md`, and `validation/architecture.toml`; update affected contracts without duplicating canonical detail, then run architecture validation.
+
+For OpenSpec changes: implementation → tests → documentation impact review → validation → complete/archive. Do not complete or archive while affected documentation is stale.
+
+Before declaring complete, review implementation diff, determine documentation impact, update affected documentation, or explicitly verify documentation is unaffected, then validate.
+
 ## Bounded command execution
 
 Never run potentially blocking commands without a bounded timeout:
