@@ -9,6 +9,34 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
+## Validation timeouts
+
+Never run potentially blocking commands without a bounded timeout. Use the repository wrapper:
+
+```bash
+./scripts/run-with-timeout.sh <duration> <command> [arguments...]
+```
+
+The wrapper preserves command status/output; deadline returns 124 after process-tree TERM and
+`CHRONICLE_TIMEOUT_GRACE_SECONDS` (default 5), then KILL. Suggested ranges: status/readiness
+30-120s; targeted tests and builds 5-15 minutes; full workspace validation 15-30 minutes; VM
+bootstrap and privileged acceptance 30-60 minutes.
+
+Hierarchy defaults: command 900s, readiness command/readiness 10s/180s, service command 30s,
+scenario 300s (600s quota/retention, 900s cargo-heavy), acceptance cleanup 180s, acceptance profile
+3300s under `validate.sh`, gate 3600s. Override with
+`CHRONICLE_VALIDATION_COMMAND_TIMEOUT_SECONDS`,
+`CHRONICLE_ACCEPTANCE_READINESS_COMMAND_TIMEOUT_SECONDS`,
+`CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS`,
+`CHRONICLE_ACCEPTANCE_SERVICE_COMMAND_TIMEOUT_SECONDS`,
+`CHRONICLE_ACCEPTANCE_SCENARIO_TIMEOUT_SECONDS`,
+`CHRONICLE_ACCEPTANCE_CLEANUP_GRACE_SECONDS`,
+`CHRONICLE_ACCEPTANCE_PROFILE_TIMEOUT_SECONDS`, and gate timeout variables. Multipass knobs:
+`CHRONICLE_ACCEPTANCE_GUEST_TIMEOUT_SECONDS`, `CHRONICLE_MULTIPASS_STATUS_TIMEOUT_SECONDS`,
+`CHRONICLE_MULTIPASS_VM_READINESS_TIMEOUT_SECONDS`, `CHRONICLE_MULTIPASS_TRANSFER_TIMEOUT_SECONDS`,
+`CHRONICLE_MULTIPASS_BOOTSTRAP_TIMEOUT_SECONDS`, `CHRONICLE_MULTIPASS_REMOTE_TIMEOUT_SECONDS`;
+guest and remote deadlines must remain shorter than the host profile deadline.
+
 The canonical local validation entry point is `./scripts/validate.sh fast` (formatting, warnings-denied Clippy, workspace tests, strict OpenSpec validation, and repository consistency checks); use `./scripts/validate.sh targeted --changed-since origin/main` for focused changed-path validation and `live-capture|recorder` / `release` for complete or release evidence. Real eBPF runtime coverage is opt-in privileged acceptance (`./scripts/acceptance.sh --profile live-capture|recorder --executor local|multipass`) on supported Linux; see the [operations guide](docs/operations.md) and [architecture](docs/architecture.md) for details.
 
 Protocol work belongs behind `chronicle-protocol` interfaces. Add fixtures containing no real credentials or production data. Keep replay examples dry-run and default-deny; reference environment variable names instead of embedding connection credentials. Bounded plaintext HTTP/1.1 fixture record/inspect/loopback replay is functional alongside fake; fixture capture is one configured WAL segment with no restart repair. eBPF capture, other real protocols, PostgreSQL/S3 adapters, TLS, chunked/close-delimited HTTP, and broad replay remain planned.

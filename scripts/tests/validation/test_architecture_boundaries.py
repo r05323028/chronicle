@@ -5,6 +5,7 @@ import importlib.util
 import shutil
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -340,6 +341,164 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.write_workspace(crates)
         issues = validation.architecture_check(self.temp, self.policy)["issues"]
         self.assertTrue(any("missing dev allowlist" in issue for issue in issues))
+
+
+class SemanticBoundaryTests(unittest.TestCase):
+    """Semantic/API boundary checks (S1/S2/policy self-consistency)."""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="chronicle-semantic-"))
+        with (ROOT / "validation/architecture.toml").open("rb") as handle:
+            self.policy = tomllib.load(handle)["semantic"]
+        # Defining crates mirror the real repo so policy self-consistency
+        # (every forbidden symbol resolves to a forbidden source crate) passes.
+        self.write(
+            "crates/chronicle-replay/src/lib.rs",
+            "pub struct LoopbackReplayOptions;\n"
+            "pub enum ReplayOutcome { Completed }\n"
+            "pub enum Replayability { FullyReplayable }\n"
+            "pub enum TimingMode { Asap }\n"
+            "pub enum OperationExecutionState { NotAttempted }\n"
+            "pub enum ReplayError { PreflightDenied }\n",
+        )
+        self.write(
+            "crates/chronicle-protocol/src/lib.rs",
+            "pub enum TransportErrorCategory { Timeout }\n"
+            "pub enum ProtocolError { Transport { category: TransportErrorCategory } }\n",
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.temp)
+
+    def write(self, rel: str, text: str) -> None:
+        path = self.temp / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def issues(self) -> list[str]:
+        return validation.semantic_check(self.temp, self.policy)
+
+    def test_application_owned_result_type_passes(self):
+        self.write(
+            "crates/chronicle-application/src/replay_inspect.rs",
+            "pub enum ReplayStatus { Completed }\n"
+            "pub struct ReplaySessionResult { pub outcome: ReplayStatus }\n",
+        )
+        self.write(
+            "crates/chronicle-cli/src/main.rs",
+            "use chronicle_application::ReplaySessionResult;\n",
+        )
+        self.assertEqual(self.issues(), [])
+
+    def test_common_primitives_re_export_passes(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub use chronicle_common::{RecordingId, SessionId, Timestamp};\n",
+        )
+        self.assertEqual(self.issues(), [])
+
+    def test_internal_application_module_uses_lower_layer_without_re_export(self):
+        self.write(
+            "crates/chronicle-application/src/command_replay.rs",
+            "use chronicle_replay::LoopbackReplayOptions;\n",
+        )
+        self.assertEqual(self.issues(), [])
+
+    def test_re_export_of_forbidden_symbol_fails(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub use chronicle_replay::ReplayOutcome;\n",
+        )
+        issues = self.issues()
+        self.assertTrue(any("semantic-boundary" in issue for issue in issues))
+        self.assertTrue(any("lib.rs" in issue for issue in issues))
+
+    def test_multiline_re_export_block_reported_once(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub use chronicle_replay::{\n    ReplayOutcome,\n    Replayability,\n};\n",
+        )
+        issues = self.issues()
+        self.assertEqual(
+            len([issue for issue in issues if "semantic-boundary" in issue]), 1
+        )
+
+    def test_bare_crate_re_export_fails(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub use chronicle_replay;\n",
+        )
+        self.assertTrue(any("semantic-boundary" in issue for issue in self.issues()))
+
+    def test_glob_re_export_fails(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub use chronicle_replay::*;\n",
+        )
+        self.assertTrue(any("semantic-boundary" in issue for issue in self.issues()))
+
+    def test_cli_vocabulary_import_fails(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub enum ReplayOutcome { Completed }\n"
+            "pub struct LoopbackReplayOptions;\n",
+        )
+        self.write(
+            "crates/chronicle-cli/src/main.rs",
+            "use chronicle_application::{ReplayOutcome, LoopbackReplayOptions};\n",
+        )
+        issues = self.issues()
+        self.assertEqual(
+            len([issue for issue in issues if "semantic-boundary" in issue]), 2
+        )
+        self.assertTrue(any("main.rs" in issue for issue in issues))
+
+    def test_comment_mention_passes(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub enum ReplayOutcome { Completed }\n",
+        )
+        self.write(
+            "crates/chronicle-cli/src/main.rs",
+            "// ReplayOutcome must not be used here\n"
+            "use chronicle_application::ReplaySessionResult;\n",
+        )
+        self.assertEqual(self.issues(), [])
+
+    def test_identifier_containing_forbidden_name_passes(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub enum ReplayOutcome { Completed }\n"
+            "pub enum Replayability { FullyReplayable }\n",
+        )
+        self.write(
+            "crates/chronicle-cli/src/main.rs",
+            "use chronicle_application::{ReplayabilityStatus, ReplayStatus};\n",
+        )
+        self.assertEqual(self.issues(), [])
+
+    def test_violation_message_has_four_elements(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub use chronicle_replay::ReplayOutcome;\n",
+        )
+        message = next(issue for issue in self.issues() if "semantic-boundary" in issue)
+        for element in ("semantic-boundary", "location:", "rationale:", "remediation:"):
+            self.assertIn(element, message)
+
+    def test_policy_self_consistency_unresolvable_symbol_fails(self):
+        self.write(
+            "crates/chronicle-application/src/lib.rs",
+            "pub enum SomeOtherSymbol { X }\n",
+        )
+        policy = {**self.policy, "forbidden_outer_vocabulary": ["GhostSymbol"]}
+        issues = validation.semantic_check(self.temp, policy)
+        self.assertTrue(any("does not resolve" in issue for issue in issues))
+
+    def test_allowlist_entry_requires_crate_scope(self):
+        policy = {**self.policy, "allowed_re_exports": ["ReplayOutcome"]}
+        issues = validation.semantic_check(self.temp, policy)
+        self.assertTrue(any("must be crate::Symbol" in issue for issue in issues))
 
 
 if __name__ == "__main__":

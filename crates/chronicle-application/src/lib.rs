@@ -70,14 +70,10 @@ mod listener_discovery;
 mod recorder_config;
 mod replay_inspect;
 pub use chronicle_common::{RecordingId, SessionId, Timestamp, escape_control};
-pub use chronicle_protocol::{ProtocolError, TransportErrorCategory};
-pub use chronicle_replay::{
-    LoopbackReplayOptions, OperationExecutionState, ReplayError, ReplayOutcome, Replayability,
-    TimingMode,
-};
 pub use replay_inspect::{
-    InspectConnectionSummary, InspectOperationSummary, InspectSessionResult, RecordFixtureResult,
-    RecordIssueSummary, ReplayCounts, ReplayOperationSummary, ReplaySessionResult, inspect_session,
+    InspectConnectionSummary, InspectOperationSummary, InspectSessionResult, OperationStatus,
+    RecordFixtureResult, RecordIssueSummary, ReplayCounts, ReplayOperationSummary, ReplayRequest,
+    ReplaySessionResult, ReplayStatus, ReplayabilityStatus, inspect_session,
     preplan_command_replay_session, production_wal_from_fixture, record_fixture,
     record_fixture_file, render_inspect_human, render_inspect_json, render_json,
     render_replay_human, render_replay_json, replay_command_inputs, replay_context, replay_session,
@@ -197,10 +193,13 @@ use chronicle_etl::{
     ETL_PIPELINE_VERSION, EtlError, EtlIssue, EtlOutput, EtlPipeline,
     assign_recording_ids_with_snapshot,
 };
-use chronicle_protocol::{ProtocolRegistry, ReplayContext, SecretBytes};
+use chronicle_protocol::{
+    ProtocolError, ProtocolRegistry, ReplayContext, SecretBytes, TransportErrorCategory,
+};
 use chronicle_replay::{
-    ReplayExecutor, ReplayPlan, ReplayPlanner, ReplayPolicy, ReplayTargetError, TargetMap,
-    TargetRule,
+    LoopbackReplayOptions, OperationExecutionState, ReplayError, ReplayExecutor, ReplayOutcome,
+    ReplayPlan, ReplayPlanner, ReplayPolicy, ReplayTargetError, Replayability, TargetMap,
+    TargetRule, TimingMode,
 };
 use chronicle_session::SessionLimits;
 use chronicle_storage::{FilesystemSessionStore, PublishSession, StorageError};
@@ -338,13 +337,15 @@ pub enum ApplicationError {
     NotImplemented(&'static str),
 }
 
-/// Stable replay-outcome exit-code classification for outer adapters.
-pub fn replay_outcome_exit_code(outcome: &ReplayOutcome) -> i32 {
-    match outcome {
-        ReplayOutcome::Completed | ReplayOutcome::CompletedWithSkips | ReplayOutcome::DryRun => 0,
-        ReplayOutcome::StoppedPolicy | ReplayOutcome::StoppedInvalidSession => 4,
-        ReplayOutcome::StoppedTransport => 5,
-        ReplayOutcome::StoppedVerification => 6,
+/// Stable replay-result exit-code classification for outer adapters.
+/// Operates on the application-owned result contract so adapters never touch
+/// the replay-owned outcome taxonomy.
+pub fn replay_result_exit_code(result: &ReplaySessionResult) -> i32 {
+    match result.outcome {
+        ReplayStatus::Completed | ReplayStatus::CompletedWithSkips | ReplayStatus::DryRun => 0,
+        ReplayStatus::StoppedPolicy | ReplayStatus::StoppedInvalidSession => 4,
+        ReplayStatus::StoppedTransport => 5,
+        ReplayStatus::StoppedVerification => 6,
     }
 }
 
@@ -1219,7 +1220,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.replay.outcome, ReplayOutcome::StoppedPolicy);
+        assert_eq!(result.replay.outcome, ReplayStatus::StoppedPolicy);
         assert!(result.replay.preflight_denied);
         assert!(result.child_exit.is_none());
         assert!(result.target_origin.is_none());
@@ -1247,7 +1248,7 @@ mod tests {
 
         let plan = command_replay_plan(&session, false).unwrap();
         let result = replay_plan_result(session.id.to_string(), &plan);
-        assert_eq!(result.outcome, ReplayOutcome::StoppedInvalidSession);
+        assert_eq!(result.outcome, ReplayStatus::StoppedInvalidSession);
         assert!(result.preflight_denied);
         assert_eq!(result.counts.executable, 0);
         std::fs::remove_dir_all(root).unwrap();
@@ -2959,8 +2960,8 @@ mod tests {
     fn replay_report_v1_serializes_outcome_and_operation_state() {
         let result = ReplaySessionResult {
             session_id: "session".into(),
-            replayability: Replayability::FullyReplayable,
-            outcome: ReplayOutcome::DryRun,
+            replayability: ReplayabilityStatus::FullyReplayable,
+            outcome: ReplayStatus::DryRun,
             dry_run: true,
             preflight_denied: false,
             transport_failed: false,
@@ -2973,7 +2974,7 @@ mod tests {
             operations: vec![ReplayOperationSummary {
                 operation_id: "operation".into(),
                 decision: "allowed".into(),
-                state: OperationExecutionState::NotAttempted,
+                state: OperationStatus::NotAttempted,
                 attempted: false,
                 verification: "not_run".into(),
                 category: "dry_run".into(),
@@ -2989,6 +2990,62 @@ mod tests {
         assert_eq!(
             result.counts,
             ReplayCounts::from_operations(&result.operations)
+        );
+    }
+
+    #[test]
+    fn application_errors_map_to_stable_exit_family() {
+        let transport = ApplicationError::Protocol(ProtocolError::Transport {
+            category: TransportErrorCategory::Timeout,
+            message: "timeout".into(),
+        });
+        for (error, expected) in [
+            (
+                ApplicationError::InvalidRecordingName("name".into(), "invalid".into()),
+                2,
+            ),
+            (ApplicationError::RecordingNotFound("missing".into()), 3),
+            (ApplicationError::TargetLaunchFailed, 3),
+            (ApplicationError::UnsupportedLivePreflight("unsupported"), 4),
+            (transport, 5),
+        ] {
+            assert_eq!(application_error_exit_code(&error), expected);
+        }
+    }
+
+    #[test]
+    fn replay_results_map_to_stable_exit_codes() {
+        let result = |outcome| ReplaySessionResult {
+            session_id: "session".into(),
+            replayability: ReplayabilityStatus::FullyReplayable,
+            outcome,
+            dry_run: outcome == ReplayStatus::DryRun,
+            preflight_denied: outcome == ReplayStatus::StoppedPolicy,
+            transport_failed: outcome == ReplayStatus::StoppedTransport,
+            counts: ReplayCounts::default(),
+            operations: Vec::new(),
+        };
+
+        for outcome in [
+            ReplayStatus::Completed,
+            ReplayStatus::CompletedWithSkips,
+            ReplayStatus::DryRun,
+        ] {
+            assert_eq!(replay_result_exit_code(&result(outcome)), 0);
+        }
+        for outcome in [
+            ReplayStatus::StoppedPolicy,
+            ReplayStatus::StoppedInvalidSession,
+        ] {
+            assert_eq!(replay_result_exit_code(&result(outcome)), 4);
+        }
+        assert_eq!(
+            replay_result_exit_code(&result(ReplayStatus::StoppedTransport)),
+            5
+        );
+        assert_eq!(
+            replay_result_exit_code(&result(ReplayStatus::StoppedVerification)),
+            6
         );
     }
 }

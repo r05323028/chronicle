@@ -1,7 +1,8 @@
 # Chronicle workspace dependency architecture policy (version 1).
 #
 # Executable mirror of AGENTS.md crate architecture rules and
-# docs/architecture/crate-boundaries.md. The policy is a maximum-coupling
+# docs/architecture/crate-boundaries.md (dependency edges) plus the
+# semantic-boundary model ([semantic] table). The policy is a maximum-coupling
 # allowlist: every allowed normal/dev/build Chronicle workspace edge is listed;
 # unlisted workspace edges are forbidden. Deleting an allowed edge is always
 # valid without editing policy. Adding a legitimate edge requires updating this
@@ -125,3 +126,48 @@ cli_non_application = true  # CLI Chronicle edges may only target chronicle-appl
 "chronicle-etl" = []
 "chronicle-application" = []
 "chronicle-cli" = []
+
+[semantic]
+# Semantic/API boundary policy (beyond Cargo edges). Mirrors the
+# "Semantic/API boundaries" section of docs/architecture/crate-boundaries.md.
+# Dependency edges say which crate may depend on which crate; this table says
+# which concepts and decisions may cross those edges. Enforcement lives in
+# scripts/validation.py architecture (re-export scan + outer-adapter
+# vocabulary scan) and is wired into validate.sh fast and release.
+#
+# forbidden_outer_vocabulary: symbols outer adapters (chronicle-cli today,
+# future external adapters) MUST NOT name, construct, or pattern-match, even
+# when reachable through application re-exports. Word-boundary exact matches.
+forbidden_outer_vocabulary = [
+  "LoopbackReplayOptions",
+  "ReplayOutcome",
+  "Replayability",
+  "TimingMode",
+  "OperationExecutionState",
+  "ReplayError",
+  "ProtocolError",
+  "TransportErrorCategory",
+]
+
+# forbidden_re_export_sources: lower-layer crates whose public items
+# chronicle-application MUST NOT re-export wholesale. chronicle-common neutral
+# primitives remain allowed. A legitimate translated contract requires an
+# allowed_re_exports entry with rationale plus a documentation update in the
+# same change.
+forbidden_re_export_sources = [
+  "chronicle-replay",
+  "chronicle-protocol",
+  "chronicle-wal",
+  "chronicle-etl",
+  "chronicle-capture",
+  "chronicle-session",
+  "chronicle-storage",
+  "chronicle-canonical",
+  "chronicle-protocol-builtins",
+  "chronicle-capture-ebpf",
+]
+
+# allowed_re_exports: reviewed per-symbol re-export allowlist (source crate
+# and symbol plus rationale). Empty today; adding an entry requires the
+# rationale and architecture documentation update in the same change.
+allowed_re_exports = []

@@ -424,11 +424,139 @@ fn payload_size(payload: &chronicle_canonical::PayloadRef) -> Option<u64> {
     }
 }
 
+/// Application-owned replay outcome classification for outer adapters.
+/// Serialized representation matches the historical replay outcome contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayStatus {
+    Completed,
+    CompletedWithSkips,
+    DryRun,
+    StoppedPolicy,
+    StoppedInvalidSession,
+    StoppedTransport,
+    StoppedVerification,
+}
+
+impl ReplayStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::CompletedWithSkips => "completed_with_skips",
+            Self::DryRun => "dry_run",
+            Self::StoppedPolicy => "stopped_policy",
+            Self::StoppedInvalidSession => "stopped_invalid_session",
+            Self::StoppedTransport => "stopped_transport",
+            Self::StoppedVerification => "stopped_verification",
+        }
+    }
+
+    /// Whether the outcome represents a completed (or dry-run) replay.
+    pub const fn succeeded(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::CompletedWithSkips | Self::DryRun
+        )
+    }
+}
+
+impl From<ReplayOutcome> for ReplayStatus {
+    fn from(value: ReplayOutcome) -> Self {
+        match value {
+            ReplayOutcome::Completed => Self::Completed,
+            ReplayOutcome::CompletedWithSkips => Self::CompletedWithSkips,
+            ReplayOutcome::DryRun => Self::DryRun,
+            ReplayOutcome::StoppedPolicy => Self::StoppedPolicy,
+            ReplayOutcome::StoppedInvalidSession => Self::StoppedInvalidSession,
+            ReplayOutcome::StoppedTransport => Self::StoppedTransport,
+            ReplayOutcome::StoppedVerification => Self::StoppedVerification,
+        }
+    }
+}
+
+/// Application-owned replayability classification for outer adapters.
+/// Serialized representation matches the historical replayability contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayabilityStatus {
+    FullyReplayable,
+    PartiallyReplayable,
+    NotReplayable,
+}
+
+impl From<Replayability> for ReplayabilityStatus {
+    fn from(value: Replayability) -> Self {
+        match value {
+            Replayability::FullyReplayable => Self::FullyReplayable,
+            Replayability::PartiallyReplayable => Self::PartiallyReplayable,
+            Replayability::NotReplayable => Self::NotReplayable,
+        }
+    }
+}
+
+/// Application-owned per-operation execution state for outer adapters.
+/// Serialized representation matches the historical execution-state contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Completed,
+    Failed,
+    NotAttempted,
+}
+
+impl OperationStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
+}
+
+impl From<OperationExecutionState> for OperationStatus {
+    fn from(value: OperationExecutionState) -> Self {
+        match value {
+            OperationExecutionState::Completed => Self::Completed,
+            OperationExecutionState::Failed => Self::Failed,
+            OperationExecutionState::NotAttempted => Self::NotAttempted,
+        }
+    }
+}
+
+/// Application-owned replay request passed by outer adapters. Plain request
+/// data only; replay policy construction stays inside application.
+#[derive(Clone, Debug)]
+pub struct ReplayRequest {
+    pub target: Option<String>,
+    pub allow_hosts: Vec<String>,
+    pub execute: bool,
+    pub allow_reads: bool,
+    pub allow_writes: bool,
+    pub timing: ReplayTiming,
+}
+
+impl From<&ReplayRequest> for LoopbackReplayOptions {
+    fn from(request: &ReplayRequest) -> Self {
+        Self {
+            target: request.target.clone(),
+            allow_hosts: request.allow_hosts.clone(),
+            execute: request.execute,
+            allow_reads: request.allow_reads,
+            allow_writes: request.allow_writes,
+            timing: match request.timing {
+                ReplayTiming::Asap => TimingMode::Asap,
+                ReplayTiming::Preserve => TimingMode::Preserve,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReplayOperationSummary {
     pub operation_id: String,
     pub decision: String,
-    pub state: OperationExecutionState,
+    pub state: OperationStatus,
     pub attempted: bool,
     pub verification: String,
     pub category: String,
@@ -463,9 +591,9 @@ impl ReplayCounts {
                 }
                 counts.attempted += usize::from(operation.attempted);
                 match operation.state {
-                    OperationExecutionState::Completed => counts.completed += 1,
-                    OperationExecutionState::Failed => counts.failed += 1,
-                    OperationExecutionState::NotAttempted => counts.unattempted += 1,
+                    OperationStatus::Completed => counts.completed += 1,
+                    OperationStatus::Failed => counts.failed += 1,
+                    OperationStatus::NotAttempted => counts.unattempted += 1,
                 }
                 match operation.verification.as_str() {
                     "passed" => counts.verification_passed += 1,
@@ -483,13 +611,20 @@ impl ReplayCounts {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReplaySessionResult {
     pub session_id: String,
-    pub replayability: Replayability,
-    pub outcome: ReplayOutcome,
+    pub replayability: ReplayabilityStatus,
+    pub outcome: ReplayStatus,
     pub dry_run: bool,
     pub preflight_denied: bool,
     pub transport_failed: bool,
     pub counts: ReplayCounts,
     pub operations: Vec<ReplayOperationSummary>,
+}
+
+impl ReplaySessionResult {
+    /// Application-owned success classification for outer adapters.
+    pub const fn succeeded(&self) -> bool {
+        self.outcome.succeeded()
+    }
 }
 
 pub(crate) fn hydrate_replay_session(
@@ -634,9 +769,9 @@ pub async fn replay_session(
     root: impl AsRef<Path>,
     session_id: &str,
     config: &ReplayConfig,
-    options: &LoopbackReplayOptions,
+    request: &ReplayRequest,
 ) -> Result<ReplaySessionResult, ApplicationError> {
-    replay_session_with_plan(root, session_id, config, options, |_| {}).await
+    replay_session_with_plan(root, session_id, config, request, |_| {}).await
 }
 
 /// Replays a session after exposing its complete plan, before any network I/O.
@@ -644,13 +779,13 @@ pub async fn replay_session_with_plan<F>(
     root: impl AsRef<Path>,
     session_id: &str,
     config: &ReplayConfig,
-    options: &LoopbackReplayOptions,
+    request: &ReplayRequest,
     on_plan: F,
 ) -> Result<ReplaySessionResult, ApplicationError>
 where
     F: FnOnce(&ReplaySessionResult),
 {
-    replay_session_with_plan_guard(root, session_id, config, options, on_plan, || Ok(())).await
+    replay_session_with_plan_guard(root, session_id, config, request, on_plan, || Ok(())).await
 }
 
 /// Same sole replay path with one zero-traffic guard immediately before any
@@ -660,7 +795,7 @@ pub async fn replay_session_with_plan_guard<F, G>(
     root: impl AsRef<Path>,
     session_id: &str,
     config: &ReplayConfig,
-    options: &LoopbackReplayOptions,
+    request: &ReplayRequest,
     on_plan: F,
     before_execute: G,
 ) -> Result<ReplaySessionResult, ApplicationError>
@@ -669,11 +804,12 @@ where
     G: FnOnce() -> Result<(), ApplicationError>,
 {
     let session = hydrate_replay_session(root.as_ref(), session_id)?;
-    let (targets, policy) = replay_command_inputs(&session, options)?;
+    let options: LoopbackReplayOptions = request.into();
+    let (targets, policy) = replay_command_inputs(&session, &options)?;
     let plan = ReplayPlanner::plan(&session, &targets, &policy, TimingMode::Asap)?;
     on_plan(&replay_plan_result(session.id.to_string(), &plan));
     let mut context = ReplayContext::default();
-    if options.execute && plan.is_executable() {
+    if request.execute && plan.is_executable() {
         context = replay_context(config)?;
         before_execute()?;
         context.authorize_execution_for(options.validate_target()?.endpoint().clone());
@@ -693,8 +829,8 @@ where
         .map(|(planned, result)| ReplayOperationSummary {
             operation_id: result.operation_id.to_string(),
             decision: format!("{:?}", planned.decision()).to_lowercase(),
-            state: result.state,
-            attempted: result.state != OperationExecutionState::NotAttempted,
+            state: OperationStatus::from(result.state),
+            attempted: OperationStatus::from(result.state) != OperationStatus::NotAttempted,
             verification: result.verification.as_ref().map_or_else(
                 || "not_run".into(),
                 |verification| format!("{:?}", verification.status).to_lowercase(),
@@ -713,8 +849,8 @@ where
         .collect();
     Ok(ReplaySessionResult {
         session_id: session.id.to_string(),
-        replayability: plan.replayability(),
-        outcome: execution.outcome,
+        replayability: ReplayabilityStatus::from(plan.replayability()),
+        outcome: ReplayStatus::from(execution.outcome),
         dry_run: plan.is_dry_run(),
         preflight_denied: !plan.is_executable(),
         transport_failed,
@@ -730,7 +866,7 @@ pub(crate) fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> Repla
         .map(|planned| ReplayOperationSummary {
             operation_id: planned.operation().id.to_string(),
             decision: format!("{:?}", planned.decision()).to_lowercase(),
-            state: OperationExecutionState::NotAttempted,
+            state: OperationStatus::NotAttempted,
             attempted: false,
             verification: "not_run".into(),
             category: String::new(),
@@ -739,15 +875,15 @@ pub(crate) fn replay_plan_result(session_id: String, plan: &ReplayPlan) -> Repla
         .collect();
     ReplaySessionResult {
         session_id,
-        replayability: plan.replayability(),
+        replayability: ReplayabilityStatus::from(plan.replayability()),
         outcome: if plan.is_dry_run() {
-            ReplayOutcome::DryRun
+            ReplayStatus::DryRun
         } else if plan.is_executable() {
-            ReplayOutcome::Completed
+            ReplayStatus::Completed
         } else if plan.has_policy_denial() {
-            ReplayOutcome::StoppedPolicy
+            ReplayStatus::StoppedPolicy
         } else {
-            ReplayOutcome::StoppedInvalidSession
+            ReplayStatus::StoppedInvalidSession
         },
         dry_run: plan.is_dry_run(),
         preflight_denied: !plan.is_executable(),

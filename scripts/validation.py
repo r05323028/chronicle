@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -315,6 +316,9 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
     cycles = find_cycles(edges)
     if cycles:
         issues.append(f"dependency cycle: {' -> '.join(cycles[0])}")
+    semantic = policy.get("semantic", {})
+    semantic_issues = semantic_check(root, semantic) if semantic else []
+    issues.extend(semantic_issues)
     return {
         "policy": str(policy_path.relative_to(root)),
         "members": sorted(member_set),
@@ -323,8 +327,158 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
         "dev_edges": sum(1 for e in edges if e["kind"] == "dev"),
         "build_edges": sum(1 for e in edges if e["kind"] == "build"),
         "cyclic": bool(cycles),
+        "semantic": bool(semantic),
         "issues": issues,
     }
+
+
+SEMANTIC_INVARIANT = (
+    "semantic-boundary violation: outer adapters operate only on "
+    "application-owned contracts"
+)
+
+
+def _semantic_statement(path: Path, lines: list[str], start: int) -> tuple[str, int]:
+    """Join a possibly multiline Rust statement starting at `start` into one string.
+
+    Returns (joined_statement, next_index_after_statement).
+    """
+    depth = 0
+    parts: list[str] = []
+    i = start
+    while i < len(lines):
+        parts.append(lines[i])
+        depth += lines[i].count("{") - lines[i].count("}")
+        if depth <= 0 and lines[i].rstrip().endswith(";"):
+            break
+        i += 1
+    return "\n".join(parts), i + 1
+
+
+def _semantic_re_export_issues(root: Path, semantic: dict[str, Any]) -> list[str]:
+    """Application must not re-export lower-layer vocabulary (invariant S2)."""
+    forbidden = set(semantic.get("forbidden_re_export_sources", []))
+    allowlist = set(semantic.get("allowed_re_exports", []))
+    app_dir = root / "crates/chronicle-application/src"
+    if not app_dir.is_dir():
+        return []
+    issues: list[str] = []
+    use_re = re.compile(r"pub\s+use\s+([a-z0-9_-]+)\s*(?:::|;|$)")
+    for path in sorted(app_dir.rglob("*.rs")):
+        lines = path.read_text(errors="replace").splitlines()
+        i = 0
+        while i < len(lines):
+            match = use_re.match(lines[i].strip())
+            if not match:
+                i += 1
+                continue
+            crate = match.group(1).replace("_", "-")
+            if crate not in forbidden:
+                i += 1
+                continue
+            statement, nxt = _semantic_statement(path, lines, i)
+            if "::*" in statement:
+                symbols = ["*"]
+            elif "{" not in statement:
+                symbols = ["*"]  # bare `pub use crate;` re-exports the crate
+            else:
+                body = statement[statement.find("{") + 1 : statement.rfind("}")]
+                symbols = [s.strip() for s in body.split(",") if s.strip()]
+            if "*" in symbols:
+                bad = ["*"]  # glob/bare crate re-exports are never allowlisted
+            else:
+                bad = [
+                    symbol
+                    for symbol in symbols
+                    if f"{crate}::{symbol}" not in allowlist
+                ]
+            if bad:
+                rel = str(path.relative_to(root))
+                issues.append(
+                    f"{SEMANTIC_INVARIANT}\n"
+                    f"location: {rel}:{i + 1}\n"
+                    f"rationale: application must not re-export lower-layer vocabulary as an "
+                    f"escape hatch around the dependency policy; only reviewed "
+                    f"allowed_re_exports entries may cross\n"
+                    f"remediation: remove the re-export or add a reviewed "
+                    f"allowed_re_exports entry (crate::Symbol) with rationale; see "
+                    f"docs/architecture/crate-boundaries.md#semantic-boundaries"
+                )
+            i = nxt
+    return issues
+
+
+def _semantic_vocabulary_issues(root: Path, semantic: dict[str, Any]) -> list[str]:
+    """Outer adapters must not name lower-layer vocabulary (invariant S1)."""
+    forbidden = semantic.get("forbidden_outer_vocabulary", [])
+    if not forbidden:
+        return []
+    issues: list[str] = []
+    for base in (
+        root / "crates/chronicle-cli/src",
+        root / "crates/chronicle-cli/tests",
+    ):
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.rs")):
+            lines = path.read_text(errors="replace").splitlines()
+            for line_no, line in enumerate(lines, start=1):
+                if line.lstrip().startswith("//"):
+                    continue  # doc/comment mentions are not violations
+                for symbol in forbidden:
+                    if re.search(rf"\b{re.escape(symbol)}\b", line):
+                        rel = str(path.relative_to(root))
+                        issues.append(
+                            f"{SEMANTIC_INVARIANT}\n"
+                            f"location: {rel}:{line_no}\n"
+                            f"rationale: replay policy and protocol/replay error taxonomies "
+                            f"stay behind the application seam; CLI operates only on "
+                            f"application-owned contracts\n"
+                            f"remediation: use the application-owned request/result/exit-code "
+                            f"API; see docs/architecture/crate-boundaries.md#semantic-boundaries"
+                        )
+    return issues
+
+
+def _semantic_policy_issues(root: Path, semantic: dict[str, Any]) -> list[str]:
+    """Every forbidden symbol must resolve to a forbidden re-export source."""
+    forbidden = semantic.get("forbidden_outer_vocabulary", [])
+    sources = semantic.get("forbidden_re_export_sources", [])
+    issues: list[str] = []
+    present = [crate for crate in sources if (root / "crates" / crate / "src").is_dir()]
+    if not present:
+        return issues  # tree too minimal to verify symbol resolution
+    for symbol in forbidden:
+        located = False
+        for crate in present:
+            crate_src = root / "crates" / crate / "src"
+            if any(
+                symbol in path.read_text(errors="replace")
+                for path in crate_src.rglob("*.rs")
+            ):
+                located = True
+                break
+        if not located:
+            issues.append(
+                f"semantic policy: forbidden symbol {symbol!r} does not resolve to any "
+                f"forbidden_re_export_sources crate source; fix the vocabulary list or the "
+                f"crate list"
+            )
+    for entry in semantic.get("allowed_re_exports", []):
+        if "::" not in entry:
+            issues.append(
+                f"semantic policy: allowlist entry {entry!r} must be crate::Symbol"
+            )
+    return issues
+
+
+def semantic_check(root: Path, semantic: dict[str, Any]) -> list[str]:
+    """Semantic/API boundary checks (S1, S2, policy self-consistency)."""
+    return (
+        _semantic_policy_issues(root, semantic)
+        + _semantic_re_export_issues(root, semantic)
+        + _semantic_vocabulary_issues(root, semantic)
+    )
 
 
 def find_cycles(edges: list[dict[str, Any]]) -> list[list[str]]:

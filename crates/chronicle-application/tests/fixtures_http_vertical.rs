@@ -1,8 +1,9 @@
 mod support;
 
-use chronicle_application::{ReplayConfig, inspect_session, record_fixture, replay_session};
+use chronicle_application::{
+    ReplayConfig, ReplayRequest, ReplayTiming, inspect_session, record_fixture, replay_session,
+};
 use chronicle_capture::FixtureCaptureSource;
-use chronicle_replay::{LoopbackReplayOptions, TimingMode};
 use chronicle_wal::segment_file_name;
 use support::{HttpTestServer, ResponseMode};
 
@@ -14,14 +15,14 @@ fn fixture() -> Vec<u8> {
     .expect("read fixture")
 }
 
-fn options(target: String) -> LoopbackReplayOptions {
-    LoopbackReplayOptions {
+fn options(target: String) -> ReplayRequest {
+    ReplayRequest {
         target: Some(target),
         allow_hosts: vec!["127.0.0.1".into()],
         execute: true,
         allow_reads: true,
         allow_writes: false,
-        timing: TimingMode::Asap,
+        timing: ReplayTiming::Asap,
     }
 }
 

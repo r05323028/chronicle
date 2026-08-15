@@ -74,6 +74,18 @@ Privileged scenario bodies may invoke cargo only for genuinely privileged work: 
 
 No forbidden workspace dev edges (see `validation/architecture.toml`); Aya/kernel ABI stays private to `chronicle-capture-ebpf`; CLI tests use application-owned test support/fixtures rather than new CLI dev dependencies.
 
+## Acceptance evidence is content-addressed
+
+Acceptance evidence is content-addressed, not commit-addressed. Acceptance-sensitive content,
+fingerprint, or compatibility changes invalidate evidence; commit SHA changes alone do not.
+Retain commit/tree SHA as provenance and preserve same-run source-mutation checks, but reuse
+compatible live-capture/recorder evidence across rebases, equivalent recommits, OpenSpec archives,
+documentation-only commits, and unrelated changes outside the validation fingerprint. Every
+release request still requires a clean, identifiable current checkout that remains unchanged
+through validation; never compare current commit/tree with historical evidence identity.
+Fingerprint inputs and reuse checks are implemented in `scripts/validation.py`
+(`acceptance_fingerprint`, `reuse`).
+
 ## Terminology
 
 live-capture and recorder are gate/acceptance selectors, not test categories or directories. Privileged acceptance proves only kernel/environment-dependent behavior; it does NOT own portable correctness. Tests are classified by functional layer + environment dimension, and live under owning paths.

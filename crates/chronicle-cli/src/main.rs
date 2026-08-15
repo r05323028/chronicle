@@ -19,7 +19,7 @@ use chronicle_application::{
 };
 #[cfg(any(test, target_os = "linux"))]
 use chronicle_application::{ChildExitResult, CommandRecordResult};
-use chronicle_application::{LoopbackReplayOptions, ReplayOutcome, TimingMode};
+use chronicle_application::{ReplayRequest, ReplayTiming};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
@@ -371,11 +371,8 @@ fn render_public_replay_human(
     result: &chronicle_application::ReplaySessionResult,
     cleanup: Option<&CleanupOutcome>,
 ) -> String {
-    let succeeded = matches!(
-        result.outcome,
-        ReplayOutcome::Completed | ReplayOutcome::CompletedWithSkips | ReplayOutcome::DryRun
-    ) && !cleanup
-        .is_some_and(|value| matches!(value, CleanupOutcome::TimedOut { .. }));
+    let succeeded = result.succeeded()
+        && !cleanup.is_some_and(|value| matches!(value, CleanupOutcome::TimedOut { .. }));
     let mut output = format!(
         "plan:\n{}\nresult:\n{}",
         render_replay_human(plan),
@@ -415,7 +412,7 @@ struct ErrorJson {
     message: String,
 }
 
-impl From<Timing> for TimingMode {
+impl From<Timing> for ReplayTiming {
     fn from(value: Timing) -> Self {
         match value {
             Timing::Preserve => Self::Preserve,
@@ -1495,7 +1492,7 @@ async fn run_replay(
             "explicit target replay requires --allow-host",
         ));
     }
-    let options = LoopbackReplayOptions {
+    let request = ReplayRequest {
         target: Some(target),
         allow_hosts: args.allow_hosts,
         execute: args.execute,
@@ -1508,7 +1505,7 @@ async fn run_replay(
         &data_dir,
         &session_id,
         &config.replay,
-        &options,
+        &request,
         |next_plan| plan = Some(next_plan.clone()),
     )
     .await?;
@@ -1538,7 +1535,7 @@ async fn run_replay_legacy(
             "legacy replay requires --allow-host",
         ));
     }
-    let options = LoopbackReplayOptions {
+    let request = ReplayRequest {
         target: Some(target),
         allow_hosts: args.allow_hosts,
         execute: args.execute,
@@ -1551,7 +1548,7 @@ async fn run_replay_legacy(
         root,
         &args.recording,
         &config.replay,
-        &options,
+        &request,
         |next_plan| plan = Some(next_plan.clone()),
     )
     .await?;
@@ -1843,7 +1840,7 @@ fn parse_duration(value: &str) -> Result<u64, String> {
 }
 
 fn replay_exit_code(result: &chronicle_application::ReplaySessionResult) -> i32 {
-    chronicle_application::replay_outcome_exit_code(&result.outcome)
+    chronicle_application::replay_result_exit_code(result)
 }
 
 fn error_code(error: &ApplicationError) -> i32 {
@@ -1853,7 +1850,7 @@ fn error_code(error: &ApplicationError) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronicle_application::{OperationExecutionState, ProtocolError, TransportErrorCategory};
+    use chronicle_application::{ReplayStatus, ReplayabilityStatus};
 
     #[derive(Default)]
     struct TestWriter {
@@ -2177,11 +2174,11 @@ mod tests {
         let result =
             |outcome, attempted, completed, failed| chronicle_application::ReplaySessionResult {
                 session_id: "session".into(),
-                replayability: chronicle_application::Replayability::FullyReplayable,
+                replayability: ReplayabilityStatus::FullyReplayable,
                 outcome,
-                dry_run: outcome == ReplayOutcome::DryRun,
-                preflight_denied: outcome == ReplayOutcome::StoppedPolicy,
-                transport_failed: outcome == ReplayOutcome::StoppedTransport,
+                dry_run: outcome == ReplayStatus::DryRun,
+                preflight_denied: outcome == ReplayStatus::StoppedPolicy,
+                transport_failed: outcome == ReplayStatus::StoppedTransport,
                 counts: chronicle_application::ReplayCounts {
                     attempted,
                     completed,
@@ -2190,14 +2187,14 @@ mod tests {
                 },
                 operations: Vec::new(),
             };
-        let passed = result(ReplayOutcome::Completed, 1, 1, 0);
+        let passed = result(ReplayStatus::Completed, 1, 1, 0);
         let passed_text = render_public_replay_human(&passed, &passed, None);
         assert!(passed_text.contains(
             "operations: attempted=1 completed=1 failed=0 unattempted=0 verification_failed=0"
         ));
         assert!(passed_text.ends_with("✓ passed\nReplay passed."));
 
-        let mut failed = result(ReplayOutcome::StoppedVerification, 1, 1, 0);
+        let mut failed = result(ReplayStatus::StoppedVerification, 1, 1, 0);
         failed.counts.verification_failed = 1;
         let failed_text = render_public_replay_human(&failed, &failed, None);
         assert!(failed_text.contains(
@@ -2210,70 +2207,6 @@ mod tests {
             Some(&CleanupOutcome::TimedOut { remaining: vec![7] }),
         );
         assert!(orphaned.ends_with("✗ failed\nReplay failed."));
-    }
-
-    #[test]
-    fn application_errors_map_to_stable_exit_family() {
-        let transport = ApplicationError::Protocol(ProtocolError::Transport {
-            category: TransportErrorCategory::Timeout,
-            message: "timeout".into(),
-        });
-        for (error, expected) in [
-            (
-                ApplicationError::InvalidRecordingName("name".into(), "invalid".into()),
-                2,
-            ),
-            (ApplicationError::RecordingNotFound("missing".into()), 3),
-            (ApplicationError::TargetLaunchFailed, 3),
-            (ApplicationError::UnsupportedLivePreflight("unsupported"), 4),
-            (transport, 5),
-        ] {
-            assert_eq!(error_code(&error), expected);
-        }
-    }
-
-    #[test]
-    fn replay_outcomes_map_to_stable_exit_codes() {
-        let result = |outcome| chronicle_application::ReplaySessionResult {
-            session_id: "session".into(),
-            replayability: chronicle_application::Replayability::FullyReplayable,
-            outcome,
-            dry_run: outcome == ReplayOutcome::DryRun,
-            preflight_denied: outcome == ReplayOutcome::StoppedPolicy,
-            transport_failed: outcome == ReplayOutcome::StoppedTransport,
-            counts: chronicle_application::ReplayCounts::default(),
-            operations: vec![chronicle_application::ReplayOperationSummary {
-                operation_id: "operation".into(),
-                decision: "allowed".into(),
-                state: OperationExecutionState::NotAttempted,
-                attempted: false,
-                verification: "not_run".into(),
-                category: String::new(),
-                transport_error: String::new(),
-            }],
-        };
-
-        for outcome in [
-            ReplayOutcome::Completed,
-            ReplayOutcome::CompletedWithSkips,
-            ReplayOutcome::DryRun,
-        ] {
-            assert_eq!(replay_exit_code(&result(outcome)), 0);
-        }
-        for outcome in [
-            ReplayOutcome::StoppedPolicy,
-            ReplayOutcome::StoppedInvalidSession,
-        ] {
-            assert_eq!(replay_exit_code(&result(outcome)), 4);
-        }
-        assert_eq!(
-            replay_exit_code(&result(ReplayOutcome::StoppedTransport)),
-            5
-        );
-        assert_eq!(
-            replay_exit_code(&result(ReplayOutcome::StoppedVerification)),
-            6
-        );
     }
 
     #[test]

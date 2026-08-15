@@ -150,6 +150,31 @@ No workspace build dependency is allowed in the target graph.
 - **Forbidden knowledge**: protocol decoding, replay policy, WAL scanning/recovery, ETL orchestration, storage publication, eBPF loading, business safety decisions.
 - **Must not change**: CLI commands, arguments, output, exit codes, or behavior.
 
+## Semantic/API boundaries
+
+Dependency edges alone do not define a boundary: `chronicle-cli -> chronicle-application` is technically satisfied even when the CLI consumes replay/protocol vocabulary re-exported by application. The semantic boundary is: **outer adapters operate only on application-owned contracts**. This section is the documentary counterpart of the `[semantic]` table in `validation/architecture.toml`.
+
+### Invariants
+
+- **S1 — Outer adapters do not consume lower-layer vocabulary.** CLI (and any future external adapter) does not name, construct, or pattern-match lower-layer vocabulary, even when reachable through application re-exports. It passes plain request data and consumes application-owned requests/results/errors/rendering.
+- **S2 — Application does not re-export lower-layer vocabulary as an escape hatch.** `pub use` of replay/protocol/WAL/ETL/capture/session/storage/canonical/built-ins/eBPF-adapter items from `chronicle-application` is forbidden except (a) neutral primitives from `chronicle-common` and (b) explicitly allowlisted reviewed contracts (`allowed_re_exports` entries with rationale, added in the same change as their documentation).
+- **S3 — Application-owned view models expose application-owned classification.** Fields an outer adapter needs to interpret (outcome, replayability, operation state) are application-owned types with stable serialization; JSON and exit codes remain unchanged.
+- **S4 — Replay policy stays in replay/application composition.** Options, timing, target mapping, and execution authorization are constructed inside application (`ReplayRequest` -> `LoopbackReplayOptions`); the CLI never builds replay policy.
+
+### CLI forbidden vocabulary (enforced)
+
+`LoopbackReplayOptions`, `ReplayOutcome`, `Replayability`, `TimingMode`, `OperationExecutionState`, `ReplayError`, `ProtocolError`, `TransportErrorCategory`. The vocabulary scan covers `crates/chronicle-cli/src/**` and `crates/chronicle-cli/tests/**` (word-boundary matches, comment lines stripped).
+
+### Reviewed access seams (intentional, allowed)
+
+- `protocol_registry()` returns a protocol-owned registry that the CLI passes through to application functions without invoking registry methods; application owns the built-ins dependency.
+- `chronicle-common` primitives (`RecordingId`, `SessionId`, `Timestamp`, `escape_control`) are re-exported as neutral domain vocabulary.
+- `InspectSessionResult.replayability` is a serialized-only field: the CLI never names the replay-owned type; application render functions own presentation. If a future adapter must interpret it, application translates.
+
+### Enforcement
+
+`scripts/validation.py architecture` scans application re-export lines and CLI source against the `[semantic]` table; wired into `validate.sh fast` and release. Violation messages state the invariant, location, rationale, and remediation.
+
 ## Reliability boundaries that must not change
 
 - Kernel ABI/Aya details remain private to `chronicle-capture-ebpf`; only normalized capture events cross outward.
