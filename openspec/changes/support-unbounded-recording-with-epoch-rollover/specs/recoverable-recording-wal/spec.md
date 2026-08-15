@@ -244,7 +244,7 @@ Automated tests SHALL cover segment size/age rotation, epoch byte/age rollover, 
 
 ### Requirement: Epoch-local WAL boundaries
 
-The WAL API SHALL make its total-byte, segment-sequence, marker, recovery, and retention boundaries explicit as epoch-local. Parent recording lifetime and aggregate identity SHALL be supplied by the application/ETL layer and SHALL not alter WAL v1 bytes or commit authority.
+The WAL API SHALL make its total-byte, segment-sequence, marker, recovery, and retention boundaries explicit as epoch-local. Parent recording lifetime and aggregate identity SHALL be supplied by application/ETL layers and SHALL not alter WAL v1 bytes or commit authority. An epoch-local WAL boundary SHALL not be treated as a protocol reconstruction boundary; any cross-epoch decoder state must arrive through the separate bounded, versioned, checksummed continuation contract.
 
 #### Scenario: Same parent across WAL directories
 

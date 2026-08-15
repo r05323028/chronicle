@@ -99,9 +99,9 @@ Doctor SHALL add recorder-operation probes for configuration/version semantics, 
 
 ### Requirement: Safe runtime lifecycle health report
 
-Application SHALL expose versioned bounded local recorder status for `healthy`, `degraded`, or `failed`, distinct from process liveness, capture readiness, processing readiness, and overall health. Report SHALL contain stable parent recording ID, recorder/process-attempt ID, active epoch ID/ordinal, finalized epoch summaries, lifecycle/capture-readiness/processing-readiness/overall-health, configuration digest, final recovery-authoritative marker per visible epoch, `IncrementalEtlCheckpoint v1` marker/lag per epoch, segment lifecycle counts, retained/quota/free bytes per filesystem domain, capture/WAL loss counters, last rollover/recovery/cleanup/publication result, stable failure/remediation codes, and observational update time.
+Application SHALL expose versioned bounded local recorder status for `healthy`, `degraded`, or `failed`, distinct from process liveness, capture readiness, processing readiness, and overall health. Report SHALL contain stable parent recording ID, recorder/process-attempt ID, active epoch ID/ordinal, finalized epoch summaries, lifecycle/capture-readiness/processing-readiness/overall-health, configuration digest, final recovery-authoritative marker per visible epoch, `IncrementalEtlCheckpoint v1` compatibility and `IncrementalEtlCheckpointV2` marker/lag per epoch where applicable, continuation-in/out state and digest status, segment lifecycle counts, retained/quota/free bytes per filesystem domain, capture/WAL loss counters, last rollover/recovery/cleanup/publication result, stable failure/remediation codes, and observational update time.
 
-Report SHALL be read from atomically persisted state plus direct safe probes. It SHALL distinguish committed from merely written bytes, identify whether a successor epoch is active, show predecessor ETL/retention blockers, and never claim parent completion while required epoch state is unresolved. It SHALL not parse payload, expose secrets/commands, or treat an unvalidated manifest/checkpoint as committed authority.
+Report SHALL be read from atomically persisted state plus direct safe probes. It SHALL distinguish committed from merely written bytes, identify whether a successor epoch is active, show predecessor ETL/retention/continuation blockers, and never claim parent completion while required epoch state is unresolved. It SHALL not parse payload, expose secrets/commands, or treat an unvalidated manifest/checkpoint/continuation as committed authority.
 
 #### Scenario: Running healthy with active successor
 
@@ -158,6 +158,20 @@ New parent/epoch/rollover probes SHALL use existing required/optional `supported
 - **THEN** required probe is not-checked and aggregate exits 4
 
 ## ADDED Requirements
+
+### Requirement: Continuation health is visible and bounded
+
+Recorder status and ETL summaries SHALL expose per-epoch continuation-in/out state, checkpoint version, digest/lineage verification, pending connection/request counts, serialized bytes, unsupported/loss counters, and lag without payload values. Invalid or unavailable continuation SHALL degrade processing/retention readiness and SHALL never be reported as a clean successor start.
+
+#### Scenario: Pending continuation status
+
+- **WHEN** finalized epoch N has a verified continuation seed for active epoch N+1
+- **THEN** status reports the bounded pending state, digest lineage, and per-epoch processing dependency
+
+#### Scenario: Continuation failure status
+
+- **WHEN** continuation restore fails checksum, version, lineage, or bound validation
+- **THEN** status reports stable failure/incompleteness and protects dependent WAL/artifacts
 
 #### Scenario: Continuous status summary
 

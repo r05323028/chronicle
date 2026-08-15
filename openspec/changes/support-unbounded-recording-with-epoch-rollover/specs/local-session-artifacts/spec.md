@@ -2,7 +2,7 @@
 
 ### Requirement: Versioned checksummed filesystem layout
 
-Each published epoch session SHALL retain the existing `<root>/sessions/<session-id>/manifest.json`, `session.json`, and `payloads/<sha256-hex>` layout and manifest v1 integrity rules. Manifest/source provenance SHALL identify the stable parent `RecordingId`, `EpochId`, epoch ordinal, epoch-local WAL identity/ranges, commit-marker boundary, WAL snapshot digest, source status/reason, capture range, completeness, and replayability. Parent aggregation SHALL reference session IDs and verified manifest digests but SHALL not replace the session manifest or promote WAL bytes. Readers SHALL continue to reject unsupported manifest versions and checksum/provenance conflicts.
+Each published epoch session SHALL retain the existing `<root>/sessions/<session-id>/manifest.json`, `session.json`, and `payloads/<sha256-hex>` layout and manifest v1 integrity rules. Manifest/source provenance SHALL identify the stable parent `RecordingId`, `EpochId`, epoch ordinal, epoch-local WAL identity/ranges, any cross-epoch contributing ranges, completion-owner epoch, commit-marker boundary, WAL snapshot digest, source status/reason, capture range, continuation-in/out artifact references, completeness, and replayability. Parent aggregation SHALL reference session IDs and verified manifest/continuation digests but SHALL not replace the session manifest, mutate a published predecessor, or promote WAL bytes. A finalized epoch session remains an independently valid/replayable artifact for its terminal operations; continuation-only evidence is explicitly partial/non-executable rather than silently omitted. Readers SHALL continue to reject unsupported manifest versions and checksum/provenance conflicts.
 
 #### Scenario: Epoch provenance manifest
 
@@ -85,7 +85,7 @@ Inspect SHALL load parent/epoch index, session manifests, canonical sessions, an
 
 ### Requirement: Typed canonical provenance and completeness
 
-Canonical Session MVP v1 SHALL continue to represent source status/reason, connection generation, WAL ranges/commit-marker provenance, loss windows, and typed completeness. New epoch output SHALL append optional parent/epoch provenance fields under the current mutable-v1 append-only policy: stable parent `RecordingId`, `EpochId`, ordinal, epoch-local source status, and any rollover-boundary warning. Completeness maps remain authoritative; an epoch boundary SHALL not mark an operation complete when required evidence is in another epoch. Parent aggregation SHALL not merge completeness maps across epochs into a false complete operation.
+Canonical Session MVP v1 SHALL continue to represent source status/reason, connection generation, WAL ranges/commit-marker provenance, loss windows, and typed completeness. New epoch output SHALL append optional parent/epoch/completion-owner, typed `epoch_wal_ranges`, and continuation-reference provenance fields under the current mutable-v1 append-only policy; legacy single-epoch `wal_ranges` remain readable. A WAL epoch boundary SHALL not mark a connection or operation complete or incomplete by itself. A pending request/connection is represented by immutable continuation evidence; the epoch where decoding terminates owns the canonical operation. Parent aggregation SHALL not merge completeness maps into a false complete operation and SHALL expose unsupported/lost continuation explicitly.
 
 #### Scenario: Complete epoch operation provenance
 
@@ -109,6 +109,10 @@ Canonical Session MVP v1 SHALL continue to represent source status/reason, conne
 
 ## ADDED Requirements
 
+### Requirement: Per-epoch session publication is parent-addressable
+
+Every finalized epoch with publishable committed evidence SHALL have at most one deterministic session associated with one parent and epoch identity. Continuation-only evidence is referenced immutably and does not create an additional replay operation.
+
 #### Scenario: One epoch one session
 
 - **WHEN** an epoch is finalized and ETL succeeds
@@ -118,3 +122,17 @@ Canonical Session MVP v1 SHALL continue to represent source status/reason, conne
 
 - **WHEN** the recorder rolls over and retries finalization of the old epoch
 - **THEN** the same epoch session is adopted or verified and no duplicate session is created
+
+### Requirement: Canonical operation ownership is completion-based
+
+A cross-epoch logical operation SHALL be owned by the epoch where its protocol decoder reaches terminal completion. Its immutable provenance SHALL include the completion-owner epoch plus every contributing parent/epoch/WAL range. Continuation-only evidence remains inspectable metadata and is not an executable replay operation. This rule preserves immutable predecessor sessions, deterministic retry, bounded ETL, and one operation per logical correlation.
+
+#### Scenario: Completion-owned operation
+
+- **WHEN** request/partial-frame evidence begins in one epoch and response/completion arrives in the next
+- **THEN** the next epoch owns one canonical operation with cross-epoch provenance and the predecessor remains immutable
+
+#### Scenario: Run ends without completion
+
+- **WHEN** continuation remains pending at terminal shutdown
+- **THEN** final trusted owner emits one incomplete/non-replayable operation with all known ranges

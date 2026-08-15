@@ -48,13 +48,15 @@ A run SHALL retain one stable `RecordingId` across all epochs and recorder proce
 
 ### Requirement: Continuous capture uses bounded recording epochs
 
-The recorder SHALL keep one capture source and bounded ingest queue attached while rolling successive epochs under one stable parent recording. Each epoch SHALL have a unique `EpochId`, monotonic ordinal, epoch-local WAL identity/sequence space, bounded age and physical bytes, segment lineage, per-epoch ETL/checkpoint state, and explicit predecessor. The existing WAL v1 frame/header bytes and commit-marker authority SHALL remain unchanged; the UUID serialized in an epoch WAL's existing `recording_id` field is its epoch/WAL identity, not a new user-visible recording.
+The recorder SHALL keep one capture source and bounded ingest queue attached while rolling successive epochs under one stable parent recording. Each epoch SHALL have a unique `EpochId`, monotonic ordinal, epoch-local WAL identity/sequence space, bounded age and physical bytes, segment lineage, per-epoch publication/checkpoint state, immutable continuation-in/out references, and explicit predecessor. The existing WAL v1 frame/header bytes and commit-marker authority SHALL remain unchanged; the UUID serialized in an epoch WAL's existing `recording_id` field is its epoch/WAL identity, not a new user-visible recording.
 
-Epoch age and byte thresholds SHALL request rollover only. Rollover SHALL stop admission at a bounded handoff boundary, commit and sync the old epoch's writable prefix, durably publish/link one successor, and route queued/new observations to exactly one epoch without planned source detach. Segment size/age rotation remains inside the active epoch. A parent run has no recording-wide WAL-size or implicit one-hour limit.
+Epoch age and byte thresholds SHALL request rollover only. A WAL epoch boundary is a durability/recovery/quota/retention/publication boundary, not inherently a protocol reconstruction boundary. Rollover SHALL stop admission at a bounded handoff boundary, commit and sync the old epoch's writable prefix, export a bounded versioned continuation checkpoint when protocol state requires it, durably publish/link one successor, and route queued/new observations to exactly one epoch without planned source detach. Segment size/age rotation remains inside the active epoch. A parent run has no recording-wide WAL-size or implicit one-hour limit.
 
-An **accepted observation** is an observation that has successfully entered the recorder-owned bounded ingest queue and received its ingest identity. At admission, every observation MUST receive a stable ingest ordinal, payload length, capture timestamp, and source metadata needed for loss reporting. During handoff, the recorder SHALL persist bounded durable outcome ranges mapping every admitted ordinal exactly once to old-epoch assignment only after that observation is covered by the old epoch's authoritative marker, successor assignment only after the successor commits it, or metadata-only `epoch_rollover_failure`. Rollover SHALL not report success until this outcome journal is durable. If outcome persistence fails, the recorder SHALL stop and leave handoff unresolved for deterministic recovery; admitted ordinals without proven assignment SHALL be counted once as rollover failure, never guessed or silently dropped.
+An accepted observation is assigned to an epoch only after that epoch's authoritative marker covers it. Continuation state is serialized immutable evidence, not shared mutable memory. It may carry only bounded connection/generation, reassembly, partial-frame, correlation, negotiation/session, loss, and issue state supported by the protocol adapter. If it cannot be exported, verified, or restored, the affected evidence receives explicit continuation-loss/incomplete provenance; successor ETL SHALL NOT claim a clean protocol start.
 
-Rollover failure, successor creation failure, protected quota pressure, metadata-limit exhaustion, or capture/WAL failure SHALL stop/fail the run visibly. The recorder SHALL NOT discard accepted observations silently, create repeated empty epochs, merge WAL sequence spaces, or continue without durable ownership.
+An accepted observation is an observation that has successfully entered the recorder-owned bounded ingest queue and received its ingest identity. At admission, every observation MUST receive a stable ingest ordinal, payload length, capture timestamp, and source metadata needed for loss reporting. During handoff, the recorder SHALL persist bounded durable outcome ranges mapping every admitted ordinal exactly once to old-epoch assignment only after that observation is covered by the old epoch's authoritative marker, successor assignment only after the successor commits it, or metadata-only `epoch_rollover_failure`. Rollover SHALL not report success until this outcome journal is durable. If outcome persistence fails, the recorder SHALL stop and leave handoff unresolved for deterministic recovery; admitted ordinals without proven assignment SHALL be counted once as rollover failure, never guessed or silently dropped.
+
+Rollover failure, successor creation failure, protected quota pressure, metadata-limit exhaustion, capture/WAL failure, or continuation handoff failure SHALL stop/fail the run visibly. The recorder SHALL NOT discard accepted observations silently, create repeated empty epochs, merge WAL sequence spaces, silently reset protocol state, or continue without durable ownership.
 
 #### Scenario: Age epoch rollover
 
@@ -216,6 +218,10 @@ Compaction SHALL preserve stable parent ID, first retained epoch ID/ordinal, las
 
 ## ADDED Requirements
 
+### Requirement: Recording, epoch, and segment responsibilities
+
+Chronicle SHALL document and expose the hierarchy in which a recording/capture run is the user-visible potentially unbounded lifecycle, an epoch is the bounded durability/rollover/recovery/ETL unit, and a segment is the bounded append/commit/recovery unit inside an epoch. A WAL epoch boundary SHALL NOT be treated as an automatic protocol reconstruction boundary. Supported protocol state may continue through bounded verified continuation artifacts; a failure to carry it is explicit incomplete/loss evidence.
+
 #### Scenario: Conceptual boundary
 
 - **WHEN** a user or operator views a recording with multiple epochs and segments
@@ -230,3 +236,17 @@ Compaction SHALL preserve stable parent ID, first retained epoch ID/ordinal, las
 
 - **WHEN** an epoch reaches age or bytes
 - **THEN** only the epoch rolls and the parent recording remains active
+
+### Requirement: Protocol continuation is explicit at rollover
+
+Rollover SHALL export no more than one bounded continuation checkpoint for the unique predecessor and SHALL seed no successor from any other source. Continuation identity, checksum, marker lineage, decoder version, and limits SHALL be visible in lifecycle/status state.
+
+#### Scenario: Rollover keeps protocol state eligible
+
+- **WHEN** a connection or partial operation crosses an epoch boundary and the predecessor exports a valid bounded continuation
+- **THEN** successor ETL may restore that continuation without treating the connection as a new protocol session
+
+#### Scenario: Unsupported continuation is visible
+
+- **WHEN** protocol state exceeds bounds or the adapter cannot serialize/restore it
+- **THEN** lifecycle records typed continuation loss/incompleteness and does not claim a clean successor start

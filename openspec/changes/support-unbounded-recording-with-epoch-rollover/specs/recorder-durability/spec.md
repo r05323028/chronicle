@@ -16,9 +16,9 @@ Recorder startup SHALL acquire the exclusive exact domain lease and quota author
 
 ### Requirement: Rollover is crash-recoverable
 
-Epoch rollover SHALL persist enough checksummed transition state to recover or roll back successor creation, epoch-local WAL appendability, accepted-observation outcome ranges, catalog activation, parent/epoch metadata publication, and quota reservations after any process interruption. The transition SHALL bind stable parent `RecordingId`, old/new `EpochId`, old/new ordinals, paths, predecessor, reservation identity, and monotonic phases `prepared`, `successor_created`, `boundary_committed`, and `metadata_published`.
+Epoch rollover SHALL persist enough checksummed transition state to recover or roll back successor creation, epoch-local WAL appendability, accepted-observation outcome ranges, predecessor continuation export, catalog activation, parent/epoch metadata publication, and quota reservations after any process interruption. The parent-aware transition SHALL bind stable parent `RecordingId`, old/new `EpochId`, old/new ordinals, paths, predecessor, reservation identity, continuation digest, and monotonic phases including `prepared`, `successor_created`, `boundary_committed`, `continuation_checkpointed`, and `metadata_published`.
 
-Exactly one successor may become active for one predecessor. A prepared/evidence-free successor may be rolled back; a successor with committed WAL, metadata, or outcome evidence is never deleted by guesswork. Predecessor identity and committed WAL remain immutable after boundary proof. Successful rollover means the old outcome journal and successor activation are durable; it does not mean the parent recording ended.
+Exactly one successor may become active for one predecessor. A prepared/evidence-free successor may be rolled back; a successor or continuation artifact with committed WAL, metadata, or outcome evidence is never deleted by guesswork. Predecessor identity and committed WAL remain immutable after boundary proof. Successful rollover means the old outcome journal, any required continuation checkpoint, and successor activation are durable; it does not mean the parent recording ended. The transition journal is in-flight proof only; `epochs.json` remains topology authority.
 
 #### Scenario: Successor activation
 
@@ -66,7 +66,7 @@ A per-epoch incremental checkpoint SHALL validate against the committed WAL epoc
 
 ### Requirement: Epoch ETL preserves independence and incremental equivalence
 
-ETL SHALL process each epoch independently while preserving one stable parent recording lineage. Each epoch SHALL have its own decoder/checkpoint cursor and canonical session; ETL SHALL not carry protocol/decoder state across epoch IDs or borrow predecessor bytes. Parent aggregation SHALL order verified epoch sessions without merging epoch-local WAL sequences. A finalized epoch SHALL be eligible for parent publication/retention only after verified incremental lineage is equivalent to clean one-shot ETL over that epoch.
+ETL SHALL process each epoch as an independent WAL snapshot, immutable publication, checkpoint, and retention unit while preserving one protocol reconstruction lineage through bounded continuation checkpoints. A successor processor MAY restore only the unique verified predecessor continuation; it SHALL NOT infer state from epoch order, wall-clock time, filesystem mtime, or unrelated output. Each finalized epoch emits completed operations and, when needed, an immutable continuation-out artifact. Parent aggregation SHALL order verified epoch sessions without merging mutable decoder state or epoch-local WAL sequences. A finalized epoch SHALL be eligible for parent publication/retention only after verified incremental lineage is equivalent to clean one-shot ETL for the same parent/epoch input and continuation seed.
 
 #### Scenario: Boundary-incomplete socket evidence
 
@@ -122,3 +122,27 @@ At any durable point a parent run SHALL have zero or one prepared successor and 
 
 - **WHEN** recovery is run twice after completing one valid rollover transition
 - **THEN** both runs select the same active epoch, parent ID, predecessor, checkpoint lineage, and quota state without duplicate successor or publication
+
+### Requirement: Continuation handoff is durable before successor activation
+
+The predecessor continuation checkpoint SHALL be written atomically after the predecessor commit marker and before successor activation when pending protocol state exists. It SHALL bind the stable parent, predecessor and successor IDs/ordinals, decoder/schema/pipeline versions, exact marker/segment lineage, bounded state/counters, and checksum. Recovery SHALL restore it at most once from the unique predecessor; it SHALL never mutate a published predecessor session or select an unrelated checkpoint.
+
+#### Scenario: Continuation checkpoint before activation
+
+- **WHEN** predecessor marker is durable and pending decoder state crosses into the allocated successor
+- **THEN** continuation checkpoint becomes durable and referenced by the transition before successor activation
+
+#### Scenario: Crash after continuation checkpoint
+
+- **WHEN** process crashes after continuation checkpoint publication but before successor catalog activation
+- **THEN** recovery verifies the checkpoint and completes exactly one matching activation/seed or fails closed without starting a clean decoder
+
+#### Scenario: Invalid continuation handoff
+
+- **WHEN** checksum, predecessor/successor identity, decoder version, or marker lineage does not match
+- **THEN** recovery preserves evidence, blocks readiness/retention, and emits explicit continuation-loss provenance
+
+#### Scenario: Repeated handoff recovery
+
+- **WHEN** recovery/retry observes the same predecessor boundary more than once
+- **THEN** it adopts one matching continuation and successor seed without duplicate state or publication

@@ -2,7 +2,7 @@
 
 ### Requirement: Dry-run default and complete plan visibility
 
-Replay SHALL load one verified epoch session or a verified deterministic parent aggregation, build one deterministic plan, and perform no network unless authorization preflight passes. Parent aggregation SHALL order epoch sessions by epoch ordinal/lineage, preserve each operation's epoch provenance, and never merge bytes or infer an operation spanning epochs. Every operation SHALL appear once as executable candidate or non-executable with stable reason. Any target/effect denial for executable candidates SHALL block all requests; non-executable epoch siblings SHALL not block authorized executable siblings. Executor SHALL return one ordered result per planned operation through existing shared atomic JSON.
+Replay SHALL load one verified epoch session or a verified deterministic parent aggregation, build one deterministic plan, and perform no network unless authorization preflight passes. Parent aggregation SHALL order epoch sessions by epoch ordinal/lineage, include each terminal canonical operation exactly once with its completion-owner and contributing epoch provenance, and verify continuation references as integrity dependencies. Continuation-only evidence is represented as non-executable completeness/provenance metadata, not as a duplicate operation. Any target/effect denial for executable candidates SHALL block all requests; non-executable epoch siblings SHALL not block authorized executable siblings. Executor SHALL return one ordered result per planned terminal operation through existing shared atomic JSON.
 
 #### Scenario: Replay one epoch
 
@@ -187,6 +187,10 @@ Inspect/planner SHALL classify each epoch and the selected parent aggregate usin
 
 ## ADDED Requirements
 
+### Requirement: Parent and epoch replay selection is explicit and deterministic
+
+CLI/application replay selection SHALL distinguish stable parent `RecordingId`, `EpochId`, and session ID. Selecting a parent resolves verified terminal operations and continuation dependencies from authoritative `epochs.json`; selecting an epoch resolves only that session. No selection uses newest directory, publication time, or filesystem mtime.
+
 #### Scenario: Explicit epoch selection
 
 - **WHEN** user supplies an epoch/session identity
@@ -204,12 +208,12 @@ Inspect/planner SHALL classify each epoch and the selected parent aggregate usin
 
 ### Requirement: Epoch boundary is replay safety boundary
 
-Replay SHALL not synthesize a request/response, carry decoder state, or infer protocol completion across epoch sessions. A connection or operation marked incomplete at rollover remains non-executable unless its own epoch canonical evidence independently satisfies existing replayability rules. Parent aggregation may execute independent operations sequentially through existing executor semantics; it SHALL not recreate original cross-epoch timing, pipelining, or live recorder behavior.
+A WAL epoch boundary SHALL not force a protocol reset during ETL, but replay SHALL never decode raw continuation fragments or synthesize a request/response at execution time. A terminal operation completed in a successor epoch is replayed once from that successor's canonical session, with predecessor ranges retained as provenance. A continuation-only predecessor session is independently inspectable but contributes no executable operation. If continuation is missing, invalid, unsupported, or incomplete, the affected operation remains non-executable/inconclusive under existing replayability rules; parent selection fails closed on a required gap rather than silently omitting it.
 
 #### Scenario: Long-lived connection at rollover
 
-- **WHEN** predecessor epoch ends with pending HTTP bytes and successor contains continuation bytes
-- **THEN** each epoch operation remains incomplete/non-executable unless independently complete, and replay sends no synthesized combined request
+- **WHEN** predecessor epoch ends with pending HTTP bytes and successor contains a valid verified continuation
+- **THEN** replay uses only a successor-owned terminal operation if one exists, otherwise reports the predecessor fragment non-executable; it never synthesizes raw combined traffic
 
 #### Scenario: Parent operation order
 
@@ -248,3 +252,17 @@ Replay SHALL retain five-second connect/operation timeout, 8 MiB observed body b
 
 - **WHEN** replay loads otherwise valid imported session containing more than 10,000 operations
 - **THEN** replay rejects before network with typed invalid-session outcome and omits no operation silently
+
+### Requirement: Replay completion-owned cross-epoch operations
+
+Parent replay plans SHALL include terminal canonical operations exactly once and SHALL verify their continuation/provenance references. Continuation-only fragments SHALL affect completeness/classification but SHALL not be decoded or sent as requests by replay. A missing, invalid, or unsupported continuation makes the affected operation non-executable/inconclusive under existing deny-by-default rules.
+
+#### Scenario: Terminal successor operation replay
+
+- **WHEN** a successor session owns an operation completed from predecessor and successor evidence
+- **THEN** parent replay plans one operation from the successor session and preserves predecessor provenance without duplicate traffic
+
+#### Scenario: Continuation-only predecessor
+
+- **WHEN** predecessor session contains only a pending continuation reference
+- **THEN** inspect reports the pending/incomplete state and replay sends no standalone request from that fragment

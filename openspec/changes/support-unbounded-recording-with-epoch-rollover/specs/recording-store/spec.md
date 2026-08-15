@@ -65,7 +65,7 @@ RecordingStore SHALL own immutable artifact persistence, identity, integrity ver
 
 ### Requirement: Explicit manifests own artifact reachability
 
-Recorder/ETL SHALL decide required epoch artifact sets from versioned manifests, checkpoints, and parent aggregation descriptors, not store listing completeness or modification time. Every artifact reference SHALL include parent/epoch identity, deterministic key, size, SHA-256, schema/pipeline version, source WAL range/digest, creation transaction identity, and retention class. A parent aggregate SHALL be persisted only after every required epoch reference is durably verified. Retention decisions SHALL use local validated WAL, epoch lifecycle manifest, checkpoint lineage, final-session proof, and parent/reference proof; duplicated sealed copies and listing SHALL never be required for correctness.
+Recorder/ETL SHALL decide required epoch artifact sets from versioned manifests, v2 checkpoints, continuation references, and parent aggregation descriptors, not store listing completeness or modification time. Every artifact reference SHALL include parent/epoch identity, deterministic key, size, SHA-256, schema/pipeline version, source WAL range/digest, continuation predecessor/successor role where applicable, creation transaction identity, and retention class. A parent aggregate SHALL be persisted only after every required epoch session, continuation artifact, and checkpoint reference is durably verified. Retention decisions SHALL use local validated WAL, authoritative epoch catalog, checkpoint/continuation lineage, final-session proof, and parent/reference proof; duplicated sealed copies and listing SHALL never be required for correctness.
 
 #### Scenario: Listing omits recent epoch artifact
 
@@ -175,6 +175,10 @@ The filesystem RecordingStore conformance suite SHALL cover parent/epoch key ide
 
 ## ADDED Requirements
 
+### Requirement: Parent aggregation references verified epoch artifacts
+
+A parent aggregate/index SHALL be a versioned metadata artifact whose entries are ordered by authoritative epoch ordinal and contain verified session, checkpoint, continuation, manifest, and retention digests. It SHALL never embed unverified payload or promote source WAL.
+
 #### Scenario: Aggregate rebuild
 
 - **WHEN** process restart finds verified epoch outputs but a missing parent aggregate
@@ -184,3 +188,17 @@ The filesystem RecordingStore conformance suite SHALL cover parent/epoch key ide
 
 - **WHEN** existing parent aggregate differs from verified epoch entry set
 - **THEN** store/application reports lineage conflict and does not overwrite or mark parent complete
+
+### Requirement: Continuation artifacts are immutable retention dependencies
+
+Continuation-in/out artifacts SHALL be immutable, content-addressed, and referenced by the epoch manifest/checkpoint before retention transitions. A successor session or checkpoint may depend on its predecessor continuation artifact, but publication/retry SHALL verify exact digest and lineage and SHALL never overwrite or synthesize a replacement from filesystem order. Retention SHALL retain every continuation artifact required by a published or recoverable successor operation.
+
+#### Scenario: Continuation artifact retry
+
+- **WHEN** retry encounters a matching continuation key
+- **THEN** it verifies and reuses the artifact without duplicate state or overwrite
+
+#### Scenario: Continuation dependency retention
+
+- **WHEN** predecessor raw WAL is eligible for deletion but a retained successor references its continuation artifact
+- **THEN** cleanup retains the required artifact/provenance and deletes only independently eligible source evidence

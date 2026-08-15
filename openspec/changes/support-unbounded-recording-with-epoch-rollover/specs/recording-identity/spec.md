@@ -4,7 +4,9 @@
 
 The primary public recording reference SHALL remain `rec_<full-uuid>`, and one public `RecordingId` SHALL identify an entire recording/capture run across every epoch and recorder restart. Public input SHALL accept `rec_<full-uuid>` and, for compatibility only, bare UUID; prefixes SHALL be rejected and resolution exact. Each epoch SHALL additionally have a unique `EpochId` and stable ordinal. Epoch IDs are operational lineage identities, not additional user-visible recordings.
 
-New parent/run metadata and catalog entries SHALL retain the stable `RecordingId`; epoch WAL directories and existing WAL v1 UUID fields SHALL retain their epoch-local identity without rewriting WAL bytes. A finalized epoch's `SessionId` MAY differ from the parent `RecordingId` and SHALL be deterministic from parent ID, epoch identity/ordinal, pipeline version, and verified epoch snapshot. A legacy one-epoch recording remains resolvable when parent and epoch IDs are equal. Public human/JSON output SHALL render the parent ID with `rec_` and expose epoch IDs only in epoch-scoped views.
+New parent/run metadata and catalog entries SHALL retain the stable typed `RecordingId`; epoch WAL directories and existing WAL v1 UUID fields SHALL retain their epoch-local identity without rewriting WAL bytes. A finalized epoch's `SessionId` MAY differ from the parent `RecordingId` and SHALL be deterministic from parent ID, epoch identity/ordinal, pipeline version, verified epoch snapshot, and continuation seed. A legacy one-epoch recording remains resolvable when parent and epoch UUID bytes are equal through an explicit compatibility adapter. Public human/JSON output SHALL render the parent ID with `rec_` and expose epoch IDs only in epoch-scoped views; epoch IDs SHALL render as `epoch_<full-uuid>` operationally.
+
+`chronicle-common` owns the two newtypes. `chronicle-wal` owns only its private legacy v1 wire adapter. New checkpoint/session/artifact schemas SHALL carry parent and epoch fields separately; no untyped UUID field may select between them.
 
 #### Scenario: Display stable parent form
 
@@ -33,13 +35,13 @@ New parent/run metadata and catalog entries SHALL retain the stable `RecordingId
 
 ### Requirement: Recording catalog
 
-Chronicle SHALL maintain bounded private/advisory parent catalog state under the data directory: atomically updated `catalog.json`, one `recording-intent.json`/run allocation, one parent run manifest, and an ordered epoch catalog for each parent recording. Existing WAL commit markers, epoch-local WAL metadata, canonical session manifests, and session artifacts remain authoritative for their domains; the parent catalog SHALL not promote bytes or invent lineage.
+Chronicle SHALL maintain bounded private parent catalog state under the data directory: atomically updated global `catalog.json` for listing/indexing, one `recording-intent.json`/run allocation, one derived parent run manifest, and exactly one authoritative ordered epoch catalog (`epochs.json`) for each parent recording. The epoch catalog SHALL contain stable parent `RecordingId`, typed `EpochId`, ordinal, predecessor/successor links, relative path, state, topology digest, and bounded commit/ETL/publication/retention summaries. Global catalog and run manifest may cache these facts but SHALL NOT participate in topology recovery or select an active epoch.
 
-A catalog parent entry SHALL contain stable recording ID, optional name, allocation/start/end facts, run status, aggregate published-session/operation counters, epoch counts, current/last epoch references, and safe child/source summary. Each epoch entry SHALL contain parent ID, unique epoch ID, ordinal, predecessor, relative path, state, commit/ETL/publication/retention summaries, and deletion/compaction proof as applicable. The successor relationship SHALL be derived from the validated next ordinal and predecessor; no conflicting second lineage is accepted. The recording-intent sidecar is written once for the parent before capture attachment, not once per rollover.
+Existing WAL commit markers, epoch-local WAL metadata, canonical session manifests, checkpoints, and continuation artifacts remain authoritative for their own domains. `epochs.json` is the sole application-level parent-to-epoch topology authority. `recording-intent.json` establishes the parent allocation only. A valid transition journal proves one in-flight change and may complete/rollback it only against catalog and WAL evidence.
 
-Public mutation SHALL acquire the same exact normalized `<domain_lock_root>/.chronicle-domain.lock` path as the recorder lease and hold it through parent/epoch allocation, capture, rollover, ETL, publication, retention, and catalog update. Read-only reconciliation MAY run without the lock and SHALL never mutate while another owner holds it. Canonical/session and recovery-authoritative WAL evidence SHALL win advisory catalog facts; contradictions SHALL surface as `inconsistent`.
+A run-summary disagreement SHALL be repaired by regenerating the summary from `epochs.json`, unless its parent ID conflicts. A catalog/transition disagreement SHALL complete or roll back only from exact phase, IDs, ordinals, paths, checksums, and WAL marker evidence. A transition/WAL disagreement SHALL defer to commit markers for bytes and fail closed unless stale derived state can be regenerated with exact identity/digest proof. Missing/corrupt/ambiguous topology SHALL fail closed or be deterministically rebuilt from unambiguous stronger evidence under the lease; it SHALL never guess by mtime or newest path.
 
-Catalog operations SHALL reject symlinks, non-regular entries, path escape, ID/directory mismatch, duplicate parent/epoch identity, broken ordinal/predecessor lineage, oversized input, and unbounded scans. Parent catalog limits and epoch-index compaction SHALL preserve enough first/last identity, digest-chain, tombstone, and aggregate proof to detect missing or forked history.
+Public mutation SHALL acquire the same exact normalized `<domain_lock_root>/.chronicle-domain.lock` path as the recorder lease and hold it through parent/epoch allocation, capture, rollover, ETL, publication, retention, and catalog update. Read-only reconciliation MAY run without the lock and SHALL never mutate while another owner holds it. Catalog operations SHALL reject symlinks, non-regular entries, path escape, ID/directory mismatch, duplicate parent/epoch identity, broken ordinal/predecessor lineage, oversized input, and unbounded scans.
 
 #### Scenario: Catalog updated across rollover
 
@@ -53,8 +55,8 @@ Catalog operations SHALL reject symlinks, non-regular entries, path escape, ID/d
 
 #### Scenario: Catalog is not authority
 
-- **WHEN** catalog, epoch metadata, canonical session, or WAL evidence disagree
-- **THEN** commands use canonical facts and recovery-authoritative WAL state, surface `inconsistent`, and never overwrite authoritative artifacts
+- **WHEN** a derived global catalog/run summary, transition journal, session, or checkpoint disagrees with authoritative `epochs.json` topology or WAL commit markers
+- **THEN** recovery rebuilds derived facts from the stronger authority when exact identity/digest proof exists, otherwise surfaces `inconsistent` and never overwrites authoritative artifacts
 
 #### Scenario: Ambiguous legacy grouping
 
@@ -113,6 +115,20 @@ Commands SHALL resolve references to stable parent recordings deterministically:
 - **THEN** `latest` resolves to the newest by start time, ties broken by recording ID
 
 ## ADDED Requirements
+
+### Requirement: Parent and epoch identity types have explicit compatibility boundaries
+
+`RecordingId` SHALL mean stable parent recording in application/common/canonical/CLI contracts. `EpochId` SHALL mean one bounded epoch in application/common/catalog/ETL/WAL adapter contracts. `chronicle-wal` MAY retain a private `WalV1RecordingIdentity` for the unchanged v1 `recording_id` field, but no public API may use that field as an untyped parent/epoch discriminator. New checkpoint/session/artifact schemas SHALL carry typed parent and epoch fields; legacy v1 UUID fields SHALL be read through an explicit one-epoch/WAL adapter. Equality of legacy UUID bytes SHALL not erase the semantic type distinction.
+
+#### Scenario: Explicit WAL compatibility conversion
+
+- **WHEN** a legacy WAL v1 header exposes a UUID in `recording_id`
+- **THEN** only the WAL compatibility adapter maps it to an `EpochId` using validated epoch context and never exposes it as parent `RecordingId`
+
+#### Scenario: Legacy one-epoch mapping
+
+- **WHEN** a legacy one-epoch recording has one UUID serving both public and WAL roles
+- **THEN** the compatibility reader creates distinct typed parent/epoch values with an explicit equality mapping and preserves legacy lookup
 
 #### Scenario: List long-running recording
 
