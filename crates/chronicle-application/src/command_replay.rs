@@ -81,7 +81,7 @@ async fn replay_command_after_preplan(
     use crate::supervised_scope::{
         create_supervised_scope, discover_delegated_root, preflight_scope_access,
     };
-    use chronicle_replay::{LoopbackReplayOptions, TimingMode};
+    use crate::{ReplayRequest, ReplayTiming};
     use std::process::Stdio;
     use std::time::Instant;
 
@@ -156,13 +156,13 @@ async fn replay_command_after_preplan(
         }
     };
     let origin = discovered.origin();
-    let inferred = LoopbackReplayOptions {
+    let inferred = ReplayRequest {
         target: Some(origin.clone()),
         allow_hosts: vec![discovered.host()],
         execute: true,
         allow_reads: true,
         allow_writes: options.allow_writes,
-        timing: TimingMode::Asap,
+        timing: ReplayTiming::Asap,
     };
     let mut final_plan = None;
     let replay = replay_session_with_plan_guard(
