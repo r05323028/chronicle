@@ -80,7 +80,7 @@ Documentation is part of product contract. Before completing any change, review 
 - architecture, crate/service/module boundaries, dependency direction, or cross-crate contracts;
 - durable engineering invariants or conventions.
 
-If affected, update relevant documentation in same change. Targets include:
+If affected, update relevant documentation in same change. User-facing behavior or canonical English documentation changes require review and update of corresponding `zh-tw` and `ja` pages; run `cd website && npm run verify:localization`. Terminology and freshness rules live in `website/TERMINOLOGY.md`. Targets include:
 
 - `README.md` for repository usage and entry-point information;
 - `docs/` for canonical product, architecture, operations, and runbook guidance;

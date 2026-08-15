@@ -2,7 +2,11 @@
 
 ## Normal documentation change
 
-Edit Latest English source under `website/src/content/docs/docs/`. Edit Latest Traditional Chinese and Japanese pages under `website/src/content/docs/zh-tw/docs/` and `website/src/content/docs/ja/docs/`. Open a PR. The Website workflow runs `npm ci`, `npm run check`, `npm run build`, and static-output verification. Merge to `main` publishes one GitHub Pages site.
+Edit Latest English source under `website/src/content/docs/docs/`. Edit the corresponding Traditional Chinese and Japanese pages under `website/src/content/docs/zh-tw/docs/` and `website/src/content/docs/ja/docs/`; English is canonical, but every exposed page must have both localized counterparts. Run `npm run verify:localization` after reviewing translations. Terminology and freshness workflow live in [TERMINOLOGY.md](TERMINOLOGY.md). Open a PR. The Website workflow runs localization/version checks, `npm ci`, `npm run check`, `npm run build`, and static-output verification. Merge to `main` publishes one GitHub Pages site.
+
+## Localization
+
+English changes require a review of both `zh-tw` and `ja` pages. `npm run verify:localization` fails on missing pages, structural/token drift, English fallback bodies, or stale canonical source hashes. After both translations are reviewed, run `npm run update:localization` and commit `localization-manifest.json`. See [TERMINOLOGY.md](TERMINOLOGY.md) for the small glossary and writing rules.
 
 ## New minor release
 

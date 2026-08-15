@@ -8,6 +8,8 @@
     "preview": "astro preview",
     "check": "astro check",
     "verify:versions": "node scripts/verify-versions.mjs",
+    "verify:localization": "node scripts/verify-localization.mjs",
+    "update:localization": "node scripts/verify-localization.mjs --update",
     "verify:build": "node scripts/verify-build.mjs",
     "docs:version": "node scripts/docs-version.mjs"
   },

@@ -1,6 +1,8 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightVersions from 'starlight-versions';
+import zhTwUi from './src/content/i18n/zh-TW.json' with { type: 'json' };
+import jaUi from './src/content/i18n/ja.json' with { type: 'json' };
 
 const isGitHubActions = process.env.GITHUB_ACTIONS === 'true';
 const repository = process.env.GITHUB_REPOSITORY?.split('/').at(-1);
@@ -15,12 +17,13 @@ const translated = (zhTw, ja) => ({
   },
 });
 
-const versionTranslations = {
+const siteTranslations = {
   name: 'Chronicle version translations',
   hooks: {
     'i18n:setup'({ injectTranslations }) {
       injectTranslations({
         'zh-TW': {
+          ...zhTwUi,
           'starlightVersions.link.latest':
             '切換至<a href={{link}}>最新版本</a>以取得最新文件。',
           'starlightVersions.outdated.label': '此內容適用於 {{label}}。',
@@ -32,6 +35,7 @@ const versionTranslations = {
           'starlightVersions.select.accessibleLabel': '選擇版本',
         },
         ja: {
+          ...jaUi,
           'starlightVersions.link.latest':
             '最新のドキュメントを見るには<a href={{link}}>最新バージョン</a>へ移動してください。',
           'starlightVersions.outdated.label': 'このコンテンツは{{label}}向けです。',
@@ -75,7 +79,7 @@ export default defineConfig({
           label: 'Getting started',
           ...translated('開始使用', 'はじめに'),
           items: [
-            { label: 'Introduction', ...translated('介紹', '概要'), slug: 'docs' },
+            { label: 'Introduction', ...translated('簡介', '概要'), slug: 'docs' },
             { label: 'Installation', ...translated('安裝', 'インストール'), slug: 'docs/getting-started/installation' },
             { label: 'Quick start', ...translated('快速開始', 'クイックスタート'), slug: 'docs/getting-started/quick-start' },
           ],
@@ -84,10 +88,10 @@ export default defineConfig({
           label: 'Concepts',
           ...translated('核心概念', '概念'),
           items: [
-            { label: 'Capture', ...translated('捕捉', 'キャプチャ'), slug: 'docs/concepts/capture' },
+            { label: 'Capture', ...translated('擷取', 'キャプチャ'), slug: 'docs/concepts/capture' },
             { label: 'WAL', ...translated('WAL', 'WAL'), slug: 'docs/concepts/wal' },
             { label: 'Sessions', ...translated('工作階段', 'セッション'), slug: 'docs/concepts/sessions' },
-            { label: 'Canonical model', ...translated('規範模型', '正規モデル'), slug: 'docs/concepts/canonical-model' },
+            { label: 'Canonical model', ...translated('canonical model', 'canonical model'), slug: 'docs/concepts/canonical-model' },
             { label: 'Replay', ...translated('重播', 'リプレイ'), slug: 'docs/concepts/replay' },
           ],
         },
@@ -96,7 +100,7 @@ export default defineConfig({
           ...translated('架構', 'アーキテクチャ'),
           items: [
             { label: 'Overview', ...translated('總覽', '概要'), slug: 'docs/architecture/overview' },
-            { label: 'Recorder', ...translated('Recorder', 'Recorder'), slug: 'docs/architecture/recorder' },
+            { label: 'Recorder', ...translated('Recorder', 'レコーダー'), slug: 'docs/architecture/recorder' },
             { label: 'ETL', ...translated('ETL', 'ETL'), slug: 'docs/architecture/etl' },
             { label: 'Storage', ...translated('儲存', 'ストレージ'), slug: 'docs/architecture/storage' },
           ],
@@ -135,7 +139,7 @@ export default defineConfig({
             { slug: '0-1', label: '0.1', redirect: 'same-page' },
           ],
         }),
-        versionTranslations,
+        siteTranslations,
       ],
     }),
   ],

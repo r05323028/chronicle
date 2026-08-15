@@ -51,4 +51,4 @@ Start with [installation](./getting-started/installation/), then follow [quick s
 
 ## Documentation status
 
-English is the canonical source. Traditional Chinese and Japanese pages are translated incrementally; when a page has no translation yet, Starlight falls back to the English page instead of creating a stale parallel definition. Keep command names, format versions, and flags unchanged across locales. See [terminology](./reference/terminology/) for recurring terms.
+English is the canonical source. Traditional Chinese and Japanese pages are maintained alongside the current English pages, with a localized counterpart for every supported page. Keep command names, format versions, and flags unchanged across locales. See [terminology](./reference/terminology/) for recurring terms.

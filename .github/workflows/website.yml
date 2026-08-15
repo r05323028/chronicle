@@ -76,6 +76,10 @@ jobs:
             echo "BASE_PATH=/${repo}"
           } >> "$GITHUB_ENV"
 
+      - name: Verify documentation localization
+        working-directory: website
+        run: npm run verify:localization
+
       - name: Verify committed documentation versions
         working-directory: website
         run: npm run verify:versions
@@ -99,6 +103,7 @@ jobs:
           source_paths=(
             website/astro.config.mjs
             website/src/content/docs
+            website/src/content/i18n
             website/src/content/versions
           )
           if [[ -n "$(git status --short -- "${source_paths[@]}")" ]]; then
