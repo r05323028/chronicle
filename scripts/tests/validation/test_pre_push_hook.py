@@ -4,9 +4,15 @@
 Verifies: the hook is repository-managed and executable, it invokes act with a
 job that exists in the GitHub Actions workflow, and missing dependencies
 produce actionable errors instead of silently skipping validation.
+
+Also guards the invariant chain end to end: the act-invoked checks job must
+keep running fast layered validation, fast mode must keep the architecture
+(dependency direction + semantic boundary) and tooling meta-test steps, and
+the semantic-boundary checks must stay wired into the architecture gate.
 """
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -18,11 +24,31 @@ ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts/pre-push-validation.sh"
 CONFIG = ROOT / ".pre-commit-config.yaml"
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
+VALIDATE = ROOT / "scripts/validate.sh"
+VALIDATION = ROOT / "scripts/validation.py"
+ARCHITECTURE_POLICY = ROOT / "validation/architecture.toml"
 CONTRIBUTING = ROOT / "CONTRIBUTING.md"
 AGENTS = ROOT / "AGENTS.md"
 
 
-def run_script(env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def ci_job_block(job: str) -> str:
+    """Text of a top-level job in ci.yml (two-space YAML indentation)."""
+    lines = WORKFLOW.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == f"{job}:")
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(lines))
+            if re.match(r"^  [a-z0-9_-]+:", lines[i])
+        ),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def run_script(
+    env_extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env.pop("CHRONICLE_PRE_PUSH_JOB", None)
     env.pop("CHRONICLE_PRE_PUSH_TIMEOUT_SECONDS", None)
@@ -87,6 +113,52 @@ class PrePushHookTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no-such-job", result.stderr)
         self.assertIn("not found in", result.stderr)
+        self.assertIn("Push aborted", result.stderr)
+
+    def test_checks_job_runs_fast_layered_validation(self):
+        # Regression protection: the act-invoked job must keep running the
+        # fast layered validation, or the hook silently stops enforcing the
+        # architecture/semantic/tooling invariants.
+        self.assertIn("./scripts/validate.sh fast", ci_job_block("checks"))
+
+    def test_fast_mode_runs_architecture_and_tooling_steps(self):
+        # The fast mode invoked by the checks job must keep the architecture
+        # gate (dependency direction + semantic boundary) and the tooling
+        # meta-test step (architecture-boundary, sleep-policy, hook tests).
+        validate = VALIDATE.read_text()
+        self.assertIn("run_shell architecture", validate)
+        self.assertIn("--config '$ROOT/validation/architecture.toml'", validate)
+        self.assertIn("run_shell tooling-tests", validate)
+        for test in (
+            "test_architecture_boundaries.py",
+            "test_pre_push_hook.py",
+            "test_sleep_policy.py",
+        ):
+            self.assertIn(test, validate)
+
+    def test_semantic_boundary_wired_into_architecture_check(self):
+        # The architecture gate must keep executing the semantic-boundary
+        # checks (outer-adapter vocabulary, forbidden re-exports).
+        self.assertIn("semantic_check(root, semantic)", VALIDATION.read_text())
+        policy = ARCHITECTURE_POLICY.read_text()
+        self.assertIn("[semantic]", policy)
+        self.assertIn("forbidden_outer_vocabulary = [", policy)
+        self.assertIn("forbidden_re_export_sources = [", policy)
+
+    def test_docker_daemon_down_produces_actionable_error(self):
+        # act present, docker present but daemon down -> actionable error.
+        with tempfile.TemporaryDirectory(prefix="prepush-docker-") as directory:
+            for name, body in (
+                ("act", "#!/bin/sh\nexit 0\n"),
+                ("docker", "#!/bin/sh\nexit 1\n"),
+            ):
+                stub = Path(directory) / name
+                stub.write_text(body)
+                stub.chmod(0o755)
+            base = path_with_only("bash", "dirname", "grep", "tr")
+            result = run_script({"PATH": f"{directory}:{base}"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("running Docker daemon", result.stderr)
         self.assertIn("Push aborted", result.stderr)
 
     def test_docs_match_implementation(self):
