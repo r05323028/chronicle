@@ -14,3 +14,13 @@ repos:
       - id: fmt
       - id: clippy
         args: ["--all-targets", "--", "-D", "warnings"]
+
+  - repo: local
+    hooks:
+      - id: pre-push-act
+        name: pre-push act validation
+        description: Run the portable CI checks job locally with act
+        entry: scripts/pre-push-validation.sh
+        language: system
+        pass_filenames: false
+        stages: [push]

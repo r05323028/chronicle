@@ -777,6 +777,14 @@ mod tests {
     fn not_delegated_root_rejected() {
         let host = FakeHost::new();
         fs::set_permissions(&host.delegated, fs::Permissions::from_mode(0o555)).unwrap();
+        if rustix::process::geteuid().as_raw() == 0 {
+            // Root supervisors skip the writability check by design (POSIX
+            // permission checks do not apply to uid 0); this test's premise
+            // only holds for non-root environments such as GitHub runners.
+            // Root containers (e.g. act) exercise the delegated path instead.
+            fs::set_permissions(&host.delegated, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
         let err = preflight_scope_access(&host.hierarchy, &host.delegated, test_uid()).unwrap_err();
         assert!(matches!(err, ScopeError::NotDelegated));
         fs::set_permissions(&host.delegated, fs::Permissions::from_mode(0o700)).unwrap();

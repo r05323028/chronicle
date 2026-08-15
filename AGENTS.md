@@ -63,6 +63,8 @@ Rules:
   `live-capture|recorder` — privileged Linux acceptance; `release` — release qualification.
 - `./scripts/acceptance.sh` — the ONLY user-facing acceptance entrypoint (`--profile
   live-capture|recorder|all`, `--executor local|multipass`). No deprecated aliases or wrappers.
+- Before pushing: the repository pre-push hook runs act-based CI checks locally
+  (`scripts/pre-push-validation.sh`, job `checks`; install with `scripts/install-pre-push-hook.sh`).
 - `openspec validate --all --strict --no-interactive` — proves SDD artifact structure only,
   never product correctness. OpenSpec is the SDD workflow for requirements, design, scope,
   acceptance criteria, validation, and archiving (see `openspec/`).
