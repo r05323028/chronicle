@@ -1,0 +1,85 @@
+---
+interface Props {
+  locale?: 'en' | 'zh-tw' | 'ja';
+}
+
+const { locale = 'en' } = Astro.props;
+const labels = {
+  en: {
+    capture: 'Capture',
+    captureMeta: 'socket evidence',
+    diagramTraffic: 'observed traffic',
+    diagramBoundary: 'durable boundary',
+    diagramTarget: 'authorized target',
+    wal: 'WAL',
+    walMeta: 'committed prefix',
+    etl: 'ETL',
+    etlMeta: 'bounded transform',
+    session: 'Canonical session',
+    sessionMeta: 'portable artifact',
+    replay: 'Replay',
+    replayMeta: 'loopback target',
+    caption: 'One path from observed traffic to an explicitly authorized replay.',
+  },
+  'zh-tw': {
+    capture: '捕捉',
+    captureMeta: 'socket 證據',
+    diagramTraffic: '觀察到的流量',
+    diagramBoundary: '持久化邊界',
+    diagramTarget: '已授權目標',
+    wal: 'WAL',
+    walMeta: '已提交前綴',
+    etl: 'ETL',
+    etlMeta: '有界轉換',
+    session: '規範工作階段',
+    sessionMeta: '可攜式產物',
+    replay: '重播',
+    replayMeta: 'loopback 目標',
+    caption: '從觀察到的流量，走向明確授權的重播。',
+  },
+  ja: {
+    capture: 'キャプチャ',
+    captureMeta: 'socket 証拠',
+    diagramTraffic: '観測したトラフィック',
+    diagramBoundary: '永続化境界',
+    diagramTarget: '許可済みターゲット',
+    wal: 'WAL',
+    walMeta: 'コミット済みプレフィックス',
+    etl: 'ETL',
+    etlMeta: '有界変換',
+    session: '正規セッション',
+    sessionMeta: 'ポータブル成果物',
+    replay: 'リプレイ',
+    replayMeta: 'loopback ターゲット',
+    caption: '観測したトラフィックを、明示的に許可したリプレイへつなぐ経路。',
+  },
+};
+const copy = labels[locale];
+const nodes = [
+  { key: 'capture', label: copy.capture, meta: copy.captureMeta },
+  { key: 'wal', label: copy.wal, meta: copy.walMeta },
+  { key: 'etl', label: copy.etl, meta: copy.etlMeta },
+  { key: 'session', label: copy.session, meta: copy.sessionMeta },
+  { key: 'replay', label: copy.replay, meta: copy.replayMeta },
+];
+---
+
+<figure class="evidence-diagram" aria-labelledby="evidence-caption">
+  <div class="diagram-header">
+    <span>{copy.diagramTraffic}</span>
+    <span class="diagram-boundary">{copy.diagramBoundary}</span>
+    <span>{copy.diagramTarget}</span>
+  </div>
+  <div class="flow-track" aria-hidden="true">
+    <span class="flow-trace"></span>
+    {nodes.map((node) => (
+      <div class={`flow-node flow-node--${node.key}`}>
+        <span class="flow-node__mark"></span>
+        <strong>{node.label}</strong>
+        <small>{node.meta}</small>
+      </div>
+    ))}
+  </div>
+  <figcaption id="evidence-caption">{copy.caption}</figcaption>
+  <p class="sr-only">{copy.caption} {nodes.map((node) => node.label).join(' → ')}</p>
+</figure>

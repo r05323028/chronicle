@@ -52,6 +52,11 @@ jobs:
           ./scripts/release/resolve-release-context.sh \
             "$MODE" Cargo.toml "$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Require committed documentation snapshot
+        env:
+          RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
+        run: node website/scripts/verify-release-docs.mjs "$RELEASE_VERSION"
+
   release:
     name: Build chronicle-${{ matrix.target }}
     needs: resolve-context

@@ -1,0 +1,323 @@
+---
+import FlowDiagram from './FlowDiagram.astro';
+import '../../styles/marketing.css';
+
+interface Props {
+  locale?: 'en' | 'zh-tw' | 'ja';
+}
+
+const { locale = 'en' } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const href = (path: string) => `${base}${path}` || '/';
+const github = 'https://github.com/r05323028/chronicle';
+
+const copy = {
+  en: {
+    lang: 'en',
+    skipLink: 'Skip to content',
+    primaryNav: 'Primary navigation',
+    commandLabel: 'chronicle / public commands',
+    brand: 'Chronicle',
+    docs: 'Documentation',
+    source: 'Source',
+    localeLabel: 'Language',
+    english: 'EN',
+    chinese: '繁中',
+    japanese: '日本語',
+    titleA: 'Real behavior.',
+    titleB: 'Replayable evidence.',
+    lede: 'Record what an application actually does. Chronicle writes captured evidence to a durable local WAL, turns it into a canonical session, and replays it against an explicitly authorized loopback target.',
+    readDocs: 'Read the docs',
+    viewSource: 'View source',
+    scopeLabel: 'Current surface',
+    scope: 'Linux · plaintext HTTP/1.1 · local filesystem',
+    section1Title: 'A request path is already a test case.',
+    section1Body: 'Hand-written fixtures describe what someone remembered to encode. Chronicle starts with behavior that happened: socket evidence, ordered bytes, and the relationships between requests and responses. No application probes. No production destination carried into replay.',
+    section1Aside: 'Capture around the workload, not inside its source.',
+    pipelineTitle: 'From traffic to a recording you can carry.',
+    pipelineBody: 'Each handoff has one job. Capture observes. WAL makes the durable prefix authoritative. ETL reconstructs. The canonical model removes capture and storage mechanics from replay.',
+    pipelineCaptureCode: 'socket → evidence',
+    pipelineWalCode: 'append → commit',
+    pipelineEtlCode: 'recover → transform',
+    pipelineSessionCode: 'publish → inspect',
+    pipelineReplayCode: 'plan → verify',
+    captureName: 'Capture',
+    captureBody: 'Attach to a supervised command, process, or cgroup. Chronicle observes socket lifecycle and plaintext payload evidence without application instrumentation.',
+    walName: 'WAL',
+    walBody: 'Append evidence to segmented WAL v1. A commit marker and sync establish what downstream processing is allowed to trust after interruption.',
+    etlName: 'ETL',
+    etlBody: 'Read the recovered committed prefix, reconstruct bounded HTTP/1.1 sessions, account for loss, and publish one deterministic canonical session.',
+    sessionName: 'Canonical session',
+    sessionBody: 'Persist a protocol- and storage-independent recording with connections, operations, completeness, integrity, and replay attributes.',
+    replayName: 'Replay',
+    replayBody: 'Plan first. Dry-run by default. Execute only against an authorized loopback target; recorded production destinations are never a fallback.',
+    safetyTitle: 'Durability before interpretation. Authorization before effects.',
+    durabilityTitle: 'Durability is part of capture.',
+    durabilityBody: 'The WAL is not an internal queue that can disappear when a later stage crashes. Recovery treats the last valid in-WAL commit marker as authority; ETL works from that boundary.',
+    safetyTitle2: 'Replay is deliberately harder than capture.',
+    safetyBody2: 'A plan can be inspected without sending traffic. Explicit-target execution requires loopback mapping, host agreement, effect authorization, and `--execute`; writes additionally require `--allow-write`.',
+    startTitle: 'Use the CLI you already have.',
+    startBody: 'The shortest useful path is visible in the command surface. Start with a readiness check, record a bounded workload, inspect the result, then replay into a fresh supervised copy.',
+    startNote: 'Commands below are the current public 0.1.x interface. Output is intentionally omitted; use `--format json` when a machine-readable contract is needed.',
+    limitsTitle: 'Small surface. Clear limits.',
+    supportedTitle: 'Works today',
+    supported: 'Live Linux capture for bounded plaintext HTTP/1.1; fixture recording on any platform; local filesystem recordings; safe loopback replay; `doctor` readiness probes.',
+    notTitle: 'Not implemented',
+    not: 'TLS decryption, HTTP/2+, PostgreSQL/S3 persistence, encryption at rest, comprehensive redaction, Docker packaging, and Kubernetes packaging.',
+    finalTitle: 'Read the boundary before you run the command.',
+    finalBody: 'Chronicle is early, runnable software. The docs keep the safe path, operational bounds, and exact CLI contract close at hand.',
+    openDocs: 'Open documentation',
+    github: 'GitHub repository',
+    footerNote: 'Apache-2.0 · static site · current docs: Latest / 0.1 archive',
+  },
+  'zh-tw': {
+    lang: 'zh-TW',
+    skipLink: '跳至內容',
+    primaryNav: '主要導覽',
+    commandLabel: 'chronicle / 公開命令',
+    brand: 'Chronicle',
+    docs: '文件',
+    source: '原始碼',
+    localeLabel: '語言',
+    english: 'EN',
+    chinese: '繁中',
+    japanese: '日本語',
+    titleA: '真實行為。',
+    titleB: '可重播的證據。',
+    lede: '記錄應用程式實際做了什麼。Chronicle 將捕捉到的證據寫入本機 WAL，轉換為規範工作階段，再針對明確授權的 loopback 目標重播。',
+    readDocs: '閱讀文件',
+    viewSource: '查看原始碼',
+    scopeLabel: '目前範圍',
+    scope: 'Linux · 明文 HTTP/1.1 · 本機檔案系統',
+    section1Title: '一條請求路徑，本身就是測試案例。',
+    section1Body: '手寫 fixture 只能描述人記得編碼的內容。Chronicle 從已發生的行為開始：socket 證據、有序位元組，以及請求與回應之間的關係。不需要在應用程式加入探針，也不會把生產目標帶進重播。',
+    section1Aside: '在工作負載周圍捕捉，而不是寫進原始碼。',
+    pipelineTitle: '從流量到可攜式錄製。',
+    pipelineBody: '每個交接只有一個工作。Capture 負責觀察；WAL 讓持久前綴成為權威；ETL 負責重建；規範模型讓重播不依賴捕捉與儲存細節。',
+    pipelineCaptureCode: 'socket → 證據',
+    pipelineWalCode: '附加 → 提交',
+    pipelineEtlCode: '復原 → 轉換',
+    pipelineSessionCode: '發佈 → 檢查',
+    pipelineReplayCode: '規劃 → 驗證',
+    captureName: 'Capture',
+    captureBody: '附加到受監督的指令、程序或 cgroup。Chronicle 觀察 socket 生命週期與明文 payload 證據，不需要應用程式插樁。',
+    walName: 'WAL',
+    walBody: '將證據附加到分段 WAL v1。提交標記與同步操作定義中斷後下游可以信任的範圍。',
+    etlName: 'ETL',
+    etlBody: '讀取復原後已提交的前綴，重建有界 HTTP/1.1 工作階段，記錄遺失，並發佈一個確定性的規範工作階段。',
+    sessionName: '規範工作階段',
+    sessionBody: '保存不依賴協定與儲存方式的錄製，包含連線、操作、完整性與重播屬性。',
+    replayName: 'Replay',
+    replayBody: '先規劃。預設 dry-run。只對已授權的 loopback 目標執行；記錄中的生產目的地永遠不會成為 fallback。',
+    safetyTitle: '先持久化再解讀。先授權再產生效果。',
+    durabilityTitle: '持久化是捕捉的一部分。',
+    durabilityBody: 'WAL 不是後續階段崩潰時可以消失的內部佇列。復原以 WAL 中最後一個有效提交標記為權威；ETL 從該邊界開始工作。',
+    safetyTitle2: '重播刻意比捕捉更難。',
+    safetyBody2: '不用傳送流量就能檢查計畫。明確目標執行需要 loopback 對應、主機一致、效果授權與 `--execute`；寫入還需要 `--allow-write`。',
+    startTitle: '使用你已經有的 CLI。',
+    startBody: '最短的實用路徑就在命令介面中：先檢查就緒狀態，再錄製有界工作負載，檢查結果，最後在新的受監督複本中重播。',
+    startNote: '以下是目前公開的 0.1.x 介面。刻意省略輸出；需要機器可讀合約時使用 `--format json`。',
+    limitsTitle: '小而清楚的邊界。',
+    supportedTitle: '目前可用',
+    supported: 'Linux 上有界明文 HTTP/1.1 即時捕捉；所有平台的 fixture 錄製；本機檔案系統錄製；安全 loopback 重播；`doctor` 就緒檢查。',
+    notTitle: '尚未實作',
+    not: 'TLS 解密、HTTP/2+、PostgreSQL/S3 持久化、靜態加密、完整遮罩、Docker 與 Kubernetes 封裝。',
+    finalTitle: '執行命令前，先讀懂邊界。',
+    finalBody: 'Chronicle 仍是早期但可執行的軟體。文件把安全路徑、操作限制與精確 CLI 合約放在手邊。',
+    openDocs: '開啟文件',
+    github: 'GitHub 儲存庫',
+    footerNote: 'Apache-2.0 · 靜態網站 · 目前文件：Latest／0.1 封存',
+  },
+  ja: {
+    lang: 'ja',
+    skipLink: '本文へスキップ',
+    primaryNav: 'メインナビゲーション',
+    commandLabel: 'chronicle / 公開コマンド',
+    brand: 'Chronicle',
+    docs: 'ドキュメント',
+    source: 'ソース',
+    localeLabel: '言語',
+    english: 'EN',
+    chinese: '繁中',
+    japanese: '日本語',
+    titleA: '実際の挙動を。',
+    titleB: '再生可能な証拠へ。',
+    lede: 'アプリケーションが実際に行ったことを記録します。Chronicle は捕捉した証拠をローカル WAL に永続化し、正規セッションへ変換して、明示的に許可した loopback ターゲットへ再生します。',
+    readDocs: 'ドキュメントを読む',
+    viewSource: 'ソースを見る',
+    scopeLabel: '現在の範囲',
+    scope: 'Linux · 平文 HTTP/1.1 · ローカルファイルシステム',
+    section1Title: 'ひとつのリクエスト経路は、すでにテストケースです。',
+    section1Body: '手書きの fixture は、誰かが覚えていて記述した内容しか表しません。Chronicle は発生した挙動、socket の証拠、順序付きバイト、リクエストとレスポンスの関係から始めます。アプリケーションへの計測追加は不要で、本番の宛先を再生へ持ち込みません。',
+    section1Aside: 'ソースの中ではなく、ワークロードの周囲で捕捉する。',
+    pipelineTitle: 'トラフィックから持ち運べる記録へ。',
+    pipelineBody: '各段階にはひとつの役割があります。Capture は観測し、WAL は永続化されたプレフィックスを権威にし、ETL は再構成し、正規モデルは再生から捕捉とストレージの仕組みを切り離します。',
+    pipelineCaptureCode: 'socket → 証拠',
+    pipelineWalCode: '追記 → commit',
+    pipelineEtlCode: '復元 → 変換',
+    pipelineSessionCode: '公開 → 検査',
+    pipelineReplayCode: '計画 → 検証',
+    captureName: 'Capture',
+    captureBody: '監視下のコマンド、プロセス、cgroup に接続します。アプリケーションへ計測を追加せず、socket のライフサイクルと平文 payload の証拠を観測します。',
+    walName: 'WAL',
+    walBody: '証拠を分割 WAL v1 へ追記します。コミットマーカーと同期によって、中断後に下流が信頼できる範囲を定めます。',
+    etlName: 'ETL',
+    etlBody: '復旧したコミット済みプレフィックスを読み、限定された HTTP/1.1 セッションを再構成し、損失を記録して、決定的な正規セッションを公開します。',
+    sessionName: '正規セッション',
+    sessionBody: 'プロトコルや保存先に依存しない記録として、接続、操作、完全性、再生属性を保存します。',
+    replayName: 'Replay',
+    replayBody: 'まず計画します。デフォルトは dry-run。許可した loopback ターゲットだけに実行し、記録された本番宛先を fallback にしません。',
+    safetyTitle: '解釈より先に永続化。効果より先に許可。',
+    durabilityTitle: '永続化は捕捉の一部です。',
+    durabilityBody: 'WAL は後段がクラッシュしたときに消えてよい内部キューではありません。復旧は WAL 内の最後の有効なコミットマーカーを権威とし、ETL はその境界から処理します。',
+    safetyTitle2: '再生は意図的に捕捉より難しい。',
+    safetyBody2: '通信せずに計画を検査できます。明示的なターゲット実行には loopback の対応、ホストの一致、効果の許可、`--execute` が必要で、書き込みには `--allow-write` も必要です。',
+    startTitle: '手元の CLI から始める。',
+    startBody: '最短の実用的な流れはコマンドに表れています。準備状態を確認し、限定したワークロードを記録し、結果を検査して、新しく監視したコピーへ再生します。',
+    startNote: '以下は現在公開されている 0.1.x のインターフェースです。出力は意図的に省略しています。機械可読な契約が必要なら `--format json` を使います。',
+    limitsTitle: '小さく、明確な境界。',
+    supportedTitle: '現在使えるもの',
+    supported: 'Linux の限定された平文 HTTP/1.1 のライブキャプチャ、全プラットフォームの fixture 記録、ローカル保存、安全な loopback 再生、`doctor` の準備状態チェック。',
+    notTitle: '未実装',
+    not: 'TLS 復号、HTTP/2 以降、PostgreSQL/S3 保存、保存時暗号化、包括的な redact、Docker と Kubernetes のパッケージング。',
+    finalTitle: 'コマンドを実行する前に、境界を読む。',
+    finalBody: 'Chronicle は初期段階ですが実行できるソフトウェアです。ドキュメントは安全な手順、運用上の上限、正確な CLI 契約を近くに置きます。',
+    openDocs: 'ドキュメントを開く',
+    github: 'GitHub リポジトリ',
+    footerNote: 'Apache-2.0 · 静的サイト · 現行ドキュメント：Latest／0.1 アーカイブ',
+  },
+};
+const text = copy[locale];
+const docsPath = locale === 'en' ? '/docs/' : `/${locale}/docs/`;
+const languagePath = (next: 'en' | 'zh-tw' | 'ja') => (next === 'en' ? '/' : `/${next}/`);
+---
+
+<html lang={text.lang}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={text.lede} />
+    <title>{text.brand} — {text.titleA} {text.titleB}</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">{text.skipLink}</a>
+    <header class="site-header">
+      <a class="wordmark" href={href(languagePath(locale))} aria-label={text.brand}>
+        <svg class="wordmark__mark" viewBox="0 0 34 34" aria-hidden="true">
+          <path d="M4 17h17M13 9l8 8-8 8M21 17h9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" />
+          <circle cx="29" cy="17" r="2" fill="currentColor" />
+        </svg>
+        <span>{text.brand}</span>
+      </a>
+      <nav class="site-nav" aria-label={text.primaryNav}>
+        <a href={href(docsPath)}>{text.docs}</a>
+        <a href={github}>{text.source}</a>
+        <span class="locale-switcher">
+          <span class="sr-only">{text.localeLabel}</span>
+          <a class={locale === 'en' ? 'list-active' : undefined} href={href(languagePath('en'))} aria-current={locale === 'en' ? 'page' : undefined}>{text.english}</a>
+          <a class={locale === 'zh-tw' ? 'list-active' : undefined} href={href(languagePath('zh-tw'))} aria-current={locale === 'zh-tw' ? 'page' : undefined}>{text.chinese}</a>
+          <a class={locale === 'ja' ? 'list-active' : undefined} href={href(languagePath('ja'))} aria-current={locale === 'ja' ? 'page' : undefined}>{text.japanese}</a>
+        </span>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero__copy">
+          <h1 id="hero-title"><span>{text.titleA}</span><span>{text.titleB}</span></h1>
+          <p class="hero__lede">{text.lede}</p>
+          <div class="hero__actions">
+            <a class="button button--signal" href={href(docsPath)}>{text.readDocs}<span aria-hidden="true"> ↗</span></a>
+            <a class="text-link text-link--light" href={github}>{text.viewSource}<span aria-hidden="true"> ↗</span></a>
+          </div>
+          <p class="scope-line"><span>{text.scopeLabel}</span><strong>{text.scope}</strong></p>
+        </div>
+        <FlowDiagram locale={locale} />
+      </section>
+
+      <section class="story section-shell" aria-labelledby="story-title">
+        <div class="section-heading">
+          <h2 id="story-title">{text.section1Title}</h2>
+        </div>
+        <div class="story__body">
+          <p class="lede">{text.section1Body}</p>
+          <p class="pull-quote">{text.section1Aside}</p>
+        </div>
+      </section>
+
+      <section class="pipeline section-shell" aria-labelledby="pipeline-title">
+        <div class="section-heading section-heading--wide">
+          <h2 id="pipeline-title">{text.pipelineTitle}</h2>
+          <p>{text.pipelineBody}</p>
+        </div>
+        <ol class="pipeline-list">
+          <li><span class="pipeline-list__mark" aria-hidden="true"></span><div><h3>{text.captureName}</h3><p>{text.captureBody}</p></div><code>{text.pipelineCaptureCode}</code></li>
+          <li><span class="pipeline-list__mark" aria-hidden="true"></span><div><h3>{text.walName}</h3><p>{text.walBody}</p></div><code>{text.pipelineWalCode}</code></li>
+          <li><span class="pipeline-list__mark" aria-hidden="true"></span><div><h3>{text.etlName}</h3><p>{text.etlBody}</p></div><code>{text.pipelineEtlCode}</code></li>
+          <li><span class="pipeline-list__mark" aria-hidden="true"></span><div><h3>{text.sessionName}</h3><p>{text.sessionBody}</p></div><code>{text.pipelineSessionCode}</code></li>
+          <li><span class="pipeline-list__mark" aria-hidden="true"></span><div><h3>{text.replayName}</h3><p>{text.replayBody}</p></div><code>{text.pipelineReplayCode}</code></li>
+        </ol>
+      </section>
+
+      <section class="safety section-shell" aria-labelledby="safety-title">
+        <div class="section-heading">
+          <h2 id="safety-title">{text.safetyTitle}</h2>
+        </div>
+        <div class="safety__grid">
+          <article>
+            <h3>{text.durabilityTitle}</h3>
+            <p>{text.durabilityBody}</p>
+          </article>
+          <article>
+            <h3>{text.safetyTitle2}</h3>
+            <p>{text.safetyBody2}</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="quick-start section-shell" aria-labelledby="quick-start-title">
+        <div class="section-heading">
+          <h2 id="quick-start-title">{text.startTitle}</h2>
+          <p>{text.startBody}</p>
+        </div>
+        <div class="command-sheet">
+          <p class="command-sheet__label">{text.commandLabel}</p>
+          <pre><code><span>$ chronicle doctor</span>
+<span>$ chronicle record --name checkout -- ./my-app</span>
+<span>$ chronicle list</span>
+<span>$ chronicle inspect checkout</span>
+<span>$ chronicle replay checkout -- ./my-app</span></code></pre>
+          <p class="command-sheet__note">{text.startNote}</p>
+        </div>
+      </section>
+
+      <section class="scope section-shell" aria-labelledby="scope-title">
+        <div class="section-heading">
+          <h2 id="scope-title">{text.limitsTitle}</h2>
+        </div>
+        <div class="scope-grid">
+          <article class="scope-block scope-block--supported"><h3>{text.supportedTitle}</h3><p>{text.supported}</p></article>
+          <article class="scope-block scope-block--not"><h3>{text.notTitle}</h3><p>{text.not}</p></article>
+        </div>
+      </section>
+
+      <section class="closing section-shell" aria-labelledby="closing-title">
+        <div class="closing__rule" aria-hidden="true"></div>
+        <div>
+          <h2 id="closing-title">{text.finalTitle}</h2>
+          <p>{text.finalBody}</p>
+          <div class="closing__actions">
+            <a class="button button--ink" href={href(docsPath)}>{text.openDocs}<span aria-hidden="true"> ↗</span></a>
+            <a class="text-link" href={github}>{text.github}<span aria-hidden="true"> ↗</span></a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>Chronicle</span>
+      <span>{text.footerNote}</span>
+      <a href={github}>GitHub ↗</a>
+    </footer>
+  </body>
+</html>

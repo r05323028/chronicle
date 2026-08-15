@@ -281,6 +281,9 @@ No checked-in configuration contains secrets: `postgres.connection_url_env` name
 - [Replay safety](docs/replay-safety.md) — the replay safety model and authorization semantics.
 - [Release notes](docs/release-notes.md) — version history and deprecation schedule.
 - [Contributing](CONTRIBUTING.md) — how to contribute.
+- [Website product brief](docs/PRODUCT.md) — website scope and product truth.
+- [Website design brief](docs/DESIGN.md) — website visual system and responsive rules.
+- [Website maintainers](website/MAINTAINERS.md) — deployment and documentation version workflow.
 
 ## License
 

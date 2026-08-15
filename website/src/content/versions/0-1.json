@@ -1,0 +1,181 @@
+{
+  "sidebar": [
+    {
+      "label": "Getting started",
+      "translations": {
+        "zh-TW": "開始使用",
+        "ja": "はじめに"
+      },
+      "items": [
+        {
+          "label": "Introduction",
+          "translations": {
+            "zh-TW": "介紹",
+            "ja": "概要"
+          },
+          "slug": "docs"
+        },
+        {
+          "label": "Installation",
+          "translations": {
+            "zh-TW": "安裝",
+            "ja": "インストール"
+          },
+          "slug": "docs/getting-started/installation"
+        },
+        {
+          "label": "Quick start",
+          "translations": {
+            "zh-TW": "快速開始",
+            "ja": "クイックスタート"
+          },
+          "slug": "docs/getting-started/quick-start"
+        }
+      ]
+    },
+    {
+      "label": "Concepts",
+      "translations": {
+        "zh-TW": "核心概念",
+        "ja": "概念"
+      },
+      "items": [
+        {
+          "label": "Capture",
+          "translations": {
+            "zh-TW": "捕捉",
+            "ja": "キャプチャ"
+          },
+          "slug": "docs/concepts/capture"
+        },
+        {
+          "label": "WAL",
+          "translations": {
+            "zh-TW": "WAL",
+            "ja": "WAL"
+          },
+          "slug": "docs/concepts/wal"
+        },
+        {
+          "label": "Sessions",
+          "translations": {
+            "zh-TW": "工作階段",
+            "ja": "セッション"
+          },
+          "slug": "docs/concepts/sessions"
+        },
+        {
+          "label": "Canonical model",
+          "translations": {
+            "zh-TW": "規範模型",
+            "ja": "正規モデル"
+          },
+          "slug": "docs/concepts/canonical-model"
+        },
+        {
+          "label": "Replay",
+          "translations": {
+            "zh-TW": "重播",
+            "ja": "リプレイ"
+          },
+          "slug": "docs/concepts/replay"
+        }
+      ]
+    },
+    {
+      "label": "Architecture",
+      "translations": {
+        "zh-TW": "架構",
+        "ja": "アーキテクチャ"
+      },
+      "items": [
+        {
+          "label": "Overview",
+          "translations": {
+            "zh-TW": "總覽",
+            "ja": "概要"
+          },
+          "slug": "docs/architecture/overview"
+        },
+        {
+          "label": "Recorder",
+          "translations": {
+            "zh-TW": "Recorder",
+            "ja": "Recorder"
+          },
+          "slug": "docs/architecture/recorder"
+        },
+        {
+          "label": "ETL",
+          "translations": {
+            "zh-TW": "ETL",
+            "ja": "ETL"
+          },
+          "slug": "docs/architecture/etl"
+        },
+        {
+          "label": "Storage",
+          "translations": {
+            "zh-TW": "儲存",
+            "ja": "ストレージ"
+          },
+          "slug": "docs/architecture/storage"
+        }
+      ]
+    },
+    {
+      "label": "Deployment",
+      "translations": {
+        "zh-TW": "部署",
+        "ja": "デプロイ"
+      },
+      "items": [
+        {
+          "label": "Local Linux",
+          "translations": {
+            "zh-TW": "本機 Linux",
+            "ja": "ローカル Linux"
+          },
+          "slug": "docs/deployment/local"
+        }
+      ]
+    },
+    {
+      "label": "Reference",
+      "translations": {
+        "zh-TW": "參考",
+        "ja": "リファレンス"
+      },
+      "items": [
+        {
+          "label": "CLI",
+          "translations": {
+            "zh-TW": "CLI",
+            "ja": "CLI"
+          },
+          "slug": "docs/reference/cli"
+        },
+        {
+          "label": "Terminology",
+          "translations": {
+            "zh-TW": "術語",
+            "ja": "用語"
+          },
+          "slug": "docs/reference/terminology"
+        }
+      ]
+    },
+    {
+      "label": "Troubleshooting",
+      "translations": {
+        "zh-TW": "疑難排解",
+        "ja": "トラブルシューティング"
+      },
+      "items": [
+        {
+          "slug": "docs/troubleshooting"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,321 @@
+/* Hallmark · macrostructure: Long Document · tone: technical · anchor hue: signal red */
+/* Chronicle documentation surface · Starlight chrome preserved · system: docs/DESIGN.md */
+
+:root {
+	--chronicle-paper: #f2efe7;
+	--chronicle-paper-deep: #e5e0d5;
+	--chronicle-ink: #18211f;
+	--chronicle-ink-soft: #53605b;
+	--chronicle-night: #121918;
+	--chronicle-signal: #a63224;
+	--chronicle-signal-ink: #fff9ee;
+	--chronicle-cyan: #1f6b6e;
+	--chronicle-line: color-mix(in srgb, var(--chronicle-ink) 20%, transparent);
+	--chronicle-focus: #a63224;
+
+	/* Tokyo Night Day / Night are reserved for code blocks. */
+	--code-bg: #e1e2e7;
+	--code-bg-deep: #d5d6db;
+	--code-fg: #3760bf;
+	--code-comment: #848cb5;
+	--code-blue: #2e7de9;
+	--code-cyan: #007197;
+	--code-green: #587539;
+	--code-orange: #b15c00;
+	--code-purple: #7847bd;
+	--code-red: #f52a65;
+	--code-line: #a8aecb;
+	--chronicle-font-display:
+		"Arial Narrow", "Avenir Next Condensed", "Hiragino Kaku Gothic ProN",
+		"Yu Gothic", "Noto Sans TC", "Noto Sans JP", sans-serif;
+	--chronicle-font-body:
+		ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+		"Noto Sans TC", "Noto Sans JP", sans-serif;
+	--chronicle-font-mono:
+		ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+		"Noto Sans Mono CJK TC", monospace;
+
+	--sl-color-accent-low: var(--chronicle-paper-deep);
+	--sl-color-accent: var(--chronicle-signal);
+	--sl-color-accent-high: var(--chronicle-ink);
+	--sl-color-white: var(--chronicle-ink);
+	--sl-color-gray-1: var(--chronicle-ink);
+	--sl-color-gray-2: var(--chronicle-ink-soft);
+	--sl-color-gray-3: #77807a;
+	--sl-color-gray-4: #aeb2aa;
+	--sl-color-gray-5: #d7d5cc;
+	--sl-color-gray-6: var(--chronicle-paper-deep);
+	--sl-color-black: var(--chronicle-paper);
+	--sl-color-bg: var(--chronicle-paper);
+	--sl-color-bg-nav: var(--chronicle-paper);
+	--sl-color-bg-sidebar: var(--chronicle-paper-deep);
+	--sl-font: var(--chronicle-font-body);
+	--sl-font-system: var(--chronicle-font-body);
+	--sl-font-mono: var(--chronicle-font-mono);
+	--sl-content-width: 58rem;
+	--sl-sidebar-width: 18rem;
+	color-scheme: light dark;
+}
+
+:root[data-theme="dark"] {
+	--chronicle-paper: #1b2422;
+	--chronicle-paper-deep: #25302d;
+	--chronicle-ink: #f2efe7;
+	--chronicle-ink-soft: #b9c2bb;
+	--chronicle-night: #0c1110;
+	--chronicle-signal: #ef745c;
+	--chronicle-signal-ink: #211512;
+	--chronicle-cyan: #72c0bd;
+	--chronicle-line: color-mix(in srgb, var(--chronicle-ink) 25%, transparent);
+	--chronicle-focus: #ff9d88;
+
+	--code-bg: #1a1b26;
+	--code-bg-deep: #16161e;
+	--code-fg: #c0caf5;
+	--code-comment: #565f89;
+	--code-blue: #7aa2f7;
+	--code-cyan: #7dcfff;
+	--code-green: #73daca;
+	--code-orange: #ff9e64;
+	--code-purple: #bb9af7;
+	--code-red: #f7768e;
+	--code-line: #3b4261;
+
+	--sl-color-accent-low: #44302b;
+	--sl-color-accent-high: var(--chronicle-ink);
+	--sl-color-white: var(--chronicle-ink);
+	--sl-color-gray-1: var(--chronicle-ink);
+	--sl-color-gray-2: var(--chronicle-ink-soft);
+	--sl-color-gray-3: #8b9690;
+	--sl-color-gray-4: #59635d;
+	--sl-color-gray-5: #34403b;
+	--sl-color-gray-6: #25302d;
+	--sl-color-black: #101514;
+	--sl-color-bg: var(--chronicle-paper);
+	--sl-color-bg-nav: var(--chronicle-paper);
+	--sl-color-bg-sidebar: var(--chronicle-paper-deep);
+}
+
+html,
+body {
+	overflow-x: clip;
+}
+
+body {
+	font-family: var(--chronicle-font-body);
+	background: var(--chronicle-paper);
+}
+
+:where(a, button, select, summary):focus-visible {
+	outline: 2px solid var(--chronicle-focus);
+	outline-offset: 3px;
+}
+
+:where(
+		.sl-markdown-content,
+		.sl-markdown-content h1,
+		.sl-markdown-content h2,
+		.sl-markdown-content h3,
+		.sl-markdown-content h4
+	) {
+	overflow-wrap: anywhere;
+	min-width: 0;
+}
+
+.sl-markdown-content {
+	line-height: 1.75;
+}
+
+.sl-markdown-content h1,
+.sl-markdown-content h2,
+.sl-markdown-content h3,
+.sl-markdown-content h4 {
+	font-family: var(--chronicle-font-display);
+	font-style: normal;
+	font-weight: 800;
+	letter-spacing: -0.035em;
+	line-height: 1.08;
+}
+
+.sl-markdown-content h1 {
+	font-size: clamp(2.5rem, 5vw, 4.6rem);
+}
+
+.sl-markdown-content h2 {
+	padding-block-start: 1.5rem;
+	border-block-start: 1px solid var(--chronicle-line);
+	font-size: clamp(1.8rem, 3vw, 2.65rem);
+}
+
+.sl-markdown-content h3 {
+	font-size: 1.45rem;
+}
+
+.sl-markdown-content p,
+.sl-markdown-content li {
+	color: var(--chronicle-ink);
+}
+
+.sl-markdown-content a {
+	color: var(--chronicle-signal);
+	text-decoration-thickness: 1px;
+	text-underline-offset: 0.2em;
+}
+
+.sl-markdown-content strong {
+	font-weight: 750;
+}
+
+.sl-markdown-content :not(pre) > code {
+	border: 1px solid var(--chronicle-line);
+	border-radius: 0;
+	background: var(--chronicle-paper-deep);
+	color: var(--chronicle-ink);
+	font-family: var(--chronicle-font-mono);
+	font-size: 0.88em;
+	padding: 0.12em 0.3em;
+}
+
+.sl-markdown-content pre {
+	border-radius: 0;
+	border-inline-start: 3px solid var(--code-red);
+	background: var(--code-bg);
+	color: var(--code-fg);
+	box-shadow: none;
+}
+
+.sl-markdown-content pre code {
+	font-family: var(--chronicle-font-mono);
+	font-size: 0.88rem;
+	line-height: 1.7;
+	color: var(--code-fg);
+}
+
+/* Expressive Code receives Tokyo Night themes; vars keep fenced blocks exact. */
+:root:not([data-theme="dark"]) .expressive-code,
+:root[data-theme="light"] .expressive-code,
+.expressive-code[data-theme="light"] {
+	--ec-codeBg: var(--code-bg);
+	--ec-codeFg: var(--code-fg);
+	--ec-gtrFg: var(--code-comment);
+	--ec-gtrBrdCol: var(--code-line);
+	--ec-frm-edBg: var(--code-bg);
+	--ec-frm-trmBg: var(--code-bg);
+	--ec-frm-edTabBarBg: var(--code-bg-deep);
+}
+
+:root[data-theme="dark"] .expressive-code,
+.expressive-code[data-theme="dark"] {
+	--ec-codeBg: var(--code-bg);
+	--ec-codeFg: var(--code-fg);
+	--ec-gtrFg: var(--code-comment);
+	--ec-gtrBrdCol: var(--code-line);
+	--ec-frm-edBg: var(--code-bg);
+	--ec-frm-trmBg: var(--code-bg);
+	--ec-frm-edTabBarBg: var(--code-bg-deep);
+}
+
+.sl-markdown-content blockquote {
+	margin-inline: 0;
+	border-inline-start: 3px solid var(--chronicle-cyan);
+	background: var(--chronicle-paper-deep);
+	color: var(--chronicle-ink);
+}
+
+.sl-markdown-content table {
+	display: table;
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 0.95rem;
+}
+
+.sl-markdown-content th,
+.sl-markdown-content td {
+	border-color: var(--chronicle-line);
+}
+
+.sl-markdown-content th {
+	background: var(--chronicle-paper-deep);
+	color: var(--chronicle-ink);
+	font-family: var(--chronicle-font-body);
+	font-size: 0.74rem;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+}
+
+.sl-markdown-content hr {
+	border-color: var(--chronicle-line);
+}
+
+.sl-markdown-content img {
+	border: 1px solid var(--chronicle-line);
+	border-radius: 0;
+}
+
+/* Starlight's conventional docs chrome stays intact; Chronicle changes its material, not its job. */
+header.header {
+	border-block-end-color: var(--chronicle-line);
+	background: var(--chronicle-paper);
+}
+
+.sidebar-pane {
+	border-inline-end-color: var(--chronicle-line);
+	background: var(--chronicle-paper-deep);
+}
+
+nav.sidebar-content a[aria-current="page"] {
+	border-inline-start: 3px solid var(--chronicle-signal);
+	background: var(--chronicle-paper);
+	color: var(--chronicle-ink);
+	font-weight: 700;
+}
+
+nav.sidebar-content a:hover {
+	color: var(--chronicle-signal);
+}
+
+starlight-version-select select {
+	border-radius: 0;
+	font-family: var(--chronicle-font-body);
+}
+
+starlight-version-select select:focus-visible {
+	outline: 2px solid var(--chronicle-focus);
+	outline-offset: 2px;
+}
+
+/* The plugin's notice is intentionally rectangular and high-signal. */
+.sl-markdown-content > p:has(+ *) {
+	max-width: 100%;
+}
+
+.sl-markdown-content kbd {
+	border-radius: 0;
+	border-color: var(--chronicle-line);
+	background: var(--chronicle-paper-deep);
+	color: var(--chronicle-ink);
+}
+
+@media (max-width: 50rem) {
+	.sl-markdown-content table {
+		display: block;
+		overflow-x: auto;
+	}
+}
+
+@media (max-width: 40rem) {
+	.sl-markdown-content h1 {
+		font-size: clamp(2.35rem, 12vw, 3.5rem);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		scroll-behavior: auto !important;
+		transition-duration: 0.001ms !important;
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+	}
+}
