@@ -54,7 +54,7 @@ Recorder failure SHALL affect only configured parent/state root. It SHALL not ki
 
 ### Requirement: Readiness, health, and liveness semantics are operationally distinct
 
-Process liveness SHALL mean recorder process is executing. Capture readiness SHALL be true only when filesystem-domain lease, parent/epoch recovery, appendable active epoch, quota reservation, and capture attachment succeed. Processing readiness SHALL be reported separately and SHALL require per-epoch checkpoint/continuation consistency, output-store availability, and incremental processing health. Overall health SHALL be policy-derived `healthy`, `degraded`, or `failed`; ETL lag/retry, continuation loss, or predecessor retention backlog MAY degrade processing/overall health while durable successor capture remains safe. Failed capture SHALL include lost WAL appendability, unrecoverable epoch/parent corruption, unsafe quota, or capture attachment loss. Failed processing SHALL include checkpoint/continuation lineage contradiction or unavailable output store.
+Process liveness SHALL mean recorder process is executing. Capture readiness SHALL be true only when filesystem-domain lease, parent/epoch recovery, appendable active epoch, quota reservation, and capture attachment succeed; it SHALL NOT require predecessor ETL catch-up or `ContinuationState::Ready`. Processing readiness SHALL be reported separately and SHALL require per-epoch checkpoint/continuation consistency, output-store availability, and incremental processing health, with `waiting_for_continuation`/`blocked_on_predecessor_continuation` visible when applicable. Overall health SHALL be policy-derived `healthy`, `degraded`, or `failed`; ETL lag/retry, continuation loss, or predecessor retention backlog MAY degrade processing/overall health while durable successor capture remains safe. Failed capture SHALL include lost WAL appendability, unrecoverable epoch/parent corruption, unsafe quota, or capture attachment loss. Failed processing SHALL include checkpoint/continuation lineage contradiction or unavailable output store, but SHALL not relabel valid capture as failed solely because ETL is behind.
 
 Status SHALL expose parent/attempt/current-epoch IDs, finalized epoch summaries, lifecycle/capture-readiness/processing-readiness/overall-health, configuration digest, recovery-authoritative marker per visible epoch, `IncrementalEtlCheckpoint v1` compatibility and `IncrementalEtlCheckpointV2` boundary/lag per epoch where applicable, continuation-in/out state, retained/quota/free bytes, segment/epoch state counts, loss counters, last rollover/recovery/cleanup/publication, and stable failure/remediation codes. `Type=simple` proves liveness only; readiness consumers SHALL poll atomic local status. No unauthenticated network metrics/HTTP server or `sd_notify` integration SHALL be added.
 
@@ -71,7 +71,7 @@ Status SHALL expose parent/attempt/current-epoch IDs, finalized epoch summaries,
 #### Scenario: Predecessor ETL lag warning
 
 - **WHEN** committed finalized epoch exceeds lag threshold while active successor WAL remains safe
-- **THEN** capture readiness remains true, processing/retention readiness degrades, and exact epoch lag is reported
+- **THEN** `capture_readiness=ready`, `processing_readiness=degraded`/`waiting_for_continuation`, and `overall_health=degraded` are valid; exact epoch lag/protected bytes are reported and capture is not reported failed
 
 #### Scenario: ETL lag warning
 
@@ -139,12 +139,12 @@ Rootless tests SHALL validate configuration parsing, parent/epoch lifecycle/stat
 
 ### Requirement: Epoch rollover is crash-safe and non-overlapping
 
-Rollover SHALL use one ordered durable transition: flush/commit active epoch through a recovery-authoritative marker; persist final epoch status/boundary and digest; persist successor metadata with parent/ordinal/trigger/lineage; acquire successor append authority; then publish active-epoch status. No two writers may append one epoch, and no successor may become active before predecessor boundary metadata is durable. A crash at any transition SHALL recover to predecessor active/finalized or successor active with no invented committed bytes and no skipped epoch ordinal.
+Rollover SHALL use one ordered durable capture/topology transition: flush/commit active epoch through a recovery-authoritative marker; persist final epoch status/boundary and admitted-observation outcome digest; persist successor metadata with parent/ordinal/trigger/lineage; acquire successor append authority; publish active-epoch status; then resume capture. No two writers may append one epoch, and no successor may become active before predecessor boundary metadata is durable. ETL continuation generation/consumption is a separate downstream dependency and is not a transition phase or activation predicate. A crash at any transition SHALL recover to predecessor active/finalized or successor active with no invented committed bytes and no skipped epoch ordinal.
 
 #### Scenario: Rollover success
 
 - **WHEN** configured epoch bound is reached and required filesystem/quota reservations are available
-- **THEN** transition yields one finalized predecessor and one active successor with linked digests/ordinals
+- **THEN** transition yields one finalized predecessor and one active successor with linked digests/ordinals, resumes capture, and does not require predecessor ETL catch-up or continuation-out
 
 #### Scenario: Crash before predecessor finalize
 

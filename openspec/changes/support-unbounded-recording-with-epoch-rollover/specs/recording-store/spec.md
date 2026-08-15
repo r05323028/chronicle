@@ -94,7 +94,7 @@ Recorder/ETL SHALL decide required epoch artifact sets from versioned manifests,
 
 ### Requirement: Artifact lifecycle is monotonic and retention-safe
 
-Immutable artifact lifecycle SHALL be `staged -> published -> referenced -> retention_eligible -> deleted`, with quarantine/evidence-preservation on integrity or lineage conflict. Published requires durable store confirmation; referenced requires durable epoch checkpoint, final session, or verified parent manifest as applicable; epoch source WAL and derived canonical artifacts have independent retention classes. A finalized epoch source SHALL be eligible for deletion only after its own checkpoint/output/final-session proof and all required parent/epoch lineage references are durable. A successor epoch becoming active SHALL not make predecessor evidence eligible. Delete SHALL use exact key/digest precondition and durable tombstone/report.
+Immutable artifact lifecycle SHALL be `staged -> published -> referenced -> retention_eligible -> deleted`, with quarantine/evidence-preservation on integrity or lineage conflict. Published requires durable store confirmation; referenced requires durable epoch checkpoint, final session, or verified parent manifest as applicable; epoch source WAL and derived canonical artifacts have independent retention classes. A finalized epoch source SHALL be eligible for deletion only after its own checkpoint/output/final-session proof, predecessor ETL cursor reaches its authoritative final marker, any continuation dependency is consumed or terminally resolved with incomplete/loss proof, and all required parent/epoch lineage references are durable. A pending, ready-but-unconsumed, or retryable failed continuation protects predecessor source WAL and checkpoints. A successor epoch becoming active SHALL not make predecessor evidence eligible. Delete SHALL use exact key/digest precondition and durable tombstone/report.
 
 #### Scenario: Epoch output retained after WAL deletion
 
@@ -191,7 +191,7 @@ A parent aggregate/index SHALL be a versioned metadata artifact whose entries ar
 
 ### Requirement: Continuation artifacts are immutable retention dependencies
 
-Continuation-in/out artifacts SHALL be immutable, content-addressed, and referenced by the epoch manifest/checkpoint before retention transitions. A successor session or checkpoint may depend on its predecessor continuation artifact, but publication/retry SHALL verify exact digest and lineage and SHALL never overwrite or synthesize a replacement from filesystem order. Retention SHALL retain every continuation artifact required by a published or recoverable successor operation.
+Continuation-in/out artifacts SHALL be immutable, content-addressed, and referenced by the epoch manifest/checkpoint before retention transitions. A successor session or checkpoint may depend on its predecessor continuation artifact, but publication/retry SHALL verify exact digest and lineage and SHALL never overwrite or synthesize a replacement from filesystem order. Retention SHALL retain every continuation artifact required by a published or recoverable successor operation and SHALL retain predecessor source WAL/checkpoints while that artifact has not yet been produced or safely consumed.
 
 #### Scenario: Continuation artifact retry
 

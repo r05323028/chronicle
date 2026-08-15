@@ -99,9 +99,9 @@ Doctor SHALL add recorder-operation probes for configuration/version semantics, 
 
 ### Requirement: Safe runtime lifecycle health report
 
-Application SHALL expose versioned bounded local recorder status for `healthy`, `degraded`, or `failed`, distinct from process liveness, capture readiness, processing readiness, and overall health. Report SHALL contain stable parent recording ID, recorder/process-attempt ID, active epoch ID/ordinal, finalized epoch summaries, lifecycle/capture-readiness/processing-readiness/overall-health, configuration digest, final recovery-authoritative marker per visible epoch, `IncrementalEtlCheckpoint v1` compatibility and `IncrementalEtlCheckpointV2` marker/lag per epoch where applicable, continuation-in/out state and digest status, segment lifecycle counts, retained/quota/free bytes per filesystem domain, capture/WAL loss counters, last rollover/recovery/cleanup/publication result, stable failure/remediation codes, and observational update time.
+Application SHALL expose versioned bounded local recorder status for `healthy`, `degraded`, or `failed`, distinct from process liveness, capture readiness, processing readiness, and overall health. Report SHALL contain stable parent recording ID, recorder/process-attempt ID, active epoch ID/ordinal, finalized epoch summaries, lifecycle/capture-readiness/processing-readiness/overall-health, configuration digest, final recovery-authoritative marker per visible epoch, `IncrementalEtlCheckpoint v1` compatibility and `IncrementalEtlCheckpointV2` marker/lag per epoch where applicable, continuation-in/out state (`pending`, `ready`, `consumed`, `unavailable`, or `failed`) and digest status, segment lifecycle counts, retained/quota/free bytes per filesystem domain, capture/WAL loss counters, last rollover/recovery/cleanup/publication result, stable failure/remediation codes, and observational update time.
 
-Report SHALL be read from atomically persisted state plus direct safe probes. It SHALL distinguish committed from merely written bytes, identify whether a successor epoch is active, show predecessor ETL/retention/continuation blockers, and never claim parent completion while required epoch state is unresolved. It SHALL not parse payload, expose secrets/commands, or treat an unvalidated manifest/checkpoint/continuation as committed authority.
+Report SHALL be read from atomically persisted state plus direct safe probes. It SHALL distinguish committed from merely written bytes, identify whether a successor epoch is active, show predecessor ETL/retention/continuation blockers, and report capture readiness independently from processing readiness. `capture_readiness=ready`, `processing_readiness=degraded`/`waiting_for_continuation`, and `overall_health=degraded` are valid while quota/safety remains sufficient. It SHALL never claim parent completion while required epoch state is unresolved. It SHALL not parse payload, expose secrets/commands, or treat an unvalidated manifest/checkpoint/continuation as committed authority.
 
 #### Scenario: Running healthy with active successor
 
@@ -111,7 +111,7 @@ Report SHALL be read from atomically persisted state plus direct safe probes. It
 #### Scenario: ETL lag on finalized epoch
 
 - **WHEN** active capture is durable but finalized epoch checkpoint lag exceeds threshold
-- **THEN** capture readiness may remain true, processing/retention readiness is degraded or false, lag and quota impact are reported, and WAL remains protected
+- **THEN** capture readiness may remain true while processing readiness is degraded/`waiting_for_continuation`, lag and protected-byte impact are reported, overall health is degraded, and WAL remains protected
 
 #### Scenario: Rollover blocked by quota
 
@@ -131,7 +131,7 @@ Report SHALL be read from atomically persisted state plus direct safe probes. It
 #### Scenario: ETL lag degraded
 
 - **WHEN** WAL is durable but `IncrementalEtlCheckpoint v1` lag exceeds configured warning threshold
-- **THEN** processing readiness is false or degraded and overall status reports lag/retention impact while capture readiness remains true and committed capture remains reported accurately
+- **THEN** processing readiness is false/degraded or `waiting_for_continuation`, overall status reports lag/retention impact, capture readiness remains true while safe, and committed capture remains reported accurately
 
 #### Scenario: Stale status file
 
@@ -165,8 +165,8 @@ Recorder status and ETL summaries SHALL expose per-epoch continuation-in/out sta
 
 #### Scenario: Pending continuation status
 
-- **WHEN** finalized epoch N has a verified continuation seed for active epoch N+1
-- **THEN** status reports the bounded pending state, digest lineage, and per-epoch processing dependency
+- **WHEN** finalized epoch N has a durable final marker, active epoch N+1 is capturing, and predecessor ETL has not yet produced continuation-out
+- **THEN** status reports bounded `pending` state, expected digest/lineage, and per-epoch processing dependency while capture readiness remains independently evaluated
 
 #### Scenario: Continuation failure status
 

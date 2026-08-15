@@ -264,9 +264,9 @@ A connection generation may cross segment and epoch boundaries through a verifie
 
 ### Requirement: Incremental lag and backpressure are bounded and visible
 
-ETL queue, worker count, per-epoch checkpoint state, output batch size, retry/backoff, and maximum lag thresholds SHALL be bounded. Recorder capture/WAL durability SHALL not wait for ETL publication during normal operation. ETL lag SHALL gate epoch retention and may degrade processing/overall health, but SHALL not authorize unprocessed WAL deletion. Quota exhaustion caused by lag SHALL stop capture through quota policy with exact counters rather than drop accepted data silently.
+ETL queue, worker count, per-epoch checkpoint state, output batch size, retry/backoff, continuation state, and maximum lag thresholds SHALL be bounded. Capture/WAL durability and rollover SHALL not wait for ETL publication, decoder progress, or continuation export during normal operation. ETL lag SHALL gate epoch retention and successor processing readiness and may degrade processing/overall health, but SHALL not authorize unprocessed WAL deletion or invalidate successor capture. Quota exhaustion caused by lag SHALL stop capture through explicit quota policy with exact counters rather than drop accepted data silently.
 
-Health/status SHALL expose active and finalized epoch committed markers, per-epoch checkpoint markers, aggregate and per-epoch lag records/bytes/age, pending/sealed/processed/retention states, last publication, retry/failure code, and output bytes without captured values.
+Health/status SHALL expose active and finalized epoch committed markers, per-epoch checkpoint markers, continuation dependency state (`pending`, `ready`, `consumed`, `unavailable`, or `failed`), aggregate and per-epoch lag records/bytes/age, pending/sealed/processed/retention states, last publication, retry/failure code, and output bytes without captured values.
 
 #### Scenario: ETL temporarily unavailable
 
@@ -350,3 +350,34 @@ A successor decoder SHALL restore continuation only from the unique verified pre
 
 - **WHEN** the parent run ends before a carried operation receives trusted completion evidence
 - **THEN** the final trusted epoch emits one incomplete operation and no earlier immutable session is mutated
+
+### Requirement: Continuation readiness is separate from capture readiness
+
+ETL SHALL create one bounded continuation dependency per verified predecessor/successor pair after capture records the predecessor final marker. `pending` means predecessor ETL has not yet caught up; `ready` means one checksummed continuation artifact exactly matches the predecessor final marker and lineage; `consumed` records successor restoration and checkpoint proof; `unavailable`/`failed` records explicit unsupported, invalid, over-limit, or retry-exhausted processing semantics. This state belongs to ETL lineage, not WAL/topology authority.
+
+Successor WAL MAY accumulate committed bytes while its ETL is `blocked_on_predecessor_continuation`. Successor ETL SHALL verify/consume continuation before decoding cross-epoch state, then process accumulated committed WAL deterministically from its own checkpoint. Invalid continuation SHALL preserve valid successor WAL and emit incomplete/loss provenance; it SHALL not roll back `epochs.json`, invalidate capture, or invent a clean decoder.
+
+#### Scenario: Predecessor ETL lags final marker
+
+- **WHEN** predecessor WAL is sealed at marker 1,000 while its ETL cursor is 900 and successor capture is active
+- **THEN** continuation is `pending`, capture readiness may remain true, successor WAL continues within quota, and successor processing readiness is degraded/blocked
+
+#### Scenario: Continuation ready after successor WAL accumulation
+
+- **WHEN** successor has committed WAL before predecessor ETL reaches marker 1,000 and a valid continuation becomes `ready`
+- **THEN** successor ETL consumes the continuation once and processes its already-recorded WAL from its own checkpoint without replaying or skipping committed input
+
+#### Scenario: Invalid continuation does not invalidate capture
+
+- **WHEN** continuation checksum, identity, version, marker lineage, or bounds fail after successor WAL is valid
+- **THEN** successor WAL/topology remain intact, ETL fails closed or emits explicit incomplete/loss provenance, and capture status is not changed to capture-failed solely by decoder handoff
+
+#### Scenario: Multiple epochs have independent processing lag
+
+- **WHEN** epoch 1 is complete, epoch 2 continuation is ready, epoch 3 is processing, and active epoch 4 waits for its predecessor
+- **THEN** each dependency has bounded state and deterministic watermarks, capture remains independent while safety headroom exists, and parent status reports per-epoch processing readiness without merging cursors
+
+#### Scenario: Sustained lag reaches quota safety limit
+
+- **WHEN** protected unprocessed epochs consume reserved headroom and no eligible cleanup can restore a safe successor reservation
+- **THEN** capture continues only until the explicit safety boundary, then stops/fails visibly before accepting unaccountable observations; no WAL or decoder lineage is silently dropped

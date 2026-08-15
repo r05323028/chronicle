@@ -111,7 +111,7 @@ Reaching this cap SHALL trigger epoch rollover when the parent run is still acti
 
 Recorder configuration SHALL declare retention mode and bounds for epoch-local raw WAL and parent/derived artifacts. The recorder SHALL support `retain` and `delete_after`; implicit deletion SHALL NOT occur. `delete_after` minimum age and optional maximum retained bytes remain subordinate to checkpoint-gated eligibility and parent lineage proof. Policy changes SHALL be recorded by configuration digest and SHALL not retroactively authorize cleanup before reconciliation.
 
-Canonical epoch sessions, parent lineage, checkpoints, manifests, tombstones, and immutable outputs SHALL have separate retention classes from source WAL. Deleting raw epoch WAL SHALL preserve parent/epoch provenance and state that raw evidence was intentionally expired; it SHALL not claim raw evidence remains available. Failed, corrupt, unprocessed, uncheckpointed, uncertain, active, or policy-unexpired epochs SHALL not be deleted automatically.
+Canonical epoch sessions, parent lineage, checkpoints, manifests, tombstones, and immutable outputs SHALL have separate retention classes from source WAL. Deleting raw epoch WAL SHALL preserve parent/epoch provenance and state that raw evidence was intentionally expired; it SHALL not claim raw evidence remains available. Failed, corrupt, unprocessed, uncheckpointed, uncertain, active, policy-unexpired, or continuation-dependent epochs SHALL not be deleted automatically. A predecessor remains protected while its final marker exceeds its ETL cursor, continuation is pending/ready-but-unconsumed, or retryable continuation failure still needs source evidence.
 
 #### Scenario: Retain policy under sustained pressure
 
@@ -120,13 +120,18 @@ Canonical epoch sessions, parent lineage, checkpoints, manifests, tombstones, an
 
 #### Scenario: Delete-after epoch
 
-- **WHEN** an epoch is finalized, its committed WAL and digest are verified, ETL checkpoint/output and final epoch session are durable, policy age/bytes permit deletion, and cleanup proof passes
+- **WHEN** an epoch is finalized, its committed WAL and digest are verified, ETL checkpoint/output and final epoch session are durable, continuation dependency is consumed or terminally resolved with incomplete/loss proof, policy age/bytes permit deletion, and cleanup proof passes
 - **THEN** cleanup may delete eligible raw segments through the existing crash-safe transaction and retain tombstone/provenance
 
 #### Scenario: Failed epoch
 
 - **WHEN** an epoch ends failed with a valid committed prefix and unresolved uncertain tail
 - **THEN** automatic cleanup preserves its WAL and parent lineage until operator resolution or an explicit safe policy covers the evidence
+
+#### Scenario: Pending continuation protects predecessor
+
+- **WHEN** predecessor WAL is sealed but ETL has not reached its final marker or its continuation is pending/ready-but-unconsumed
+- **THEN** raw WAL, checkpoint, and continuation evidence remain retention-protected even while successor capture continues, and cleanup reports the dependency rather than deleting source evidence
 
 #### Scenario: Retain policy
 
@@ -142,7 +147,7 @@ Canonical epoch sessions, parent lineage, checkpoints, manifests, tombstones, an
 
 Continuous recording SHALL enforce configured physical quota per filesystem while retaining the existing per-epoch hard maximum. One synchronized reservation authority SHALL account for the active epoch, sealed epochs awaiting ETL/retention, successor header/first-marker capacity, parent/epoch manifests and checkpoints, RecordingStore outputs, final-session staging, temporary files, and cleanup trash peak. Separate filesystem roots SHALL maintain independent quota/minimum-free reserves and cannot borrow one another's reserve.
 
-Admission and every rollover SHALL reserve complete next frames/markers, segment/epoch headers, transition/catalog writes, concurrent ETL/session publication peaks, and temporary cleanup bytes before mutation. At pressure, the recorder SHALL first run only already-eligible cleanup. It SHALL never delete unprocessed/unverified/unexpired data to make space. If reservation still fails, it SHALL stop intake, persist typed quota-pressure/rollover-failure evidence, finalize the current authoritative prefix where possible, and fail/not-ready under controlled policy. It SHALL not loop-roll empty epochs or continue capture without durable capacity.
+Admission and every rollover SHALL reserve complete next frames/markers, segment/epoch headers, transition/catalog writes, concurrent ETL/session publication peaks, protected continuation/backlog bytes, and temporary cleanup bytes before mutation. Ordinary ETL lag SHALL not block rollover while the next successor and safety margin remain reservable. At pressure, the recorder SHALL first run only already-eligible cleanup. It SHALL never delete unprocessed/unverified/unexpired data to make space. If reservation still fails, it SHALL stop intake, persist typed quota-pressure/rollover-failure evidence, finalize the current authoritative prefix where possible, and fail/not-ready under controlled policy. It SHALL not loop-roll empty epochs or continue capture without durable capacity.
 
 #### Scenario: Eligible cleanup restores headroom
 
@@ -162,7 +167,7 @@ Admission and every rollover SHALL reserve complete next frames/markers, segment
 #### Scenario: ETL lag consumes quota
 
 - **WHEN** finalized epochs cannot be processed while the active successor continues and protected WAL consumes headroom
-- **THEN** capture health reports lag and stops/fails before unsafe deletion or silent loss
+- **THEN** capture continues while successor/safety reservation remains valid, reports processing lag and protected bytes, and stops/fails before unsafe deletion or silent loss when no safe reservation remains
 
 #### Scenario: Separate store filesystem
 
@@ -171,7 +176,7 @@ Admission and every rollover SHALL reserve complete next frames/markers, segment
 
 ### Requirement: Lifecycle indexes remain bounded
 
-Recorder SHALL enforce configured maximum byte and entry bounds for the parent epoch catalog, epoch lineage history, deletion tombstones, and retention metadata. Startup recovery, readiness, list, inspect, and status MUST NOT scan unbounded historical epochs. An epoch is eligible for compaction only after finalization, required ETL/checkpoint/session proof, policy reconciliation, cleanup completion, and durable tombstones.
+Recorder SHALL enforce configured maximum byte and entry bounds for the parent epoch catalog, epoch lineage history, deletion tombstones, and retention metadata. Startup recovery, readiness, list, inspect, and status MUST NOT scan unbounded historical epochs. An epoch is eligible for compaction only after finalization, required ETL/checkpoint/session proof, continuation dependency resolution, policy reconciliation, cleanup completion, and durable tombstones.
 
 Eligible history SHALL compact into a deterministic bounded lineage anchor preserving parent ID, first retained epoch identity/ordinal, last compacted epoch identity/ordinal, predecessor relationship, digest-chain root/tip, cleanup summary, aggregate counters, and range/count data sufficient to detect missing committed evidence, digest mismatch, lineage fork, incomplete cleanup, or conflicting compaction. Candidate installation SHALL use private temp-write, file sync, atomic rename, directory sync, source revision/digest, and candidate digest validation. If protected history cannot fit after legal compaction, stop new admission/epoch creation with bounded metadata-limit failure; never delete protected lineage or exceed limits.
 
