@@ -164,6 +164,15 @@ operate only on application-owned contracts (no lower-layer vocabulary via re-ex
 - Adding a legitimate dependency requires updating `docs/architecture/crate-boundaries.md`,
   `AGENTS.md`, and `validation/architecture.toml` together, then running the architecture check.
 
+## Service architecture (durable)
+
+Chronicle's long-term production pipeline separates Recorder, Local WAL, Durable Evidence Store, ETL, and Canonical Store. The current local runtime co-locates Recorder and incremental ETL in one process over filesystem storage; that is an implementation/deployment choice, not a correctness requirement.
+
+- **Local WAL is the capture durability and recovery authority.** Remote evidence stores are durable handoff/distribution boundaries and never replace local WAL durability in the capture hot path.
+- **Recorder and ETL are separate logical boundaries.** Correctness must not depend on sharing a process, memory, capture ownership, or a local filesystem namespace; ETL must remain independently deployable in the architecture.
+- **ETL owns canonical publication, publication verification, and checkpoint advancement ordering.** It consumes recovery-authoritative evidence through a durable evidence contract, not by owning the capture runtime.
+- Architecture changes affecting these service boundaries require architecture documentation and validation-policy review together.
+
 ## Test Architecture
 
 Every significant test is exactly one functional layer (unit/integration/smoke/acceptance/e2e/

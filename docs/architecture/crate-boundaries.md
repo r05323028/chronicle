@@ -2,9 +2,9 @@
 
 This document enumerates one primary responsibility, owned public concepts, allowed Chronicle dependencies, forbidden knowledge, and "must not change" reliability boundaries for every crate in the root workspace. It is the detailed counterpart to the normative `AGENTS.md` crate architecture section; `validation/architecture.toml` is the executable mirror of the dependency rules. When dependencies change, update all three in the same change.
 
-## Current graph (implementation start, 2026-08-11)
+## Current graph
 
-Bounded `cargo metadata --format-version 1 --no-deps` captures 13 root-workspace crates, 43 normal path-dependency declarations, 4 dev declarations, 0 build declarations, and no dependency cycle.
+Bounded `cargo metadata --format-version 1 --no-deps` captures 13 root-workspace crates, 38 normal path-dependency declarations, 2 dev declarations, 0 build declarations, and no dependency cycle. This is the actual current graph and equals the target graph; earlier problem edges (`chronicle-session -> chronicle-wal`, `chronicle-cli` to lower-layer crates) were removed and belong to Git history and archived OpenSpec changes, not the current architecture contract.
 
 ```text
 chronicle-common -> {}
@@ -12,37 +12,17 @@ chronicle-canonical -> {chronicle-common}
 chronicle-capture -> {chronicle-common}
 chronicle-capture-ebpf -> {chronicle-capture, chronicle-common}
 chronicle-wal -> {chronicle-capture, chronicle-common}
-chronicle-session -> {chronicle-capture, chronicle-common, chronicle-wal}   # problem edge
+chronicle-session -> {chronicle-capture, chronicle-common}
 chronicle-protocol -> {chronicle-canonical, chronicle-common, chronicle-session}
 chronicle-protocol-builtins -> {chronicle-canonical, chronicle-common, chronicle-protocol}
 chronicle-storage -> {chronicle-canonical, chronicle-common}
 chronicle-replay -> {chronicle-canonical, chronicle-common, chronicle-protocol}
 chronicle-etl -> {canonical, capture, common, protocol, session, storage, wal}
 chronicle-application -> {canonical, capture, common, etl, protocol, protocol-builtins, replay, session, storage, wal, capture-ebpf[optional,linux]}
-chronicle-cli -> {application, common, protocol, protocol-builtins, replay}  # problem edges
+chronicle-cli -> {chronicle-application}
 ```
 
-Dev-only declarations: `application -> wal` (test-support, also normal), `cli -> capture`, `cli -> wal`, `etl -> protocol-builtins` (protocol integration tests).
-
-## Target graph
-
-```text
-chronicle-common -> {}
-chronicle-canonical -> {chronicle-common}
-chronicle-capture -> {chronicle-common}
-chronicle-capture-ebpf -> {chronicle-capture, chronicle-common}
-chronicle-wal -> {chronicle-capture, chronicle-common}
-chronicle-session -> {chronicle-capture, chronicle-common}                  # wal edge removed
-chronicle-protocol -> {chronicle-canonical, chronicle-common, chronicle-session}
-chronicle-protocol-builtins -> {chronicle-canonical, chronicle-common, chronicle-protocol}
-chronicle-storage -> {chronicle-canonical, chronicle-common}
-chronicle-replay -> {chronicle-canonical, chronicle-common, chronicle-protocol}
-chronicle-etl -> {canonical, capture, common, protocol, session, storage, wal}  (+ dev builtins)
-chronicle-application -> {canonical, capture, common, etl, protocol, protocol-builtins, replay, session, storage, wal, capture-ebpf[optional,linux]}
-chronicle-cli -> {chronicle-application}                                    # sole Chronicle edge, every kind
-```
-
-No workspace build dependency is allowed in the target graph.
+Additional dev declarations: `application -> wal` (test-support; also a normal edge), `etl -> protocol-builtins` (protocol integration tests). No workspace build dependency is allowed.
 
 ## Crate ownership
 

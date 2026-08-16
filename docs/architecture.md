@@ -23,7 +23,7 @@ chronicle-protocol -> chronicle-canonical + chronicle-common
 chronicle-protocol-builtins -> chronicle-protocol + chronicle-canonical + chronicle-common
 chronicle-storage -> chronicle-canonical
 chronicle-replay -> chronicle-canonical + chronicle-protocol
-chronicle-etl -> capture + WAL + session + protocol + canonical
+chronicle-etl -> capture + WAL + session + protocol + canonical + storage
 chronicle-application -> capture + WAL + ETL + protocol + storage + replay
 chronicle-cli -> chronicle-application
 ```
@@ -36,11 +36,17 @@ Thirteen crates consolidate real protocol modules into `chronicle-protocol-built
 
 Fixture and eBPF sources emit the same `CaptureEvent` v1 model. `SocketConnected` carries stable socket identity, local/remote IP endpoints, and active/passive role before endpoint-free payload fragments. Capture adapter caches complete evidence by socket identity and rejects conflicting tuple or role.
 
-A bounded 4096-event queue feeds segmented WAL v1. Each group appends data, one in-WAL `CommitMarker`, flushes, and performs one `fdatasync`; recording metadata is non-authoritative and reconciled from validated markers. Recovery mutates only a verified incomplete final tail. ETL consumes the final recovery-authoritative prefix, reconstructs socket generations/TCP positions, decodes bounded HTTP/1.1, and publishes one deterministic Canonical Session v1. Active maps local→client and remote→server; passive maps remote→client and local→server. Ingress/egress controls byte direction only. Missing or conflicting evidence is typed failure; production never fabricates `unknown:0` endpoints.
+A bounded 4096-event queue feeds segmented WAL v1. Each group appends data, one in-WAL `CommitMarker`, flushes, and performs one `fdatasync`; recording metadata is non-authoritative and reconciled from validated markers. Recovery mutates only a verified incomplete final tail. ETL consumes the recovery-authoritative committed WAL prefix, reconstructs socket generations and TCP positions, and decodes bounded HTTP/1.1. During recording it runs incrementally over committed evidence, publishing canonical delta batches under durable incremental checkpoints; epoch rollover persists bounded, checksummed, lineage-verified continuation evidence for cross-epoch state. On finalization, one-shot ETL performs the final authoritative publication of one deterministic Canonical Session v1 per finalized epoch. Active maps local→client and remote→server; passive maps remote→client and local→server. Ingress/egress controls byte direction only. Missing or conflicting evidence is typed failure; production never fabricates `unknown:0` endpoints.
 
 `FilesystemSessionStore` atomically writes sole-v1 manifest, session JSON, and SHA-256-addressed payloads. Replay hydrates only persisted artifacts. Command mode infers one owned loopback listener for supervised target and grants only execution/read/host/target gates; explicit-target mode requires loopback target, matching allow-host, effect flag, and `--execute`. Fake protocol remains available for boundary tests.
 
 JSON is current capture-event payload encoding; WAL framing remains encoding-independent. Public recording lifetime has no implicit time deadline when `--duration` is omitted; explicit deadlines are checked independently from bounded epoch and segment WAL limits. A recording may own many finalized epoch sessions, and a WAL epoch boundary is not a protocol reconstruction boundary: cross-epoch state requires bounded, checksummed, lineage-verified continuation evidence.
+
+## Service boundaries
+
+The production pipeline separates five logical components: **Recorder** (eBPF capture, protocol-neutral evidence, local WAL append/commit/recovery, segment and epoch rollover, capture-side loss accounting, future durable evidence shipping), **Local WAL** (capture durability and recovery authority), **Durable Evidence Store** (immutable evidence handoff preserving checksums and parent/epoch lineage, idempotent publication, independent Recorder/ETL lifecycles), **ETL** (reconstruction, protocol decoding, canonicalization, incremental and final publication, publication verification, checkpoint advancement ordering), and **Canonical Store** (persisted canonical sessions and payload artifacts consumed by inspect/replay).
+
+Recorder and ETL MAY be co-located in the current local deployment, but their correctness must not depend on sharing a process, memory, capture ownership, or a local filesystem namespace. A future S3-compatible evidence store is a durable handoff/distribution boundary and does not replace local WAL durability in the capture hot path. WAL segment, epoch, object-store object, and ETL batch boundaries never define protocol or logical interaction boundaries. Replay consumes canonical evidence and remains independent from Recorder, WAL, ETL, and evidence-store internals.
 
 ## Public data directory and recording identity
 
@@ -54,7 +60,7 @@ Public commands resolve data directory in fixed precedence: `--data-dir`, config
   sessions/<session-uuid>/             # canonical manifest/session/artifacts
 ```
 
-`RecordingId` is user-facing stable identity rendered `rec_<uuid>`; `latest` and exact names resolve through bounded reconciled catalog view. Catalog and `recording-intent.json` sidecars are advisory. Recovery-authoritative WAL metadata and canonical session facts win contradictions. One exact normalized `.chronicle-domain.lock` path protects name claim, capture, ETL, publication, and catalog update as one transaction.
+`RecordingId` is user-facing stable identity rendered `rec_<uuid>`; `latest` and exact names resolve through bounded reconciled catalog view. Catalog and `recording-intent.json` sidecars are advisory. Recovery-authoritative WAL metadata and canonical session facts win contradictions. Within one local filesystem deployment, one exact normalized `.chronicle-domain.lock` path protects name claim, capture, ETL, publication, and catalog update as one transaction. The lock is a local deployment coordination mechanism, not a universal distributed transaction lock; future independent authority domains (Recorder-local, evidence-store, ETL) are not required to share it.
 
 Canonical `SessionId` is independently deterministic and may differ from recording ID. Association uses `source_provenance.recording_id` / `epoch_id` only; identifier equality is never lineage, and sessions without explicit provenance are unresolved. Public users operate on recording references; the hidden `internal` namespace is the operational surface for recorder, recorder-status, ETL, and deterministic fixture recording.
 
@@ -88,4 +94,4 @@ Hook coverage and kernel compatibility; incomplete socket lifecycle observation;
 
 ## Crate boundaries
 
-[`docs/architecture/crate-boundaries.md`](architecture/crate-boundaries.md) documents one primary responsibility, allowed dependencies, forbidden knowledge, the current and target dependency graphs, and the reliability boundaries that must not change for every root-workspace crate. `validation/architecture.toml` is the executable mirror; `AGENTS.md` carries the normative rules.
+[`docs/architecture/crate-boundaries.md`](architecture/crate-boundaries.md) documents one primary responsibility, allowed dependencies, forbidden knowledge, the current dependency graph (which equals the target graph), and the reliability boundaries that must not change for every root-workspace crate. `validation/architecture.toml` is the executable mirror; `AGENTS.md` carries the normative rules.
