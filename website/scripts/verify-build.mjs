@@ -40,8 +40,9 @@ for (const token of ['--code-bg:', '--code-fg:', '--code-red:']) {
   if (!marketingCss.includes(token)) errors.push(`marketing code token missing: ${token}`);
   if (!starlightCss.includes(token)) errors.push(`Starlight code token missing: ${token}`);
 }
+const normalizedEcConfig = expressiveCodeConfig.replaceAll('"', "'");
 for (const token of ["codePaddingInline: '1.25rem'", "codePaddingBlock: '1rem'"]) {
-  if (!expressiveCodeConfig.includes(token)) errors.push(`Expressive Code padding override missing: ${token}`);
+  if (!normalizedEcConfig.includes(token)) errors.push(`Expressive Code padding override missing: ${token}`);
 }
 for (const token of ['--color-paper: #f2efe7;', '--color-night: #121918;']) {
   if (!marketingCss.includes(token)) errors.push(`marketing page palette missing: ${token}`);

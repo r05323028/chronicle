@@ -64,7 +64,8 @@ Rules:
 - `./scripts/acceptance.sh` — the ONLY user-facing acceptance entrypoint (`--profile
   live-capture|recorder|all`, `--executor local|multipass`). No deprecated aliases or wrappers.
 - Before pushing: the repository pre-push hook runs act-based CI checks locally
-  (`scripts/pre-push-validation.sh`, job `checks`; install with `scripts/install-pre-push-hook.sh`).
+  (`scripts/pre-push-validation.sh`, jobs `checks` and website `validate-build`;
+  install with `scripts/install-pre-push-hook.sh`).
   Pre-push act = local CI parity; GitHub CI = authoritative remote validation; release gates = full qualification.
 - `openspec validate --all --strict --no-interactive` — proves SDD artifact structure only,
   never product correctness. OpenSpec is the SDD workflow for requirements, design, scope,
