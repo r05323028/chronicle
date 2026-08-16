@@ -81,7 +81,7 @@ rationale: <why the invariant exists>
 remediation: <preferred fix, with documentation pointer>
 ```
 
-Legacy checks (sleep policy, catalog) name the violation and location and are upgraded to the full
+Older checks (sleep policy, catalog) name the violation and location and are upgraded to the full
 format opportunistically. Agents should not need to search a large policy document to understand a
 failure.
 

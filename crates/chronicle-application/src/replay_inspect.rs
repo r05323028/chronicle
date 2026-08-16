@@ -73,8 +73,8 @@ pub struct InspectConnectionSummary {
 pub struct InspectSessionResult {
     pub session_id: chronicle_common::SessionId,
     pub complete: bool,
-    /// Retained compatibility flag: true only for fully replayable sessions.
-    pub replayable: bool,
+    /// Authoritative replay classification; the removed pre-0.1 `replayable`
+    /// boolean alias is gone (replayable == `FullyReplayable`).
     pub replayability: Replayability,
     pub executable_operations: usize,
     pub non_executable_operations: usize,
@@ -330,7 +330,6 @@ pub fn inspect_session(
     Ok(InspectSessionResult {
         session_id,
         complete,
-        replayable: replayability == Replayability::FullyReplayable,
         replayability,
         executable_operations,
         non_executable_operations,
@@ -352,10 +351,9 @@ struct InspectJson<'a> {
 /// Renders stable, body-free inspect output for interactive use.
 pub fn render_inspect_human(inspected: &InspectSessionResult) -> String {
     let mut output = format!(
-        "session_id: {}\ncomplete: {}\nreplayable: {}\nreplayability: {:?}\noperations: executable={} non_executable={}\nintegrity_valid: {}\nsource_status: {:?}\nsource_reason: {}\nblockers: {}\nissues: {}\n",
+        "session_id: {}\ncomplete: {}\nreplayability: {:?}\noperations: executable={} non_executable={}\nintegrity_valid: {}\nsource_status: {:?}\nsource_reason: {}\nblockers: {}\nissues: {}\n",
         inspected.session_id,
         inspected.complete,
-        inspected.replayable,
         inspected.replayability,
         inspected.executable_operations,
         inspected.non_executable_operations,

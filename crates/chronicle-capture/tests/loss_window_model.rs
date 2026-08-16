@@ -1,6 +1,6 @@
 //! Portable loss-window state-machine boundary matrix (migration 3.6).
 //!
-//! Split from chronicle-capture-ebpf privileged feasibility suite: sampler
+//! Split from chronicle-capture-ebpf privileged kernel suite: sampler
 //! window/no-growth transitions and reason classification are pure logic and
 //! run on any host; the eBPF sampler must satisfy this contract on supported
 //! Linux. This copy guards the model everywhere.

@@ -49,7 +49,10 @@ async fn fixture_wal_http_artifact_replay_and_verification_vertical_slice() {
     std::fs::remove_file(fixture_path).expect("remove fixture copy");
     std::fs::remove_dir_all(root.join("recordings")).expect("remove WAL");
     let inspected = inspect_session(&root, recorded.session_id).expect("inspect persisted session");
-    assert!(inspected.replayable);
+    assert_eq!(
+        inspected.replayability,
+        chronicle_replay::Replayability::FullyReplayable
+    );
 
     let pass_server = HttpTestServer::spawn(ResponseMode::Pass).await;
     let passed = replay_session(

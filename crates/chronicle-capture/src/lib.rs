@@ -850,7 +850,7 @@ pub trait CaptureSource: Send {
         Ok(CaptureSourceSummary::default())
     }
 
-    /// Compatibility alias for existing finite fixture sources and callers.
+    /// Pull the next capture event; returns None when the finite source is exhausted.
     fn next_event(&mut self) -> Result<Option<CaptureEvent>, CaptureError>;
 }
 

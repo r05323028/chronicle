@@ -1293,8 +1293,12 @@ mod tests {
 
         let inspected = inspect_session(&root, recorded.session_id).unwrap();
         assert!(inspected.complete);
-        assert!(inspected.replayable, "{:?}", inspected.blockers);
-        assert_eq!(inspected.replayability, Replayability::FullyReplayable);
+        assert_eq!(
+            inspected.replayability,
+            Replayability::FullyReplayable,
+            "{:?}",
+            inspected.blockers
+        );
         assert_eq!(inspected.executable_operations, 1);
         assert_eq!(inspected.non_executable_operations, 0);
         assert!(inspected.integrity_valid);
@@ -1357,7 +1361,6 @@ mod tests {
 
         let inspected = inspect_session(&root, recorded.session_id).unwrap();
         assert!(!inspected.complete);
-        assert!(!inspected.replayable);
         assert_eq!(inspected.replayability, Replayability::NotReplayable);
         assert_eq!(inspected.executable_operations, 0);
         assert!(!inspected.blockers.is_empty());

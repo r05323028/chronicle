@@ -68,7 +68,7 @@ pub fn probe_embedded() -> EbpfPreflight {
             embedded_object,
             required_programs,
             attach: PreflightCheck::NotChecked(
-                "attach feasibility requires an explicit recording selector",
+                "attach preflight requires an explicit recording selector",
             ),
             cap_bpf: capability_check(capabilities, CAP_BPF, "CAP_BPF unavailable"),
             cap_net_admin: capability_check(

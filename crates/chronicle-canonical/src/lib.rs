@@ -1,6 +1,6 @@
 //! Protocol-independent canonical replay model.
 //!
-//! Canonical v1 is an evolving pre-release MVP schema until its contract is frozen.
+//! Canonical v1 is an evolving pre-release schema until its contract is frozen.
 //! Serde validates wire shape and schema version; [`CanonicalSession::validate`] checks
 //! cross-field structure before publication.
 

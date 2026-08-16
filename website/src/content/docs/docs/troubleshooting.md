@@ -31,7 +31,7 @@ The current decoder supports bounded plaintext HTTP/1.1 only. TLS ciphertext, HT
 
 ## Finalization stopped or the WAL is near its limit
 
-One-shot recording is bounded by duration and a 4 GiB physical WAL ceiling. Inspect disk space and the recording directory. If the recording is recoverable, retry finalization without recapturing:
+Public recording has no implicit time deadline; a bounded epoch WAL (4 GiB physical ceiling by default) rolls over rather than terminating the recording. Inspect disk space and the recording directory. If the recording is recoverable, retry finalization without recapturing:
 
 ```bash
 chronicle record --retry checkout

@@ -2726,7 +2726,10 @@ mod tests {
         let published = process_and_publish_recording_wal(&wal, &output, &registry).unwrap();
         let inspection = crate::inspect_session(&output, published.session_id).unwrap();
         assert!(inspection.integrity_valid);
-        assert!(inspection.replayable);
+        assert_eq!(
+            inspection.replayability,
+            chronicle_replay::Replayability::FullyReplayable
+        );
         let repeated = process_and_publish_recording_wal(&wal, &output, &registry).unwrap();
         assert_eq!(published.session_id, repeated.session_id);
         assert!(repeated.already_published);
