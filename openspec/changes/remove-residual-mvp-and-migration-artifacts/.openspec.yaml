@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-08-16
+# Normative specs updated in place (user-intent-cli, recording-identity,
+# mvp-schema-versioning); no delta spec copies carried.
+skip_specs: true
