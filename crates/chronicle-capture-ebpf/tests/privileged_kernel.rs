@@ -76,7 +76,7 @@ fn bpftool_program_names() -> Result<BTreeSet<String>, Box<dyn std::error::Error
         .args(["prog", "show", "-j"])
         .output()?;
     if !output.status.success() {
-        return Err(std::io::Error::other(format!("bpftool prog show failed")).into());
+        return Err(std::io::Error::other("bpftool prog show failed").into());
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     Ok(value
