@@ -6,7 +6,27 @@ Restartable recording-scoped ETL, deterministic reconstruction, publication, and
 
 ### Requirement: Recording-scoped ETL input
 
-ETL SHALL accept one recording WAL directory, recover and validate metadata/segments, and process exactly recovered committed snapshot through last valid v1 `CommitMarker` (or unchanged declared P0 v1 boundary). It SHALL process `completed`, `failed`, and recovered `aborted` recordings when committed prefix is valid, preserving source status/reason. A live `starting`/`recording` writer holding the advisory lock SHALL be rejected without reading partial live state; stale `starting`/`recording` metadata after lock release SHALL be reconciled to `aborted` with `process_crash_recovered` before processing. Unsupported versions, corrupt committed prefix/marker reference, contradictory metadata, or WAL digest conflict SHALL be rejected. Complete frames after final valid marker SHALL remain written-not-durable uncertainty and SHALL NOT be promoted.
+ETL SHALL accept one epoch WAL directory plus its parent/epoch lineage descriptor and optional immutable continuation-in descriptor, recover and validate exactly through the last valid v1 `CommitMarker`, and process only that epoch's committed snapshot. The continuation-in descriptor SHALL be accepted only when it names the unique predecessor in authoritative `epochs.json`, matches predecessor/successor IDs and ordinal, and verifies checksum, decoder/schema/pipeline version, marker/segment lineage, and bounded state. ETL SHALL process finalized, failed, and crash-recovered epochs when their committed prefix is valid, preserving epoch and parent status/reason. A live active epoch writer holding its WAL lock SHALL be rejected by standalone ETL; recorder-owned incremental ETL MAY consume a read-only committed snapshot while the writer is live. Unsupported versions, corrupt committed prefix/marker reference, contradictory parent/epoch metadata, WAL digest conflict, invalid continuation, or ambiguous predecessor SHALL be rejected. Complete frames after the final valid marker remain written-not-durable uncertainty and SHALL not be promoted.
+
+#### Scenario: Finalized epoch input
+
+- **WHEN** a valid finalized epoch is supplied with parent/epoch metadata
+- **THEN** ETL discovers ordered segments, validates lineage, and processes exactly through that epoch's recovery-authoritative marker
+
+#### Scenario: Recorder-owned live snapshot
+
+- **WHEN** the long-lived recorder owns the active successor and exposes a stable committed snapshot
+- **THEN** incremental ETL processes only that snapshot without repair or mutation and leaves the active suffix for a later snapshot
+
+#### Scenario: Standalone ETL sees live writer
+
+- **WHEN** an operator invokes standalone ETL against an epoch held by a live writer
+- **THEN** standalone ETL rejects without reading partial live state or publishing a session
+
+#### Scenario: Failed epoch input
+
+- **WHEN** capture/WAL failure leaves a valid committed epoch prefix
+- **THEN** ETL publishes/reports that epoch with failed/aborted provenance and does not claim parent completion
 
 #### Scenario: Completed recording input
 
@@ -151,21 +171,46 @@ ETL SHALL detect protocol from reconstructed streams, invoke registered decoder/
 
 ### Requirement: Deterministic one-session publication
 
-Recording ETL SHALL group one stopped recording into one canonical session. Session, connection, and operation identifiers SHALL derive deterministically from recording ID, pipeline version, stable connection provenance, and message order. Publication SHALL use existing filesystem store atomic no-replace boundary.
+Recording ETL SHALL publish one deterministic Canonical Session v1 per finalized epoch, plus immutable continuation references when a decoder has bounded state crossing into a successor. Epoch session identity SHALL derive from stable parent `RecordingId`, `EpochId`/ordinal, pipeline version, and the verified epoch input/continuation seed. A continuation-only predecessor session remains inspectable and independently immutable but SHALL not contain a replayable duplicate operation that a successor may complete. The parent aggregate references verified epoch manifests/checkpoints and terminal operations without replacing session-store authority or merging mutable decoder state.
+
+#### Scenario: First epoch publication
+
+- **WHEN** a valid finalized epoch has no prior output
+- **THEN** ETL atomically publishes one deterministic epoch session and records its parent/epoch association
+
+#### Scenario: Multiple epoch publication
+
+- **WHEN** three epochs of one parent finalize
+- **THEN** ETL publishes three independently valid sessions whose parent association and ordinal order are deterministic
+
+#### Scenario: Atomic publication failure
+
+- **WHEN** write/sync/rename fails before an epoch session is published
+- **THEN** its final session path is absent, its checkpoint does not advance, and retry is safe without affecting successor capture
 
 #### Scenario: First successful run
 
 - **WHEN** valid recording has no prior output
 - **THEN** ETL atomically publishes deterministic session and reports ID
 
-#### Scenario: Atomic publication failure
-
-- **WHEN** write/sync/rename fails before publication
-- **THEN** final session path is absent, checkpoint does not advance, and rerun is safe
-
 ### Requirement: Checkpoint-after-publication idempotency without output binding
 
-ETL SHALL derive deterministic session ID and `wal_snapshot_sha256` over exact ordered verified segment bytes through last valid commit marker before publication. In each requested output root it SHALL use existing atomic no-replace publication and verify any existing deterministic manifest/session/provenance/checksums before reporting `already_processed`; mismatch SHALL fail without overwrite. Recording-local `output-binding.json` SHALL NOT be created or required. Versioned atomic checkpoint SHALL contain recording ID, commit-marker segment/offset/sequence, WAL/recovery digests, format/pipeline/canonical versions, session ID, latest manifest checksum/output identity, status, and counters, but SHALL be advisory across roots and written only after publication. ETL SHALL permit same recording to materialize intentionally into another output root. Interruption before publication SHALL reread committed WAL; missing checkpoint after publication SHALL be repaired from verified requested-store manifest.
+ETL SHALL derive deterministic epoch session identity and WAL snapshot digest over exact ordered verified epoch bytes through the last valid marker before publication. In each requested output root it SHALL use existing atomic no-replace publication and verify any existing deterministic epoch session/manifest/provenance/checksums before reporting `already_processed`; mismatch SHALL fail without overwrite. `IncrementalEtlCheckpoint v1` SHALL bind stable parent ID, epoch ID/ordinal, epoch WAL identity, marker/segment lineage, decoder state, output references, source status, and configuration/pipeline digests. A parent aggregate SHALL advance only after every referenced epoch output/checkpoint is verified.
+
+#### Scenario: Second idempotent epoch run
+
+- **WHEN** the same unchanged epoch is processed after matching publication/checkpoint
+- **THEN** ETL returns the same session/output identity without duplicate session or delta publication
+
+#### Scenario: Published output but missing checkpoint
+
+- **WHEN** epoch output is durable but checkpoint write was interrupted
+- **THEN** retry verifies/adopts the matching output and repairs that epoch checkpoint once
+
+#### Scenario: Conflicting publication
+
+- **WHEN** deterministic epoch output exists with different provenance/checksum
+- **THEN** ETL fails closed, preserves existing output, and does not advance checkpoint or parent aggregation
 
 #### Scenario: Second idempotent run
 
@@ -232,44 +277,50 @@ Canonical session and ETL summary SHALL include source recording ID/status/shutd
 
 ### Requirement: Incremental ETL consumes recovery-authoritative snapshots
 
-Recorder-owned incremental ETL worker/API SHALL consume committed WAL while recorder is running. Existing standalone `etl --wal-dir --output` SHALL retain stopped-recording ownership and SHALL continue to reject a live writer; it MAY process a finalized recorder epoch. Processing input for recorder-owned incremental ETL SHALL be an immutable snapshot descriptor containing recording epoch ID, segment ordinal/digest where sealed, final marker segment/offset/sequence/digest, exact ordered input-byte digest through marker, and capture/clock lineage. ETL SHALL independently validate segment/header/envelope/marker conditions through descriptor boundary before processing. Manifest, metadata, file length, or writer acknowledgement alone SHALL NOT promote input.
+Recorder-owned incremental ETL SHALL consume committed WAL snapshots for the active epoch while capture continues. Each snapshot descriptor SHALL include parent recording ID, epoch ID/ordinal, epoch WAL identity, sealed segment identity/digest where applicable, final marker segment/offset/sequence/digest, exact ordered input-byte digest, and capture/clock lineage. ETL SHALL validate segment/header/envelope/marker conditions through the descriptor boundary before processing. Manifest, metadata, file length, or writer acknowledgement alone SHALL not promote input.
 
-Live ETL SHALL use read-only snapshot semantics and SHALL never repair, truncate, reopen, delete, or classify concurrently growing suffix as committed corruption. If active segment changes while snapshot is established, ETL SHALL retry from prior checkpoint or process only stable validated marker. Startup exclusive recovery retains existing repair authority.
+Live ETL SHALL be read-only and SHALL never repair, truncate, reopen, delete, or classify a concurrent suffix as committed corruption. If the active segment changes while a snapshot is established, ETL SHALL retry from the prior per-epoch checkpoint or process only the stable marker boundary. Startup exclusive recovery retains repair authority.
 
 #### Scenario: New committed batch
 
-- **WHEN** recorder-owned worker observes recovery-authoritative marker beyond ETL checkpoint
-- **THEN** worker validates exact snapshot and processes records after checkpoint through marker
+- **WHEN** the active successor exposes a marker beyond its epoch checkpoint
+- **THEN** ETL validates exact lineage and processes records after that checkpoint through the marker
+
+#### Scenario: No new marker
+
+- **WHEN** active WAL has only complete/partial frames after the last authoritative marker
+- **THEN** ETL does not advance input state or output
+
+#### Scenario: Concurrent append
+
+- **WHEN** writer appends while ETL reads the active epoch
+- **THEN** ETL remains bounded by its chosen marker and never repairs the mutable suffix
 
 #### Scenario: Standalone ETL sees live writer
 
 - **WHEN** operator runs existing standalone ETL against recording held by live writer
 - **THEN** standalone command retains existing behavior and rejects without reading live state or publishing
 
-#### Scenario: No new marker
-
-- **WHEN** active WAL has only complete or partial frames after last authoritative marker
-- **THEN** ETL does not advance input state or output
-
-#### Scenario: Concurrent append
-
-- **WHEN** writer appends while ETL reads active segment
-- **THEN** ETL remains bounded by chosen marker and never repairs mutable suffix
-
 ### Requirement: FinalSessionCheckpoint v1 and IncrementalEtlCheckpoint v1 are distinct
 
-`FinalSessionCheckpoint v1` SHALL remain the existing stopped-recording checkpoint artifact and SHALL not be extended to represent live incremental state. It owns final-session ETL/publication lifecycle and existing finalization behavior.
+`FinalSessionCheckpoint v1` SHALL remain the existing stopped-recording final-session artifact. `IncrementalEtlCheckpointV1` SHALL remain a distinct read-only compatibility artifact for legacy epoch-local processing; its serialized `recording_id` is a legacy WAL/epoch identity and MUST NOT be interpreted as the parent. New parent-aware multi-epoch processing SHALL use `IncrementalEtlCheckpointV2` with a distinct discriminator and owner/lifecycle contract. V2 SHALL bind typed parent `RecordingId`, current `EpochId`/ordinal, optional unique predecessor/successor IDs, exact marker/segment lineage, continuation-in/out references and digests, decoder/schema/pipeline versions, bounded decoder state, emitted operation fingerprints, immutable output identities, source status, and checksum. `EpochContinuationCheckpointV1` SHALL be a separate bounded handoff artifact whose identity binds parent, predecessor, successor, marker/segment lineage, decoder/schema/pipeline versions, and checksum.
 
-`IncrementalEtlCheckpoint v1` SHALL be a separate artifact with a different discriminator, owner, and lifecycle. It SHALL persist enough bounded state to resume without rereading deleted input or changing semantic output. It SHALL include WAL marker lineage; segment digest lineage; decoder reconstruction state; TCP direction state; HTTP correlation state; loss-window state; emitted delta batch references; deterministic ID counters; recorder/epoch/configuration/pipeline/canonical versions; prior checkpoint digest; exact input marker and WAL snapshot digest; sealed segment identities/digests; active connection generation map; directional TCP ranges/chunks/provenance; lifecycle/loss-window state; protocol detector/decoder state including pending request/response correlation; deterministic ID derivation inputs; emitted immutable output identities/digests; source status; bounds/counters; and checkpoint checksum.
-
-`IncrementalEtlCheckpoint v1` SHALL reject unknown/non-v1 before allocation. No version SHALL have dual interpretation. State SHALL obey existing 1024 connections, 65,536 chunks/connection, 8 MiB/connection, five-minute event-time idle, 8 MiB operation body, 10,000 operations/epoch, 1024 issues, and 4096-record read-batch bounds. It MAY contain pending captured bytes and SHALL use private permissions and payload-safe output.
-
-`IncrementalEtlCheckpoint v1` SHALL be written atomically only after every output it references is durably published and verified. It SHALL never advance beyond recovery-authoritative input or rely on wall-clock/process scheduling for deterministic identity.
+V2 restore SHALL reject unknown versions, v1/v2 discriminator confusion, parent/epoch/predecessor/successor mismatch, marker/cursor mismatch, lineage fork/gap, checksum failure, unsupported decoder kind/version, duplicate/inconsistent state, and bound/configuration overflow before output or retention eligibility. A fresh decoder SHALL never replace failed continuation restore. Legacy v1 artifacts may be materialized only through an explicit one-epoch compatibility adapter.
 
 #### Scenario: Mid-connection checkpoint
 
-- **WHEN** HTTP request or response spans committed snapshots
-- **THEN** checkpoint preserves bounded directional/parser/correlation state and resume completes same operation once
+- **WHEN** an epoch's HTTP request/response spans committed snapshots
+- **THEN** its checkpoint preserves bounded parser/correlation state and resume completes that epoch operation once
+
+#### Scenario: Unsupported or wrong-epoch checkpoint
+
+- **WHEN** checkpoint declares an unknown version or belongs to another parent/epoch
+- **THEN** ETL fails closed before output or retention eligibility
+
+#### Scenario: Pending continuation restart
+
+- **WHEN** ETL restarts with pending fragmented connection bytes in an epoch checkpoint
+- **THEN** restored state and uninterrupted state produce byte-equivalent epoch output without duplicate operations
 
 #### Scenario: Unsupported checkpoint version
 
@@ -283,107 +334,111 @@ Live ETL SHALL use read-only snapshot semantics and SHALL never repair, truncate
 
 ### Requirement: Deterministic immutable incremental publication
 
-ETL SHALL publish completed canonical operations/evidence as immutable bounded batches keyed deterministically by recording epoch, pipeline version, exact source WAL provenance, and canonical content. Batch ordering SHALL derive from capture/WAL provenance, not poll interval, worker timing, checkpoint grouping, or restart count. Existing canonical types and completeness/provenance semantics SHALL be reused; Incremental ETL SHALL NOT redefine HTTP protocol meaning or weaken Canonical Session v1 validation.
-
-Publication SHALL use `RecordingStore` put-if-absent semantics. Existing same key SHALL be accepted only after size/digest/schema/provenance verification; mismatch SHALL fail without overwrite. Epoch finalization SHALL materialize existing deterministic Canonical Session v1 equivalent to one-shot ETL over same final committed WAL and source status, then use existing atomic session publication semantics.
+ETL SHALL publish completed canonical operations/evidence as immutable bounded batches keyed deterministically by stable parent ID, epoch ID/ordinal, pipeline version, exact source WAL provenance, and canonical content. Batch ordering SHALL derive from capture/WAL provenance, not poll interval, worker timing, checkpoint grouping, or restart count. Existing canonical types and completeness/provenance semantics SHALL be reused; Incremental ETL SHALL not redefine HTTP meaning or weaken Canonical Session v1 validation.
 
 #### Scenario: Different polling cadence
 
-- **WHEN** same WAL is processed with one large snapshot or many smaller snapshots
-- **THEN** final canonical session, operation IDs/order/content, provenance, and completeness are byte-identical
+- **WHEN** the same epoch WAL is processed through one large snapshot or many smaller snapshots
+- **THEN** epoch session bytes, operation IDs/order/content, provenance, completeness, and parent aggregate association are identical
 
 #### Scenario: Existing matching batch
 
-- **WHEN** retry encounters deterministic batch already published with matching digest/provenance
+- **WHEN** retry encounters a deterministic epoch batch already published with matching digest/provenance
 - **THEN** ETL verifies and reuses it without duplicate
 
 #### Scenario: Existing conflicting batch
 
-- **WHEN** deterministic key exists with different bytes or provenance
+- **WHEN** a deterministic key exists with different bytes or provenance
 - **THEN** ETL fails and does not overwrite or advance checkpoint
 
 ### Requirement: Publication-before-checkpoint crash safety
 
-Incremental transaction SHALL follow: validate input snapshot; derive outputs and next bounded state deterministically; publish/verify every immutable output; atomically write checkpoint referencing exact input and outputs; then make source segment eligible for processed transition. `processed` SHALL NOT by itself make finalized-epoch WAL retention eligible: final Canonical Session v1 and its manifest MUST also be durably published and verified. Checkpoint SHALL NOT reference unpublished output. Retention SHALL NOT rely on in-memory success.
-
-Crash before publication SHALL replay input. Crash during publication SHALL verify/delete only private staging according to store semantics. Crash after publication but before checkpoint SHALL recompute same deterministic keys, verify outputs, and repair checkpoint. Crash after checkpoint but before manifest processed transition SHALL repair manifest from checkpoint. Every retry over unchanged input SHALL converge without duplicate or omitted canonical operation.
+Each epoch incremental transaction SHALL follow: validate snapshot; derive bounded next state; publish/verify every immutable output; atomically write that epoch checkpoint; then mark eligible segment/epoch state. A finalized epoch SHALL not become retention-eligible from `processed` alone: its final Canonical Session v1 and manifest/payload integrity MUST also be verified. Parent aggregate publication SHALL reference only durable matching epoch outputs/checkpoints.
 
 #### Scenario: Crash before output
 
-- **WHEN** ETL stops after input validation/state derivation but before publication
-- **THEN** old checkpoint remains and retry deterministically reprocesses input
+- **WHEN** ETL stops after validation/state derivation but before immutable publication
+- **THEN** old checkpoint remains and retry reprocesses the epoch deterministically
 
 #### Scenario: Crash after output before checkpoint
 
-- **WHEN** all immutable outputs exist but checkpoint remains old
-- **THEN** retry verifies same outputs and advances checkpoint once
+- **WHEN** all epoch outputs exist but checkpoint remains old
+- **THEN** retry verifies matching outputs and advances the epoch checkpoint once
 
 #### Scenario: Crash after checkpoint
 
-- **WHEN** checkpoint is durable but WAL manifest still labels segment sealed
-- **THEN** reconciliation marks segment processed from verified checkpoint/output proof
+- **WHEN** epoch checkpoint is durable but epoch manifest processed transition is not
+- **THEN** reconciliation repairs processed state from verified checkpoint/output proof without changing parent lineage
 
 ### Requirement: Duplicate prevention uses lineage, not event heuristics
 
-ETL SHALL identify already-consumed input by exact epoch/segment/sequence/marker and digest lineage. It SHALL identify already-published output by deterministic key plus content/provenance digest. It SHALL NOT deduplicate operations only by timestamp, HTTP fields, payload equality, socket tuple, or process ID. Same captured operation observed twice at distinct WAL provenance SHALL remain two observations unless existing TCP retransmission rules prove duplicate byte range.
+ETL SHALL identify consumed input by exact parent/epoch/segment/sequence/marker and digest lineage. It SHALL identify published output by deterministic parent/epoch key plus content/provenance digest. It SHALL not deduplicate operations only by timestamp, HTTP fields, payload equality, socket tuple, or process ID. Same captured operation at distinct epoch/WAL provenance remains two observations unless existing retransmission rules prove duplicate byte range. Forked checkpoints, predecessor mismatch, parent/epoch mismatch, checkpoint ahead of WAL, same boundary with different digest, or output-set mismatch SHALL fail closed and block retention.
 
-Checkpoint lineage SHALL form one unambiguous chain. Forked checkpoints, predecessor mismatch, checkpoint ahead of WAL, same boundary with different digest, or output set mismatch SHALL fail closed and block retention.
+#### Scenario: Same request in two epochs
+
+- **WHEN** workload legitimately sends identical HTTP requests before and after a rollover
+- **THEN** ETL emits distinct operations with distinct epoch/WAL provenance and does not collapse them by payload equality
+
+#### Scenario: Checkpoint fork
+
+- **WHEN** two checkpoint revisions claim conflicting parent/epoch input/output digests
+- **THEN** reconciliation fails without choosing by timestamp
 
 #### Scenario: Same HTTP request twice
 
 - **WHEN** workload legitimately sends identical request at different WAL ranges
 - **THEN** ETL emits distinct operations with distinct provenance-derived IDs
 
-#### Scenario: Checkpoint fork
-
-- **WHEN** two checkpoint revisions claim same predecessor with conflicting input/output digest
-- **THEN** reconciliation fails without choosing by timestamp
-
 ### Requirement: Resume preserves provenance and clock domains
 
-Incremental outputs and final session SHALL preserve recorder ID, recording epoch ID/ordinal, boot/clock identity, connection generation, capture time range, WAL segment/offset/sequence/marker/digest ranges, loss windows, source lifecycle status/reason, ETL checkpoint/output identities, and recovery warnings. Restart time, process-attempt ID, polling cadence, and publication time SHALL be observational metadata only and SHALL NOT affect deterministic canonical identity/order.
+Incremental outputs, continuation artifacts, and final epoch sessions SHALL preserve stable parent recording ID, epoch ID/ordinal, epoch WAL identity, boot/clock identity, connection generation, capture time range, all contributing WAL segment/offset/sequence/marker/digest ranges, loss windows, source lifecycle status/reason, checkpoint/output identities, and recovery warnings. Process-attempt ID, restart time, polling cadence, publication time, and rollover scheduling SHALL be observational only and SHALL not affect canonical identity/order.
 
-Long-lived connection crossing segment snapshots SHALL retain one connection generation and complete only from trusted evidence. Connection crossing recording-epoch boundary SHALL finalize old epoch incomplete unless explicit complete lifecycle evidence precedes boundary; Incremental ETL SHALL not carry protocol state across recording IDs or invent cross-epoch session identity.
+A connection generation may cross segment and epoch boundaries through a verified bounded continuation seed. A logical operation belongs to the epoch where its protocol decoder reaches terminal completion. If request/partial frame evidence begins in N and response/completion arrives in N+1, N+1 emits the sole operation with both epoch ranges; the already-published N session is not mutated. If the run ends before completion, the final epoch that owns the last trusted evidence emits one incomplete operation. Unsupported or invalid continuation produces explicit incomplete/loss provenance rather than a clean new connection or silently omitted evidence.
 
 #### Scenario: Recorder restart in same epoch
 
-- **WHEN** recorder/ETL restart after committed checkpoint and continue same safely reopenable epoch
-- **THEN** resumed outputs retain original capture/WAL identity and deterministic IDs
+- **WHEN** recorder/ETL restarts after a committed checkpoint and safely reopens the same epoch
+- **THEN** resumed output retains original parent/epoch/WAL identity and deterministic IDs
 
 #### Scenario: Connection spans epoch rollover
 
-- **WHEN** TCP connection remains open across bounded recording epoch boundary
-- **THEN** each epoch preserves its observed evidence and old epoch does not claim complete operation from future epoch bytes
+- **WHEN** one TCP connection remains open across a bounded epoch boundary
+- **THEN** each epoch preserves observed evidence and neither session claims complete future bytes from the other epoch
+
+#### Scenario: Parent aggregate after restart
+
+- **WHEN** an old epoch is already published and the successor process restarts
+- **THEN** parent aggregation keeps the old session once and resumes only the successor lineage
 
 ### Requirement: Incremental lag and backpressure are bounded and visible
 
-ETL queue, worker count, checkpoint state, output batch size, retry count/backoff, and maximum lag thresholds SHALL be configured/documented and bounded. Recorder capture/WAL durability SHALL not wait for ETL publication during normal operation. ETL lag SHALL gate retention and may trigger warning/not-ready according to policy, but SHALL not cause unprocessed WAL deletion. Quota exhaustion caused by ETL lag SHALL stop capture through WAL quota policy with exact counters rather than drop already accepted data silently.
+ETL queue, worker count, per-epoch checkpoint state, output batch size, retry/backoff, continuation state, and maximum lag thresholds SHALL be bounded. Capture/WAL durability and rollover SHALL not wait for ETL publication, decoder progress, or continuation export during normal operation. ETL lag SHALL gate epoch retention and successor processing readiness and may degrade processing/overall health, but SHALL not authorize unprocessed WAL deletion or invalidate successor capture. Quota exhaustion caused by lag SHALL stop capture through explicit quota policy with exact counters rather than drop accepted data silently.
 
-Health/status SHALL expose committed marker, checkpoint marker, lag records/bytes/age, pending/sealed/processed segment counts, last successful publication, retry/failure code, and output bytes without captured values.
+Health/status SHALL expose active and finalized epoch committed markers, per-epoch checkpoint markers, continuation dependency state (`pending`, `ready`, `consumed`, `unavailable`, or `failed`), aggregate and per-epoch lag records/bytes/age, pending/sealed/processed/retention states, last publication, retry/failure code, and output bytes without captured values.
 
 #### Scenario: ETL temporarily unavailable
 
-- **WHEN** ETL worker fails while WAL retains headroom
-- **THEN** recorder continues durable capture, reports growing lag, and keeps segments ineligible for cleanup
+- **WHEN** an epoch ETL worker fails while active successor WAL retains headroom
+- **THEN** recorder continues durable capture, reports growing per-epoch lag, and keeps that epoch ineligible for cleanup
 
 #### Scenario: Lag consumes quota
 
-- **WHEN** unprocessed WAL reaches reserved quota and no segment is eligible
-- **THEN** recorder stops/fails visibly rather than delete or skip input
+- **WHEN** unprocessed finalized epochs reach reserved quota and no cleanup is eligible
+- **THEN** recorder stops/fails visibly rather than delete, skip, or fork input
 
 ### Requirement: Incremental and one-shot ETL remain equivalent
 
-Standalone ETL SHALL remain supported for stopped recordings. For one final committed epoch snapshot, incremental execution and clean one-shot execution SHALL produce same deterministic Canonical Session v1, session/connection/operation IDs, timeline order, payload digests, completeness, replayability, provenance, and issue ordering. Incremental-only batch/checkpoint metadata SHALL not change replay semantics.
+Standalone ETL SHALL remain supported for stopped recordings and finalized epochs. For a finalized parent run, incremental execution across committed epoch snapshots with verified continuation seeds and clean one-shot execution over the same ordered parent WAL evidence SHALL produce equivalent terminal Canonical Session v1 operations: deterministic IDs, completion-owner epoch, timeline order, payload digests, completeness, replayability, cross-epoch provenance, and issue ordering. Per-epoch session bytes remain independently immutable; the parent aggregate is a deterministic ordered view and SHALL not alter them.
 
 #### Scenario: Equivalence fixture
 
-- **WHEN** deterministic WAL fixture is processed incrementally across every commit boundary and separately by one-shot ETL
-- **THEN** canonical session bytes and manifest/checksums match exactly
+- **WHEN** a deterministic WAL fixture is processed incrementally across every commit boundary and separately as one finalized epoch
+- **THEN** canonical epoch session bytes and manifest/checksums match exactly and parent association is identical
 
 #### Scenario: Crash-resume equivalence
 
-- **WHEN** ETL is killed at every publication/checkpoint boundary then resumed
-- **THEN** final output matches uninterrupted run with no duplicate/missing operation
+- **WHEN** ETL is killed at every publication/checkpoint boundary across repeated epochs and resumed
+- **THEN** final parent aggregate and every epoch output match uninterrupted execution with no duplicate/missing operation
 
 ### Requirement: Incremental ETL acceptance
 
@@ -396,16 +451,88 @@ Rootless automated tests SHALL include snapshot concurrency, serialized-state ro
 
 ### Requirement: Decoder snapshot and cursor restoration fail closed
 
-The decoder reconstruction snapshot SHALL be a versioned, non-empty bounded representation of active/finalized connection evidence, continuation fragments, loss evidence, and decoder limits. Its metadata SHALL bind decoder kind and implementation version, snapshot schema version, session identity, recording/epoch identity, marker cursor/digest, and serialized length. Restore SHALL reject malformed bytes, unsupported versions or kinds, bound/configuration mismatch, duplicate or inconsistent connection state, session/recording mismatch, cursor mismatch, and segment-lineage fork. A fresh decoder SHALL never replace failed restore.
+The decoder reconstruction snapshot SHALL bind decoder kind/version, snapshot version, parent recording ID, current epoch ID/ordinal, optional predecessor/successor IDs, session identity, marker cursor/digest, segment lineage, continuation-in/out identity/digest, bounded serialized length, active/finalized connection evidence, continuation fragments, loss evidence, and decoder limits. Restore SHALL reject malformed bytes, unsupported versions/kinds, parent/epoch/session mismatch, predecessor/successor mismatch, cursor mismatch, duplicate/inconsistent state, bound mismatch, and WAL fork/gap. A fresh decoder SHALL never replace failed restore. Repeated recovery/retry over unchanged input SHALL restore identical serialized state and operation fingerprints.
 
-An incremental retry SHALL require contiguous WAL envelope sequence after its checkpoint cursor and exact matching digest/range for every previously checkpointed segment. Delta publication SHALL retain stable operation fingerprints in checkpoint state and publish only unseen operations; rollback SHALL restore reconstruction, evidence, issue, lineage, fingerprint, and cursor state together.
+#### Scenario: WAL fork or gap
+
+- **WHEN** a resumed epoch snapshot omits a sequence or changes a checkpointed segment digest/range
+- **THEN** ETL fails closed before publication and preserves prior checkpoint/output
 
 #### Scenario: Pending continuation restart
 
 - **WHEN** checkpoint is taken with pending fragmented connection bytes and ETL restarts
 - **THEN** restore reconstructs same state and uninterrupted/restarted publication is byte-equivalent without duplicate operations
 
-#### Scenario: WAL fork or gap
+### Requirement: Finalized epoch publication is independent of successor capture
 
-- **WHEN** resumed snapshot omits a sequence or changes any checkpointed segment digest/range
-- **THEN** ETL fails closed before publication and preserves prior checkpoint/output
+A finalized epoch SHALL progress through ETL and immutable publication while its successor captures. This concurrency SHALL use verified continuation references and SHALL not make the successor active before authoritative catalog activation.
+
+#### Scenario: Concurrent incremental ETL
+
+- **WHEN** epoch N is finalized and epoch N+1 is active
+- **THEN** ETL may publish N while capture commits N+1, and both parent/epoch lineages remain independently recoverable
+
+#### Scenario: No duplicate publication after rollover
+
+- **WHEN** rollover and ETL retry observe the same finalized epoch boundary more than once
+- **THEN** one matching session/output/checkpoint is retained and every retry reports/adopts the same identity
+
+### Requirement: Cross-epoch continuation and completion ownership
+
+A successor decoder SHALL restore continuation only from the unique verified predecessor. A logical operation SHALL appear in exactly one canonical epoch session: the session of the epoch where decoding reaches terminal completion. Predecessor sessions may retain immutable continuation references and incomplete connection evidence, but SHALL not publish a provisional replayable duplicate that later completion would supersede. At final run shutdown, the last trusted epoch emits one incomplete operation for unresolved continuation.
+
+#### Scenario: HTTP request and response cross rollover
+
+- **WHEN** request bytes are committed in epoch N and response bytes complete the protocol operation in epoch N+1 through a valid continuation
+- **THEN** epoch N+1 publishes exactly one operation with both epoch/WAL provenance ranges and epoch N publishes no duplicate operation
+
+#### Scenario: Long-lived connection crosses multiple epochs
+
+- **WHEN** one TCP connection remains established across epochs 1 through 4 without close/reopen evidence
+- **THEN** continuation preserves one connection generation with bounded state and no synthetic reconnect or duplicate operation
+
+#### Scenario: Pipelined correlation crosses rollover
+
+- **WHEN** multiple outstanding operations cross a boundary
+- **THEN** correlation state restores deterministically and each terminal operation is emitted once by its completion-owner epoch
+
+#### Scenario: Continuation unsupported or exhausted
+
+- **WHEN** continuation is unsupported, corrupt, missing, or exceeds connection/request/reassembly limits
+- **THEN** affected evidence receives explicit incomplete/loss provenance and no clean successor protocol state is claimed
+
+#### Scenario: Final unresolved continuation
+
+- **WHEN** the parent run ends before a carried operation receives trusted completion evidence
+- **THEN** the final trusted epoch emits one incomplete operation and no earlier immutable session is mutated
+
+### Requirement: Continuation readiness is separate from capture readiness
+
+ETL SHALL create one bounded continuation dependency per verified predecessor/successor pair after capture records the predecessor final marker. `pending` means predecessor ETL has not yet caught up; `ready` means one checksummed continuation artifact exactly matches the predecessor final marker and lineage; `consumed` records successor restoration and checkpoint proof; `unavailable`/`failed` records explicit unsupported, invalid, over-limit, or retry-exhausted processing semantics. This state belongs to ETL lineage, not WAL/topology authority.
+
+Successor WAL MAY accumulate committed bytes while its ETL is `blocked_on_predecessor_continuation`. Successor ETL SHALL verify/consume continuation before decoding cross-epoch state, then process accumulated committed WAL deterministically from its own checkpoint. Invalid continuation SHALL preserve valid successor WAL and emit incomplete/loss provenance; it SHALL not roll back `epochs.json`, invalidate capture, or invent a clean decoder.
+
+#### Scenario: Predecessor ETL lags final marker
+
+- **WHEN** predecessor WAL is sealed at marker 1,000 while its ETL cursor is 900 and successor capture is active
+- **THEN** continuation is `pending`, capture readiness may remain true, successor WAL continues within quota, and successor processing readiness is degraded/blocked
+
+#### Scenario: Continuation ready after successor WAL accumulation
+
+- **WHEN** successor has committed WAL before predecessor ETL reaches marker 1,000 and a valid continuation becomes `ready`
+- **THEN** successor ETL consumes the continuation once and processes its already-recorded WAL from its own checkpoint without replaying or skipping committed input
+
+#### Scenario: Invalid continuation does not invalidate capture
+
+- **WHEN** continuation checksum, identity, version, marker lineage, or bounds fail after successor WAL is valid
+- **THEN** successor WAL/topology remain intact, ETL fails closed or emits explicit incomplete/loss provenance, and capture status is not changed to capture-failed solely by decoder handoff
+
+#### Scenario: Multiple epochs have independent processing lag
+
+- **WHEN** epoch 1 is complete, epoch 2 continuation is ready, epoch 3 is processing, and active epoch 4 waits for its predecessor
+- **THEN** each dependency has bounded state and deterministic watermarks, capture remains independent while safety headroom exists, and parent status reports per-epoch processing readiness without merging cursors
+
+#### Scenario: Sustained lag reaches quota safety limit
+
+- **WHEN** protected unprocessed epochs consume reserved headroom and no eligible cleanup can restore a safe successor reservation
+- **THEN** capture continues only until the explicit safety boundary, then stops/fails visibly before accepting unaccountable observations; no WAL or decoder lineage is silently dropped

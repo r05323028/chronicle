@@ -112,14 +112,44 @@ Recovery authority SHALL apply only to persisted WAL durability and SHALL be det
 
 ### Requirement: Physical total-WAL hard cap and reservation
 
-`max_wal_bytes` SHALL default to and be hard-capped at 4 GiB; configurable lower value SHALL be at least selected segment size. It SHALL be a physical hard limit over every byte under `segments/`, including headers, envelopes, and temporary publication files; metadata/lock/ETL reports outside `segments/` SHALL be excluded. Before writing a non-marker frame, writer SHALL reserve/check both current-segment and total capacity for complete frame plus fixed final commit-marker frame; if pair cannot fit current segment, writer SHALL commit current batch and rotate before data frame. Total-capacity check SHALL also include next segment header plus peak temporary publication bytes when rotation is required. Rename-only publication counts one header allocation; implementations that duplicate bytes SHALL reserve peak duplicate storage. Writer SHALL never write partial frame or exceed configured cap.
+`max_wal_bytes` SHALL remain a physical hard cap for one epoch, defaulting to and never exceeding 4 GiB; a configured lower value SHALL be at least the selected segment size. It covers every byte under that epoch's `segments/`, including headers, envelopes, and temporary publication files, while metadata/lock/ETL reports outside `segments/` remain separate. Before every non-marker frame, the writer SHALL reserve/check current-segment and epoch capacity for the complete frame plus final commit-marker frame, and rotation SHALL reserve the next segment header and peak temporary bytes. Writer SHALL never write a partial frame or exceed the epoch cap.
 
-When next complete frame cannot fit while preserving reservation, writer SHALL return typed clean-limit signal, set `shutdown_reason = wal_size_limit`, stop capture intake immediately, and write only longest queued prefix whose complete frames preserve final-marker reservation. It SHALL classify remaining accepted queue records/bytes as `discarded_from_queue_due_to_wal_limit`; classify post-stop arrivals separately; append final marker for every already written writable frame; and `fdatasync`. Successful marker sync/metadata finalization SHALL produce `completed`; marker/sync/metadata failure SHALL produce `failed` with `wal_failure`. One format-oversized record SHALL remain typed invalid-record failure rather than partial write.
+Reaching this cap SHALL trigger epoch rollover when the parent run is still active and a successor reservation/creation can succeed. It SHALL not emit a public recording-wide `wal_size_limit` stop. If successor resources cannot be reserved or created, the coordinator SHALL stop intake, preserve the old authoritative prefix, record typed quota/rollover failure and exact admitted-observation loss evidence, and fail the parent run. A legacy hidden one-shot adapter may retain old `wal_size_limit` behavior only under its compatibility contract.
+
+#### Scenario: Epoch cap reached with successor capacity
+
+- **WHEN** the next complete frame cannot fit in the active epoch while a successor can be reserved
+- **THEN** the active epoch is finalized and one successor is linked; the parent continues without discarding accepted observations as a normal WAL-limit stop
 
 #### Scenario: Limit reached with empty queue
 
-- **WHEN** reservation check reaches hard cap with no queued event remaining
-- **THEN** intake stops, any unsynced written batch is marker-committed, and successful finalization completes with `wal_size_limit`
+- **WHEN** an epoch capacity check reaches its cap with no admitted event remaining
+- **THEN** the epoch is sealed and rollover is attempted without creating an empty successor until new evidence or an operational transition requires one
+
+#### Scenario: Queue partially writable at boundary
+
+- **WHEN** only a prefix of admitted observations fits before the old epoch marker
+- **THEN** the fitting prefix is committed, every remaining ordinal is assigned to the successor after its marker or recorded once as `epoch_rollover_failure`, and the parent does not claim silent loss
+
+#### Scenario: No successor capacity
+
+- **WHEN** the successor reservation fails because quota/minimum-free headroom is unavailable
+- **THEN** intake stops, protected evidence remains, typed quota/rollover failure is persisted, and no empty-epoch loop occurs
+
+#### Scenario: Exact epoch hard-cap boundary
+
+- **WHEN** the final old-epoch marker ends exactly at its configured physical limit
+- **THEN** that epoch remains valid, measured bytes never exceed its cap, and the parent may continue in a separately reserved successor
+
+#### Scenario: Oversized single record
+
+- **WHEN** one framed record exceeds format or segment maximum independent of remaining epoch capacity
+- **THEN** the writer returns typed invalid-record failure and creates no ambiguous partial frame
+
+#### Scenario: Final commit sync failure
+
+- **WHEN** old-epoch final marker write/flush/`fdatasync` fails during rollover
+- **THEN** the old committed prefix remains authoritative, transition recovery preserves evidence, and the parent fails visibly without pretending rollover succeeded
 
 #### Scenario: Writable queued prefix
 
@@ -151,20 +181,10 @@ When next complete frame cannot fit while preserving reservation, writer SHALL r
 - **WHEN** final marker ends exactly at configured physical byte limit
 - **THEN** finalization succeeds and measured bytes under `segments/` equal but never exceed limit
 
-#### Scenario: Oversized single record
-
-- **WHEN** one framed record exceeds format or segment maximum independent of remaining total capacity
-- **THEN** writer rejects typed invalid record and creates no ambiguous partial frame
-
 #### Scenario: Concurrent duration and WAL limits
 
 - **WHEN** duration expiry and writer reservation failure are observed in same shutdown cycle
 - **THEN** `wal_size_limit` takes precedence because physical-cap enforcement caused accepted queue discard
-
-#### Scenario: Final commit sync failure
-
-- **WHEN** final marker write/flush/`fdatasync` fails during WAL-limit stop
-- **THEN** recording is `failed` with `wal_failure`, prior committed prefix remains authoritative, and hard cap remains unexceeded
 
 ### Requirement: Bounded ingest and categorized no-silent-loss counters
 
@@ -349,24 +369,29 @@ Recovery output SHALL include stable codes/counts for repaired partial tails, un
 
 ### Requirement: Size-and-age segment rotation
 
-The recorder WAL writer SHALL preserve existing size rotation and additionally rotate a non-empty active segment when configured maximum age expires. Default size SHALL remain 256 MiB with existing 16 MiB through 4 GiB range. Default age SHALL be five minutes with documented bounded configuration; age SHALL use monotonic elapsed time for trigger and persisted wall time only for observability. Rotation check SHALL run on append and periodic writer tick so low-traffic segments eventually seal. Empty segment SHALL NOT rotate only because age elapsed.
+The recorder WAL writer SHALL preserve existing size rotation and rotate a non-empty active segment when configured maximum age expires. Rotation bounds apply inside one epoch; a segment rotation SHALL never end the parent recording or allocate a new epoch. Default size SHALL remain 256 MiB with the existing 16 MiB through 4 GiB range. Default age SHALL remain the documented bounded value; age triggers SHALL use monotonic elapsed time. Rotation checks SHALL run on append and periodic writer tick so low-traffic segments eventually seal. Empty segments SHALL NOT rotate only because age elapsed.
 
-Age rotation SHALL use existing order: commit/sync all current-segment data with recovery-authoritative marker, seal segment, persist integrity/lifecycle metadata, create/sync/publish next header, then append. Rotation SHALL not alter 64-byte segment header, 48-byte envelope frame, 76-byte commit marker, one-sync authority, sequence order, or acknowledgement semantics.
+Age/size rotation SHALL use existing order: commit/sync current-segment data with recovery-authoritative marker, seal the segment, persist integrity/lifecycle metadata, create/sync/publish the next header, then append. It SHALL not alter 64-byte segment headers, 48-byte envelope frames, 76-byte commit markers, one-sync authority, sequence order, or acknowledgement semantics.
 
 #### Scenario: Size rotation remains compatible
 
-- **WHEN** next complete frame plus final-marker reservation exceeds configured segment size
-- **THEN** existing size-triggered commit/sync/rotation behavior occurs unchanged
+- **WHEN** the next complete frame plus final-marker reservation exceeds configured segment size inside an active epoch
+- **THEN** existing size-triggered commit/sync/rotation behavior occurs unchanged and the parent/epoch continue
 
 #### Scenario: Age rotation under low traffic
 
-- **WHEN** non-empty segment reaches configured age without another event
-- **THEN** periodic writer tick commits pending data, seals segment, and opens successor
+- **WHEN** a non-empty segment reaches configured age without another event
+- **THEN** a periodic writer tick commits pending data, seals that segment, and opens the next segment in the same epoch
 
 #### Scenario: Empty segment age
 
-- **WHEN** empty active segment reaches age threshold
-- **THEN** writer does not create endless empty segments
+- **WHEN** an empty active segment reaches its age threshold
+- **THEN** the writer does not create endless empty segments or epochs
+
+#### Scenario: Crash during segment rotation
+
+- **WHEN** the process fails at an age/size rotation write, sync, or publish step
+- **THEN** recovery recognizes only existing validated WAL authority and resumes or fails by existing rules without ending the parent solely for segment age
 
 #### Scenario: Crash during age rotation
 
@@ -452,9 +477,29 @@ Cleanup ordering SHALL be: persist `deleting` intent with transaction ID and exa
 
 ### Requirement: Retention policy is explicit and conservative
 
-Recorder configuration SHALL declare retention mode and bounds. The recorder SHALL support `retain` and `delete_after` policy for local WAL; implicit deletion SHALL NOT occur. `delete_after` SHALL specify minimum age and MAY specify maximum retained bytes, but both remain subordinate to checkpoint-gated eligibility. Policy changes SHALL be recorded by configuration digest and SHALL NOT retroactively authorize cleanup until next successful reconciliation.
+Recorder configuration SHALL declare retention mode and bounds for epoch-local raw WAL and parent/derived artifacts. The recorder SHALL support `retain` and `delete_after`; implicit deletion SHALL NOT occur. `delete_after` minimum age and optional maximum retained bytes remain subordinate to checkpoint-gated eligibility and parent lineage proof. Policy changes SHALL be recorded by configuration digest and SHALL not retroactively authorize cleanup before reconciliation.
 
-Canonical outputs, checkpoints, manifests, and tombstones SHALL have separate retention classes from source WAL. Deleting source WAL SHALL preserve provenance that source was intentionally expired and SHALL not claim raw evidence remains available. Failed, corrupted, unprocessed, uncheckpointed, or policy-unexpired segments SHALL not be deleted automatically.
+Canonical epoch sessions, parent lineage, checkpoints, manifests, tombstones, and immutable outputs SHALL have separate retention classes from source WAL. Deleting raw epoch WAL SHALL preserve parent/epoch provenance and state that raw evidence was intentionally expired; it SHALL not claim raw evidence remains available. Failed, corrupt, unprocessed, uncheckpointed, uncertain, active, policy-unexpired, or continuation-dependent epochs SHALL not be deleted automatically. A predecessor remains protected while its final marker exceeds its ETL cursor, continuation is pending/ready-but-unconsumed, or retryable continuation failure still needs source evidence.
+
+#### Scenario: Retain policy under sustained pressure
+
+- **WHEN** finalized epochs are processed but `retain` policy leaves no eligible raw data to delete
+- **THEN** the recorder preserves epochs and may stop/fail new admission at quota pressure; it does not silently lose lineage
+
+#### Scenario: Delete-after epoch
+
+- **WHEN** an epoch is finalized, its committed WAL and digest are verified, ETL checkpoint/output and final epoch session are durable, continuation dependency is consumed or terminally resolved with incomplete/loss proof, policy age/bytes permit deletion, and cleanup proof passes
+- **THEN** cleanup may delete eligible raw segments through the existing crash-safe transaction and retain tombstone/provenance
+
+#### Scenario: Failed epoch
+
+- **WHEN** an epoch ends failed with a valid committed prefix and unresolved uncertain tail
+- **THEN** automatic cleanup preserves its WAL and parent lineage until operator resolution or an explicit safe policy covers the evidence
+
+#### Scenario: Pending continuation protects predecessor
+
+- **WHEN** predecessor WAL is sealed but ETL has not reached its final marker or its continuation is pending/ready-but-unconsumed
+- **THEN** raw WAL, checkpoint, and continuation evidence remain retention-protected even while successor capture continues, and cleanup reports the dependency rather than deleting source evidence
 
 #### Scenario: Retain policy
 
@@ -466,74 +511,62 @@ Canonical outputs, checkpoints, manifests, and tombstones SHALL have separate re
 - **WHEN** segment is processed, unambiguous, older than configured minimum, and cleanup proof passes
 - **THEN** recorder may perform cleanup transaction and retain tombstone
 
-#### Scenario: Failed epoch
-
-- **WHEN** epoch ends failed with valid committed prefix and unresolved uncertain tail
-- **THEN** automatic cleanup preserves its WAL until operator resolves or policy explicitly covers verified data and uncertainty handling
-
 ### Requirement: Global quota and minimum-free-space protection
 
-Continuous recorder SHALL enforce configured physical quota domain per filesystem while retaining existing per-epoch 4 GiB hard maximum. The recorder supports one active Chronicle mutating owner per filesystem domain. Recorder lease ownership SHALL cover the domain, not only the recorder process; multiple recorder instances sharing the same WAL/store filesystem are unsupported. Standalone mutating commands SHALL reject execution when a live recorder owns the domain, while read-only commands may continue. Different cgroup scopes requiring independent recorder instances SHALL use isolated filesystem domains.
+Continuous recording SHALL enforce configured physical quota per filesystem while retaining the existing per-epoch hard maximum. One synchronized reservation authority SHALL account for the active epoch, sealed epochs awaiting ETL/retention, successor header/first-marker capacity, parent/epoch manifests and checkpoints, RecordingStore outputs, final-session staging, temporary files, and cleanup trash peak. Separate filesystem roots SHALL maintain independent quota/minimum-free reserves and cannot borrow one another's reserve.
 
-Within one owner, one synchronized reservation authority SHALL account for active/sealed WAL, manifests/checkpoints, RecordingStore objects, final Canonical Session staging/objects when co-located, temporary files, and cleanup trash peak. This is not a cross-process quota ledger. Each distinct filesystem root SHALL have independent configured quota and minimum-free-space reserve. Admission SHALL reserve complete next frame, final marker, required segment/epoch header, manifest/checkpoint update, concurrent ETL/session publication peak, and temp/trash bytes before write or rollover; separate roots SHALL not borrow one another's reserve.
-
-At pressure threshold recorder SHALL first run only already-eligible cleanup. It SHALL never delete unprocessed/unverified/unexpired data to make space. If reservation still fails, it SHALL stop intake, persist typed quota-pressure loss/failure evidence, finalize current authoritative prefix where possible, enter failed/not-ready, and rely on supervisor/operator recovery. It SHALL not loop-roll empty epochs or continue capture without durable capacity.
+Admission and every rollover SHALL reserve complete next frames/markers, segment/epoch headers, transition/catalog writes, concurrent ETL/session publication peaks, protected continuation/backlog bytes, and temporary cleanup bytes before mutation. Ordinary ETL lag SHALL not block rollover while the next successor and safety margin remain reservable. At pressure, the recorder SHALL first run only already-eligible cleanup. It SHALL never delete unprocessed/unverified/unexpired data to make space. If reservation still fails, it SHALL stop intake, persist typed quota-pressure/rollover-failure evidence, finalize the current authoritative prefix where possible, and fail/not-ready under controlled policy. It SHALL not loop-roll empty epochs or continue capture without durable capacity.
 
 #### Scenario: Eligible cleanup restores headroom
 
-- **WHEN** reservation fails but processed retention-eligible segments can be safely deleted
-- **THEN** cleanup completes before new admission and recorder continues within quota
+- **WHEN** a successor or ETL reservation fails but finalized processed epochs are safely retention-eligible
+- **THEN** eligible cleanup completes, quota is rebuilt, and one successor/reservation may proceed without changing parent identity
 
 #### Scenario: No eligible data
 
-- **WHEN** quota/minimum-free-space reservation fails and no segment is eligible
-- **THEN** recorder stops rather than delete protected evidence
+- **WHEN** quota/minimum-free reservation fails and no epoch/segment is eligible
+- **THEN** the recorder stops new admission rather than delete protected evidence or invent a new recording
 
 #### Scenario: Temporary peak accounting
 
-- **WHEN** cleanup, manifest, incremental output, or final session publication requires temporary bytes on WAL filesystem
-- **THEN** synchronized quota calculation includes concurrent peak bytes and never exceeds configured physical bound
+- **WHEN** rollover, manifest, incremental output, final session, or cleanup requires temporary bytes
+- **THEN** synchronized quota calculation includes the concurrent peak and never exceeds configured physical bounds
+
+#### Scenario: ETL lag consumes quota
+
+- **WHEN** finalized epochs cannot be processed while the active successor continues and protected WAL consumes headroom
+- **THEN** capture continues while successor/safety reservation remains valid, reports processing lag and protected bytes, and stops/fails before unsafe deletion or silent loss when no safe reservation remains
 
 #### Scenario: Separate store filesystem
 
-- **WHEN** canonical/store root resides on different filesystem from active WAL
-- **THEN** each filesystem enforces independent quota/minimum-free reserve and failure in store domain cannot consume WAL reserve
+- **WHEN** canonical/store root resides on a different filesystem from active WAL
+- **THEN** each filesystem enforces its own reserve and store pressure cannot consume the WAL reserve
 
 ### Requirement: Lifecycle indexes remain bounded
 
-Recorder SHALL enforce configured maximum byte and entry bounds for `epochs.json`, epoch lineage history, deletion tombstones, and retention metadata. Startup recovery, readiness checks, and status queries MUST NOT scan unbounded historical epochs. An epoch is eligible for compaction only after it is finalized, retained according to policy, cleanup is complete, and all deletion tombstones are persisted.
+Recorder SHALL enforce configured maximum byte and entry bounds for the parent epoch catalog, epoch lineage history, deletion tombstones, and retention metadata. Startup recovery, readiness, list, inspect, and status MUST NOT scan unbounded historical epochs. An epoch is eligible for compaction only after finalization, required ETL/checkpoint/session proof, continuation dependency resolution, policy reconciliation, cleanup completion, and durable tombstones.
 
-Eligible history SHALL compact into a deterministic bounded lineage anchor preserving first retained epoch identity, last compacted epoch identity, predecessor relationship, digest-chain root/tip, cleanup summary, and range/count data sufficient to detect missing committed evidence, digest mismatch, lineage fork, incomplete cleanup, or conflicting/incomplete compaction. Each compaction candidate SHALL carry monotonic generation, unique transaction ID, source-index revision/digest, candidate digest, and anchor data; candidate digest SHALL cover anchor, active epochs, tombstone summary, and source metadata. The representation MAY retain active epochs separately:
-
-```text
-compacted-lineage-anchor:
-  first_retained_epoch
-  last_compacted_epoch
-  predecessor_epoch
-  digest_chain_root
-  digest_chain_tip
-  cleanup_summary
-active_epochs:
-  epoch-100001
-  epoch-100002
-```
-
-Compaction SHALL use private temp-write, file sync, atomic rename, and directory sync. Crash recovery SHALL validate old and candidate indexes independently, install a candidate only when its source revision/digest matches the old authoritative index and its candidate digest/anchor recompute exactly, and otherwise preserve old index with stable contradiction evidence. If protected history cannot fit after legal compaction, recorder SHALL stop new admission/epoch creation with bounded metadata-limit failure evidence; it SHALL not delete protected lineage or exceed configured bounds.
+Eligible history SHALL compact into a deterministic bounded lineage anchor preserving parent ID, first retained epoch identity/ordinal, last compacted epoch identity/ordinal, predecessor relationship, digest-chain root/tip, cleanup summary, aggregate counters, and range/count data sufficient to detect missing committed evidence, digest mismatch, lineage fork, incomplete cleanup, or conflicting compaction. Candidate installation SHALL use private temp-write, file sync, atomic rename, directory sync, source revision/digest, and candidate digest validation. If protected history cannot fit after legal compaction, stop new admission/epoch creation with bounded metadata-limit failure; never delete protected lineage or exceed limits.
 
 #### Scenario: Multi-year history compaction
 
-- **WHEN** synthetic multi-year finalized epoch history exceeds configured byte or entry limit
-- **THEN** compaction reduces index size within hard bounds while preserving required contradiction-detection lineage
+- **WHEN** finalized epoch history exceeds configured byte or entry limits
+- **THEN** compaction reduces the index within bounds while preserving parent/epoch range, predecessor/digest proof, cleanup summary, and active tail
 
 #### Scenario: Crash during compaction
 
-- **WHEN** process crashes before or after compaction rename/sync
-- **THEN** recovery selects old or complete new index deterministically and never loses required tombstone/lineage proof
+- **WHEN** the process crashes before or after compaction rename/sync
+- **THEN** recovery selects the old or complete digest-matching index deterministically and never loses tombstone/lineage proof
 
 #### Scenario: Lineage contradiction after compaction
 
-- **WHEN** compacted summary conflicts with committed evidence, digest, predecessor, or cleanup proof
-- **THEN** recovery reports stable contradiction and fails closed without scanning unrelated historical epochs
+- **WHEN** a compacted summary conflicts with committed evidence, parent/epoch digest, predecessor, or cleanup proof
+- **THEN** recovery reports stable contradiction and fails closed without scanning unrelated history
+
+#### Scenario: Protected history exhausts bound
+
+- **WHEN** failed, unprocessed, uncertain, or retained history cannot fit after legal compaction
+- **THEN** recorder stops new admission/epoch creation with stable metadata-limit failure and does not delete protected lineage
 
 #### Scenario: Stale compaction candidate
 
@@ -542,35 +575,54 @@ Compaction SHALL use private temp-write, file sync, atomic rename, and directory
 
 ### Requirement: Continuous recovery reconciles manifest, files, and checkpoints
 
-Startup recovery SHALL enumerate recognized files deterministically, validate all non-deleted segment headers/envelopes/markers and sealed digests, reconcile manifest revision and deletion transactions, compare ETL checkpoints/publications, and derive exact active/sealed/processed/eligible states. Read-only validation of live active segment SHALL stop at stable recovery-authoritative marker snapshot and SHALL treat concurrently growing/partial suffix as mutable uncertainty, not corruption; only exclusive startup recovery MAY repair/truncate existing allowed final tail.
+Startup recovery SHALL enumerate recognized files deterministically for every epoch, validate all non-deleted segment headers/envelopes/markers and sealed digests, reconcile parent/epoch manifest revisions and deletion transactions, compare per-epoch ETL checkpoints/publications, and derive exact active/sealed/processed/eligible states. Read-only validation of a live active segment SHALL stop at a stable recovery-authoritative marker snapshot and treat a concurrent partial suffix as mutable uncertainty, not corruption; only exclusive recovery MAY repair/truncate the allowed final tail.
 
-Manifest rebuild SHALL preserve existing segment ordinals, sequence ranges, commit authority, and retention tombstones. Corruption before or at committed boundary, unexplained missing segment, digest mismatch, impossible overlapping range, or checkpoint beyond authority SHALL fail closed and preserve available bytes.
+Manifest rebuild SHALL preserve parent/epoch identity, epoch-local segment ordinals, sequence ranges, commit authority, retention tombstones, and predecessor lineage. Corruption before or at a committed boundary, unexplained missing segment/epoch, digest mismatch, impossible overlap, parent/epoch fork, or checkpoint beyond authority SHALL fail closed and preserve available bytes.
 
 #### Scenario: Live ETL sees partial suffix
 
-- **WHEN** reader snapshots active segment while writer appends incomplete later frame
-- **THEN** reader processes only prior validated marker boundary and neither repairs nor reports committed corruption
+- **WHEN** ETL snapshots an active successor while the writer appends an incomplete later frame
+- **THEN** ETL processes only the prior validated marker boundary and neither repairs nor reports committed corruption
 
 #### Scenario: Startup with interrupted cleanup
 
-- **WHEN** manifest and filesystem show valid deleting transaction
+- **WHEN** parent/epoch manifest and filesystem show a valid deleting transaction
 - **THEN** exclusive recovery deterministically completes or rolls it back before readiness
 
 #### Scenario: Repeated reconciliation
 
-- **WHEN** recovery runs twice over unchanged state after one allowed repair
-- **THEN** second run produces identical manifest/checkpoint states with no additional mutation
+- **WHEN** recovery runs twice over unchanged parent/epoch state after one allowed repair
+- **THEN** the second run produces identical manifest/checkpoint/lineage state with no additional mutation
 
 ### Requirement: WAL lifecycle acceptance
 
-Automated tests SHALL cover size/age rotation, manifest atomicity/rebuild/contradiction, every segment transition, quota reservation, retention eligibility, cleanup crash points, corruption, live snapshot behavior, and deterministic recovery. Privileged acceptance SHALL retain machine-readable manifest, segment/checkpoint digests, quota/cleanup report, acceptance fingerprint, compatible environment, and source provenance for real continuous capture across multiple rotations and restart. Exact commit/tree identity is release-only.
+Automated tests SHALL cover segment size/age rotation, epoch byte/age rollover, manifest atomicity/rebuild/contradiction, every transition phase, quota reservation and pressure, retention eligibility, cleanup crash points, corruption, live snapshots, parent/epoch identity, repeated rollover, and deterministic recovery. Privileged acceptance SHALL retain machine-readable parent/epoch manifests, segment/checkpoint digests, quota/cleanup report, acceptance fingerprint, compatible environment, and source provenance for real continuous capture across multiple epochs and restarts. Exact commit/tree identity is release-only.
 
 #### Scenario: Rotation and recovery proof
 
-- **WHEN** acceptance forces size and age rotation then kills recorder at selected rotation step
-- **THEN** restart recovers final authoritative marker, reconciles manifest, and continues without missing or duplicated committed sequence
+- **WHEN** acceptance forces segment and epoch size/age rotation then kills the recorder at selected transition steps
+- **THEN** restart recovers the final authoritative marker, reconciles parent/epoch lineage, and continues without missing or duplicated committed sequence
+
+#### Scenario: Retention/pressure proof
+
+- **WHEN** acceptance applies retain/delete-after and sustained quota pressure while ETL is delayed
+- **THEN** only proof-eligible data is deleted and recorder stops visibly when protected headroom is exhausted
 
 #### Scenario: Corruption detection proof
 
-- **WHEN** acceptance corrupts sealed segment before cleanup eligibility
-- **THEN** recorder preserves evidence in place, blocks cleanup/readiness for affected lineage, and reports stable code
+- **WHEN** acceptance corrupts a sealed segment or parent/epoch lineage before cleanup eligibility
+- **THEN** evidence remains preserved, affected readiness/cleanup is blocked, and stable diagnostics are retained
+
+### Requirement: Epoch-local WAL boundaries
+
+The WAL API SHALL make its total-byte, segment-sequence, marker, recovery, and retention boundaries explicit as epoch-local. Parent recording lifetime and aggregate identity SHALL be supplied by application/ETL layers and SHALL not alter WAL v1 bytes or commit authority. An epoch-local WAL boundary SHALL not be treated as a protocol reconstruction boundary; any cross-epoch decoder state must arrive through the separate bounded, versioned, checksummed continuation contract.
+
+#### Scenario: Same parent across WAL directories
+
+- **WHEN** one parent recording owns two epoch WAL directories with independent sequence ranges
+- **THEN** each directory validates its own epoch WAL identity/markers and the parent lineage links them without merging sequences
+
+#### Scenario: Segment limit is not run stop
+
+- **WHEN** a segment or epoch reaches its configured bound and successor resources are valid
+- **THEN** WAL returns a rollover-safe boundary to the application rather than a public recording termination

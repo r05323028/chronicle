@@ -205,6 +205,8 @@ pub struct SessionSummary {
     /// Recording this session belongs to, from `source_provenance.recording_id`
     /// (legacy sessions without provenance link by id equality).
     pub recording_id: Option<chronicle_common::RecordingId>,
+    pub epoch_id: Option<chronicle_common::EpochId>,
+    pub epoch_ordinal: Option<u64>,
     pub started_at: Timestamp,
     pub ended_at: Option<Timestamp>,
     pub operation_count: usize,
@@ -526,6 +528,8 @@ impl FilesystemSessionStore {
             summaries.push(SessionSummary {
                 session_id: session.id,
                 recording_id: session.source_provenance.recording_id,
+                epoch_id: session.source_provenance.epoch_id,
+                epoch_ordinal: session.source_provenance.epoch_ordinal,
                 started_at: session.started_at,
                 ended_at: session.ended_at,
                 operation_count: session.timeline.len(),
@@ -977,6 +981,11 @@ mod tests {
         let mut original = session(Vec::new());
         let provenance = SourceProvenance {
             recording_id: Some(RecordingId::new()),
+            epoch_id: Some(chronicle_common::EpochId::new()),
+            epoch_ordinal: Some(2),
+            wal_sequence_range: Some((1, 7)),
+            continuation_in: Some("continuation-in".into()),
+            continuation_out: Some("continuation-out".into()),
             status: SourceStatus::Completed,
             reason: Some("duration_limit".into()),
             commit_marker: Some(CommitMarkerProvenance {

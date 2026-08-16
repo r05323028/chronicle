@@ -30,9 +30,9 @@ Users work from a shell and repository. The current public CLI is intent-oriente
 
 - Current end-to-end functional protocol: bounded plaintext HTTP/1.1 only.
 - Live capture: Linux 6.1+, cgroup v2, BTF, little-endian x86_64/aarch64, and eBPF capabilities; no application instrumentation.
-- One-shot recording is bounded to 600 seconds by default, 3600 seconds maximum, with a 4 GiB physical WAL ceiling.
+- Recording lifetime is optional at the public surface; omitted `--duration` has no whole-run deadline. Epoch and segment WAL limits remain bounded, and a parent recording may own multiple immutable epoch sessions.
 - WAL v1 is segmented, append-only, group-committed, checksum-validated, and recovery-authoritative through in-WAL commit markers.
-- ETL reconstructs bounded sessions and atomically publishes one canonical session to local filesystem storage.
+- ETL reconstructs bounded sessions and atomically publishes one canonical session per finalized epoch to local filesystem storage; a WAL epoch boundary is not a protocol reconstruction boundary.
 - Replay is dry-run by default, denies effects until authorized, requires loopback target mapping, and never falls back to the recorded production destination.
 - Public data is local filesystem storage today. PostgreSQL, S3-compatible persistence, TLS decryption, HTTP/2+, additional protocols, encryption at rest, comprehensive redaction, Docker packaging, and Kubernetes packaging are not implemented.
 - Canonical English is the source for localized site content. Traditional Chinese (zh-TW) and Japanese (ja) are supported locales; technical terms must remain consistent through a glossary.

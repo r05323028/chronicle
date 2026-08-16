@@ -35,13 +35,13 @@ chronicle record --cgroup /sys/fs/cgroup/my-service
 chronicle record --retry checkout
 ```
 
-Public flags include `--name`, `--duration`, `--retry`, `--pid`, and `--cgroup`. Command arguments follow `--`.
+Public flags include `--name`, optional whole-recording `--duration`, `--retry`, `--pid`, and `--cgroup`. `list` reports one row per stable parent with bounded epoch counts. Command arguments follow `--`.
 
 ### replay
 
 ```bash
 chronicle replay checkout -- ./my-app
-chronicle replay checkout --target http://127.0.0.1:8080 \
+chronicle replay checkout --epoch 0 --target http://127.0.0.1:8080 \
   --allow-host 127.0.0.1 --allow-read --execute
 ```
 

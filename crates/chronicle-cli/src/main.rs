@@ -5,17 +5,19 @@ use chronicle_application::{
     AppConfig, ApplicationError, ChildStdio, CleanupOutcome, CommandReplayOptions, DoctorProbe,
     DoctorReport, DoctorStatus, InspectSessionResult, ListedRecording, REPLAY_REPORT_VERSION,
     RecorderConfigV1, RecorderLease, RecorderStatusV1, RecordingCounters, RecordingEtlCheckpoint,
-    RecordingStatus, ShutdownReason, data_dir_doctor_probe, inspect_session, list_recordings,
-    load_recorder_metadata, process_and_publish_recording_wal, record_fixture_file,
-    render_inspect_human, render_inspect_json, render_json, render_replay_human, replay_command,
-    replay_config_doctor_probe, replay_session_with_plan, resolve_data_dir, resolve_recording,
-    resolve_session, retry_recording,
+    RecordingStatus, ShutdownReason, build_parent_replay_plan, data_dir_doctor_probe,
+    inspect_session, list_parent_recording_views, list_recordings, load_recorder_metadata,
+    process_and_publish_recording_wal, record_fixture_file, render_inspect_human,
+    render_inspect_json, render_json, render_replay_human, replay_command,
+    replay_config_doctor_probe, replay_parent_session_with_plan, replay_session_with_plan,
+    resolve_data_dir, resolve_recording, resolve_session, retry_recording,
 };
 #[cfg(target_os = "linux")]
 use chronicle_application::{
-    CgroupSelector, CommandRecordOptions, ProductionRecordingBounds, ProductionSignalStop,
-    load_recording_metadata, mark_recording_forced_termination, record_command,
-    record_continuous_ebpf, record_live_ebpf, recording_physical_wal_bytes,
+    CaptureMode, CgroupSelector, CommandRecordOptions, ProductionRecordingBounds,
+    ProductionSignalStop, RecordingLifetime, RunStopPolicy, load_recording_metadata,
+    mark_recording_forced_termination, record_command, record_continuous_ebpf, record_live_ebpf,
+    recording_physical_wal_bytes,
 };
 #[cfg(any(test, target_os = "linux"))]
 use chronicle_application::{ChildExitResult, CommandRecordResult};
@@ -26,6 +28,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -127,9 +130,10 @@ struct RecordArgs {
     /// Optional human-readable recording name (exact UTF-8, 1-128 bytes).
     #[arg(long)]
     name: Option<String>,
-    /// Recording duration, e.g. `5m`, `2h`, or plain seconds. Default 600s, max 3600s.
+    /// Optional whole-recording deadline, e.g. `10m`, `24h`, or plain seconds.
+    /// Omitted means run until source completion, explicit stop, or fatal failure.
     #[arg(long, value_parser = parse_duration)]
-    duration: Option<u64>,
+    duration: Option<Duration>,
     /// Retry recovery/finalization/publication for a recoverable recording.
     #[arg(long)]
     retry: Option<String>,
@@ -162,6 +166,9 @@ struct RecordArgs {
 struct ReplayArgs {
     /// Recording to replay: `latest`, `rec_<uuid>`, bare UUID, or exact name.
     recording: String,
+    /// Explicit epoch ordinal for multi-epoch parent replay.
+    #[arg(long)]
+    epoch: Option<u64>,
     /// Command to spawn and replay against, after `--` (command mode).
     #[arg(
         last = true,
@@ -1176,7 +1183,7 @@ fn public_record(
 fn record_command_mode(
     command: Vec<String>,
     name: Option<String>,
-    duration: Option<u64>,
+    duration: Option<Duration>,
     cli_data_dir: Option<&Path>,
     config: &AppConfig,
     format: Format,
@@ -1188,7 +1195,12 @@ fn record_command_mode(
     let result = record_command(CommandRecordOptions {
         command,
         name,
-        duration_seconds: duration.unwrap_or(600),
+        duration_seconds: duration.map_or(0, |value| value.as_secs()),
+        lifetime: RecordingLifetime {
+            deadline: duration,
+            stop_policy: RunStopPolicy::AnyTerminalCondition,
+        },
+        capture_mode: CaptureMode::Command,
         data_dir,
         domain_lock_root: config.domain_lock_root.clone(),
         child_stdout: if matches!(format, Format::Json) {
@@ -1224,7 +1236,7 @@ fn record_selector_mode(
     pid: Option<u32>,
     cgroup: Option<std::path::PathBuf>,
     allow_shared_cgroup: bool,
-    intent: (Option<String>, Option<u64>),
+    intent: (Option<String>, Option<Duration>),
     cli_data_dir: Option<&Path>,
     config: &AppConfig,
     format: Format,
@@ -1240,6 +1252,10 @@ fn record_selector_mode(
             ));
         }
     };
+    let capture_mode = match &selector {
+        CgroupSelector::Pid(_) => CaptureMode::Pid,
+        CgroupSelector::Explicit(_) => CaptureMode::Cgroup,
+    };
     let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
     let stop = ProductionSignalStop::default();
     spawn_command_signal_watcher(stop.clone());
@@ -1249,7 +1265,12 @@ fn record_selector_mode(
         CommandRecordOptions {
             command: vec!["selector".into()],
             name,
-            duration_seconds: duration.unwrap_or(600),
+            duration_seconds: duration.map_or(0, |value| value.as_secs()),
+            lifetime: RecordingLifetime {
+                deadline: duration,
+                stop_policy: RunStopPolicy::AnyTerminalCondition,
+            },
+            capture_mode,
             data_dir,
             domain_lock_root: config.domain_lock_root.clone(),
             child_stdout: ChildStdio::Null,
@@ -1273,7 +1294,7 @@ fn record_selector_mode(
     _pid: Option<u32>,
     _cgroup: Option<std::path::PathBuf>,
     _allow_shared_cgroup: bool,
-    _intent: (Option<String>, Option<u64>),
+    _intent: (Option<String>, Option<Duration>),
     _cli_data_dir: Option<&Path>,
     _config: &AppConfig,
     _format: Format,
@@ -1287,7 +1308,7 @@ fn record_selector_mode(
 fn record_command_mode(
     _command: Vec<String>,
     _name: Option<String>,
-    _duration: Option<u64>,
+    _duration: Option<Duration>,
     _cli_data_dir: Option<&Path>,
     _config: &AppConfig,
     _format: Format,
@@ -1433,6 +1454,7 @@ const fn shutdown_reason_json(reason: ShutdownReason) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_replay(
     args: ReplayArgs,
     cli_data_dir: Option<&Path>,
@@ -1444,10 +1466,36 @@ async fn run_replay(
     }
     let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
     let recording_id = resolve_recording(&data_dir, &args.recording)?;
-    let session_id = resolve_session(&data_dir, recording_id)?
-        .ok_or_else(|| ApplicationError::RecordingNotFound(args.recording.clone()))?
-        .to_string();
+    let parent_plan = build_parent_replay_plan(&data_dir, recording_id)?;
+    let selected_session_id = match args.epoch {
+        Some(ordinal) => Some(
+            parent_plan
+                .epochs
+                .iter()
+                .find(|epoch| epoch.ordinal == ordinal && epoch.selected)
+                .and_then(|epoch| epoch.session_id)
+                .ok_or_else(|| {
+                    ApplicationError::InvalidConfig(
+                        "requested epoch is not a contiguous published replay epoch".into(),
+                    )
+                })?,
+        ),
+        None => match parent_plan.selected_session_ids.as_slice() {
+            [session_id] => Some(*session_id),
+            [] => {
+                return Err(ApplicationError::InvalidConfig(
+                    "recording has no published replay epoch".into(),
+                ));
+            }
+            _ => None,
+        },
+    };
     if !args.command.is_empty() {
+        let session_id = selected_session_id.ok_or_else(|| {
+            ApplicationError::InvalidConfig(
+                "command-mode parent replay requires explicit --epoch".into(),
+            )
+        })?;
         let child_stdio = match format {
             Format::Human => ChildStdio::Inherit,
             Format::Json => ChildStdio::Null,
@@ -1456,7 +1504,7 @@ async fn run_replay(
             CommandReplayOptions {
                 command: args.command,
                 data_dir,
-                session_id,
+                session_id: session_id.to_string(),
                 allow_writes: args.allow_write,
                 child_stdout: child_stdio,
                 child_stderr: child_stdio,
@@ -1501,14 +1549,29 @@ async fn run_replay(
         timing: args.timing.unwrap_or(Timing::Asap).into(),
     };
     let mut plan = None;
-    let result = replay_session_with_plan(
-        &data_dir,
-        &session_id,
-        &config.replay,
-        &request,
-        |next_plan| plan = Some(next_plan.clone()),
-    )
-    .await?;
+    let result = match selected_session_id {
+        Some(session_id) => {
+            replay_session_with_plan(
+                &data_dir,
+                &session_id.to_string(),
+                &config.replay,
+                &request,
+                |next_plan| plan = Some(next_plan.clone()),
+            )
+            .await?
+        }
+        None => {
+            replay_parent_session_with_plan(
+                &data_dir,
+                recording_id,
+                &parent_plan.selected_session_ids,
+                &config.replay,
+                &request,
+                |next_plan| plan = Some(next_plan.clone()),
+            )
+            .await?
+        }
+    };
     let plan = plan.expect("replay plan callback must run");
     let output = match format {
         Format::Human => render_public_replay_human(&plan, &result, None),
@@ -1576,7 +1639,11 @@ struct ListRecordingJson {
     duration: Option<u64>,
     sessions: usize,
     operations: usize,
-    status: chronicle_application::RecordingCatalogStatus,
+    epoch_count: usize,
+    active_epoch: Option<u64>,
+    published_epoch_count: usize,
+    status: chronicle_application::RunLifecycleState,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1595,12 +1662,19 @@ struct InspectRecordingJson<'a> {
     sessions: usize,
     operations: usize,
     status: chronicle_application::RecordingCatalogStatus,
+    epoch_count: usize,
+    active_epoch: Option<u64>,
+    published_epoch_count: usize,
+    warnings: &'a [String],
+    epochs: Vec<chronicle_application::ParentReplayEpochPlan>,
     #[serde(flatten)]
     result: &'a InspectSessionResult,
 }
 
 fn render_recording_inspect_human(
     recording: &ListedRecording,
+    parent: &chronicle_application::ParentRecordingViewV2,
+    epochs: &[chronicle_application::ParentReplayEpochPlan],
     inspected: &InspectSessionResult,
 ) -> String {
     let name = recording
@@ -1610,8 +1684,24 @@ fn render_recording_inspect_human(
     let duration = recording
         .duration_ms
         .map_or_else(|| "unknown".to_owned(), format_duration_millis);
+    let epoch_lines = epochs
+        .iter()
+        .map(|epoch| {
+            format!(
+                "epoch: ordinal={} id={} session={} selected={} reason={}",
+                epoch.ordinal,
+                epoch.epoch_id.to_cli_string(),
+                epoch
+                    .session_id
+                    .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                epoch.selected,
+                epoch.reason.as_deref().unwrap_or("none"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "recording_id: {}\nname: {}\ncreated_at: {}\nduration: {}\nsessions: {}\noperations: {}\nstatus: {}\n{}",
+        "recording_id: {}\nname: {}\ncreated_at: {}\nduration: {}\nsessions: {}\noperations: {}\nstatus: {}\nepoch_count: {}\nactive_epoch: {:?}\npublished_epoch_count: {}\nparent_state: {}\nwarnings: {}\nepochs:\n{}\n{}",
         recording.recording_id.to_cli_string(),
         name,
         format_created_at(&recording.created_at),
@@ -1619,6 +1709,12 @@ fn render_recording_inspect_human(
         recording.sessions,
         recording.operations,
         recording_status_human(recording.status),
+        parent.epoch_count,
+        parent.active_epoch,
+        parent.published_epoch_count,
+        parent_status_human(parent.state),
+        parent.warnings.len(),
+        epoch_lines,
         render_inspect_human(inspected),
     )
 }
@@ -1630,6 +1726,18 @@ fn recording_status_human(status: chronicle_application::RecordingCatalogStatus)
         chronicle_application::RecordingCatalogStatus::Published => "published",
         chronicle_application::RecordingCatalogStatus::Failed => "failed",
         chronicle_application::RecordingCatalogStatus::Inconsistent => "inconsistent",
+    }
+}
+
+fn parent_status_human(status: chronicle_application::RunLifecycleState) -> &'static str {
+    match status {
+        chronicle_application::RunLifecycleState::Starting => "starting",
+        chronicle_application::RunLifecycleState::Running => "running",
+        chronicle_application::RunLifecycleState::Draining => "draining",
+        chronicle_application::RunLifecycleState::Completed => "completed",
+        chronicle_application::RunLifecycleState::Stopped => "stopped",
+        chronicle_application::RunLifecycleState::Failed => "failed",
+        chronicle_application::RunLifecycleState::Inconsistent => "inconsistent",
     }
 }
 
@@ -1654,13 +1762,13 @@ fn run_list(
     format: Format,
 ) -> Result<(String, i32), ApplicationError> {
     let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
-    let rows = list_recordings(&data_dir)?;
+    let rows = list_parent_recording_views(&data_dir)?;
     let output = match format {
         Format::Human => {
             if rows.is_empty() {
                 "No recordings yet.\nRun 'chronicle record -- COMMAND...' to record your first application.".to_owned()
             } else {
-                let header = "ID  NAME  CREATED  DURATION  SESSIONS  OPERATIONS  STATUS";
+                let header = "ID  NAME  CREATED  DURATION  SESSIONS  OPERATIONS  EPOCHS  ACTIVE  PUBLISHED  STATUS";
                 let mut lines = vec![header.to_owned()];
                 for row in &rows {
                     let name = row
@@ -1670,15 +1778,21 @@ fn run_list(
                     let duration = row
                         .duration_ms
                         .map_or_else(|| "—".to_owned(), format_duration_millis);
+                    let active = row
+                        .active_epoch
+                        .map_or_else(|| "—".to_owned(), |epoch| epoch.to_string());
                     lines.push(format!(
-                        "{}  {}  {}  {}  {}  {}  {}",
-                        row.recording_id.to_cli_string(),
+                        "{}  {}  {}  {}  {}  {}  {}  {}  {}  {}",
+                        row.parent_id.to_cli_string(),
                         name,
-                        format_created_at(&row.created_at),
+                        row.created_at_unix_millis,
                         duration,
                         row.sessions,
                         row.operations,
-                        recording_status_human(row.status),
+                        row.epoch_count,
+                        active,
+                        row.published_epoch_count,
+                        parent_status_human(row.state),
                     ));
                 }
                 lines.join("\n")
@@ -1689,13 +1803,17 @@ fn run_list(
             recordings: rows
                 .into_iter()
                 .map(|row| ListRecordingJson {
-                    recording_id: row.recording_id.to_cli_string(),
+                    recording_id: row.parent_id.to_cli_string(),
                     name: row.name,
-                    created_at: format_created_at(&row.created_at),
+                    created_at: row.created_at_unix_millis.to_string(),
                     duration: row.duration_ms,
                     sessions: row.sessions,
                     operations: row.operations,
-                    status: row.status,
+                    epoch_count: row.epoch_count,
+                    active_epoch: row.active_epoch,
+                    published_epoch_count: row.published_epoch_count,
+                    status: row.state,
+                    warnings: row.warnings,
                 })
                 .collect(),
         })?,
@@ -1724,11 +1842,18 @@ fn run_inspect(
         .into_iter()
         .find(|row| row.recording_id == recording_id)
         .ok_or_else(|| ApplicationError::RecordingNotFound(args.recording.clone()))?;
+    let parent = list_parent_recording_views(&data_dir)?
+        .into_iter()
+        .find(|view| view.parent_id == recording_id)
+        .ok_or_else(|| ApplicationError::RecordingNotFound(args.recording.clone()))?;
+    let parent_plan = build_parent_replay_plan(&data_dir, recording_id)?;
     let session_id = resolve_session(&data_dir, recording_id)?
         .ok_or_else(|| ApplicationError::RecordingNotFound(args.recording.clone()))?;
     let result = inspect_session(&data_dir, session_id)?;
     let output = match format {
-        Format::Human => render_recording_inspect_human(&recording, &result),
+        Format::Human => {
+            render_recording_inspect_human(&recording, &parent, &parent_plan.epochs, &result)
+        }
         Format::Json => render_json(&InspectRecordingJson {
             version: 1,
             recording_id: recording.recording_id.to_cli_string(),
@@ -1738,6 +1863,11 @@ fn run_inspect(
             sessions: recording.sessions,
             operations: recording.operations,
             status: recording.status,
+            epoch_count: parent.epoch_count,
+            active_epoch: parent.active_epoch,
+            published_epoch_count: parent.published_epoch_count,
+            warnings: &parent.warnings,
+            epochs: parent_plan.epochs,
             result: &result,
         })?,
     };
@@ -1812,31 +1942,10 @@ fn parse_session_id(value: &str) -> Result<chronicle_application::SessionId, App
         .map_err(|_| ApplicationError::InvalidConfig("session ID must be a UUID".into()))
 }
 
-/// Parse `--duration`: plain seconds, `5m`, or `2h`; bounds 1..=3600 seconds
-/// (default 600 is applied by the application). Values outside the bound are
-/// Clap usage errors (exit 2).
-fn parse_duration(value: &str) -> Result<u64, String> {
-    let seconds = if let Some(minutes) = value.strip_suffix('m') {
-        minutes
-            .parse::<u64>()
-            .map_err(|_| format!("invalid duration '{value}'"))?
-            .saturating_mul(60)
-    } else if let Some(hours) = value.strip_suffix('h') {
-        hours
-            .parse::<u64>()
-            .map_err(|_| format!("invalid duration '{value}'"))?
-            .saturating_mul(3600)
-    } else {
-        value
-            .parse::<u64>()
-            .map_err(|_| format!("invalid duration '{value}'"))?
-    };
-    if seconds == 0 || seconds > 3600 {
-        return Err(format!(
-            "duration must be between 1s and 3600s (1h), got '{value}'"
-        ));
-    }
-    Ok(seconds)
+/// Parse checked optional whole-recording duration. Public parsing imposes no
+/// arbitrary recording-wide maximum; epoch/WAL bounds remain separate.
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    chronicle_application::parse_recording_duration(value).map_err(|error| error.to_string())
 }
 
 fn replay_exit_code(result: &chronicle_application::ReplaySessionResult) -> i32 {
@@ -2226,14 +2335,17 @@ mod new_surface_tests {
     use super::*;
 
     #[test]
-    fn duration_parser_accepts_seconds_minutes_hours_and_bounds() {
-        assert_eq!(parse_duration("30").unwrap(), 30);
-        assert_eq!(parse_duration("5m").unwrap(), 300);
-        assert_eq!(parse_duration("1h").unwrap(), 3600);
-        // Over-max exits 2 via Clap usage error.
-        assert!(parse_duration("2h").is_err());
-        assert!(parse_duration("3601").is_err());
+    fn duration_parser_accepts_optional_uncapped_deadlines() {
+        assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_mins(5));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_hours(1));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_hours(24));
+        assert_eq!(
+            parse_duration("1500ms").unwrap(),
+            Duration::from_millis(1500)
+        );
         assert!(parse_duration("0").is_err());
+        assert!(parse_duration("1w").is_err());
         assert!(parse_duration("bogus").is_err());
     }
 

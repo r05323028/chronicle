@@ -2,6 +2,7 @@
 #![allow(clippy::format_collect, clippy::bool_assert_comparison)]
 
 use crate::{NormalizedScopeConfig, RecorderHealth, RecorderLifecycleState, RecorderReadiness};
+use chronicle_common::{EpochId, RecordingId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -18,6 +19,20 @@ const MAX_QUOTA_DOMAINS: usize = 16;
 pub struct RecorderMetadataV1 {
     pub version: u16,
     pub recorder_id: uuid::Uuid,
+    #[serde(default)]
+    pub parent_id: Option<RecordingId>,
+    #[serde(default)]
+    pub current_epoch_id: Option<EpochId>,
+    #[serde(default)]
+    pub finalized_epoch_count: u64,
+    #[serde(default)]
+    pub continuation_in: Option<String>,
+    #[serde(default)]
+    pub continuation_out: Option<String>,
+    #[serde(default)]
+    pub retention_state: Option<String>,
+    #[serde(default)]
+    pub last_rollover: Option<String>,
     pub attempt_id: uuid::Uuid,
     pub config_digest: String,
     pub scope: NormalizedScopeConfig,
@@ -49,6 +64,29 @@ impl RecorderMetadataV1 {
         validate_digest(&self.config_digest)?;
         if self.boot_clock_identity.is_empty() || self.boot_clock_identity.len() > 128 {
             return Err(RecorderMetadataError::InvalidField("boot_clock_identity"));
+        }
+        if self.parent_id.is_some_and(|id| id.as_uuid().is_nil())
+            || self
+                .current_epoch_id
+                .is_some_and(|id| id.as_uuid().is_nil())
+            || self
+                .continuation_in
+                .as_deref()
+                .is_some_and(|value| value.len() > 128)
+            || self
+                .continuation_out
+                .as_deref()
+                .is_some_and(|value| value.len() > 128)
+            || self
+                .retention_state
+                .as_deref()
+                .is_some_and(|value| value.len() > 64)
+            || self
+                .last_rollover
+                .as_deref()
+                .is_some_and(|value| value.len() > 128)
+        {
+            return Err(RecorderMetadataError::InvalidField("lineage diagnostics"));
         }
         if self.quota.len() > MAX_QUOTA_DOMAINS {
             return Err(RecorderMetadataError::InvalidField("quota"));
@@ -346,6 +384,13 @@ mod tests {
         RecorderMetadataV1 {
             version: 1,
             recorder_id: uuid::Uuid::new_v4(),
+            parent_id: None,
+            current_epoch_id: None,
+            finalized_epoch_count: 0,
+            continuation_in: None,
+            continuation_out: None,
+            retention_state: None,
+            last_rollover: None,
             attempt_id: uuid::Uuid::new_v4(),
             config_digest: "a".repeat(64),
             scope: NormalizedScopeConfig {

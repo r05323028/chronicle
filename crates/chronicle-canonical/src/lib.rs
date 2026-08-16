@@ -63,6 +63,16 @@ pub struct CommitMarkerProvenance {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceProvenance {
     pub recording_id: Option<RecordingId>,
+    #[serde(default)]
+    pub epoch_id: Option<chronicle_common::EpochId>,
+    #[serde(default)]
+    pub epoch_ordinal: Option<u64>,
+    #[serde(default)]
+    pub wal_sequence_range: Option<(u64, u64)>,
+    #[serde(default)]
+    pub continuation_in: Option<String>,
+    #[serde(default)]
+    pub continuation_out: Option<String>,
     pub status: SourceStatus,
     pub reason: Option<String>,
     pub commit_marker: Option<CommitMarkerProvenance>,
@@ -188,11 +198,48 @@ pub struct WalByteRange {
     pub gap_before: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationEpochRange {
+    #[serde(default)]
+    pub parent_id: Option<RecordingId>,
+    pub epoch_id: chronicle_common::EpochId,
+    #[serde(default)]
+    pub epoch_ordinal: Option<u64>,
+    #[serde(default)]
+    pub wal_sequence_range: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationCompletion {
+    #[default]
+    Complete,
+    Incomplete,
+    Unsupported,
+    Invalid,
+    BoundExhausted,
+}
+
+impl OperationCompletion {
+    pub const fn is_replayable(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationProvenance {
     pub connection_generation: Option<SourceConnectionGeneration>,
     pub wal_ranges: Vec<WalByteRange>,
     pub missing_payload_provenance: bool,
+    /// Epoch where decoder reached terminal completion, if any.
+    #[serde(default)]
+    pub completion_owner_epoch: Option<chronicle_common::EpochId>,
+    /// Ordered parent/epoch/WAL ranges contributing to this operation.
+    #[serde(default)]
+    pub epoch_ranges: Vec<OperationEpochRange>,
+    /// Explicit fallback prevents incomplete handoffs from becoming replay traffic.
+    #[serde(default)]
+    pub completion: OperationCompletion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +331,10 @@ pub enum CanonicalValidationError {
     },
     #[error("timeline contains duplicate operation {id}")]
     DuplicateTimelineOperation { id: OperationId },
+    #[error("canonical operation {id} completion owner is absent from epoch provenance")]
+    CompletionOwnerMissingRange { id: OperationId },
+    #[error("canonical operation {id} epoch range names a different parent recording")]
+    OperationRangeParentMismatch { id: OperationId },
     #[error("timeline is missing operation {id}")]
     MissingTimelineOperation { id: OperationId },
 }
@@ -362,6 +413,25 @@ impl CanonicalSession {
                 }
                 if !self.operation_completeness.contains_key(&operation.id) {
                     return Err(CanonicalValidationError::MissingOperationCompleteness {
+                        id: operation.id,
+                    });
+                }
+                if let Some(owner) = operation.provenance.completion_owner_epoch
+                    && !operation
+                        .provenance
+                        .epoch_ranges
+                        .iter()
+                        .any(|range| range.epoch_id == owner)
+                {
+                    return Err(CanonicalValidationError::CompletionOwnerMissingRange {
+                        id: operation.id,
+                    });
+                }
+                if operation.provenance.epoch_ranges.iter().any(|range| {
+                    range.parent_id.is_some()
+                        && range.parent_id != self.source_provenance.recording_id
+                }) {
+                    return Err(CanonicalValidationError::OperationRangeParentMismatch {
                         id: operation.id,
                     });
                 }
@@ -519,6 +589,36 @@ mod tests {
             });
         }
         session
+    }
+
+    #[test]
+    fn completion_owner_requires_contributing_epoch_range() {
+        let mut session = valid_session();
+        let owner = chronicle_common::EpochId::new();
+        session.connections[0].operations[0]
+            .provenance
+            .completion_owner_epoch = Some(owner);
+        assert!(matches!(
+            session.validate(),
+            Err(CanonicalValidationError::CompletionOwnerMissingRange { .. })
+        ));
+        session.connections[0].operations[0]
+            .provenance
+            .epoch_ranges
+            .push(OperationEpochRange {
+                parent_id: None,
+                epoch_id: owner,
+                epoch_ordinal: Some(1),
+                wal_sequence_range: Some((10, 20)),
+            });
+        assert!(session.validate().is_ok());
+        session.source_provenance.recording_id = Some(RecordingId::new());
+        session.connections[0].operations[0].provenance.epoch_ranges[0].parent_id =
+            Some(RecordingId::new());
+        assert!(matches!(
+            session.validate(),
+            Err(CanonicalValidationError::OperationRangeParentMismatch { .. })
+        ));
     }
 
     #[test]

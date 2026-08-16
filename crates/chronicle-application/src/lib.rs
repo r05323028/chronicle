@@ -27,7 +27,8 @@ pub use record::{
     RedactionConfig, ReplayConfig, ReplayTiming, S3Config, ShutdownReason, TargetMappingConfig,
     TerminalWalLossPersistence, TerminalWalLossSummary, TerminalWalLossSummaryEntry,
     TerminalWalLossTimeSource, WalConfig, preflight_production_record, preflight_recording_store,
-    preflight_wal_destination, validate_production_recording_bounds,
+    preflight_wal_destination, preflight_wal_destination_for_lifetime,
+    validate_epoch_recording_bounds, validate_production_recording_bounds,
 };
 #[cfg(test)]
 pub(crate) use record::{
@@ -35,9 +36,11 @@ pub(crate) use record::{
     mark_epoch_cleanup_complete, recover_rollover_transition_for_root, save_lifecycle_index,
 };
 #[cfg(target_os = "linux")]
-pub(crate) use record::{live_capture_metadata, monotonic_millis, preflight_embedded_ebpf};
+pub(crate) use record::{
+    preflight_embedded_ebpf, public_continuous_config, record_continuous_ebpf_with_source,
+};
 #[cfg(target_os = "linux")]
-pub use record::{record_continuous_ebpf, record_live_ebpf};
+pub use record::{record_continuous_ebpf, record_live_ebpf, record_live_ebpf_with_lifetime};
 mod epoch_catalog;
 mod etl;
 pub use etl::{
@@ -46,11 +49,12 @@ pub use etl::{
     RecoveredRecordingForAppend, RecoveryIssueCode, RecoveryReport, RecoveryTailRepairSummary,
     build_recovery_report, build_recovery_report_for_reopen, decode_recording_metadata,
     decode_recovery_report, load_recording_metadata, mark_recording_forced_termination,
-    persist_recovery_report, process_and_publish_recording_wal, process_fixture_wal,
-    process_recording_wal, reconcile_recording_metadata, reconcile_recording_metadata_with_scan,
-    record_production, recording_physical_wal_bytes, recover_recording_for_append,
-    recovery_issue_code, render_recovery_report_json, write_capture_to_wal,
-    write_recording_metadata,
+    persist_recovery_report, process_and_publish_recording_wal,
+    process_and_publish_recording_wal_with_parent, process_fixture_wal, process_recording_wal,
+    process_recording_wal_with_parent, reconcile_recording_metadata,
+    reconcile_recording_metadata_with_scan, record_production, record_production_with_lifetime,
+    recording_physical_wal_bytes, recover_recording_for_append, recovery_issue_code,
+    render_recovery_report_json, write_capture_to_wal, write_recording_metadata,
 };
 #[cfg(target_os = "linux")]
 pub(crate) use etl::{
@@ -69,14 +73,17 @@ mod incremental_worker;
 mod listener_discovery;
 mod recorder_config;
 mod replay_inspect;
-pub use chronicle_common::{RecordingId, SessionId, Timestamp, escape_control};
+pub use chronicle_common::{
+    EpochId, EpochIdParseError, RecordingId, SessionId, Timestamp, escape_control,
+};
 pub use replay_inspect::{
     InspectConnectionSummary, InspectOperationSummary, InspectSessionResult, OperationStatus,
-    RecordFixtureResult, RecordIssueSummary, ReplayCounts, ReplayOperationSummary, ReplayRequest,
-    ReplaySessionResult, ReplayStatus, ReplayabilityStatus, inspect_session,
-    preplan_command_replay_session, production_wal_from_fixture, record_fixture,
-    record_fixture_file, render_inspect_human, render_inspect_json, render_json,
-    render_replay_human, render_replay_json, replay_command_inputs, replay_context, replay_session,
+    ParentReplayEpochPlan, ParentReplayPlan, RecordFixtureResult, RecordIssueSummary, ReplayCounts,
+    ReplayOperationSummary, ReplayRequest, ReplaySessionResult, ReplayStatus, ReplayabilityStatus,
+    build_parent_replay_plan, inspect_session, preplan_command_replay_session,
+    production_wal_from_fixture, record_fixture, record_fixture_file, render_inspect_human,
+    render_inspect_json, render_json, render_replay_human, render_replay_json,
+    replay_command_inputs, replay_context, replay_parent_session_with_plan, replay_session,
     replay_session_with_plan, replay_session_with_plan_guard,
 };
 #[cfg(test)]
@@ -93,6 +100,7 @@ mod recorder_quota;
 mod recorder_startup;
 mod recorder_status;
 mod recording_catalog;
+mod recording_run;
 mod rollover_transition;
 mod supervised_scope;
 
@@ -118,7 +126,10 @@ pub use domain_lock::{
     resolve_domain_lock_path,
 };
 pub use epoch_catalog::{
-    EPOCH_CATALOG_FILE, EpochCatalogEntry, EpochCatalogError, EpochCatalogState, EpochCatalogV1,
+    EPOCH_CATALOG_FILE, EPOCH_CATALOG_V2_VERSION, EpochAuthorityError, EpochCatalogEntry,
+    EpochCatalogEntryV2, EpochCatalogError, EpochCatalogState, EpochCatalogSummaryV2,
+    EpochCatalogV1, EpochCatalogV2, EpochEvidenceAuthority, EpochRecoveryDecision,
+    EpochRecoveryEvidence, LegacyOneEpochMapping, reconcile_epoch_evidence,
 };
 pub use epoch_rollover::{
     EpochAdmittedObservation, EpochOutcomeError, EpochOutcomeJournalV1, OutcomeRange,
@@ -164,15 +175,23 @@ pub use recording_catalog::{
     CATALOG_FILE, CATALOG_MAX_BYTES, CATALOG_MAX_ENTRIES, CatalogEntryV1, CatalogV1,
     ChildExitResult, RECORDING_INTENT_FILE, RECORDING_INTENT_MAX_BYTES, RECORDINGS_SUBDIR,
     RecordingCatalogStatus, RecordingIntentV1, catalog_path, claim_recording_name,
-    list_recording_ids, list_recordings, load_catalog, load_recording_intent,
-    persist_reconciled_catalog, reconcile_catalog, reconcile_entry_status, recording_intent_path,
-    recordings_root, resolve_recording, resolve_session, save_catalog, validate_catalog,
-    validate_recording_name, write_recording_intent,
+    list_parent_recording_views, list_recording_ids, list_recordings, load_catalog,
+    load_recording_intent, persist_reconciled_catalog, reconcile_catalog, reconcile_entry_status,
+    recording_intent_path, recordings_root, resolve_recording, resolve_session, save_catalog,
+    validate_catalog, validate_recording_name, write_recording_intent,
+};
+pub use recording_run::{
+    CaptureMode, ContinuousRecordingCoordinator, CoordinatorAction, EpochBounds,
+    ParentRecordingViewV2, RECORDING_RUN_FILE, RECORDING_RUN_SCHEMA_VERSION,
+    RecordingDurationError, RecordingLifetime, RecordingRunV2, RunEpochSummaryV2,
+    RunLifecycleState, RunPersistenceError, RunStopController, RunStopPolicy, RunStopReason,
+    SegmentBounds, TargetOwnership, parse_recording_duration, sort_parent_recording_views,
 };
 pub use rollover_transition::{
-    ROLLOVER_TRANSITION_FILE, ROLLOVER_TRANSITION_SCHEMA_VERSION, RolloverTransitionError,
-    RolloverTransitionPhase, RolloverTransitionV1, load_transition, remove_transition,
-    write_transition_atomic,
+    ROLLOVER_TRANSITION_FILE, ROLLOVER_TRANSITION_SCHEMA_VERSION,
+    ROLLOVER_TRANSITION_V2_SCHEMA_VERSION, RolloverTransitionError, RolloverTransitionPhase,
+    RolloverTransitionV1, RolloverTransitionV2, RolloverTransitionV2Phase, load_transition,
+    load_transition_v2, remove_transition, write_transition_atomic, write_transition_v2_atomic,
 };
 pub use supervised_scope::{
     CleanupOutcome, RealClock, SCOPE_CLEANUP_ABSOLUTE, SCOPE_KILL_WAIT, SCOPE_POLL_INTERVAL,
@@ -190,8 +209,8 @@ use chronicle_capture::{
 };
 
 use chronicle_etl::{
-    ETL_PIPELINE_VERSION, EtlError, EtlIssue, EtlOutput, EtlPipeline,
-    assign_recording_ids_with_snapshot,
+    ETL_PIPELINE_VERSION, EpochContinuationCheckpointV1, EtlError, EtlIssue, EtlOutput,
+    EtlPipeline, assign_recording_ids_with_snapshot, stamp_epoch_operation_provenance,
 };
 use chronicle_protocol::{
     ProtocolError, ProtocolRegistry, ReplayContext, SecretBytes, TransportErrorCategory,
@@ -242,8 +261,8 @@ pub const MAX_RECORDING_CAPTURE_ERRORS: usize = 64;
 pub const MAX_RECORDING_CAPABILITIES: usize = 32;
 pub const REPLAY_REPORT_VERSION: u16 = 1;
 pub const RECOVERY_REPORT_VERSION: u16 = 1;
-pub const DEFAULT_RECORDING_DURATION_SECONDS: u64 = 600;
-pub const MAX_RECORDING_DURATION_SECONDS: u64 = 3_600;
+pub(crate) const DEFAULT_RECORDING_DURATION_SECONDS: u64 = 600;
+pub(crate) const MAX_RECORDING_DURATION_SECONDS: u64 = 3_600;
 pub const RECORDING_FINALIZATION_GRACE_MILLIS: u64 = 5_000;
 pub const DOCTOR_REPORT_VERSION: u16 = 1;
 
@@ -721,29 +740,13 @@ mod tests {
         .unwrap()
     }
 
-    fn retention_catalog() -> EpochCatalogV1 {
-        let old_id = RecordingId::new();
-        let new_id = RecordingId::new();
-        let catalog = EpochCatalogV1 {
-            version: 1,
-            epochs: vec![
-                EpochCatalogEntry {
-                    ordinal: 0,
-                    recording_id: old_id,
-                    predecessor: None,
-                    path: "epochs/0".into(),
-                    state: EpochCatalogState::Finalized,
-                },
-                EpochCatalogEntry {
-                    ordinal: 1,
-                    recording_id: new_id,
-                    predecessor: Some(old_id),
-                    path: "epochs/1".into(),
-                    state: EpochCatalogState::Active,
-                },
-            ],
-        };
-        catalog.validate().unwrap();
+    fn retention_catalog() -> EpochCatalogV2 {
+        let parent_id = RecordingId::new();
+        let old_id = EpochId::new();
+        let new_id = EpochId::new();
+        let mut catalog = EpochCatalogV2::new(parent_id, old_id, "epochs/0").unwrap();
+        catalog.append_successor(new_id, "epochs/1").unwrap();
+        catalog.activate_successor(new_id).unwrap();
         catalog
     }
 

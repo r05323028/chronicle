@@ -3,8 +3,8 @@
 
 use crate::{
     DECODER_IMPLEMENTATION_VERSION, DECODER_KIND, DECODER_SNAPSHOT_VERSION,
-    DecoderReconstructionState, EtlError, EtlEvidence, EtlIssue, EtlOutput, EtlPipeline,
-    SegmentLineage,
+    DecoderReconstructionState, EpochContinuationCheckpointV1, EtlError, EtlEvidence, EtlIssue,
+    EtlOutput, EtlPipeline, SegmentLineage,
 };
 use chronicle_canonical::CanonicalOperation;
 use chronicle_common::{OperationId, SessionId};
@@ -176,6 +176,7 @@ impl IncrementalProcessor {
             session_id,
         )?;
         let mut emitted_operation_keys = self.emitted_operation_keys.clone();
+        let mut operation_ids = BTreeMap::new();
         for connection in &mut output.session.connections {
             // Keep the last occurrence of each key so a deterministic id that
             // reappears in a later session after crash recovery keeps the
@@ -184,13 +185,31 @@ impl IncrementalProcessor {
             connection.operations.retain_mut(|operation| {
                 let key = operation_key(operation);
                 if emitted_operation_keys.insert(key.clone()) {
-                    operation.id = operation_id_from_key(&key);
+                    let previous = operation.id;
+                    let current = operation_id_from_key(&key);
+                    operation_ids.insert(previous, current);
+                    operation.id = current;
                     true
                 } else {
                     false
                 }
             });
             connection.operations.reverse();
+        }
+        output.session.operation_completeness = output
+            .session
+            .operation_completeness
+            .into_iter()
+            .filter_map(|(id, completeness)| {
+                operation_ids
+                    .get(&id)
+                    .map(|current| (*current, completeness))
+            })
+            .collect();
+        for entry in &mut output.session.timeline {
+            if let Some(id) = operation_ids.get(&entry.operation_id) {
+                entry.operation_id = *id;
+            }
         }
         self.assembler = assembler;
         self.evidence = evidence;
@@ -325,6 +344,30 @@ impl IncrementalProcessor {
         &self.segment_lineage
     }
 
+    /// Restore bounded protocol state from a verified predecessor continuation.
+    /// The successor starts its own WAL cursor; predecessor marker sequences are
+    /// lineage evidence, not successor snapshot sequence numbers.
+    pub fn restore_continuation(
+        &mut self,
+        checkpoint: &EpochContinuationCheckpointV1,
+        parent_id: chronicle_common::RecordingId,
+        predecessor_epoch_id: chronicle_common::EpochId,
+        successor_epoch_id: chronicle_common::EpochId,
+        pipeline_version: &str,
+    ) -> Result<(), EtlError> {
+        checkpoint
+            .validate_against(
+                parent_id,
+                predecessor_epoch_id,
+                successor_epoch_id,
+                &checkpoint.predecessor_final_marker,
+                &checkpoint.segment_lineage,
+                pipeline_version,
+            )
+            .map_err(|_| EtlError::DecoderCheckpointMismatch)?;
+        self.restore_decoder_snapshot(&checkpoint.state, None, Vec::new())
+    }
+
     pub fn restore_decoder_snapshot(
         &mut self,
         state: &[u8],
@@ -439,6 +482,36 @@ fn digest_hex(value: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chronicle_capture::{CaptureSource, FixtureCaptureSource, encode_event};
+    use chronicle_common::RecordingId;
+
+    fn fixture_envelopes(bytes: &[u8]) -> Vec<WalRecordEnvelope> {
+        let mut source = FixtureCaptureSource::from_json(bytes).unwrap();
+        let recording_id = RecordingId::new();
+        let mut sequence = 1;
+        let mut envelopes = Vec::new();
+        while let Some(event) = source.next_event().unwrap() {
+            envelopes.push(WalRecordEnvelope::unplaced(
+                recording_id,
+                sequence,
+                chronicle_wal::RecordKind::CaptureEvent,
+                chronicle_capture::CAPTURE_EVENT_SCHEMA_VERSION,
+                0,
+                encode_event(&event).unwrap(),
+            ));
+            sequence += 1;
+        }
+        envelopes
+    }
+
+    fn segment(last_sequence: u64, digest: u8) -> [chronicle_wal::CommittedSegment; 1] {
+        [chronicle_wal::CommittedSegment {
+            ordinal: 0,
+            digest: [digest; 32],
+            first_sequence: 1,
+            last_sequence,
+        }]
+    }
 
     #[test]
     fn empty_committed_snapshots_do_not_advance_without_records() {
@@ -475,6 +548,141 @@ mod tests {
         assert_eq!(second.first_marker_sequence, 1);
         assert_eq!(processor.last_marker_sequence(), Some(0));
         assert!(!processor.decoder_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn http_request_response_split_at_rollover_matches_one_shot_after_restart() {
+        let envelopes = fixture_envelopes(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/http/basic-session.json"
+        )));
+        assert_eq!(envelopes.len(), 4);
+        let registry = chronicle_protocol_builtins::registry().unwrap();
+        let session_id = SessionId::new();
+        let mut incremental = IncrementalProcessor::new(SessionLimits::default());
+        let first_segment = segment(3, 1);
+        incremental
+            .process_snapshot(
+                CommittedWalSnapshot {
+                    marker_sequence: 3,
+                    marker_digest: [1; 32],
+                    envelopes: &envelopes[..3],
+                    segment_lineage: &first_segment,
+                },
+                &registry,
+                session_id,
+            )
+            .unwrap();
+        let mut restarted = IncrementalProcessor::new(SessionLimits::default());
+        restarted.restore_state(incremental.state_snapshot());
+        let final_segment = segment(4, 2);
+        let incremental_output = restarted
+            .process_snapshot(
+                CommittedWalSnapshot {
+                    marker_sequence: 4,
+                    marker_digest: [2; 32],
+                    envelopes: &envelopes,
+                    segment_lineage: &final_segment,
+                },
+                &registry,
+                session_id,
+            )
+            .unwrap();
+
+        let mut one_shot = IncrementalProcessor::new(SessionLimits::default());
+        let one_shot_output = one_shot
+            .process_snapshot(
+                CommittedWalSnapshot {
+                    marker_sequence: 4,
+                    marker_digest: [2; 32],
+                    envelopes: &envelopes,
+                    segment_lineage: &final_segment,
+                },
+                &registry,
+                session_id,
+            )
+            .unwrap();
+        assert_eq!(
+            incremental_output.output.session,
+            one_shot_output.output.session
+        );
+        assert_eq!(
+            incremental_output.output.session.connections[0]
+                .operations
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn long_lived_pipelined_connection_survives_multiple_rollovers() {
+        let envelopes = fixture_envelopes(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/http/multiple-exchanges.json"
+        )));
+        assert_eq!(envelopes.len(), 5);
+        let registry = chronicle_protocol_builtins::registry().unwrap();
+        let session_id = SessionId::new();
+        let mut incremental = IncrementalProcessor::new(SessionLimits::default());
+        let first_segment = segment(3, 1);
+        incremental
+            .process_snapshot(
+                CommittedWalSnapshot {
+                    marker_sequence: 3,
+                    marker_digest: [1; 32],
+                    envelopes: &envelopes[..3],
+                    segment_lineage: &first_segment,
+                },
+                &registry,
+                session_id,
+            )
+            .unwrap();
+        let second_segment = segment(4, 2);
+        incremental
+            .process_snapshot(
+                CommittedWalSnapshot {
+                    marker_sequence: 4,
+                    marker_digest: [2; 32],
+                    envelopes: &envelopes[..4],
+                    segment_lineage: &second_segment,
+                },
+                &registry,
+                session_id,
+            )
+            .unwrap();
+        let final_segment = segment(5, 3);
+        incremental
+            .process_snapshot(
+                CommittedWalSnapshot {
+                    marker_sequence: 5,
+                    marker_digest: [3; 32],
+                    envelopes: &envelopes,
+                    segment_lineage: &final_segment,
+                },
+                &registry,
+                session_id,
+            )
+            .unwrap();
+        let incremental_output = incremental.finalize(&registry, session_id).unwrap();
+        let mut one_shot = IncrementalProcessor::new(SessionLimits::default());
+        one_shot
+            .process_snapshot(
+                CommittedWalSnapshot {
+                    marker_sequence: 5,
+                    marker_digest: [3; 32],
+                    envelopes: &envelopes,
+                    segment_lineage: &final_segment,
+                },
+                &registry,
+                session_id,
+            )
+            .unwrap();
+        let one_shot_output = one_shot.finalize(&registry, session_id).unwrap();
+        assert_eq!(incremental_output.session, one_shot_output.session);
+        assert_eq!(
+            incremental_output.session.connections[0].operations.len(),
+            2
+        );
     }
 
     #[test]

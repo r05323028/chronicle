@@ -35,13 +35,13 @@ chronicle record --cgroup /sys/fs/cgroup/my-service
 chronicle record --retry checkout
 ```
 
-公開フラグには `--name`、`--duration`、`--retry`、`--pid`、`--cgroup` があります。コマンド引数は `--` の後に続けます。
+公開フラグには `--name`、任意の recording 全体向け `--duration`、`--retry`、`--pid`、`--cgroup` があります。`list` は安定した parent ごとに 1 行を表示し、境界付き epoch 件数を示します。コマンド引数は `--` の後に続けます。
 
 ### replay
 
 ```bash
 chronicle replay checkout -- ./my-app
-chronicle replay checkout --target http://127.0.0.1:8080 \
+chronicle replay checkout --epoch 0 --target http://127.0.0.1:8080 \
   --allow-host 127.0.0.1 --allow-read --execute
 ```
 

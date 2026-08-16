@@ -29,7 +29,7 @@ chronicle --format json doctor
 
 ## 本機資料與容量
 
-Recording、WAL segment、manifest、checkpoint 與 canonical payload 都會留在解析後的本機 data directory。一次性 recording 預設 600 秒，最大 3600 秒，且不能超過 4 GiB 的實體 WAL 容量上限。規劃磁碟與檔案權限時，應以擷取資料而不是二進位檔大小為準。
+Recording、WAL segment、manifest、checkpoint 與 canonical payload 都會留在解析後的本機 data directory。省略 `--duration` 代表整個 recording 沒有時間 deadline；明確 deadline 與有明確上限的 epoch／segment WAL 容量分開計算。同一個 parent recording 可以擁有多個 epoch，沒有總 WAL 上限。規劃磁碟與檔案權限時，應以擷取資料而不是二進位檔大小為準。
 
 ## 部署邊界
 

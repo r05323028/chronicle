@@ -32,6 +32,20 @@ pub struct RecorderStatusV1 {
     pub failure: Option<MetadataCode>,
     pub lifecycle: RecorderLifecycleState,
     pub recorder_id: uuid::Uuid,
+    #[serde(default)]
+    pub parent_id: Option<crate::RecordingId>,
+    #[serde(default)]
+    pub current_epoch_id: Option<crate::EpochId>,
+    #[serde(default)]
+    pub finalized_epoch_count: u64,
+    #[serde(default)]
+    pub continuation_in: Option<String>,
+    #[serde(default)]
+    pub continuation_out: Option<String>,
+    #[serde(default)]
+    pub retention_state: Option<String>,
+    #[serde(default)]
+    pub last_rollover: Option<String>,
     pub attempt_id: uuid::Uuid,
     pub config_digest: String,
     pub current_epoch: Option<u64>,
@@ -115,6 +129,13 @@ impl RecorderStatusV1 {
             failure: metadata.failure,
             lifecycle: metadata.lifecycle,
             recorder_id: metadata.recorder_id,
+            parent_id: metadata.parent_id,
+            current_epoch_id: metadata.current_epoch_id,
+            finalized_epoch_count: metadata.finalized_epoch_count,
+            continuation_in: metadata.continuation_in.clone(),
+            continuation_out: metadata.continuation_out.clone(),
+            retention_state: metadata.retention_state.clone(),
+            last_rollover: metadata.last_rollover.clone(),
             attempt_id: metadata.attempt_id,
             config_digest: metadata.config_digest.clone(),
             current_epoch: metadata.current_epoch.as_ref().map(|epoch| epoch.ordinal),
@@ -143,13 +164,19 @@ impl RecorderStatusV1 {
     pub fn render_human(&self) -> Result<String, RecorderStatusError> {
         self.validate()?;
         Ok(format!(
-            "state={:?} liveness={} capture_readiness={:?} processing_readiness={:?} health={:?} lifecycle={:?} lag_records={} lag_bytes={} stale_owner={}",
+            "state={:?} liveness={} parent_id={:?} current_epoch_id={:?} finalized_epochs={} capture_readiness={:?} processing_readiness={:?} health={:?} lifecycle={:?} continuation_in={:?} continuation_out={:?} retention_state={:?} lag_records={} lag_bytes={} stale_owner={}",
             self.state,
             self.liveness,
+            self.parent_id,
+            self.current_epoch_id,
+            self.finalized_epoch_count,
             self.capture_readiness,
             self.processing_readiness,
             self.health,
             self.lifecycle,
+            self.continuation_in,
+            self.continuation_out,
+            self.retention_state,
             self.lag_records,
             self.lag_bytes,
             self.stale_owner,
@@ -210,6 +237,13 @@ mod tests {
         RecorderMetadataV1 {
             version: 1,
             recorder_id: uuid::Uuid::new_v4(),
+            parent_id: None,
+            current_epoch_id: None,
+            finalized_epoch_count: 0,
+            continuation_in: None,
+            continuation_out: None,
+            retention_state: None,
+            last_rollover: None,
             attempt_id: uuid::Uuid::new_v4(),
             config_digest: "a".repeat(64),
             scope: NormalizedScopeConfig {

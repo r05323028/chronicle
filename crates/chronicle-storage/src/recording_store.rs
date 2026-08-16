@@ -5,6 +5,7 @@
 //! and provenance indexes only. WAL commit/repair, ETL checkpoints, and final
 //! session publication remain owned by their existing components.
 
+use chronicle_common::{EpochId, RecordingId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -23,6 +24,7 @@ const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum RecordingArtifactKind {
     SealedWalCopy,
+    ContinuationCheckpoint,
     CanonicalDeltaBatch,
     RecoveryReport,
     ProvenanceIndex,
@@ -31,8 +33,10 @@ pub enum RecordingArtifactKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactLifecycle {
+    Staged,
     Published,
     Verified,
+    Referenced,
     RetentionEligible,
     Deleting,
     Deleted,
@@ -45,6 +49,12 @@ pub struct RecordingArtifact {
     pub version: u16,
     pub key: String,
     pub kind: RecordingArtifactKind,
+    #[serde(default)]
+    pub parent_id: Option<RecordingId>,
+    #[serde(default)]
+    pub epoch_id: Option<EpochId>,
+    #[serde(default)]
+    pub epoch_ordinal: Option<u64>,
     pub checksum: String,
     pub lifecycle: ArtifactLifecycle,
     pub bytes: Vec<u8>,
@@ -66,10 +76,38 @@ impl RecordingArtifact {
             version: RECORDING_STORE_SCHEMA_VERSION,
             key,
             kind,
+            parent_id: None,
+            epoch_id: None,
+            epoch_ordinal: None,
             checksum,
             lifecycle: ArtifactLifecycle::Published,
             bytes,
         })
+    }
+
+    /// Create an artifact that is not publishable until its staged bytes are
+    /// durably promoted through the monotonic lifecycle.
+    pub fn staged(
+        key: impl Into<String>,
+        kind: RecordingArtifactKind,
+        bytes: Vec<u8>,
+    ) -> Result<Self, RecordingStoreError> {
+        let mut artifact = Self::new(key, kind, bytes)?;
+        artifact.lifecycle = ArtifactLifecycle::Staged;
+        Ok(artifact)
+    }
+
+    pub fn with_lineage(
+        mut self,
+        parent_id: RecordingId,
+        epoch_id: EpochId,
+        epoch_ordinal: u64,
+    ) -> Result<Self, RecordingStoreError> {
+        self.parent_id = Some(parent_id);
+        self.epoch_id = Some(epoch_id);
+        self.epoch_ordinal = Some(epoch_ordinal);
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), RecordingStoreError> {
@@ -77,6 +115,11 @@ impl RecordingArtifact {
             return Err(RecordingStoreError::InvalidArtifact);
         }
         validate_key(&self.key)?;
+        if self.parent_id.is_some_and(|id| id.as_uuid().is_nil())
+            || self.epoch_id.is_some_and(|id| id.as_uuid().is_nil())
+        {
+            return Err(RecordingStoreError::InvalidArtifact);
+        }
         if self.checksum != digest(&self.bytes) {
             return Err(RecordingStoreError::ChecksumMismatch);
         }
@@ -89,9 +132,14 @@ impl RecordingArtifact {
     pub fn transition(&mut self, next: ArtifactLifecycle) -> Result<(), RecordingStoreError> {
         let valid = matches!(
             (self.lifecycle, next),
-            (ArtifactLifecycle::Published, ArtifactLifecycle::Verified)
+            (ArtifactLifecycle::Staged, ArtifactLifecycle::Published)
+                | (ArtifactLifecycle::Published, ArtifactLifecycle::Verified)
                 | (
                     ArtifactLifecycle::Verified,
+                    ArtifactLifecycle::Referenced | ArtifactLifecycle::RetentionEligible
+                )
+                | (
+                    ArtifactLifecycle::Referenced,
                     ArtifactLifecycle::RetentionEligible
                 )
                 | (
@@ -113,6 +161,9 @@ impl RecordingArtifact {
             version: self.version,
             key: self.key.clone(),
             kind: self.kind,
+            parent_id: self.parent_id,
+            epoch_id: self.epoch_id,
+            epoch_ordinal: self.epoch_ordinal,
             checksum: self.checksum.clone(),
             lifecycle: self.lifecycle,
             bytes: self.bytes.len() as u64,
@@ -126,6 +177,12 @@ pub struct RecordingArtifactHead {
     pub version: u16,
     pub key: String,
     pub kind: RecordingArtifactKind,
+    #[serde(default)]
+    pub parent_id: Option<RecordingId>,
+    #[serde(default)]
+    pub epoch_id: Option<EpochId>,
+    #[serde(default)]
+    pub epoch_ordinal: Option<u64>,
     pub checksum: String,
     pub lifecycle: ArtifactLifecycle,
     pub bytes: u64,
@@ -202,7 +259,14 @@ impl RecordingStore for InMemoryRecordingStore {
             return Err(RecordingStoreError::Conflict);
         }
         match artifacts.get(&artifact.key) {
-            Some(existing) if existing.checksum == artifact.checksum => {
+            Some(existing)
+                if existing.version == artifact.version
+                    && existing.kind == artifact.kind
+                    && existing.checksum == artifact.checksum
+                    && existing.parent_id == artifact.parent_id
+                    && existing.epoch_id == artifact.epoch_id
+                    && existing.epoch_ordinal == artifact.epoch_ordinal =>
+            {
                 Ok(PutIfAbsent::AlreadyExistsMatching)
             }
             Some(_) => Err(RecordingStoreError::Conflict),
@@ -705,8 +769,20 @@ mod tests {
             PutIfAbsent::Created
         );
         assert_eq!(
-            store.put_if_absent(artifact).unwrap(),
+            store.put_if_absent(artifact.clone()).unwrap(),
             PutIfAbsent::AlreadyExistsMatching
+        );
+        let lineage_conflict = RecordingArtifact::new(
+            "delta/0001",
+            RecordingArtifactKind::CanonicalDeltaBatch,
+            b"x".to_vec(),
+        )
+        .unwrap()
+        .with_lineage(RecordingId::new(), EpochId::new(), 1)
+        .unwrap();
+        assert_eq!(
+            store.put_if_absent(lineage_conflict),
+            Err(RecordingStoreError::Conflict)
         );
         let conflict = RecordingArtifact::new(
             "delta/0001",
@@ -722,6 +798,15 @@ mod tests {
 
     #[test]
     fn lifecycle_transitions_are_monotonic_and_quarantine_is_terminal() {
+        let mut staged = RecordingArtifact::staged(
+            "continuation/1",
+            RecordingArtifactKind::ContinuationCheckpoint,
+            vec![1],
+        )
+        .unwrap();
+        staged.transition(ArtifactLifecycle::Published).unwrap();
+        staged.transition(ArtifactLifecycle::Verified).unwrap();
+
         let mut artifact =
             RecordingArtifact::new("recovery/1", RecordingArtifactKind::RecoveryReport, vec![])
                 .unwrap();

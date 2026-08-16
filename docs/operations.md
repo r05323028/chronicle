@@ -15,7 +15,7 @@ chronicle inspect latest
 chronicle replay latest -- ./bin/my-app
 ```
 
-`record -- COMMAND...` starts application only after capture attachment. Send representative traffic while recording runs; Chronicle stops on application exit, signal, or duration, then finalizes WAL, runs ETL, publishes canonical session, and updates catalog under one data-domain lock. `replay RECORDING -- COMMAND...` plans first, starts application in supervised cgroup, discovers unique owned loopback listener, then reuses existing replay executor. Writes still require `--allow-write`.
+`record -- COMMAND...` starts application only after capture attachment. Send representative traffic while recording runs; Chronicle rolls over bounded epochs without detaching capture, then stops on application exit, signal, explicit deadline, or fatal failure. Finalization publishes immutable epoch sessions and one parent summary under one data-domain lock. `replay RECORDING -- COMMAND...` plans first, starts application in supervised cgroup, discovers unique owned loopback listener, then reuses existing replay executor. Writes still require `--allow-write`.
 
 Recording references are `latest`, `rec_<uuid>`, bare UUID, or exact name. Global `--data-dir` overrides configured `data_dir`, then `CHRONICLE_DATA_DIR`, then platform default. Human output suggests next intent command; `--format json` emits one versioned object.
 
@@ -29,8 +29,8 @@ selected cgroup subtree -> eBPF capture -> 4096-event queue -> segmented WAL
 
 Defaults and hard limits:
 
-- duration: 600 seconds; accepted range `1..=3600` seconds;
-- total WAL: 4 GiB physical ceiling by default, including segment headers, frames, and temporary segment files; lower values are allowed down to segment size;
+- whole-recording deadline: omitted by default; explicit positive durations such as `10m` and `24h` are checked for runtime-clock overflow;
+- epoch WAL: 4 GiB physical ceiling by default, including segment headers, frames, and temporary segment files; lower values are allowed down to segment size; each epoch is bounded independently; the parent recording has no total-WAL cap;
 - segment: 256 MiB default, `16 MiB..=4 GiB`;
 - group commit: 4 MiB unsynced data or 10 ms, plus rotation, flush, and shutdown;
 - loss sampling: complete per-CPU sample at least every 100 ms, using actual monotonic timestamps, plus mandatory final sample;
@@ -41,7 +41,7 @@ A delayed poll records its actual expanded interval. Zero counter delta advances
 
 A group writes data frames, one in-WAL `CommitMarker`, flushes, and calls one `fdatasync`. Runtime acknowledgement exists only after sync returns. Recovery trusts a marker only after validating frame references, contiguous sequences, same-segment membership, cumulative counts, identities, CRCs, and exact batch digest. Recovery can therefore recognize persisted durability without claiming any caller observed its acknowledgement. There is no external watermark file or second metadata-watermark sync cycle.
 
-Recording status describes finalization: `starting`, `recording`, `completed`, `failed`, or recovery-produced `aborted`. Shutdown reason is separate: `user_interrupt`, `termination_signal`, `source_completed`, `duration_limit`, `wal_size_limit`, `capture_failure`, `wal_failure`, `process_crash_recovered`, or `forced_termination`.
+Recording status describes finalization: `starting`, `recording`, `completed`, `failed`, or recovery-produced `aborted`. Shutdown reason is separate: `user_interrupt`, `termination_signal`, `source_completed`, `duration_limit`, `capture_failure`, `wal_failure`, `process_crash_recovered`, or `forced_termination`; legacy `wal_size_limit` remains readable but new epoch thresholds request rollover rather than parent termination.
 
 Only a verified incomplete final WAL frame may be repaired. Middle corruption, invalid marker references/digests, and unsupported versions fail closed. Complete frames after the final authoritative marker remain uncertainty and are excluded from ETL.
 
@@ -55,7 +55,7 @@ chronicle --data-dir /var/lib/chronicle record --duration 5m \
   --cgroup /sys/fs/cgroup/my-workload --allow-shared-cgroup
 ```
 
-Selector mode never terminates selected workload. It uses same recording ID, WAL → ETL → publication, catalog, and exact-lock transaction as command mode.
+Selector mode never terminates selected workload. It uses the same stable parent ID, bounded epoch WAL → ETL/publication flow, parent catalog, and exact-lock transaction as command mode. `capture_readiness` may remain ready while predecessor ETL reports lag or waits for continuation.
 
 The selected scope is the exact cgroup node plus descendants, called the **selected subtree**. `cgroup.procs` is read directly from the selected node. Numeric PIDs are resolved to host-visible thread-group IDs and deduplicated into the **direct cgroup TGID set**; its cardinality is **direct TGID count**. This is not POSIX PGID, session ID, thread count, container ID, or descendant membership. Descendant directories are counted separately as **descendant cgroup count**.
 
@@ -70,9 +70,9 @@ The flag is invalid with `--pid` and cannot override `/`, `/system.slice`, `/use
 
 ## Record, recover, and publish
 
-Public `record` writes private intent/catalog state and `recordings/<uuid>/recording.json` plus `segments/*.chwal`. It stops on application exit, signal, duration, or physical WAL limit. WAL-limit shutdown writes only capacity-safe queued prefix, counts remainder as `discarded_from_queue_due_to_wal_limit`, and emits typed terminal loss evidence when space permits. Kernel/backend drops, post-stop arrivals, and written-not-committed bytes remain separate counters.
+Public `record` writes private parent intent/run state and bounded epoch WAL under `recordings/<recording-id>/`. Epoch age/bytes trigger a checksummed successor transition; they do not terminate the parent. A missing deadline means capture continues until source completion, explicit stop, or fatal safety failure. If successor reservation, WAL handoff, outcome, or topology activation cannot be proven, capture stops visibly at the last authoritative boundary; it never drops or deletes protected evidence.
 
-After capture, public command/PID/cgroup modes process only recovery-authoritative committed prefix, publish one deterministic Canonical Session v1, write advisory ETL checkpoint, and complete catalog entry before releasing domain lock. Recoverable failures retry without recapture:
+After capture, public command/PID/cgroup modes process only recovery-authoritative committed prefix, publish one immutable Canonical Session v1 per finalized epoch with parent/epoch provenance, write advisory ETL checkpoint, and complete parent catalog entry before releasing domain lock. Recoverable failures retry without recapture:
 
 ```bash
 chronicle --data-dir /var/lib/chronicle record --retry RECORDING
@@ -85,7 +85,7 @@ Hidden `chronicle internal etl --wal-dir DIR --output DIR` remains deployment/co
 ```bash
 chronicle --data-dir /var/lib/chronicle inspect latest
 chronicle --data-dir /var/lib/chronicle replay latest -- ./bin/my-app
-chronicle --data-dir /var/lib/chronicle replay latest \
+chronicle --data-dir /var/lib/chronicle replay latest --epoch 0 \
   --target http://127.0.0.1:18080 --allow-host 127.0.0.1 \
   --allow-read --execute
 ```

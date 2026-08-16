@@ -32,6 +32,7 @@ scenarios = [
   "resource-cleanup",
   "recorder-readiness",
   "incremental-etl",
+  "continuation-rollover",
   "checkpoint-kill-restart",
   "quota-pressure",
   "retention-interruption",
@@ -45,6 +46,7 @@ execution_order = [
   "capture-basic",
   "recorder-readiness",
   "incremental-etl",
+  "continuation-rollover",
   "quota-pressure",
   "checkpoint-kill-restart",
   "reboot-recovery",
@@ -125,6 +127,11 @@ legacy_recorder_checks = [
   "standalone_etl_live_rejection",
   "one_shot_equivalence",
 ]
+
+[scenarios.continuation-rollover]
+timeout_seconds = 600
+capabilities = ["privileged", "continuation", "etl", "replay", "bounded-state", "invalid-continuation", "multiple-etl-lags"]
+phases = ["rollover", "continuation", "lineage", "invalid-continuation"]
 
 [scenarios.checkpoint-kill-restart]
 timeout_seconds = 300

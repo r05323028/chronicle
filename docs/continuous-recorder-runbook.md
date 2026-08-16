@@ -30,11 +30,11 @@ systemctl restart chronicle-recorder
 journalctl -u chronicle-recorder -b --no-pager
 ```
 
-First SIGINT/SIGTERM drains. A second signal forces termination and leaves crash-recovery metadata. Never delete WAL or state files manually while lease is held.
+First SIGINT/SIGTERM drains. A second signal forces termination and leaves crash-recovery metadata. Omitted `--duration` means no whole-recording deadline; epoch and segment bounds still force safe rollover. Never delete WAL or state files manually while lease is held.
 
 ## ETL lag and disk pressure
 
-Check status counters and quota/free bytes. Stop new admission when minimum-free reserve is threatened. Resolve eligible cleanup only after checkpoint and finalized-session integrity verification. Lag never authorizes cleanup.
+Check status counters and quota/free bytes. Stop new admission when minimum-free reserve is threatened. Resolve eligible cleanup only after checkpoint and finalized-session integrity verification. Lag never authorizes cleanup. A successor may capture while predecessor ETL waits for verified continuation; this affects processing readiness, not capture admission.
 
 ## Corruption and recovery
 

@@ -40,7 +40,7 @@ A bounded 4096-event queue feeds segmented WAL v1. Each group appends data, one 
 
 `FilesystemSessionStore` atomically writes sole-v1 manifest, session JSON, and SHA-256-addressed payloads. Replay hydrates only persisted artifacts. Command mode infers one owned loopback listener for supervised target and grants only execution/read/host/target gates; explicit-target mode requires loopback target, matching allow-host, effect flag, and `--execute`. Fake protocol remains available for boundary tests.
 
-JSON is current capture-event payload encoding; WAL framing remains encoding-independent. Public one-shot capture is bounded to 600 seconds by default (maximum 3600) and a 4 GiB physical WAL ceiling. Hidden continuous-recorder service owns epoch rotation and incremental ETL for supported deployments.
+JSON is current capture-event payload encoding; WAL framing remains encoding-independent. Public recording lifetime has no implicit time deadline when `--duration` is omitted; explicit deadlines are checked independently from bounded epoch and segment WAL limits. A recording may own many finalized epoch sessions, and a WAL epoch boundary is not a protocol reconstruction boundary: cross-epoch state requires bounded, checksummed, lineage-verified continuation evidence. Hidden 0.1.x one-shot adapters retain old duration semantics only for compatibility.
 
 ## Public data directory and recording identity
 

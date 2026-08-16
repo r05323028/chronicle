@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use chronicle_common::SessionId;
 
 use crate::{
-    CanonicalDeltaBatchV1, CheckpointError, IncrementalEtlCheckpointV1, read_checkpoint,
-    write_checkpoint_atomic,
+    CanonicalDeltaBatchV1, CheckpointError, ContinuationError, IncrementalEtlCheckpointV1,
+    IncrementalEtlCheckpointV2, read_checkpoint, write_checkpoint_atomic,
 };
 use chronicle_storage::{
     FilesystemSessionStore, PublishSession, PutIfAbsent, RecordingArtifact, RecordingArtifactKind,
@@ -33,6 +33,8 @@ pub enum PublicationError {
     Store(#[from] RecordingStoreError),
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
+    #[error(transparent)]
+    Continuation(#[from] ContinuationError),
     #[error("published delta failed verification")]
     Verification,
     #[error("checkpoint does not reference published delta")]
@@ -120,6 +122,75 @@ pub fn recover_pending_checkpoint<S: RecordingStore>(
         }
     };
     remove_pending_checkpoint(&pending_path)?;
+    Ok(Some(outcome))
+}
+
+/// Recover an interrupted parent-aware checkpoint publication. V2 uses the
+/// same output-first contract as V1, but owns its pending file and checksum.
+pub fn recover_pending_checkpoint_v2<S: RecordingStore>(
+    store: &S,
+    checkpoint_path: impl AsRef<Path>,
+) -> Result<Option<ReconcileOutcome>, PublicationError> {
+    let checkpoint_path = checkpoint_path.as_ref();
+    let pending_path = pending_checkpoint_path(checkpoint_path);
+    if !pending_path.exists() {
+        return Ok(None);
+    }
+    let candidate = IncrementalEtlCheckpointV2::load(&pending_path)?;
+    let existing = match IncrementalEtlCheckpointV2::load(checkpoint_path) {
+        Ok(existing) => Some(existing),
+        Err(ContinuationError::Io) if !checkpoint_path.exists() => None,
+        Err(error) => return Err(PublicationError::Continuation(error)),
+    };
+    let existing_len = existing.as_ref().map_or(0, |value| value.outputs.len());
+    if candidate.outputs.len() < existing_len
+        || existing.as_ref().is_some_and(|value| {
+            candidate.parent_id != value.parent_id
+                || candidate.epoch_id != value.epoch_id
+                || candidate.outputs[..existing_len] != value.outputs
+        })
+    {
+        return Err(PublicationError::OutputLineage);
+    }
+    let mut present = 0usize;
+    for (index, output) in candidate.outputs.iter().enumerate() {
+        let head = match store.head(&output.key) {
+            Ok(head)
+                if head.kind == RecordingArtifactKind::CanonicalDeltaBatch
+                    && head.checksum == output.digest
+                    && head.bytes == output.bytes =>
+            {
+                Some(())
+            }
+            Ok(_) => return Err(PublicationError::Verification),
+            Err(RecordingStoreError::NotFound) => None,
+            Err(error) => return Err(PublicationError::Store(error)),
+        };
+        if head.is_some() {
+            present += 1;
+        }
+        if index < existing_len && head.is_none() {
+            return Err(PublicationError::OutputLineage);
+        }
+    }
+    if present != candidate.outputs.len() {
+        remove_pending_v2(&pending_path)?;
+        return Ok(None);
+    }
+    let outcome = match existing {
+        Some(existing) if existing.encode()? == candidate.encode()? => {
+            ReconcileOutcome::AlreadyConsistent
+        }
+        Some(_) => {
+            candidate.write_atomic(checkpoint_path)?;
+            ReconcileOutcome::AdoptedOutput
+        }
+        None => {
+            candidate.write_atomic(checkpoint_path)?;
+            ReconcileOutcome::RepairedCheckpoint
+        }
+    };
+    remove_pending_v2(&pending_path)?;
     Ok(Some(outcome))
 }
 
@@ -364,6 +435,111 @@ pub fn publish_delta_then_checkpoint_with_fault<S: RecordingStore>(
     Ok(outcome)
 }
 
+/// V2 equivalent of [`publish_delta_then_checkpoint`]. The immutable output
+/// is verified before the parent-aware checkpoint advances, so a crash leaves
+/// either a retryable pending suffix or one adopted matching artifact.
+pub fn publish_delta_then_checkpoint_v2<S: RecordingStore>(
+    store: &S,
+    key: impl Into<String>,
+    batch: &CanonicalDeltaBatchV1,
+    checkpoint: &IncrementalEtlCheckpointV2,
+    checkpoint_path: impl AsRef<Path>,
+) -> Result<PutIfAbsent, PublicationError> {
+    batch.validate()?;
+    checkpoint.validate()?;
+    let checkpoint_path = checkpoint_path.as_ref();
+    let pending_path = pending_checkpoint_path(checkpoint_path);
+    checkpoint.write_atomic(&pending_path)?;
+    let key = key.into();
+    let artifact = RecordingArtifact::new(
+        key.clone(),
+        RecordingArtifactKind::CanonicalDeltaBatch,
+        batch.encode()?,
+    )?;
+    let checksum = artifact.checksum.clone();
+    let head = artifact.head();
+    if !checkpoint
+        .outputs
+        .iter()
+        .any(|output| output.key == key && output.digest == checksum)
+    {
+        return Err(PublicationError::OutputLineage);
+    }
+    let outcome = store.put_if_absent(artifact)?;
+    let stored = store.head(&key)?;
+    if stored.version != head.version
+        || stored.kind != head.kind
+        || stored.bytes != head.bytes
+        || stored.checksum != head.checksum
+    {
+        return Err(PublicationError::Verification);
+    }
+    wait_for_checkpoint_commit()?;
+    checkpoint.write_atomic(checkpoint_path)?;
+    remove_pending_v2(&pending_path)?;
+    Ok(outcome)
+}
+
+/// Publish one immutable continuation-out artifact before advancing a v2
+/// checkpoint. Matching retries adopt the existing digest; conflicts fail.
+pub fn publish_continuation_then_checkpoint_v2<S: RecordingStore>(
+    store: &S,
+    key: impl Into<String>,
+    continuation: &crate::EpochContinuationCheckpointV1,
+    checkpoint: &IncrementalEtlCheckpointV2,
+    checkpoint_path: impl AsRef<Path>,
+) -> Result<PutIfAbsent, PublicationError> {
+    continuation.validate()?;
+    checkpoint.validate()?;
+    if checkpoint.continuation.state != crate::ContinuationState::Ready
+        || checkpoint.continuation.predecessor_epoch_id != Some(continuation.predecessor_epoch_id)
+        || checkpoint.continuation.successor_epoch_id != continuation.successor_epoch_id
+        || checkpoint.parent_id != continuation.parent_id
+        || checkpoint.pipeline_version != continuation.pipeline_version
+    {
+        return Err(PublicationError::OutputLineage);
+    }
+    let bytes = continuation.encode()?;
+    let artifact =
+        RecordingArtifact::new(key, RecordingArtifactKind::ContinuationCheckpoint, bytes)?
+            .with_lineage(
+                checkpoint.parent_id,
+                checkpoint.epoch_id,
+                checkpoint.epoch_ordinal,
+            )?;
+    if checkpoint.continuation.output_digest.as_deref() != Some(artifact.checksum.as_str()) {
+        return Err(PublicationError::OutputLineage);
+    }
+    let checkpoint_path = checkpoint_path.as_ref();
+    let pending_path = pending_checkpoint_path(checkpoint_path);
+    checkpoint.write_atomic(&pending_path)?;
+    let key = artifact.key.clone();
+    let expected = artifact.head();
+    let outcome = store.put_if_absent(artifact)?;
+    let stored = store.head(&key)?;
+    if stored.version != expected.version
+        || stored.kind != expected.kind
+        || stored.parent_id != expected.parent_id
+        || stored.epoch_id != expected.epoch_id
+        || stored.epoch_ordinal != expected.epoch_ordinal
+        || stored.bytes != expected.bytes
+        || stored.checksum != expected.checksum
+    {
+        return Err(PublicationError::Verification);
+    }
+    checkpoint.write_atomic(checkpoint_path)?;
+    remove_pending_v2(&pending_path)?;
+    Ok(outcome)
+}
+
+fn remove_pending_v2(path: &Path) -> Result<(), PublicationError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(PublicationError::Continuation(ContinuationError::Io)),
+    }
+}
+
 fn wait_for_checkpoint_commit() -> Result<(), PublicationError> {
     let Ok(control_path) = std::env::var("CHRONICLE_CHECKPOINT_PAUSE_FILE") else {
         return Ok(());
@@ -402,9 +578,11 @@ fn remove_pending_checkpoint(path: &Path) -> Result<(), CheckpointError> {
 mod tests {
     use super::*;
     use crate::{
-        CheckpointLifecycle, CheckpointOwner, DecoderReconstructionState, DeltaBatchReference,
+        CheckpointLifecycle, CheckpointOwner, ContinuationDependencyV2, ContinuationState,
+        DecoderReconstructionState, DeltaBatchReference, INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION,
         MarkerLineage, SegmentLineage, SourceStatus,
     };
+    use chronicle_common::{EpochId, RecordingId};
     use chronicle_storage::InMemoryRecordingStore;
     use sha2::Digest;
     use uuid::Uuid;
@@ -695,6 +873,69 @@ mod tests {
             reconcile_delta_checkpoint(&store, key, &value, &checkpoint_path),
             Err(PublicationError::OutputLineage)
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v2_pending_checkpoint_adopts_durable_output() {
+        let store = InMemoryRecordingStore::default();
+        let batch = CanonicalDeltaBatchV1::new(0, 0, Vec::new()).unwrap();
+        let key = "delta/v2-recovery";
+        let artifact = RecordingArtifact::new(
+            key,
+            RecordingArtifactKind::CanonicalDeltaBatch,
+            batch.encode().unwrap(),
+        )
+        .unwrap();
+        store.put_if_absent(artifact).unwrap();
+
+        let base = checkpoint_with_output(key, &batch);
+        let epoch_id = EpochId::new();
+        let mut decoder = base.decoder.clone();
+        decoder.recording_id = epoch_id.as_uuid();
+        let candidate = IncrementalEtlCheckpointV2 {
+            version: INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION,
+            owner: CheckpointOwner::Etl,
+            lifecycle: CheckpointLifecycle::Active,
+            parent_id: RecordingId::from_uuid(base.recording_id),
+            epoch_id,
+            epoch_ordinal: 0,
+            config_digest: base.config_digest,
+            pipeline_version: base.pipeline_version,
+            canonical_schema_version: base.canonical_schema_version,
+            marker: base.marker,
+            segment_lineage: base.segment_lineage,
+            continuation: ContinuationDependencyV2 {
+                parent_id: Some(RecordingId::from_uuid(base.recording_id)),
+                state: ContinuationState::Unavailable,
+                predecessor_epoch_id: None,
+                successor_epoch_id: epoch_id,
+                input_digest: None,
+                output_digest: None,
+                failure_code: Some("no_predecessor".into()),
+            },
+            decoder,
+            outputs: base.outputs,
+            published_operation_keys: Vec::new(),
+            source_status: SourceStatus::Live,
+            checksum: String::new(),
+        }
+        .with_checksum()
+        .unwrap();
+        let root =
+            std::env::temp_dir().join(format!("chronicle-v2-recovery-{}", std::process::id()));
+        let checkpoint_path = root.join("incremental-etl-checkpoint-v2.json");
+        let pending_path = pending_checkpoint_path(&checkpoint_path);
+        candidate.write_atomic(&pending_path).unwrap();
+        assert_eq!(
+            recover_pending_checkpoint_v2(&store, &checkpoint_path).unwrap(),
+            Some(ReconcileOutcome::RepairedCheckpoint)
+        );
+        assert!(!pending_path.exists());
+        assert_eq!(
+            IncrementalEtlCheckpointV2::load(&checkpoint_path).unwrap(),
+            candidate
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

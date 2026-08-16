@@ -25,6 +25,7 @@ const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointOwner {
     Recorder,
+    Etl,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

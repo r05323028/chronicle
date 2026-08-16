@@ -6,6 +6,9 @@
 //! the caller; this module performs no locking itself.
 
 use crate::domain_lock::DomainLockGuard;
+use crate::recording_run::{
+    ParentRecordingViewV2, RECORDING_RUN_FILE, RecordingRunV2, RunLifecycleState,
+};
 use crate::{
     ApplicationError, FilesystemSessionStore, RecordingStatus, load_recording_metadata,
     write_private_atomic_json,
@@ -641,6 +644,101 @@ pub fn list_recordings(data_dir: &Path) -> Result<Vec<ListedRecording>, Applicat
             .then_with(|| right.recording_id.cmp(&left.recording_id))
     });
     Ok(rows)
+}
+
+/// Deterministic parent-level list view. New runs load only their checksummed
+/// `recording-run.json`; legacy directories fall back to one explicitly linked
+/// epoch and never infer a chain from filesystem order or mtime.
+pub fn list_parent_recording_views(
+    data_dir: &Path,
+) -> Result<Vec<ParentRecordingViewV2>, ApplicationError> {
+    let summaries = FilesystemSessionStore::new(data_dir)
+        .list_summaries(SESSION_SUMMARY_LIMIT)
+        .map_err(ApplicationError::from)?;
+    let legacy_rows = list_recordings(data_dir)?;
+    let mut views = Vec::new();
+    for row in legacy_rows {
+        let root = recordings_root(data_dir).join(row.recording_id.to_string());
+        let run_path = root.join(RECORDING_RUN_FILE);
+        match fs::symlink_metadata(&run_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(ApplicationError::CatalogUnsafePath(run_path));
+            }
+            Ok(_) => {
+                let run = RecordingRunV2::load(&root).map_err(|error| {
+                    ApplicationError::RecordingMetadataValidation(error.to_string())
+                })?;
+                let parent_summaries: Vec<_> = summaries
+                    .iter()
+                    .filter(|summary| summary.recording_id == Some(run.parent_id))
+                    .collect();
+                let duration_ms = aggregate_duration_millis(&parent_summaries);
+                let mut view = ParentRecordingViewV2::from(&run);
+                view.sessions = parent_summaries.len();
+                view.operations = parent_summaries
+                    .iter()
+                    .map(|summary| summary.operation_count)
+                    .sum();
+                view.duration_ms = duration_ms;
+                views.push(view);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let state = match row.status {
+                    RecordingCatalogStatus::InProgress => RunLifecycleState::Running,
+                    RecordingCatalogStatus::Recoverable | RecordingCatalogStatus::Failed => {
+                        RunLifecycleState::Failed
+                    }
+                    RecordingCatalogStatus::Published => RunLifecycleState::Completed,
+                    RecordingCatalogStatus::Inconsistent => RunLifecycleState::Inconsistent,
+                };
+                views.push(ParentRecordingViewV2 {
+                    parent_id: row.recording_id,
+                    name: row.name,
+                    created_at_unix_millis: timestamp_millis(row.created_at),
+                    state,
+                    stop_reason: None,
+                    epoch_count: 1,
+                    active_epoch: (state == RunLifecycleState::Running).then_some(0),
+                    published_epoch_count: usize::from(row.sessions > 0),
+                    sessions: row.sessions,
+                    operations: row.operations,
+                    duration_ms: row.duration_ms,
+                    warnings: Vec::new(),
+                });
+            }
+            Err(error) => return Err(ApplicationError::Io(error)),
+        }
+    }
+    views.sort_by(|left, right| {
+        left.created_at_unix_millis
+            .cmp(&right.created_at_unix_millis)
+            .then_with(|| left.parent_id.cmp(&right.parent_id))
+    });
+    Ok(views)
+}
+
+fn timestamp_millis(timestamp: Timestamp) -> u64 {
+    u64::try_from(
+        (timestamp - Timestamp::UNIX_EPOCH)
+            .whole_milliseconds()
+            .max(0),
+    )
+    .unwrap_or(0)
+}
+
+fn aggregate_duration_millis(summaries: &[&SessionSummary]) -> Option<u64> {
+    if summaries.is_empty() || summaries.iter().any(|summary| summary.ended_at.is_none()) {
+        return None;
+    }
+    summaries.iter().try_fold(0_u64, |total, summary| {
+        let duration = u64::try_from(
+            (summary.ended_at? - summary.started_at)
+                .whole_milliseconds()
+                .max(0),
+        )
+        .ok()?;
+        total.checked_add(duration)
+    })
 }
 
 #[cfg(test)]

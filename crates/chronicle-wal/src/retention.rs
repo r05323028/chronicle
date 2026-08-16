@@ -403,7 +403,11 @@ impl SegmentLifecycleRecord {
         let allowed = match (self.state, next) {
             (SegmentLifecycle::Active, SegmentLifecycle::Sealed) => proof.sealed,
             (SegmentLifecycle::Sealed, SegmentLifecycle::Processed) => proof.processed,
-            (SegmentLifecycle::Processed, SegmentLifecycle::RetentionEligible) => proof.retention,
+            (SegmentLifecycle::Processed, SegmentLifecycle::RetentionEligible) => {
+                proof.retention
+                    && !proof.continuation_pending
+                    && !proof.continuation.protects_source()
+            }
             (SegmentLifecycle::RetentionEligible, SegmentLifecycle::Deleting) => {
                 proof.retention && proof.cleanup
             }
@@ -426,10 +430,31 @@ impl SegmentLifecycleRecord {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContinuationRetentionState {
+    #[default]
+    None,
+    Pending,
+    Ready,
+    Consumed,
+    Unavailable,
+    Failed,
+}
+
+impl ContinuationRetentionState {
+    pub const fn protects_source(self) -> bool {
+        matches!(self, Self::Pending | Self::Ready | Self::Failed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LifecycleProof {
     pub sealed: bool,
     pub processed: bool,
     pub retention: bool,
+    /// Compatibility flag for callers that have not adopted typed state.
+    pub continuation_pending: bool,
+    /// Pending or ready-but-unconsumed continuation protects source evidence.
+    pub continuation: ContinuationRetentionState,
     pub cleanup: bool,
     pub corruption: bool,
 }
@@ -576,6 +601,48 @@ mod tests {
         );
         assert!(!source.exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn continuation_dependency_blocks_retention_until_resolved() {
+        let mut segment = SegmentLifecycleRecord {
+            ordinal: 1,
+            digest: "a".repeat(64),
+            state: SegmentLifecycle::Processed,
+            tombstone_generation: None,
+        };
+        assert_eq!(
+            segment.transition(
+                SegmentLifecycle::RetentionEligible,
+                LifecycleProof {
+                    retention: true,
+                    continuation_pending: true,
+                    ..LifecycleProof::default()
+                }
+            ),
+            Err(RetentionError::TransitionDenied)
+        );
+        assert_eq!(
+            segment.transition(
+                SegmentLifecycle::RetentionEligible,
+                LifecycleProof {
+                    retention: true,
+                    continuation: ContinuationRetentionState::Ready,
+                    ..LifecycleProof::default()
+                },
+            ),
+            Err(RetentionError::TransitionDenied)
+        );
+        segment
+            .transition(
+                SegmentLifecycle::RetentionEligible,
+                LifecycleProof {
+                    retention: true,
+                    continuation: ContinuationRetentionState::Consumed,
+                    ..LifecycleProof::default()
+                },
+            )
+            .unwrap();
     }
 
     #[test]

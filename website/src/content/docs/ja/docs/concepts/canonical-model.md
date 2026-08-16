@@ -19,7 +19,7 @@ canonical session は、キャプチャとリプレイの間で Chronicle が受
 - replay attribute と明示的な blocker；
 - core field と分離して保持する protocol extension bytes。
 
-timeline が唯一の operation order です。completeness map が権威になります。endpoint evidence が欠落または衝突した場合、ETL は失敗し、捏造した `unknown:0` endpoint を保存することはありません。
+timeline が唯一の operation order です。completeness map が権威になります。epoch をまたぐ operation は completion owner と contributing epoch/WAL provenance を保持し、continuation のみ、または incomplete の outcome は replay できません。endpoint evidence が欠落または衝突した場合、ETL は失敗し、捏造した `unknown:0` endpoint を保存することはありません。
 
 ## 1 つの可変 v1 契約
 

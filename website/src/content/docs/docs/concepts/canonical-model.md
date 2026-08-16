@@ -19,7 +19,7 @@ The current v1 model includes:
 - replay attributes and explicit blockers;
 - protocol extension bytes kept separate from core fields.
 
-The timeline is the sole operation order. Completeness maps are authoritative. ETL fails for missing or conflicting endpoint evidence; it never stores a fabricated `unknown:0` endpoint.
+The timeline is the sole operation order. Completeness maps are authoritative. Cross-epoch operations retain completion-owner and contributing epoch/WAL provenance; continuation-only and incomplete outcomes are not replayable. ETL fails for missing or conflicting endpoint evidence; it never stores a fabricated `unknown:0` endpoint.
 
 ## One mutable v1 contract
 

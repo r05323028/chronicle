@@ -15,7 +15,7 @@ chronicle record --pid 12345
 chronicle record --cgroup /sys/fs/cgroup/my-service
 ```
 
-command mode 會監督該命令。PID 與 cgroup mode 會觀察既有工作負載，不會終止它們。使用 `--name` 為 recording 設定穩定且容易辨識的名稱，使用 `--duration` 設定較短且有明確上限的錄製時間。
+command mode 會監督該命令。PID 與 cgroup mode 會觀察既有工作負載，不會終止它們。使用 `--name` 設定穩定名稱，使用 `--duration` 設定可選的整段 recording deadline。省略時會持續到來源完成、明確停止或安全性致命失敗。擷取會在不重新連接來源的情況下輪替有明確上限的 epoch。
 
 ## 哪些資料會跨過邊界
 
@@ -29,6 +29,6 @@ Chronicle 會從命令、程序或 cgroup 外部掛接。應用程式不必加�
 
 ## 上限是契約的一部分
 
-一次性錄製預設為 600 秒，最大為 3600 秒。WAL 的實體容量上限為 4 GiB。擷取佇列有明確上限；無法納入佇列的證據會成為可見的遺失，而不是被靜默丟棄。
+整段 recording 的 duration 可省略；`10m`、`24h` 等經檢查的值會設定 deadline，且不會在 epoch 輪替時重設。每個 epoch 仍有有明確上限的 WAL/segment 上限，parent 沒有總 WAL 上限。擷取佇列仍有明確上限；無法納入的證據會成為可見遺失，而不是被靜默丟棄。
 
 接著閱讀 [WAL](../wal/)、[ETL](../../architecture/etl/) 與[本機部署](../../deployment/local/)，了解後續邊界。

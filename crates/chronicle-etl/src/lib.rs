@@ -1,6 +1,7 @@
 //! Restartable WAL-to-canonical transformation boundary.
 
 mod checkpoint;
+mod continuation;
 mod delta;
 mod incremental;
 mod publication;
@@ -11,13 +12,21 @@ pub use checkpoint::{
     IncrementalEtlCheckpointV1, MarkerLineage, RecoveryAuthoritativeSnapshot, SegmentLineage,
     SourceStatus, read_checkpoint, write_checkpoint_atomic,
 };
+pub use continuation::{
+    ContinuationCoordinator, ContinuationDependencyV2, ContinuationError, ContinuationLimits,
+    ContinuationState, EPOCH_CONTINUATION_CHECKPOINT_VERSION, EPOCH_CONTINUATION_FILE,
+    EPOCH_CONTINUATION_IN_FILE, EPOCH_CONTINUATION_OUT_FILE, EPOCH_CONTINUATION_STATE_FILE,
+    EpochContinuationCheckpointV1, INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION,
+    IncrementalEtlCheckpointV2,
+};
 pub use delta::{CANONICAL_DELTA_SCHEMA_VERSION, CanonicalDeltaBatchV1, DeltaBatchError};
 pub use incremental::{CommittedWalSnapshot, IncrementalProcessor, IncrementalResult};
 pub use publication::{
     CheckpointFault, OneShotPublicationError, OneShotPublicationOutcome, PublicationError,
-    ReconcileOutcome, finalize_incremental_session, publish_delta_then_checkpoint,
+    ReconcileOutcome, finalize_incremental_session, publish_continuation_then_checkpoint_v2,
+    publish_delta_then_checkpoint, publish_delta_then_checkpoint_v2,
     publish_delta_then_checkpoint_with_fault, publish_final_session, reconcile_delta_checkpoint,
-    recover_pending_checkpoint, verify_one_shot_equivalence,
+    recover_pending_checkpoint, recover_pending_checkpoint_v2, verify_one_shot_equivalence,
 };
 
 /// ETL input boundary before protocol-specific decoding.
@@ -25,9 +34,9 @@ pub use chronicle_protocol::ProtocolNeutralConnection;
 
 use chronicle_canonical::{
     Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalOperation,
-    CanonicalSession, Completeness, OperationEffect, OperationKind, OperationProvenance,
-    PROTOCOL_DATA_SCHEMA_VERSION, PayloadRef, ProtocolData, RelativeTimeNanos, ReplayMetadata,
-    SourceMetadata, TimelineEntry,
+    CanonicalSession, Completeness, OperationCompletion, OperationEffect, OperationEpochRange,
+    OperationKind, OperationProvenance, PROTOCOL_DATA_SCHEMA_VERSION, PayloadRef, ProtocolData,
+    RelativeTimeNanos, ReplayMetadata, SourceMetadata, TimelineEntry,
 };
 use chronicle_capture::{
     CaptureEvent, CaptureEventKind, LossWindowObserved, SocketRole, decode_event,
@@ -85,6 +94,61 @@ pub struct EtlOutput {
     pub issues: Vec<EtlIssue>,
     /// Typed loss evidence preserved from committed envelopes for reconstruction.
     pub evidence: EtlEvidence,
+}
+
+/// Stamp canonical operations with immutable completion-owner and epoch/WAL provenance.
+/// Incomplete decoder output remains explicitly non-replayable.
+pub fn stamp_epoch_operation_provenance(
+    session: &mut CanonicalSession,
+    parent_id: chronicle_common::RecordingId,
+    epoch_id: chronicle_common::EpochId,
+    epoch_ordinal: Option<u64>,
+    wal_sequence_range: Option<(u64, u64)>,
+) {
+    session.source_provenance.recording_id = Some(parent_id);
+    session.source_provenance.epoch_id = Some(epoch_id);
+    session.source_provenance.epoch_ordinal = epoch_ordinal;
+    session.source_provenance.wal_sequence_range = wal_sequence_range;
+    let operation_completeness = session.operation_completeness.clone();
+    let mut operation_ids = BTreeMap::new();
+    for connection in &mut session.connections {
+        for operation in &mut connection.operations {
+            let old_id = operation.id;
+            let range = OperationEpochRange {
+                parent_id: Some(parent_id),
+                epoch_id,
+                epoch_ordinal,
+                wal_sequence_range,
+            };
+            if !operation.provenance.epoch_ranges.contains(&range) {
+                operation.provenance.epoch_ranges.push(range);
+            }
+            operation.provenance.completion_owner_epoch = Some(epoch_id);
+            operation.provenance.completion = match operation_completeness
+                .get(&old_id)
+                .copied()
+                .unwrap_or(Completeness::Incomplete)
+            {
+                Completeness::Complete => OperationCompletion::Complete,
+                Completeness::Unsupported => OperationCompletion::Unsupported,
+                _ => OperationCompletion::Incomplete,
+            };
+            let new_id = deterministic_operation_id(operation);
+            operation.id = new_id;
+            operation_ids.insert(old_id, new_id);
+        }
+    }
+    session.operation_completeness = operation_completeness
+        .into_iter()
+        .filter_map(|(id, completeness)| {
+            operation_ids.get(&id).map(|new_id| (*new_id, completeness))
+        })
+        .collect();
+    for entry in &mut session.timeline {
+        if let Some(new_id) = operation_ids.get(&entry.operation_id) {
+            entry.operation_id = *new_id;
+        }
+    }
 }
 
 /// Assigns stable recording-derived identifiers after canonicalization.
@@ -1276,6 +1340,43 @@ mod tests {
             assert_ne!(connection.client.port, 0);
             assert_ne!(connection.server.port, 0);
         }
+    }
+
+    #[test]
+    fn completion_stamp_binds_owner_and_epoch_range() {
+        let parent = RecordingId::new();
+        let epoch = chronicle_common::EpochId::new();
+        let envelopes = endpoint_envelopes(
+            parent,
+            NetworkFamily::Ipv4,
+            SocketRole::Active,
+            PayloadDirection::Egress,
+            Endpoint::new("192.0.2.10", 41_000),
+            Endpoint::new("192.0.2.20", 8_080),
+        );
+        let mut output = EtlPipeline::new(SessionLimits::default())
+            .process_envelopes(&envelopes, &ProtocolRegistry::new(), SessionId::new())
+            .unwrap();
+        stamp_epoch_operation_provenance(&mut output.session, parent, epoch, Some(2), Some((1, 4)));
+        assert_eq!(output.session.source_provenance.recording_id, Some(parent));
+        assert_eq!(output.session.source_provenance.epoch_id, Some(epoch));
+        let operation = &output.session.connections[0].operations[0];
+        assert_eq!(operation.provenance.completion_owner_epoch, Some(epoch));
+        assert_eq!(operation.provenance.epoch_ranges.len(), 1);
+        assert_eq!(
+            operation.provenance.epoch_ranges[0].wal_sequence_range,
+            Some((1, 4))
+        );
+        let first_id = operation.id;
+        let mut next_epoch = output.session.clone();
+        stamp_epoch_operation_provenance(
+            &mut next_epoch,
+            parent,
+            chronicle_common::EpochId::new(),
+            Some(3),
+            Some((1, 4)),
+        );
+        assert_ne!(next_epoch.connections[0].operations[0].id, first_id);
     }
 
     #[test]

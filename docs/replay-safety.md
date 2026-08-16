@@ -2,6 +2,8 @@
 
 Replay is primary capability and highest-risk boundary.
 
+Parent replay aggregates only verified terminal canonical operations from ordered epoch sessions. Continuation-only predecessor evidence remains inspectable completeness metadata and never becomes executable traffic. A WAL epoch boundary is not a protocol reconstruction boundary; missing or invalid continuation fails closed rather than synthesizing a request.
+
 ## Current safeguards
 
 Replay planner preserves one result per canonical operation. Complete supported operations can execute while incomplete, truncated, malformed, unmatched, unsupported, pipelined, or ambiguous-loss operations remain visible as not attempted. Aggregate outcomes are `completed`, `completed_with_skips`, `dry_run`, `stopped_policy`, `stopped_invalid_session`, `stopped_transport`, and `stopped_verification`; a transport or verification stop retains prior, current, and later unattempted results.

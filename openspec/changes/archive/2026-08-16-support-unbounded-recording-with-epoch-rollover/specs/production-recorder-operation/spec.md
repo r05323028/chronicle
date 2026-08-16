@@ -120,8 +120,6 @@ Rootless tests SHALL validate configuration parsing, parent/epoch lifecycle/stat
 - **THEN** retained report proves recommended placement, continuous operation, restart, resource/failure behavior, and cleanup for compatible environment without treating OpenSpec validation as runtime proof
 - **AND THEN** release reports additionally prove clean stable source identity
 
-## ADDED Requirements
-
 #### Scenario: Epoch reaches configured bound
 
 - **WHEN** active epoch reaches configured duration or size bound
@@ -136,6 +134,8 @@ Rootless tests SHALL validate configuration parsing, parent/epoch lifecycle/stat
 
 - **WHEN** capture/WAL durability or global quota fails
 - **THEN** recorder stops parent visibly, preserves every committed epoch prefix and failure reason, and does not claim unbounded success
+
+## ADDED Requirements
 
 ### Requirement: Epoch rollover is crash-safe and non-overlapping
 

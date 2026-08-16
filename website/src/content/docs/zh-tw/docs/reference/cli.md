@@ -35,13 +35,13 @@ chronicle record --cgroup /sys/fs/cgroup/my-service
 chronicle record --retry checkout
 ```
 
-公開旗標包含 `--name`、`--duration`、`--retry`、`--pid` 與 `--cgroup`。命令引數放在 `--` 之後。
+公開旗標包含 `--name`、可選的整段 recording `--duration`、`--retry`、`--pid` 與 `--cgroup`。`list` 每個穩定 parent 顯示一列，並提供有明確上限的 epoch 計數。命令引數放在 `--` 之後。
 
 ### replay
 
 ```bash
 chronicle replay checkout -- ./my-app
-chronicle replay checkout --target http://127.0.0.1:8080 \
+chronicle replay checkout --epoch 0 --target http://127.0.0.1:8080 \
   --allow-host 127.0.0.1 --allow-read --execute
 ```
 

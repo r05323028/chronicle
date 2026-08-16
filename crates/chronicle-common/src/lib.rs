@@ -87,6 +87,14 @@ macro_rules! uuid_id {
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
+
+            pub const fn from_uuid(value: Uuid) -> Self {
+                Self(value)
+            }
+
+            pub const fn as_uuid(self) -> Uuid {
+                self.0
+            }
         }
 
         impl Default for $name {
@@ -104,6 +112,7 @@ macro_rules! uuid_id {
 }
 
 uuid_id!(RecordingId);
+uuid_id!(EpochId);
 uuid_id!(SessionId);
 uuid_id!(ConnectionId);
 uuid_id!(OperationId);
@@ -125,6 +134,50 @@ pub fn escape_control(input: &str) -> String {
     }
     out
 }
+
+impl EpochId {
+    /// CLI/display form: `epoch_<full-uuid>`.
+    pub fn to_cli_string(&self) -> String {
+        format!("epoch_{}", self.0)
+    }
+
+    /// Parse `epoch_<full-uuid>` or a bare full UUID for internal compatibility.
+    pub fn parse_cli(input: &str) -> Result<Self, EpochIdParseError> {
+        let rest = input.strip_prefix("epoch_").unwrap_or(input);
+        let uuid = Uuid::parse_str(rest).map_err(|_| EpochIdParseError::new(input))?;
+        Ok(Self(uuid))
+    }
+}
+
+/// Error returned when an epoch reference cannot be parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpochIdParseError {
+    input: String,
+}
+
+impl EpochIdParseError {
+    pub fn new(input: impl Into<String>) -> Self {
+        Self {
+            input: input.into(),
+        }
+    }
+
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+}
+
+impl fmt::Display for EpochIdParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid epoch reference '{}': expected 'epoch_<full-uuid>' or a full UUID",
+            self.input
+        )
+    }
+}
+
+impl std::error::Error for EpochIdParseError {}
 
 impl RecordingId {
     /// CLI display form: `rec_<full-uuid>`.
@@ -183,6 +236,10 @@ mod tests {
 
     fn sample() -> RecordingId {
         RecordingId(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
+    }
+
+    fn sample_epoch() -> EpochId {
+        EpochId(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
     }
 
     #[test]
@@ -247,6 +304,28 @@ mod tests {
         let err = RecordingId::parse_cli("rec_abc12").unwrap_err();
         assert_eq!(err.input(), "rec_abc12");
         assert!(err.to_string().contains("rec_<full-uuid>"));
+    }
+
+    #[test]
+    fn epoch_cli_string_and_parser_are_typed() {
+        let id = sample_epoch();
+        assert_eq!(
+            id.to_cli_string(),
+            "epoch_00000000-0000-0000-0000-000000000002"
+        );
+        assert_eq!(EpochId::parse_cli(&id.to_cli_string()).unwrap(), id);
+        assert_eq!(
+            EpochId::parse_cli("00000000-0000-0000-0000-000000000002").unwrap(),
+            id
+        );
+        assert!(EpochId::parse_cli("epoch_abc12").is_err());
+        assert!(EpochId::parse_cli("EPOCH_00000000-0000-0000-0000-000000000002").is_err());
+    }
+
+    #[test]
+    fn epoch_uuid_accessors_do_not_change_type() {
+        let id = sample_epoch();
+        assert_eq!(EpochId::from_uuid(id.as_uuid()), id);
     }
 
     #[test]

@@ -49,7 +49,7 @@ Envelope CRC32C covers bytes `0..44` plus payload. Active kinds are capture even
 
 The marker carries cumulative durable sequence/count/bytes, batch bounds, and SHA-256 over exact placed framed bytes. Recovery authority requires complete marker/frame CRCs, contiguous same-segment references, exact boundaries, cumulative totals, recording identity, versions, and digest. A valid marker proves persisted WAL durability only; recovery never reconstructs whether a caller observed its acknowledgement. Complete records after the final valid marker remain visible as uncommitted suffix and never enter ETL.
 
-Writer reserves a complete data frame plus final marker in current and total physical capacity before writing. Rotation also reserves the next header and temporary publication peak. Segment size is bounded from 16 MiB through 4 GiB; total bytes under `segments/` default to and never exceed 4 GiB. Unix directories/files use `0700`/`0600`. Queue-limit discard is recorder admission loss, not kernel loss, and is represented by typed terminal WAL-loss evidence or metadata-only summary.
+Writer reserves a complete data frame plus final marker in current and total physical capacity before writing. Rotation also reserves the next header and temporary publication peak. Segment size is bounded from 16 MiB through 4 GiB; total bytes under one epoch's `segments/` directory default to and never exceed 4 GiB. A parent recording may own many such epochs; this does not change WAL v1 bytes or marker authority. Unix directories/files use `0700`/`0600`. Queue-limit discard is recorder admission loss, not kernel loss, and is represented by typed terminal WAL-loss evidence or metadata-only summary.
 
 ## Recovery
 

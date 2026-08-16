@@ -7,18 +7,23 @@ use crate::{
     RecorderHealth, RecorderLifecycleError, RecorderMetadataV1, RecorderOrchestrationError,
     RecorderOrchestrator, RecorderPoll, RecorderReadiness, RecorderStartup, RecorderStartupError,
     RecordingCaptureMetadata, RecordingMetadata, RecordingStatus, ReservationKind,
-    RolloverTransitionPhase, RolloverTransitionV1, load_transition, write_recorder_metadata,
-    write_recording_metadata, write_transition_atomic,
+    RolloverTransitionPhase, RolloverTransitionV1, RolloverTransitionV2, RolloverTransitionV2Phase,
+    load_transition, load_transition_v2, write_recorder_metadata, write_recording_metadata,
+    write_transition_atomic, write_transition_v2_atomic,
 };
 use chronicle_capture::{CaptureError, CaptureSource};
-use chronicle_common::{RecordingId, SessionId};
+use chronicle_common::{EpochId, RecordingId, SessionId};
 use chronicle_etl::{
     CanonicalDeltaBatchV1, CheckpointFault, CheckpointLifecycle, CheckpointOwner,
-    CommittedWalSnapshot, DeltaBatchReference, ETL_PIPELINE_VERSION,
-    INCREMENTAL_CHECKPOINT_SCHEMA_VERSION, IncrementalEtlCheckpointV1, IncrementalProcessor,
+    CommittedWalSnapshot, ContinuationDependencyV2, ContinuationLimits, ContinuationState,
+    DeltaBatchReference, EPOCH_CONTINUATION_IN_FILE, EPOCH_CONTINUATION_OUT_FILE,
+    EPOCH_CONTINUATION_STATE_FILE, ETL_PIPELINE_VERSION, EpochContinuationCheckpointV1,
+    INCREMENTAL_CHECKPOINT_SCHEMA_VERSION, INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION,
+    IncrementalEtlCheckpointV1, IncrementalEtlCheckpointV2, IncrementalProcessor,
     IncrementalResult, MarkerLineage, RecoveryAuthoritativeSnapshot, SegmentLineage, SourceStatus,
-    publish_delta_then_checkpoint, publish_delta_then_checkpoint_with_fault, read_checkpoint,
-    recover_pending_checkpoint,
+    publish_delta_then_checkpoint, publish_delta_then_checkpoint_v2,
+    publish_delta_then_checkpoint_with_fault, read_checkpoint, recover_pending_checkpoint,
+    recover_pending_checkpoint_v2, stamp_epoch_operation_provenance,
 };
 use chronicle_protocol::ProtocolRegistry;
 use chronicle_protocol_builtins::registry;
@@ -32,6 +37,93 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
+
+#[derive(Clone, Debug)]
+struct PendingContinuation {
+    old_wal_directory: std::path::PathBuf,
+    old_epoch_id: EpochId,
+    successor_epoch_id: EpochId,
+    old_epoch_ordinal: u64,
+}
+
+fn recover_pending_continuation(
+    wal_directory: &Path,
+    current_epoch_id: EpochId,
+    continuation_in: Option<&EpochContinuationCheckpointV1>,
+) -> Result<Option<PendingContinuation>, ContinuousRecorderError> {
+    let state_path = wal_directory.join(EPOCH_CONTINUATION_STATE_FILE);
+    match fs::metadata(&state_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ContinuousRecorderError::Incremental(error.to_string()));
+        }
+    }
+    let dependency = ContinuationDependencyV2::load(&state_path)
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    if dependency.successor_epoch_id != current_epoch_id {
+        return Err(ContinuousRecorderError::Incremental(
+            "continuation dependency successor mismatch".into(),
+        ));
+    }
+    let Some(predecessor_epoch_id) = dependency.predecessor_epoch_id else {
+        return Err(ContinuousRecorderError::Incremental(
+            "pending continuation has no predecessor".into(),
+        ));
+    };
+    if let Some(checkpoint) = continuation_in {
+        if checkpoint.predecessor_epoch_id != predecessor_epoch_id
+            || checkpoint.successor_epoch_id != current_epoch_id
+        {
+            return Err(ContinuousRecorderError::Incremental(
+                "continuation dependency/input lineage mismatch".into(),
+            ));
+        }
+        if dependency.state == ContinuationState::Pending {
+            let parent_id = dependency.parent_id.unwrap_or(checkpoint.parent_id);
+            ContinuationDependencyV2::ready_from_checkpoint(
+                parent_id,
+                predecessor_epoch_id,
+                checkpoint,
+                &ETL_PIPELINE_VERSION.to_string(),
+            )
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?
+            .write_atomic(&state_path)
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        }
+        return Ok(None);
+    }
+    if dependency.state == ContinuationState::Ready {
+        return Err(ContinuousRecorderError::Incremental(
+            "ready continuation has no successor handoff".into(),
+        ));
+    }
+    if dependency.state != ContinuationState::Pending {
+        return Ok(None);
+    }
+    let epochs_directory = wal_directory
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "epochs"))
+        .ok_or_else(|| {
+            ContinuousRecorderError::Incremental(
+                "pending continuation active path is outside epoch catalog".into(),
+            )
+        })?;
+    let root = epochs_directory.parent().ok_or_else(|| {
+        ContinuousRecorderError::Incremental("pending continuation catalog root missing".into())
+    })?;
+    let catalog = crate::EpochCatalogV2::load(root)
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    let predecessor = catalog.epoch(predecessor_epoch_id).ok_or_else(|| {
+        ContinuousRecorderError::Incremental("pending continuation predecessor missing".into())
+    })?;
+    Ok(Some(PendingContinuation {
+        old_wal_directory: root.join(&predecessor.path),
+        old_epoch_id: predecessor_epoch_id,
+        successor_epoch_id: current_epoch_id,
+        old_epoch_ordinal: predecessor.ordinal,
+    }))
+}
 
 #[derive(Debug, Error)]
 pub enum ContinuousRecorderError {
@@ -69,6 +161,11 @@ pub struct ContinuousRecorderService<S> {
     incremental_registry: ProtocolRegistry,
     incremental_session_id: SessionId,
     incremental_checkpoint: Option<IncrementalEtlCheckpointV1>,
+    /// Verified predecessor handoff for current epoch ETL. Legacy V1 checkpoints
+    /// remain readable; continuation state is separate and immutable.
+    continuation_in: Option<EpochContinuationCheckpointV1>,
+    continuation_out: Option<EpochContinuationCheckpointV1>,
+    pending_continuation: Option<PendingContinuation>,
     next_incremental_millis: u64,
     checkpoint_fault: Option<CheckpointFault>,
     last_wal_bytes: u64,
@@ -195,6 +292,69 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         incremental_worker.start();
         let starting_epoch_ordinal = recorder.epoch_ordinal();
         let wal_directory = wal_directory.as_ref().to_path_buf();
+        let recording_id = recorder.ingest().recording_id();
+        let continuation_in = match fs::metadata(wal_directory.join(EPOCH_CONTINUATION_IN_FILE)) {
+            Ok(_) => {
+                let checkpoint = EpochContinuationCheckpointV1::load(
+                    wal_directory.join(EPOCH_CONTINUATION_IN_FILE),
+                )
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+                if checkpoint.successor_epoch_id != EpochId::from_uuid(recording_id.0)
+                    || checkpoint.pipeline_version != ETL_PIPELINE_VERSION.to_string()
+                {
+                    return Err(ContinuousRecorderError::Incremental(
+                        "continuation-in lineage mismatch".into(),
+                    ));
+                }
+                Some(checkpoint)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(ContinuousRecorderError::Incremental(error.to_string())),
+        };
+        let pending_continuation = recover_pending_continuation(
+            &wal_directory,
+            EpochId::from_uuid(recording_id.0),
+            continuation_in.as_ref(),
+        )?;
+        let parent_id = continuation_in
+            .as_ref()
+            .map_or(recording_id, |checkpoint| checkpoint.parent_id);
+        let v2_checkpoint_path = wal_directory.join("incremental-etl-checkpoint-v2.json");
+        if fs::metadata(&v2_checkpoint_path).is_ok() {
+            let checkpoint = IncrementalEtlCheckpointV2::load(&v2_checkpoint_path)
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+            if checkpoint.parent_id != parent_id
+                || checkpoint.epoch_id != EpochId::from_uuid(recording_id.0)
+                || checkpoint.config_digest
+                    != config
+                        .stable_digest()
+                        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?
+                || checkpoint.pipeline_version != ETL_PIPELINE_VERSION.to_string()
+            {
+                return Err(ContinuousRecorderError::Incremental(
+                    "incremental V2 checkpoint lineage mismatch".into(),
+                ));
+            }
+            if checkpoint.continuation.state == ContinuationState::Ready {
+                let handoff = continuation_in.as_ref().ok_or_else(|| {
+                    ContinuousRecorderError::Incremental(
+                        "ready continuation has no successor handoff".into(),
+                    )
+                })?;
+                let digest: [u8; 32] =
+                    Sha256::digest(handoff.encode().map_err(|error| {
+                        ContinuousRecorderError::Incremental(error.to_string())
+                    })?)
+                    .into();
+                if checkpoint.continuation.output_digest.as_deref()
+                    != Some(digest_hex(&digest).as_str())
+                {
+                    return Err(ContinuousRecorderError::Incremental(
+                        "ready continuation digest mismatch".into(),
+                    ));
+                }
+            }
+        }
         let last_wal_bytes = crate::recording_physical_wal_bytes(&wal_directory)
             .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
         let checkpoint_path = wal_directory.join("incremental-etl-checkpoint.json");
@@ -224,7 +384,6 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                 return Err(ContinuousRecorderError::Incremental(error.to_string()));
             }
         };
-        let recording_id = recorder.ingest().recording_id();
         let metadata = RecordingMetadata {
             version: crate::RECORDING_METADATA_SCHEMA_VERSION,
             recording_id,
@@ -244,6 +403,15 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         let active_metadata = RecorderMetadataV1 {
             version: crate::RECORDER_METADATA_SCHEMA_VERSION,
             recorder_id: recording_id.0,
+            parent_id: Some(parent_id),
+            current_epoch_id: Some(EpochId::from_uuid(recording_id.0)),
+            finalized_epoch_count: 0,
+            continuation_in: continuation_in
+                .as_ref()
+                .map(|_| EPOCH_CONTINUATION_IN_FILE.to_owned()),
+            continuation_out: None,
+            retention_state: None,
+            last_rollover: None,
             attempt_id: uuid::Uuid::new_v4(),
             config_digest: config
                 .stable_digest()
@@ -258,7 +426,10 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                 ordinal: starting_epoch_ordinal,
                 recording_id: recording_id.0,
             }),
-            previous_epoch: None,
+            previous_epoch: pending_continuation.as_ref().map(|pending| EpochMetadata {
+                ordinal: pending.old_epoch_ordinal,
+                recording_id: pending.old_epoch_id.as_uuid(),
+            }),
             active_segment: None,
             commit: None,
             incremental_checkpoint: incremental_checkpoint.as_ref().map(|checkpoint| {
@@ -313,6 +484,16 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             incremental_processor
                 .restore_publication_keys(checkpoint.published_operation_keys.clone())
                 .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        } else if let Some(checkpoint) = &continuation_in {
+            incremental_processor
+                .restore_continuation(
+                    checkpoint,
+                    parent_id,
+                    checkpoint.predecessor_epoch_id,
+                    EpochId::from_uuid(recording_id.0),
+                    &ETL_PIPELINE_VERSION.to_string(),
+                )
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
         }
         Ok(Self {
             startup,
@@ -327,6 +508,9 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             incremental_registry,
             incremental_session_id,
             incremental_checkpoint,
+            continuation_in,
+            continuation_out: None,
+            pending_continuation,
             next_incremental_millis: 0,
             checkpoint_fault: None,
             last_wal_bytes,
@@ -339,14 +523,21 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
     pub fn finalize_incremental_session(&mut self) -> Result<(), ContinuousRecorderError> {
         let recording_id = self.recorder.ingest().recording_id();
         let session_id = self.incremental_session_id;
-        self.finalize_incremental_recording(recording_id, session_id)
+        let epoch_ordinal = self.recorder.epoch_ordinal();
+        self.finalize_incremental_recording(recording_id, session_id, epoch_ordinal)
     }
 
     fn finalize_incremental_recording(
         &mut self,
         recording_id: RecordingId,
         session_id: SessionId,
+        epoch_ordinal: u64,
     ) -> Result<(), ContinuousRecorderError> {
+        if self.pending_continuation.is_some() {
+            return Err(ContinuousRecorderError::Incremental(
+                "successor ETL cannot finalize while predecessor continuation is unresolved".into(),
+            ));
+        }
         match chronicle_wal::read_committed_snapshot_with_records(
             &self.wal_directory,
             recording_id,
@@ -369,10 +560,34 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             Err(chronicle_wal::WalError::NoPublishedSegments) => return Ok(()),
             Err(error) => return Err(ContinuousRecorderError::Wal(error)),
         }
-        let output = self
+        let mut output = self
             .incremental_processor
             .finalize(&self.incremental_registry, session_id)
             .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let parent_id = self
+            .active_metadata
+            .parent_id
+            .unwrap_or(self.metadata.recording_id);
+        output.session.source_provenance.recording_id = Some(parent_id);
+        output.session.source_provenance.epoch_id = Some(EpochId::from_uuid(recording_id.0));
+        output.session.source_provenance.epoch_ordinal = Some(epoch_ordinal);
+        output.session.source_provenance.continuation_in = self
+            .continuation_in
+            .as_ref()
+            .map(|_| EPOCH_CONTINUATION_IN_FILE.to_owned());
+        output.session.source_provenance.continuation_out = self
+            .continuation_out
+            .as_ref()
+            .map(|_| EPOCH_CONTINUATION_OUT_FILE.to_owned());
+        stamp_epoch_operation_provenance(
+            &mut output.session,
+            parent_id,
+            EpochId::from_uuid(recording_id.0),
+            Some(epoch_ordinal),
+            self.incremental_processor
+                .last_marker_sequence()
+                .map(|sequence| (0, sequence)),
+        );
         let checkpoint = self
             .incremental_checkpoint
             .as_ref()
@@ -434,11 +649,129 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         Ok(())
     }
 
+    pub fn set_parent_id(&mut self, parent_id: RecordingId) -> Result<(), ContinuousRecorderError> {
+        if parent_id.as_uuid().is_nil() {
+            return Err(ContinuousRecorderError::Metadata(
+                "parent recording identity is nil".into(),
+            ));
+        }
+        self.active_metadata.parent_id = Some(parent_id);
+        write_recorder_metadata(&self.state_root, &self.active_metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        Ok(())
+    }
+
+    fn complete_pending_continuation(&mut self) -> Result<(), ContinuousRecorderError> {
+        let Some(pending) = self.pending_continuation.clone() else {
+            return Ok(());
+        };
+        let parent_id = self
+            .active_metadata
+            .parent_id
+            .unwrap_or(RecordingId(pending.old_epoch_id.as_uuid()));
+        // Export on a scratch processor: a retry after a mid-completion crash
+        // must never re-ingest the predecessor WAL into an already-restored
+        // assembler, so the live processor stays untouched until Ready is
+        // durable.
+        let mut processor = IncrementalProcessor::new(chronicle_session::SessionLimits::default());
+        // A chained rollover's predecessor is itself a successor: restore its
+        // verified handoff so connections idle across that epoch survive the
+        // next continuation instead of being silently reset.
+        match fs::metadata(pending.old_wal_directory.join(EPOCH_CONTINUATION_IN_FILE)) {
+            Ok(_) => {
+                let handoff = EpochContinuationCheckpointV1::load(
+                    pending.old_wal_directory.join(EPOCH_CONTINUATION_IN_FILE),
+                )
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+                if handoff.successor_epoch_id != pending.old_epoch_id
+                    || handoff.pipeline_version != ETL_PIPELINE_VERSION.to_string()
+                {
+                    return Err(ContinuousRecorderError::Incremental(
+                        "predecessor continuation-in lineage mismatch".into(),
+                    ));
+                }
+                processor
+                    .restore_continuation(
+                        &handoff,
+                        parent_id,
+                        handoff.predecessor_epoch_id,
+                        pending.old_epoch_id,
+                        &ETL_PIPELINE_VERSION.to_string(),
+                    )
+                    .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ContinuousRecorderError::Incremental(error.to_string()));
+            }
+        }
+        let checkpoint = Self::export_continuation(
+            parent_id,
+            &mut processor,
+            &self.incremental_registry,
+            self.incremental_session_id,
+            &pending.old_wal_directory,
+            pending.old_epoch_id,
+            pending.successor_epoch_id,
+            pending.old_epoch_ordinal,
+        )?;
+        self.publish_continuation(
+            &checkpoint,
+            &pending.old_wal_directory,
+            &self.wal_directory,
+            pending.old_epoch_ordinal,
+        )?;
+        // Durable Ready precedes any live-processor mutation; later steps are
+        // idempotent overwrites, so a crash here retries cleanly.
+        ContinuationDependencyV2::ready_from_checkpoint(
+            parent_id,
+            pending.old_epoch_id,
+            &checkpoint,
+            &ETL_PIPELINE_VERSION.to_string(),
+        )
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?
+        .write_atomic(self.wal_directory.join(EPOCH_CONTINUATION_STATE_FILE))
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        self.incremental_processor
+            .restore_continuation(
+                &checkpoint,
+                parent_id,
+                pending.old_epoch_id,
+                pending.successor_epoch_id,
+                &ETL_PIPELINE_VERSION.to_string(),
+            )
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        self.continuation_in = Some(checkpoint);
+        self.active_metadata.continuation_in = Some(EPOCH_CONTINUATION_IN_FILE.to_owned());
+        self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+        self.active_metadata.updated_at_unix_seconds = unix_seconds();
+        write_recorder_metadata(&self.state_root, &self.active_metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        self.pending_continuation = None;
+        Ok(())
+    }
+
     pub fn poll(&mut self, now_millis: u64) -> Result<RecorderPoll, ContinuousRecorderError> {
         self.refresh_quota_metadata()?;
         let poll = self.recorder.poll(now_millis)?;
         self.sync_active_progress();
-        self.poll_incremental(now_millis)?;
+        if let Err(error) = self.complete_pending_continuation() {
+            eprintln!("continuation completion deferred: {error}");
+            self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+            self.active_metadata.health = RecorderHealth::Degraded;
+            self.active_metadata.updated_at_unix_seconds = unix_seconds();
+            write_recorder_metadata(&self.state_root, &self.active_metadata)
+                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        }
+        if self.pending_continuation.is_none() {
+            self.poll_incremental(now_millis)?;
+        } else {
+            self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+            self.active_metadata.health = RecorderHealth::Degraded;
+            self.active_metadata.updated_at_unix_seconds = unix_seconds();
+            write_recorder_metadata(&self.state_root, &self.active_metadata)
+                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        }
         Ok(poll)
     }
 
@@ -595,6 +928,9 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
                         {
                             self.active_metadata.health = RecorderHealth::Degraded;
                         }
+                    } else if self.pending_continuation.is_some() {
+                        self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+                        self.active_metadata.health = RecorderHealth::Degraded;
                     } else {
                         self.active_metadata.processing_readiness = RecorderReadiness::Ready;
                         self.active_metadata.health = RecorderHealth::Healthy;
@@ -644,9 +980,22 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         marker_digest: [u8; 32],
         active_segment_digest: [u8; 32],
     ) -> Result<(), ContinuousRecorderError> {
-        let operations = result
-            .output
-            .session
+        let recording_id = self.recorder.ingest().recording_id();
+        let epoch_ordinal = self
+            .active_metadata
+            .current_epoch
+            .as_ref()
+            .map_or(0, |epoch| epoch.ordinal);
+        let parent_id = self.active_metadata.parent_id.unwrap_or(recording_id);
+        let mut session = result.output.session.clone();
+        stamp_epoch_operation_provenance(
+            &mut session,
+            parent_id,
+            EpochId::from_uuid(recording_id.0),
+            Some(epoch_ordinal),
+            Some((result.first_marker_sequence, result.last_marker_sequence)),
+        );
+        let operations = session
             .connections
             .iter()
             .flat_map(|connection| connection.operations.iter().cloned())
@@ -657,7 +1006,6 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             operations,
         )
         .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
-        let recording_id = self.recorder.ingest().recording_id();
         let key = format!(
             "deltas/{}/{}.json",
             recording_id.0, result.last_marker_sequence
@@ -683,11 +1031,6 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             bytes: bytes.len() as u64,
         });
         let marker_digest_hex = digest_hex(&marker_digest);
-        let epoch_ordinal = self
-            .active_metadata
-            .current_epoch
-            .as_ref()
-            .map_or(0, |epoch| epoch.ordinal);
         let decoder = self
             .incremental_processor
             .decoder_state(
@@ -750,6 +1093,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             let _ = quota.release(ReservationKind::RecordingStore, recording_reservation);
             return Err(error.into());
         }
+        let v2_key = key.clone();
         let publication = if let Some(fault) = self.checkpoint_fault.take() {
             publish_delta_then_checkpoint_with_fault(
                 &store,
@@ -783,6 +1127,67 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         let checkpoint =
             read_checkpoint(self.wal_directory.join("incremental-etl-checkpoint.json"))
                 .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let successor_epoch_id = EpochId::from_uuid(recording_id.0);
+        let continuation = if let Some(handoff) = &self.continuation_in {
+            let handoff_bytes = handoff
+                .encode()
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+            let handoff_digest: [u8; 32] = Sha256::digest(handoff_bytes).into();
+            ContinuationDependencyV2::pending_for_parent(
+                Some(parent_id),
+                handoff.predecessor_epoch_id,
+                successor_epoch_id,
+            )
+            .transition(
+                ContinuationState::Ready,
+                Some(digest_hex(&handoff_digest)),
+                None,
+            )
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?
+        } else if self.pending_continuation.is_some() {
+            ContinuationDependencyV2::load(self.wal_directory.join(EPOCH_CONTINUATION_STATE_FILE))
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?
+        } else {
+            ContinuationDependencyV2 {
+                parent_id: Some(parent_id),
+                state: ContinuationState::Unavailable,
+                predecessor_epoch_id: None,
+                successor_epoch_id,
+                input_digest: None,
+                output_digest: None,
+                failure_code: Some("no_predecessor".into()),
+            }
+        };
+        let v2_checkpoint = IncrementalEtlCheckpointV2 {
+            version: INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION,
+            owner: CheckpointOwner::Etl,
+            lifecycle: CheckpointLifecycle::Active,
+            parent_id,
+            epoch_id: successor_epoch_id,
+            epoch_ordinal,
+            config_digest: self.active_metadata.config_digest.clone(),
+            pipeline_version: ETL_PIPELINE_VERSION.to_string(),
+            canonical_schema_version: chronicle_canonical::CANONICAL_SCHEMA_VERSION,
+            marker: checkpoint.marker.clone(),
+            segment_lineage: checkpoint.segment_lineage.clone(),
+            continuation,
+            decoder: checkpoint.decoder.clone(),
+            outputs: checkpoint.outputs.clone(),
+            published_operation_keys: checkpoint.published_operation_keys.clone(),
+            source_status: SourceStatus::Live,
+            checksum: String::new(),
+        }
+        .with_checksum()
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        publish_delta_then_checkpoint_v2(
+            &store,
+            v2_key,
+            &batch,
+            &v2_checkpoint,
+            self.wal_directory
+                .join("incremental-etl-checkpoint-v2.json"),
+        )
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
         self.active_metadata.incremental_checkpoint = Some(crate::IncrementalCheckpointSummaryV1 {
             marker_sequence: checkpoint.marker.sequence,
             checkpoint_digest: checkpoint.checksum.clone(),
@@ -931,6 +1336,60 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         Ok(())
     }
 
+    pub fn begin_rollover_transition_v2(
+        &self,
+        parent_id: RecordingId,
+        next_wal_directory: impl AsRef<Path>,
+        next_epoch_id: EpochId,
+        reservation_bytes: u64,
+    ) -> Result<(), ContinuousRecorderError> {
+        let next_wal_directory = next_wal_directory.as_ref();
+        if reservation_bytes != self.epoch_max_bytes
+            || self
+                .startup
+                .quota_authorities()
+                .iter()
+                .filter(|authority| {
+                    next_wal_directory.starts_with(Path::new(&authority.quota().domain))
+                })
+                .count()
+                != 1
+        {
+            return Err(ContinuousRecorderError::Metadata(
+                "rollover successor quota domain or reservation mismatch".into(),
+            ));
+        }
+        if load_transition_v2(&self.state_root)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?
+            .is_some()
+            || load_transition(&self.state_root)
+                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?
+                .is_some()
+        {
+            return Err(ContinuousRecorderError::Metadata(
+                "rollover transition already exists".into(),
+            ));
+        }
+        let old_epoch_id = EpochId::from_uuid(self.recorder.ingest().recording_id().0);
+        let transition = RolloverTransitionV2::new(
+            parent_id,
+            old_epoch_id,
+            next_epoch_id,
+            self.recorder.epoch_ordinal(),
+            self.recorder.epoch_ordinal().saturating_add(1),
+            &self.wal_directory,
+            next_wal_directory,
+            "pending-boundary",
+            "pending-outcome",
+            format!("epoch-{next_epoch_id}"),
+            reservation_bytes,
+        )
+        .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        write_transition_v2_atomic(&self.state_root, &transition)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        Ok(())
+    }
+
     fn ensure_rollover_transition(
         &self,
         next_wal_directory: &Path,
@@ -1045,6 +1504,149 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn export_continuation(
+        parent_id: RecordingId,
+        processor: &mut IncrementalProcessor,
+        registry: &ProtocolRegistry,
+        session_id: SessionId,
+        old_wal_directory: &Path,
+        old_epoch_id: EpochId,
+        successor_epoch_id: EpochId,
+        old_epoch_ordinal: u64,
+    ) -> Result<EpochContinuationCheckpointV1, ContinuousRecorderError> {
+        let snapshot = chronicle_wal::read_committed_snapshot_with_records(
+            old_wal_directory,
+            RecordingId(old_epoch_id.as_uuid()),
+            chronicle_wal::DEFAULT_MAX_RECORD_BYTES,
+        )?;
+        let marker_sequence = snapshot.snapshot.marker_sequence;
+        let marker_digest = snapshot.snapshot.marker_digest;
+        let needs_catch_up = processor
+            .last_marker_sequence()
+            .is_none_or(|sequence| sequence != marker_sequence);
+        if needs_catch_up {
+            processor
+                .process_snapshot(
+                    CommittedWalSnapshot {
+                        marker_sequence,
+                        marker_digest,
+                        envelopes: &snapshot.envelopes,
+                        segment_lineage: &snapshot.snapshot.segment_lineage,
+                    },
+                    registry,
+                    session_id,
+                )
+                .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        } else if !processor.marker_digest_matches(&marker_digest) {
+            return Err(ContinuousRecorderError::Incremental(
+                "predecessor continuation marker digest mismatch".into(),
+            ));
+        }
+        let marker_digest_hex = digest_hex(&marker_digest);
+        let decoder = processor
+            .decoder_state(
+                session_id,
+                old_epoch_id.as_uuid(),
+                old_epoch_ordinal,
+                marker_sequence,
+                marker_digest_hex.clone(),
+            )
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let marker = MarkerLineage {
+            sequence: marker_sequence,
+            segment_ordinal: snapshot.snapshot.marker_segment_ordinal,
+            marker_digest: marker_digest_hex,
+            active_segment_digest: digest_hex(&chronicle_wal::verified_segment_prefix_sha256(
+                old_wal_directory,
+                RecordingId(old_epoch_id.as_uuid()),
+                &snapshot.envelopes,
+                snapshot.snapshot.marker_segment_ordinal,
+                marker_sequence,
+            )?),
+        };
+        let segment_lineage = snapshot
+            .snapshot
+            .segment_lineage
+            .iter()
+            .map(|segment| SegmentLineage {
+                ordinal: segment.ordinal,
+                digest: digest_hex(&segment.digest),
+                first_sequence: segment.first_sequence,
+                last_sequence: segment.last_sequence,
+            })
+            .collect();
+        EpochContinuationCheckpointV1::new(
+            parent_id,
+            old_epoch_id,
+            successor_epoch_id,
+            marker,
+            segment_lineage,
+            ETL_PIPELINE_VERSION.to_string(),
+            decoder.state,
+            ContinuationLimits::default(),
+        )
+        .and_then(|checkpoint| {
+            checkpoint.with_counts([decoder.pending_connection_count, 0, 0, 0, 0, 0, 0])
+        })
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))
+    }
+
+    fn publish_continuation(
+        &self,
+        checkpoint: &EpochContinuationCheckpointV1,
+        old_wal_directory: &Path,
+        successor_wal_directory: &Path,
+        old_epoch_ordinal: u64,
+    ) -> Result<(), ContinuousRecorderError> {
+        let bytes = checkpoint
+            .encode()
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let key = format!(
+            "continuations/{}/{}/{}.json",
+            checkpoint.parent_id, checkpoint.predecessor_epoch_id, checkpoint.successor_epoch_id
+        );
+        let artifact = RecordingArtifact::new(
+            key.clone(),
+            RecordingArtifactKind::ContinuationCheckpoint,
+            bytes,
+        )
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?
+        .with_lineage(
+            checkpoint.parent_id,
+            checkpoint.predecessor_epoch_id,
+            old_epoch_ordinal,
+        )
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let store = FilesystemRecordingStore::new(self.store_root.clone());
+        let expected = artifact.head();
+        store
+            .put_if_absent(artifact)
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        let actual = store
+            .head(&key)
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        if actual.version != expected.version
+            || actual.kind != expected.kind
+            || actual.parent_id != expected.parent_id
+            || actual.epoch_id != expected.epoch_id
+            || actual.epoch_ordinal != expected.epoch_ordinal
+            || actual.bytes != expected.bytes
+            || actual.checksum != expected.checksum
+        {
+            return Err(ContinuousRecorderError::Incremental(
+                "continuation artifact verification failed".into(),
+            ));
+        }
+        checkpoint
+            .write_atomic(old_wal_directory.join(EPOCH_CONTINUATION_OUT_FILE))
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        checkpoint
+            .write_atomic(successor_wal_directory.join(EPOCH_CONTINUATION_IN_FILE))
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+        Ok(())
+    }
+
     pub fn rollover(
         &mut self,
         now_millis: u64,
@@ -1066,6 +1668,7 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         Ok(boundary)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn rollover_to(
         &mut self,
         next_wal_directory: impl AsRef<Path>,
@@ -1084,7 +1687,31 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             .recorder
             .rollover_to(next_writer, now_millis, outcome_path)?;
         self.advance_rollover_transition(RolloverTransitionPhase::BoundaryCommitted)?;
-        self.finalize_incremental_recording(boundary.old_recording_id, old_session_id)?;
+        let continuation = Self::export_continuation(
+            self.active_metadata
+                .parent_id
+                .unwrap_or(boundary.old_recording_id),
+            &mut self.incremental_processor,
+            &self.incremental_registry,
+            old_session_id,
+            &old_wal_directory,
+            EpochId::from_uuid(boundary.old_recording_id.0),
+            EpochId::from_uuid(boundary.new_recording_id.0),
+            boundary.old_epoch_ordinal,
+        )?;
+        self.publish_continuation(
+            &continuation,
+            &old_wal_directory,
+            &next_wal_directory,
+            boundary.old_epoch_ordinal,
+        )?;
+        self.continuation_out = Some(continuation.clone());
+        self.active_metadata.continuation_out = Some(EPOCH_CONTINUATION_OUT_FILE.to_owned());
+        self.finalize_incremental_recording(
+            boundary.old_recording_id,
+            old_session_id,
+            boundary.old_epoch_ordinal,
+        )?;
         for authority in self.startup.quota_authorities() {
             if old_wal_directory.starts_with(Path::new(&authority.quota().domain)) {
                 authority.release_prefix(ReservationKind::Wal, self.epoch_max_bytes)?;
@@ -1118,7 +1745,22 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         self.incremental_processor =
             IncrementalProcessor::new(chronicle_session::SessionLimits::default());
         self.incremental_session_id = SessionId(boundary.new_recording_id.0);
+        let parent_id = self
+            .active_metadata
+            .parent_id
+            .unwrap_or(boundary.old_recording_id);
+        self.incremental_processor
+            .restore_continuation(
+                &continuation,
+                parent_id,
+                continuation.predecessor_epoch_id,
+                continuation.successor_epoch_id,
+                &ETL_PIPELINE_VERSION.to_string(),
+            )
+            .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
         self.incremental_checkpoint = None;
+        self.continuation_in = Some(continuation);
+        self.continuation_out = None;
         self.next_incremental_millis = 0;
         self.active_metadata.previous_epoch = Some(EpochMetadata {
             ordinal: boundary.old_epoch_ordinal,
@@ -1128,6 +1770,10 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
             ordinal: boundary.new_epoch_ordinal,
             recording_id: boundary.new_recording_id.0,
         });
+        self.active_metadata.current_epoch_id =
+            Some(EpochId::from_uuid(boundary.new_recording_id.0));
+        self.active_metadata.continuation_in = Some(EPOCH_CONTINUATION_IN_FILE.to_owned());
+        self.active_metadata.continuation_out = None;
         self.active_metadata.incremental_checkpoint = None;
         self.active_metadata.updated_at_unix_seconds = unix_seconds();
         write_recorder_metadata(&self.state_root, &self.active_metadata)
@@ -1135,7 +1781,149 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         Ok(boundary)
     }
 
+    #[allow(clippy::too_many_lines)]
+    pub fn rollover_to_v2(
+        &mut self,
+        next_wal_directory: impl AsRef<Path>,
+        next_writer: GroupCommitWalWriter,
+        now_millis: u64,
+        outcome_path: impl AsRef<Path>,
+    ) -> Result<RecorderEpochBoundary, ContinuousRecorderError> {
+        if self.pending_continuation.is_some() {
+            return Err(ContinuousRecorderError::Metadata(
+                "V2 rollover while predecessor continuation is unresolved".into(),
+            ));
+        }
+        let next_wal_directory = next_wal_directory.as_ref().to_path_buf();
+        let next_epoch_id = EpochId::from_uuid(next_writer.recording_id().0);
+        let transition = load_transition_v2(&self.state_root)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?
+            .ok_or_else(|| {
+                ContinuousRecorderError::Metadata("V2 rollover transition missing".into())
+            })?;
+        if transition.phase != RolloverTransitionV2Phase::Prepared
+            || transition.new_epoch_id != next_epoch_id
+            || transition.new_path != next_wal_directory.to_string_lossy()
+        {
+            return Err(ContinuousRecorderError::Metadata(
+                "V2 rollover transition identity mismatch".into(),
+            ));
+        }
+        let transition = transition
+            .with_phase(RolloverTransitionV2Phase::SuccessorCreated)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        write_transition_v2_atomic(&self.state_root, &transition)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        let old_wal_directory = self.wal_directory.clone();
+        self.sync_active_progress();
+        let boundary = self
+            .recorder
+            .rollover_to(next_writer, now_millis, &outcome_path)?;
+        let boundary_digest = Sha256::digest(
+            serde_json::to_vec(&boundary.old_commit)
+                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?,
+        );
+        let outcome_digest = Sha256::digest(
+            fs::read(&outcome_path)
+                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?,
+        );
+        let transition = transition
+            .with_boundary_evidence(
+                digest_hex(&boundary_digest.into()),
+                digest_hex(&outcome_digest.into()),
+            )
+            .and_then(|transition| {
+                transition.with_phase(RolloverTransitionV2Phase::BoundaryCommitted)
+            })
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        write_transition_v2_atomic(&self.state_root, &transition)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        // Durable pending continuation precedes successor metadata: a crash
+        // after the journal but before the state file would otherwise activate
+        // a successor whose ETL starts without restored predecessor state.
+        let parent_id = self
+            .active_metadata
+            .parent_id
+            .unwrap_or(boundary.old_recording_id);
+        ContinuationDependencyV2::pending_for_parent(
+            Some(parent_id),
+            EpochId::from_uuid(boundary.old_recording_id.0),
+            next_epoch_id,
+        )
+        .write_atomic(next_wal_directory.join(EPOCH_CONTINUATION_STATE_FILE))
+        .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+
+        self.metadata.recording_id = boundary.old_recording_id;
+        self.metadata
+            .last_valid_commit
+            .clone_from(&boundary.old_commit);
+        write_recording_metadata(&old_wal_directory, &self.metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        let selector = self.metadata.selector.clone();
+        let capture = self.metadata.capture.clone();
+        self.wal_directory.clone_from(&next_wal_directory);
+        self.last_wal_bytes = crate::recording_physical_wal_bytes(&self.wal_directory)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        self.metadata = RecordingMetadata {
+            version: crate::RECORDING_METADATA_SCHEMA_VERSION,
+            recording_id: boundary.new_recording_id,
+            selector,
+            status: RecordingStatus::Recording,
+            shutdown_reason: None,
+            last_valid_commit: None,
+            counters: crate::RecordingCounters::default(),
+            terminal_wal_loss: None,
+            capture,
+        };
+        write_recording_metadata(&self.wal_directory, &self.metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+
+        self.pending_continuation = Some(PendingContinuation {
+            old_wal_directory: old_wal_directory.clone(),
+            old_epoch_id: EpochId::from_uuid(boundary.old_recording_id.0),
+            successor_epoch_id: next_epoch_id,
+            old_epoch_ordinal: boundary.old_epoch_ordinal,
+        });
+        self.incremental_processor =
+            IncrementalProcessor::new(chronicle_session::SessionLimits::default());
+        self.incremental_session_id = SessionId(boundary.new_recording_id.0);
+        self.incremental_checkpoint = None;
+        self.continuation_in = None;
+        self.continuation_out = None;
+        self.next_incremental_millis = 0;
+        self.active_metadata.previous_epoch = Some(EpochMetadata {
+            ordinal: boundary.old_epoch_ordinal,
+            recording_id: boundary.old_recording_id.0,
+        });
+        self.active_metadata.current_epoch = Some(EpochMetadata {
+            ordinal: boundary.new_epoch_ordinal,
+            recording_id: boundary.new_recording_id.0,
+        });
+        self.active_metadata.current_epoch_id = Some(next_epoch_id);
+        self.active_metadata.continuation_in = None;
+        self.active_metadata.continuation_out = None;
+        self.active_metadata.incremental_checkpoint = None;
+        self.active_metadata.processing_readiness = RecorderReadiness::NotReady;
+        self.active_metadata.updated_at_unix_seconds = unix_seconds();
+        write_recorder_metadata(&self.state_root, &self.active_metadata)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+        Ok(boundary)
+    }
+
     pub fn complete_rollover_transition(&self) -> Result<(), ContinuousRecorderError> {
+        if let Some(transition) = load_transition_v2(&self.state_root)
+            .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?
+        {
+            let transition = transition
+                .with_phase(RolloverTransitionV2Phase::TopologyActivated)
+                .and_then(|transition| transition.with_phase(RolloverTransitionV2Phase::Complete))
+                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+            write_transition_v2_atomic(&self.state_root, &transition)
+                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+            crate::remove_transition(&self.state_root)
+                .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
+            return Ok(());
+        }
         crate::remove_transition(&self.state_root)
             .map_err(|error| ContinuousRecorderError::Metadata(error.to_string()))?;
         Ok(())
@@ -1174,6 +1962,9 @@ impl<S: CaptureSource> ContinuousRecorderService<S> {
         // second fd for the same file in the same process as a conflicting
         // owner, so release the active epoch lock before publication runs.
         self.recorder.ingest_mut().release_wal_lock();
+        if let Err(error) = self.complete_pending_continuation() {
+            eprintln!("continuation completion deferred during shutdown: {error}");
+        }
         self.sync_active_progress();
         self.active_metadata.lifecycle = crate::RecorderLifecycleState::Stopped;
         self.active_metadata.capture_readiness = RecorderReadiness::NotReady;
@@ -1221,6 +2012,11 @@ fn validate_checkpoint_before_capture(
     let store = FilesystemRecordingStore::new(config.store_root.clone());
     recover_pending_checkpoint(&store, &checkpoint_path)
         .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
+    recover_pending_checkpoint_v2(
+        &store,
+        wal_directory.join("incremental-etl-checkpoint-v2.json"),
+    )
+    .map_err(|error| ContinuousRecorderError::Incremental(error.to_string()))?;
     if !checkpoint_path.exists() {
         return Ok(());
     }
@@ -1355,7 +2151,7 @@ mod tests {
         StoreConfig, process_and_publish_recording_wal,
     };
     use chronicle_capture::FixtureCaptureSource;
-    use chronicle_common::RecordingId;
+    use chronicle_common::{EpochId, RecordingId};
     use chronicle_protocol_builtins::registry;
     use chronicle_wal::{DEFAULT_SEGMENT_BYTES, GroupCommitWalWriter};
     use std::fs;
@@ -1494,6 +2290,13 @@ mod tests {
             &crate::RecorderMetadataV1 {
                 version: crate::RECORDER_METADATA_SCHEMA_VERSION,
                 recorder_id,
+                parent_id: None,
+                current_epoch_id: None,
+                finalized_epoch_count: 0,
+                continuation_in: None,
+                continuation_out: None,
+                retention_state: None,
+                last_rollover: None,
                 attempt_id,
                 config_digest,
                 scope: config.scope.clone(),
@@ -1547,6 +2350,113 @@ mod tests {
         fn next_event(&mut self) -> Result<Option<chronicle_capture::CaptureEvent>, CaptureError> {
             Ok(None)
         }
+    }
+
+    #[test]
+    fn pending_v2_continuation_recovers_predecessor_from_catalog() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-pending-continuation-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("epochs/1")).unwrap();
+        let parent_id = RecordingId::new();
+        let predecessor = EpochId::new();
+        let successor = EpochId::new();
+        let mut catalog = crate::EpochCatalogV2::new(parent_id, predecessor, "epochs/0").unwrap();
+        catalog.append_successor(successor, "epochs/1").unwrap();
+        catalog.activate_successor(successor).unwrap();
+        catalog.write_atomic(&root).unwrap();
+        ContinuationDependencyV2::pending_for_parent(Some(parent_id), predecessor, successor)
+            .write_atomic(root.join("epochs/1/continuation-state.json"))
+            .unwrap();
+
+        let pending = recover_pending_continuation(&root.join("epochs/1"), successor, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.old_epoch_id, predecessor);
+        assert_eq!(pending.successor_epoch_id, successor);
+        assert_eq!(pending.old_epoch_ordinal, 0);
+        assert_eq!(pending.old_wal_directory, root.join("epochs/0"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v2_rollover_publishes_pending_continuation_before_successor_etl() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-v2-continuation-rollover-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = config(&root);
+        let wal_root = Path::new(&config.domains[0].identity.canonical_root).join("wal");
+        let old_recording_id = RecordingId::new();
+        let writer =
+            GroupCommitWalWriter::create(&wal_root, old_recording_id, DEFAULT_SEGMENT_BYTES, 1, 0)
+                .unwrap();
+        let source = FixtureCaptureSource::from_json(include_bytes!(
+            "../../../fixtures/http/basic-session.json"
+        ))
+        .unwrap();
+        let recorder = RecorderOrchestrator::new(source, crate::RecordingIngest::new(writer));
+        let mut service = ContinuousRecorderService::start(
+            &config,
+            &wal_root,
+            recorder,
+            |_| Ok(()),
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        let parent_id = RecordingId::new();
+        service.set_parent_id(parent_id).unwrap();
+        for tick in 0..20 {
+            service.poll(tick * 250).unwrap();
+        }
+        assert!(service.recorder().ingest().commit_boundary().is_some());
+
+        let successor = EpochId::new();
+        let next = wal_root.join("epochs").join(format!("1-{successor}"));
+        fs::create_dir_all(&next).unwrap();
+        service
+            .reserve_successor_quota(&next, config.epoch.max_bytes)
+            .unwrap();
+        service
+            .begin_rollover_transition_v2(parent_id, &next, successor, config.epoch.max_bytes)
+            .unwrap();
+        let mut catalog =
+            crate::EpochCatalogV2::new(parent_id, EpochId::from_uuid(old_recording_id.0), ".")
+                .unwrap();
+        let successor_path = format!("epochs/1-{successor}");
+        catalog
+            .append_successor(successor, &successor_path)
+            .unwrap();
+        catalog.write_atomic(&wal_root).unwrap();
+        let next_writer = GroupCommitWalWriter::create(
+            &next,
+            RecordingId::from_uuid(successor.as_uuid()),
+            DEFAULT_SEGMENT_BYTES,
+            1,
+            0,
+        )
+        .unwrap();
+        let outcome = root.join("epoch-outcome.json");
+        fs::write(&outcome, b"{}\n").unwrap();
+        service
+            .rollover_to_v2(&next, next_writer, 10_000, &outcome)
+            .unwrap();
+        catalog.activate_successor(successor).unwrap();
+        catalog.write_atomic(&wal_root).unwrap();
+        service.complete_rollover_transition().unwrap();
+
+        service.poll(10_250).unwrap();
+        let dependency =
+            ContinuationDependencyV2::load(next.join(EPOCH_CONTINUATION_STATE_FILE)).unwrap();
+        assert_eq!(dependency.state, ContinuationState::Ready);
+        assert!(next.join(EPOCH_CONTINUATION_IN_FILE).exists());
+        assert!(wal_root.join(EPOCH_CONTINUATION_OUT_FILE).exists());
+        assert!(service.pending_continuation.is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

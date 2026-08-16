@@ -397,6 +397,7 @@ impl ReplayPlanner {
                 let decision = if invalid_session
                     || !connection_complete
                     || completeness != Completeness::Complete
+                    || !operation.provenance.completion.is_replayable()
                     || operation.recorded_response.is_none()
                     || operation
                         .attributes
@@ -652,8 +653,9 @@ fn verification(status: VerificationStatus, summary: &str, category: &str) -> Ve
 mod tests {
     use super::*;
     use chronicle_canonical::{
-        Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalSession, OperationKind,
-        PayloadRef, ProtocolData, ReplayMetadata, SourceMetadata,
+        Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalSession,
+        OperationCompletion, OperationKind, PayloadRef, ProtocolData, ReplayMetadata,
+        SourceMetadata,
     };
     use chronicle_common::{OperationId, SessionId};
     use chronicle_protocol::{
@@ -750,6 +752,45 @@ mod tests {
                 TimingMode::Asap,
             )
             .unwrap();
+            assert_eq!(
+                plan.operations()[0].decision(),
+                &ReplayDecision::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn non_terminal_completion_provenance_is_not_replayable() {
+        for completion in [
+            OperationCompletion::Incomplete,
+            OperationCompletion::Unsupported,
+            OperationCompletion::Invalid,
+            OperationCompletion::BoundExhausted,
+        ] {
+            let mut session = session(OperationEffect::Read);
+            session.connections[0].operations[0].provenance.completion = completion;
+            let operation_id = session.connections[0].operations[0].id;
+            let connection_id = session.connections[0].id;
+            let targets = TargetMap {
+                rules: vec![TargetRule {
+                    protocol: None,
+                    host: None,
+                    port: None,
+                    connection_id: Some(connection_id),
+                    target: Endpoint::new("test", 2),
+                }],
+            };
+            let plan = ReplayPlanner::plan(
+                &session,
+                &targets,
+                &ReplayPolicy {
+                    allow_reads: true,
+                    ..ReplayPolicy::default()
+                },
+                TimingMode::Asap,
+            )
+            .unwrap();
+            assert_eq!(plan.operations()[0].operation().id, operation_id);
             assert_eq!(
                 plan.operations()[0].decision(),
                 &ReplayDecision::Unsupported

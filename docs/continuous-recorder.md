@@ -3,13 +3,19 @@
 ## Runtime shape
 
 ```text
-config -> domain lease -> state/WAL/manifest/checkpoint recovery
-       -> quota reservations -> appendable epoch -> capture attach
-       -> incremental ETL resume -> running
+config -> domain lease -> parent intent/run + epochs.json recovery
+       -> quota reservations -> appendable bounded epoch -> capture attach
+       -> incremental ETL/continuation resume -> running
 
-SIGTERM/SIGINT -> stop intake -> drain -> commit/sync -> seal
-               -> ETL safe point -> detach -> stopped metadata -> unlock
+SIGTERM/SIGINT -> stop intake -> drain -> commit/sync -> seal active epoch
+               -> configured ETL safe point -> stopped parent metadata -> unlock
 ```
+
+A parent recording owns ordered bounded epochs. Epoch age/bytes and segment
+limits trigger rollover, never ordinary parent termination. A whole-run
+`--duration` is optional; omitted means no time deadline. Rollover capture and
+ETL continuation are independent: successor capture may continue while a
+predecessor checkpoint is pending.
 
 Recorder owns one filesystem domain. WAL commit markers remain acknowledgement authority. Manifest, checkpoint, RecordingStore artifacts, and status metadata never promote uncommitted WAL bytes.
 
@@ -18,9 +24,14 @@ Recorder owns one filesystem domain. WAL commit markers remain acknowledgement a
 - `state_root/recorder.json`: versioned, checksummed active metadata.
 - `state_root/.chronicle-recorder.lock`: subordinate recorder-state lease.
 - `<domain-lock-root>/.chronicle-domain.lock`: filesystem-domain lease.
-- `wal_dir/record.lock`: per-recording WAL lock.
+- `recordings/<recording-id>/recording-intent.json`: one-time parent allocation/name.
+- `recordings/<recording-id>/recording-run.json`: derived parent lifecycle summary.
+- `recordings/<recording-id>/epochs.json`: checksummed parent-to-epoch topology authority.
+- `recordings/<recording-id>/epochs/<ordinal>-<epoch-id>/`: bounded epoch WAL and ETL artifacts.
+- `wal_dir/record.lock`: per-epoch WAL lock.
 - `wal_dir/manifest.json`: reconciled segment metadata; never WAL authority.
-- `wal_dir/etl-checkpoint.json`: recorder-owned incremental ETL checkpoint.
+- `wal_dir/incremental-etl-checkpoint-v2.json`: parent-aware ETL cursor when enabled.
+- `wal_dir/continuation-in.json` / `continuation-out.json`: immutable bounded handoff evidence.
 - `store_root/`: immutable delta, recovery, and provenance artifacts.
 
 One mutating recorder per filesystem domain. Standalone ETL, cleanup, or store mutation must not bypass that ownership boundary.
@@ -33,7 +44,7 @@ Acceptance polls machine-readable status for at most `CHRONICLE_ACCEPTANCE_READI
 
 ## Retention and quota
 
-Retention transitions require sealed, processed, checkpointed, and verified finalized-session evidence. Cleanup writes deleting intent, renames to same-filesystem trash, syncs, writes a tombstone, unlinks, and syncs again. Digest mismatch, missing intent, incomplete cleanup, and protected lineage fail closed.
+Retention transitions require sealed, processed, checkpointed, and verified finalized-epoch session evidence. Pending, ready-but-unconsumed, or retryable failed continuation protects predecessor WAL/checkpoints. Cleanup writes deleting intent, renames to same-filesystem trash, syncs, writes a tombstone, unlinks, and syncs again. Digest mismatch, missing intent, incomplete cleanup, and protected lineage fail closed.
 
 Quota reserves WAL, manifest/checkpoint, RecordingStore, final-session, staging, and trash peaks while preserving configured minimum free bytes. Insufficient headroom stops admission; cleanup never authorizes deletion of unverified data.
 

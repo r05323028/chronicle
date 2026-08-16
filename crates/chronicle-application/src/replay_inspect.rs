@@ -524,6 +524,141 @@ impl From<OperationExecutionState> for OperationStatus {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ParentReplayEpochPlan {
+    pub ordinal: u64,
+    pub epoch_id: chronicle_common::EpochId,
+    pub session_id: Option<chronicle_common::SessionId>,
+    pub selected: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ParentReplayPlan {
+    pub parent_id: chronicle_common::RecordingId,
+    pub epochs: Vec<ParentReplayEpochPlan>,
+    pub selected_session_ids: Vec<chronicle_common::SessionId>,
+    pub active_tail_omitted: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Build replay selection from parent-owned topology and published session
+/// provenance. Raw WAL and continuation-only evidence never enter selection.
+#[allow(clippy::too_many_lines)]
+pub fn build_parent_replay_plan(
+    data_dir: &Path,
+    parent_id: chronicle_common::RecordingId,
+) -> Result<ParentReplayPlan, ApplicationError> {
+    let summaries = FilesystemSessionStore::new(data_dir)
+        .list_summaries(chronicle_storage::SESSION_SUMMARY_LIMIT)
+        .map_err(ApplicationError::from)?;
+    let run_root = recordings_root(data_dir).join(parent_id.to_string());
+    let run_path = run_root.join(RECORDING_RUN_FILE);
+    let has_run = match fs::symlink_metadata(&run_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(ApplicationError::CatalogUnsafePath(run_path));
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(ApplicationError::Io(error)),
+    };
+    if !has_run {
+        let mut matches: Vec<_> = summaries
+            .into_iter()
+            .filter(|summary| {
+                summary.recording_id == Some(parent_id)
+                    || (summary.recording_id.is_none() && summary.session_id.0 == parent_id.0)
+            })
+            .collect();
+        matches.sort_by_key(|summary| (summary.epoch_ordinal.unwrap_or(0), summary.session_id));
+        if matches.is_empty() {
+            return Err(ApplicationError::RecordingNotFound(
+                parent_id.to_cli_string(),
+            ));
+        }
+        let epochs = matches
+            .iter()
+            .map(|summary| ParentReplayEpochPlan {
+                ordinal: summary.epoch_ordinal.unwrap_or(0),
+                epoch_id: summary
+                    .epoch_id
+                    .unwrap_or(chronicle_common::EpochId(parent_id.0)),
+                session_id: Some(summary.session_id),
+                selected: true,
+                reason: None,
+            })
+            .collect::<Vec<_>>();
+        let selected_session_ids = matches.iter().map(|summary| summary.session_id).collect();
+        return Ok(ParentReplayPlan {
+            parent_id,
+            epochs,
+            selected_session_ids,
+            active_tail_omitted: false,
+            warnings: Vec::new(),
+        });
+    }
+
+    let run = RecordingRunV2::load(&run_root)
+        .map_err(|error| ApplicationError::RecordingMetadataValidation(error.to_string()))?;
+    if run.parent_id != parent_id {
+        return Err(ApplicationError::RecordingMetadataValidation(
+            "run parent identity conflicts with requested parent".into(),
+        ));
+    }
+    let mut epochs = Vec::with_capacity(run.epochs.len());
+    let mut selected_session_ids = Vec::new();
+    let mut warnings = run.warnings.clone();
+    let mut active_tail_omitted = false;
+    for epoch in &run.epochs {
+        let summary = summaries.iter().find(|summary| {
+            summary.recording_id == Some(parent_id) && summary.epoch_id == Some(epoch.epoch_id)
+        });
+        let active = epoch.state == EpochCatalogState::Active;
+        let terminal_run = matches!(
+            run.state,
+            RunLifecycleState::Completed | RunLifecycleState::Stopped | RunLifecycleState::Failed
+        );
+        let selected = epoch.summary.published && summary.is_some() && (!active || terminal_run);
+        let reason = if selected {
+            let session_id = summary
+                .ok_or_else(|| {
+                    ApplicationError::RecordingMetadataValidation(format!(
+                        "parent epoch {} has no session summary",
+                        epoch.ordinal
+                    ))
+                })?
+                .session_id;
+            selected_session_ids.push(session_id);
+            None
+        } else if active && !terminal_run {
+            active_tail_omitted = true;
+            Some("active_epoch_not_selected".into())
+        } else {
+            return Err(ApplicationError::RecordingMetadataValidation(format!(
+                "parent epoch {} is not a verified published session",
+                epoch.ordinal
+            )));
+        };
+        epochs.push(ParentReplayEpochPlan {
+            ordinal: epoch.ordinal,
+            epoch_id: epoch.epoch_id,
+            session_id: summary.map(|summary| summary.session_id),
+            selected,
+            reason,
+        });
+    }
+    if active_tail_omitted {
+        warnings.push("active_epoch_not_selected".into());
+    }
+    Ok(ParentReplayPlan {
+        parent_id,
+        epochs,
+        selected_session_ids,
+        active_tail_omitted,
+        warnings,
+    })
+}
+
 /// Application-owned replay request passed by outer adapters. Plain request
 /// data only; replay policy construction stays inside application.
 #[derive(Clone, Debug)]
@@ -764,6 +899,269 @@ pub fn preplan_command_replay_session(
     Ok(replay_plan_result(session.id.to_string(), &plan))
 }
 
+/// Build a transient parent session from verified terminal epoch sessions.
+///
+/// Aggregate is never persisted and never reads raw WAL/continuation bytes. Each
+/// selected epoch must hydrate and validate; duplicate operation IDs, conflicting
+/// connection identity, foreign parent provenance, missing sessions, and the bounded
+/// operation limit fail closed before replay planning.
+#[allow(clippy::too_many_lines)]
+fn aggregate_parent_session(
+    root: &Path,
+    parent_id: chronicle_common::RecordingId,
+    session_ids: &[chronicle_common::SessionId],
+) -> Result<chronicle_canonical::CanonicalSession, ApplicationError> {
+    if session_ids.is_empty() {
+        return Err(ApplicationError::InvalidConfig(
+            "parent has no selected published epochs".into(),
+        ));
+    }
+    let mut connections: Vec<chronicle_canonical::CanonicalConnection> = Vec::new();
+    let mut connection_completeness = BTreeMap::new();
+    let mut operation_completeness = BTreeMap::new();
+    let mut timeline = Vec::new();
+    let mut operation_ids = BTreeSet::new();
+    let mut source_provenance = SourceProvenance {
+        recording_id: Some(parent_id),
+        status: SourceStatus::Completed,
+        reason: Some("verified_parent_epoch_aggregate".into()),
+        ..SourceProvenance::default()
+    };
+    let mut started_at: Option<chronicle_common::Timestamp> = None;
+    let mut ended_at: Option<chronicle_common::Timestamp> = None;
+    let mut epoch_base = 0_u64;
+    let mut operation_count = 0_usize;
+
+    for session_id in session_ids {
+        let mut session = hydrate_replay_session(root, &session_id.to_string())?;
+        session.validate().map_err(|error| {
+            ApplicationError::InvalidConfig(format!(
+                "parent epoch session {session_id} is invalid: {error}"
+            ))
+        })?;
+        if session
+            .source_provenance
+            .recording_id
+            .is_some_and(|recording_id| recording_id != parent_id)
+        {
+            return Err(ApplicationError::InvalidConfig(format!(
+                "parent epoch session {session_id} belongs to another recording"
+            )));
+        }
+        operation_count = operation_count
+            .checked_add(
+                session
+                    .connections
+                    .iter()
+                    .map(|connection| connection.operations.len())
+                    .sum::<usize>(),
+            )
+            .ok_or_else(|| {
+                ApplicationError::InvalidConfig("parent operation count overflow".into())
+            })?;
+        if operation_count > chronicle_replay::MAX_REPLAY_OPERATIONS {
+            return Err(ApplicationError::InvalidConfig(format!(
+                "parent replay exceeds {} operations",
+                chronicle_replay::MAX_REPLAY_OPERATIONS
+            )));
+        }
+        started_at =
+            Some(started_at.map_or(session.started_at, |value| value.min(session.started_at)));
+        ended_at = match (ended_at, session.ended_at) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (None, right) => right,
+            (left, None) => left,
+        };
+        let session_status = session.source_provenance.status;
+        source_provenance
+            .evidence
+            .extend(std::mem::take(&mut session.source_provenance.evidence));
+        if session_status != SourceStatus::Completed {
+            source_provenance.status = session_status;
+        }
+
+        let session_connection_completeness = std::mem::take(&mut session.connection_completeness);
+        let session_operation_completeness = std::mem::take(&mut session.operation_completeness);
+        let mut local_max = 0_u64;
+        for mut connection in session.connections {
+            let connection_id = connection.id;
+            let connection_state = session_connection_completeness
+                .get(&connection_id)
+                .copied()
+                .unwrap_or_default();
+            for operation in &mut connection.operations {
+                if !operation_ids.insert(operation.id) {
+                    return Err(ApplicationError::InvalidConfig(format!(
+                        "parent replay has duplicate operation {}",
+                        operation.id
+                    )));
+                }
+                local_max = local_max.max(operation.started_at_offset.0);
+                local_max =
+                    local_max.max(operation.completed_at_offset.map_or(0, |offset| offset.0));
+                operation.started_at_offset = chronicle_canonical::RelativeTimeNanos(
+                    operation
+                        .started_at_offset
+                        .0
+                        .checked_add(epoch_base)
+                        .ok_or_else(|| {
+                            ApplicationError::InvalidConfig(
+                                "parent replay timeline overflows".into(),
+                            )
+                        })?,
+                );
+                operation.completed_at_offset = operation
+                    .completed_at_offset
+                    .map(|offset| {
+                        offset
+                            .0
+                            .checked_add(epoch_base)
+                            .map(chronicle_canonical::RelativeTimeNanos)
+                            .ok_or_else(|| {
+                                ApplicationError::InvalidConfig(
+                                    "parent replay timeline overflows".into(),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                operation_completeness.insert(
+                    operation.id,
+                    session_operation_completeness
+                        .get(&operation.id)
+                        .copied()
+                        .unwrap_or_default(),
+                );
+            }
+            if let Some(existing) = connections
+                .iter_mut()
+                .find(|value| value.id == connection_id)
+            {
+                if existing.protocol != connection.protocol
+                    || existing.client != connection.client
+                    || existing.server != connection.server
+                {
+                    return Err(ApplicationError::InvalidConfig(format!(
+                        "parent replay has conflicting connection identity {connection_id}"
+                    )));
+                }
+                existing.operations.extend(connection.operations);
+            } else {
+                connections.push(connection);
+            }
+            connection_completeness
+                .entry(connection_id)
+                .and_modify(|existing| {
+                    if *existing == Completeness::Complete {
+                        *existing = connection_state;
+                    }
+                })
+                .or_insert(connection_state);
+        }
+        for mut entry in session.timeline {
+            entry.offset = chronicle_canonical::RelativeTimeNanos(
+                entry.offset.0.checked_add(epoch_base).ok_or_else(|| {
+                    ApplicationError::InvalidConfig("parent replay timeline overflows".into())
+                })?,
+            );
+            timeline.push(entry);
+        }
+        epoch_base = epoch_base
+            .checked_add(local_max.saturating_add(1))
+            .ok_or_else(|| {
+                ApplicationError::InvalidConfig("parent replay timeline overflows".into())
+            })?;
+    }
+
+    let aggregate = chronicle_canonical::CanonicalSession {
+        schema_version: chronicle_canonical::CANONICAL_SCHEMA_VERSION,
+        id: chronicle_common::SessionId(parent_id.0),
+        started_at: started_at.ok_or_else(|| {
+            ApplicationError::InvalidConfig("parent has no session start timestamp".into())
+        })?,
+        ended_at,
+        source: chronicle_canonical::SourceMetadata::default(),
+        source_provenance,
+        connections,
+        connection_completeness,
+        operation_completeness,
+        timeline,
+        replay: chronicle_canonical::ReplayMetadata::default(),
+        replay_attributes: chronicle_canonical::Attributes::new(),
+    };
+    aggregate.validate().map_err(|error| {
+        ApplicationError::InvalidConfig(format!("parent aggregate is invalid: {error}"))
+    })?;
+    Ok(aggregate)
+}
+
+/// Replays a verified parent aggregate through the same loopback-only planner
+/// and executor used for one epoch. No aggregate artifact is written.
+pub async fn replay_parent_session_with_plan<F>(
+    root: impl AsRef<Path>,
+    parent_id: chronicle_common::RecordingId,
+    session_ids: &[chronicle_common::SessionId],
+    config: &ReplayConfig,
+    request: &ReplayRequest,
+    on_plan: F,
+) -> Result<ReplaySessionResult, ApplicationError>
+where
+    F: FnOnce(&ReplaySessionResult),
+{
+    let session = aggregate_parent_session(root.as_ref(), parent_id, session_ids)?;
+    let options: LoopbackReplayOptions = request.into();
+    let (targets, policy) = replay_command_inputs(&session, &options)?;
+    let plan = ReplayPlanner::plan(&session, &targets, &policy, TimingMode::Asap)?;
+    on_plan(&replay_plan_result(parent_id.to_cli_string(), &plan));
+    let mut context = ReplayContext::default();
+    if request.execute && plan.is_executable() {
+        context = replay_context(config)?;
+        context.authorize_execution_for(options.validate_target()?.endpoint().clone());
+    }
+    let contexts = BTreeMap::from([(chronicle_common::ProtocolId::new("http/1.1"), context)]);
+    let execution = ReplayExecutor::new(&chronicle_protocol_builtins::registry()?)
+        .execute(&plan, &contexts)
+        .await?;
+    let transport_failed = execution
+        .results
+        .iter()
+        .any(|result| result.transport_error.is_some());
+    let operations: Vec<_> = plan
+        .operations()
+        .iter()
+        .zip(execution.results)
+        .map(|(planned, result)| ReplayOperationSummary {
+            operation_id: result.operation_id.to_string(),
+            decision: format!("{:?}", planned.decision()).to_lowercase(),
+            state: OperationStatus::from(result.state),
+            attempted: OperationStatus::from(result.state) != OperationStatus::NotAttempted,
+            verification: result.verification.as_ref().map_or_else(
+                || "not_run".into(),
+                |verification| format!("{:?}", verification.status).to_lowercase(),
+            ),
+            category: result
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.details.get("category"))
+                .cloned()
+                .unwrap_or_default(),
+            transport_error: result
+                .transport_error
+                .map(|category| format!("{category:?}").to_lowercase())
+                .unwrap_or_default(),
+        })
+        .collect();
+    Ok(ReplaySessionResult {
+        session_id: parent_id.to_cli_string(),
+        replayability: ReplayabilityStatus::from(plan.replayability()),
+        outcome: ReplayStatus::from(execution.outcome),
+        dry_run: plan.is_dry_run(),
+        preflight_denied: !plan.is_executable(),
+        transport_failed,
+        counts: ReplayCounts::from_operations(&operations),
+        operations,
+    })
+}
+
 /// Replays hydrated filesystem session through explicit loopback-only options.
 pub async fn replay_session(
     root: impl AsRef<Path>,
@@ -941,4 +1339,158 @@ pub fn render_replay_json(result: &ReplaySessionResult) -> Result<String, Applic
 
 fn optional_text(value: &str) -> &str {
     if value.is_empty() { "none" } else { value }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chronicle_canonical::{
+        Attributes, CANONICAL_SCHEMA_VERSION, CanonicalConnection, CanonicalOperation,
+        OperationEffect, OperationKind, OperationProvenance, PROTOCOL_DATA_SCHEMA_VERSION,
+        PayloadRef, ProtocolData, RelativeTimeNanos, ReplayMetadata, SourceMetadata, TimelineEntry,
+    };
+    use chronicle_storage::{FilesystemSessionStore, PublishSession};
+    use std::collections::BTreeMap;
+    use time::OffsetDateTime;
+
+    fn session(parent_id: chronicle_common::RecordingId) -> chronicle_canonical::CanonicalSession {
+        let connection_id = chronicle_common::ConnectionId::new();
+        let operation_id = chronicle_common::OperationId::new();
+        let operation = CanonicalOperation {
+            id: operation_id,
+            sequence: 1,
+            started_at_offset: RelativeTimeNanos(0),
+            completed_at_offset: Some(RelativeTimeNanos(1)),
+            kind: OperationKind::Request,
+            effect: OperationEffect::Read,
+            request: PayloadRef::Inline {
+                content_type: Some("text/plain".into()),
+                bytes: b"request".to_vec(),
+            },
+            recorded_response: Some(PayloadRef::Inline {
+                content_type: Some("text/plain".into()),
+                bytes: b"response".to_vec(),
+            }),
+            attributes: Attributes::new(),
+            protocol_data: ProtocolData {
+                schema_version: PROTOCOL_DATA_SCHEMA_VERSION,
+                media_type: None,
+                bytes: Vec::new(),
+            },
+            provenance: OperationProvenance::default(),
+            redactions: Vec::new(),
+            warnings: Vec::new(),
+        };
+        chronicle_canonical::CanonicalSession {
+            schema_version: CANONICAL_SCHEMA_VERSION,
+            id: chronicle_common::SessionId::new(),
+            started_at: OffsetDateTime::UNIX_EPOCH,
+            ended_at: Some(OffsetDateTime::UNIX_EPOCH),
+            source: SourceMetadata::default(),
+            source_provenance: SourceProvenance {
+                recording_id: Some(parent_id),
+                epoch_id: Some(chronicle_common::EpochId::new()),
+                status: SourceStatus::Completed,
+                ..SourceProvenance::default()
+            },
+            connections: vec![CanonicalConnection {
+                id: connection_id,
+                protocol: chronicle_common::ProtocolId::new("http/1.1"),
+                client: chronicle_common::Endpoint::new("127.0.0.1", 1),
+                server: chronicle_common::Endpoint::new("127.0.0.1", 2),
+                attributes: Attributes::new(),
+                operations: vec![operation],
+            }],
+            connection_completeness: BTreeMap::from([(connection_id, Completeness::Complete)]),
+            operation_completeness: BTreeMap::from([(operation_id, Completeness::Complete)]),
+            timeline: vec![TimelineEntry {
+                connection_id,
+                operation_id,
+                offset: RelativeTimeNanos(0),
+            }],
+            replay: ReplayMetadata::default(),
+            replay_attributes: Attributes::new(),
+        }
+    }
+
+    fn publish(root: &std::path::Path, session: chronicle_canonical::CanonicalSession) {
+        FilesystemSessionStore::new(root)
+            .publish(PublishSession {
+                session,
+                checkpoint: None,
+                issues: Vec::new(),
+                replayability: Vec::new(),
+                complete: true,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn parent_aggregate_orders_verified_epochs_and_normalizes_offsets() {
+        let root =
+            std::env::temp_dir().join(format!("chronicle-parent-replay-{}", uuid::Uuid::new_v4()));
+        let parent_id = chronicle_common::RecordingId::new();
+        let first = session(parent_id);
+        let first_id = first.id;
+        let mut second = session(parent_id);
+        let second_id = second.id;
+        let shared_connection_id = first.connections[0].id;
+        second.connections[0].id = shared_connection_id;
+        second.connection_completeness.clear();
+        second
+            .connection_completeness
+            .insert(shared_connection_id, Completeness::Complete);
+        second.timeline[0].connection_id = shared_connection_id;
+        publish(&root, first);
+        publish(&root, second);
+
+        let aggregate = aggregate_parent_session(&root, parent_id, &[first_id, second_id]).unwrap();
+        assert_eq!(aggregate.id, chronicle_common::SessionId(parent_id.0));
+        assert_eq!(aggregate.connections.len(), 1);
+        assert_eq!(aggregate.connections[0].operations.len(), 2);
+        assert_eq!(aggregate.timeline.len(), 2);
+        assert!(aggregate.connections[0].operations[1].started_at_offset.0 > 0);
+        assert!(aggregate.validate().is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_session_id_provides_parent_replay_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-parent-replay-legacy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let parent_id = chronicle_common::RecordingId::new();
+        let mut legacy = session(parent_id);
+        legacy.id = chronicle_common::SessionId(parent_id.0);
+        legacy.source_provenance.recording_id = None;
+        legacy.source_provenance.epoch_id = None;
+        publish(&root, legacy);
+
+        let plan = build_parent_replay_plan(&root, parent_id).unwrap();
+        assert_eq!(
+            plan.selected_session_ids,
+            vec![chronicle_common::SessionId(parent_id.0)]
+        );
+        assert_eq!(plan.epochs.len(), 1);
+        assert!(plan.epochs[0].selected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_aggregate_rejects_foreign_provenance() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-parent-replay-foreign-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let parent_id = chronicle_common::RecordingId::new();
+        let foreign = session(chronicle_common::RecordingId::new());
+        let foreign_id = foreign.id;
+        publish(&root, foreign);
+        assert!(matches!(
+            aggregate_parent_session(&root, parent_id, &[foreign_id]),
+            Err(ApplicationError::InvalidConfig(message)) if message.contains("another recording")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

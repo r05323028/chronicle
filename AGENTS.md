@@ -123,6 +123,8 @@ Extract-Transform-Load; replay default-deny safety; deterministic replay/test be
 test architecture; privileged acceptance semantics; release qualification guarantees. Detail:
 `docs/architecture/crate-boundaries.md`.
 
+Recording lifetime may be unbounded while epochs and segments remain bounded. A WAL epoch boundary is not a protocol reconstruction boundary; cross-epoch state requires bounded, versioned, checksummed, lineage-verified continuation evidence.
+
 ## Crate Architecture (mandatory)
 
 13-crate workspace; every crate has one primary owner (see `docs/architecture/crate-boundaries.md`).

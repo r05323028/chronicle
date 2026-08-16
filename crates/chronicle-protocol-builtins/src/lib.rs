@@ -35,9 +35,9 @@ const PLANNED: ProtocolCapabilities = ProtocolCapabilities {
 pub mod http {
     use super::ProtocolRegistration;
     use chronicle_canonical::{
-        Attributes, CanonicalOperation, CanonicalWarning, Completeness, OperationEffect,
-        OperationKind, OperationProvenance, PayloadRef, ProtocolData, RelativeTimeNanos,
-        SourceConnectionGeneration, WalByteRange,
+        Attributes, CanonicalOperation, CanonicalWarning, Completeness, OperationCompletion,
+        OperationEffect, OperationKind, OperationProvenance, PayloadRef, ProtocolData,
+        RelativeTimeNanos, SourceConnectionGeneration, WalByteRange,
     };
     use chronicle_common::{Direction, Endpoint, OperationId, ProtocolId};
     use chronicle_protocol::{
@@ -1185,6 +1185,9 @@ pub mod http {
                         connection_generation,
                         wal_ranges,
                         missing_payload_provenance,
+                        completion_owner_epoch: None,
+                        epoch_ranges: Vec::new(),
+                        completion: OperationCompletion::Complete,
                     },
                     redactions: Vec::new(),
                     warnings,
@@ -3381,8 +3384,9 @@ pub mod nats {
 
 pub mod fake {
     use chronicle_canonical::{
-        Attributes, CanonicalOperation, CanonicalWarning, Completeness, OperationEffect,
-        OperationKind, OperationProvenance, PayloadRef, ProtocolData, RelativeTimeNanos,
+        Attributes, CanonicalOperation, CanonicalWarning, Completeness, OperationCompletion,
+        OperationEffect, OperationKind, OperationProvenance, PayloadRef, ProtocolData,
+        RelativeTimeNanos,
     };
     use chronicle_common::{Direction, Endpoint, OperationId, ProtocolId};
     use chronicle_protocol::{
@@ -3553,6 +3557,9 @@ pub mod fake {
                         connection_generation,
                         wal_ranges,
                         missing_payload_provenance,
+                        completion_owner_epoch: None,
+                        epoch_ranges: Vec::new(),
+                        completion: OperationCompletion::Complete,
                     },
                     redactions: Vec::new(),
                     warnings,

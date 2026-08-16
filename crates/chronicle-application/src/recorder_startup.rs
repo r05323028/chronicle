@@ -525,6 +525,13 @@ mod tests {
                     &crate::RecorderMetadataV1 {
                         version: crate::RECORDER_METADATA_SCHEMA_VERSION,
                         recorder_id,
+                        parent_id: None,
+                        current_epoch_id: None,
+                        finalized_epoch_count: 0,
+                        continuation_in: None,
+                        continuation_out: None,
+                        retention_state: None,
+                        last_rollover: None,
                         attempt_id,
                         config_digest: config_digest.clone(),
                         scope: scope.clone(),

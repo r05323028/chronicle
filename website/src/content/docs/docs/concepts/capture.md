@@ -15,7 +15,7 @@ chronicle record --pid 12345
 chronicle record --cgroup /sys/fs/cgroup/my-service
 ```
 
-Command mode supervises the command. PID and cgroup modes observe an existing workload and do not terminate it. Use `--name` to give a recording a stable human reference and `--duration` to set a shorter bounded window.
+Command mode supervises the command. PID and cgroup modes observe an existing workload and do not terminate it. Use `--name` to give a recording a stable human reference and `--duration` for an optional whole-recording deadline. Omit it to run until source completion, explicit stop, or fatal safety failure. Capture rolls over bounded epochs without detaching the source.
 
 ## What crosses the boundary
 
@@ -29,6 +29,6 @@ Chronicle attaches around a command, process, or cgroup. The application does no
 
 ## Bounds are part of the contract
 
-One-shot recording defaults to 600 seconds and is capped at 3600 seconds. The physical WAL ceiling is 4 GiB. Capture queues are bounded; when evidence cannot be admitted, the loss is visible rather than silently dropped.
+Whole-recording duration is optional; checked values such as `10m` and `24h` set a deadline that is not reset at epoch rollover. Each epoch retains bounded WAL/segment limits, while the parent has no total-WAL cap. Capture queues remain bounded; when evidence cannot be admitted, the loss is visible rather than silently dropped.
 
 Read [WAL](../wal/), [ETL](../../architecture/etl/), and [local deployment](../../deployment/local/) for the next boundaries.

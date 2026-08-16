@@ -29,7 +29,7 @@ chronicle --format json doctor
 
 ## ローカルデータと容量
 
-recording、WAL segment、manifest、checkpoint、canonical payload は、解決されたローカル data directory に残ります。ワンショット recording のデフォルトは 600 秒、上限は 3600 秒、物理 WAL 容量は 4 GiB を超えません。ディスク容量とファイル権限は、バイナリサイズだけでなくキャプチャしたデータを基準に計画してください。
+recording、WAL segment、manifest、checkpoint、canonical payload は、解決されたローカル data directory に残ります。`--duration` を省略すると recording 全体の時間 deadline はなく、明示した deadline は上限付き epoch／segment WAL 容量とは独立です。1 つの parent recording は複数の epoch を持て、全体 WAL 上限はありません。ディスク容量とファイル権限は、バイナリサイズだけでなくキャプチャしたデータを基準に計画してください。
 
 ## デプロイの境界
 

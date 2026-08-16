@@ -1,7 +1,7 @@
 //! WAL v1 append-only framing, segmented writer, and recovery.
 
 use chronicle_capture::{ClockIdentity, MonotonicTimestamp};
-use chronicle_common::RecordingId;
+use chronicle_common::{EpochId, RecordingId};
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use rustix::fs::{CWD, FlockOperation, RenameFlags, flock, renameat_with};
 use serde::{Deserialize, Serialize};
@@ -23,13 +23,57 @@ pub use manifest::{
     write_manifest_atomic,
 };
 pub use retention::{
-    CleanupFault, CleanupIntent, CleanupOutcome, LifecycleEpochEntry, LifecycleIndexV1,
-    LifecycleProof, RETENTION_PRODUCTION_ENABLED, RetentionError, SegmentLifecycleRecord,
-    cleanup_finalized_segment, cleanup_finalized_segment_verified,
+    CleanupFault, CleanupIntent, CleanupOutcome, ContinuationRetentionState, LifecycleEpochEntry,
+    LifecycleIndexV1, LifecycleProof, RETENTION_PRODUCTION_ENABLED, RetentionError,
+    SegmentLifecycleRecord, cleanup_finalized_segment, cleanup_finalized_segment_verified,
     cleanup_finalized_segment_with_policy, recover_cleanup, recover_cleanup_with_policy,
 };
 
 pub const WAL_FORMAT_VERSION: u16 = 1;
+
+/// Explicit bridge between typed epoch identity and the unchanged WAL v1 UUID field.
+///
+/// Parent `RecordingId` values are intentionally not accepted by this adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WalV1RecordingIdentity {
+    epoch_id: EpochId,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum WalIdentityError {
+    #[error("legacy WAL UUID does not match supplied epoch identity")]
+    LegacyUuidMismatch,
+}
+
+impl WalV1RecordingIdentity {
+    pub const fn from_epoch_id(epoch_id: EpochId) -> Self {
+        Self { epoch_id }
+    }
+
+    pub const fn epoch_id(self) -> EpochId {
+        self.epoch_id
+    }
+
+    pub const fn legacy_uuid(self) -> uuid::Uuid {
+        self.epoch_id.as_uuid()
+    }
+
+    pub const fn legacy_recording_id(self) -> RecordingId {
+        RecordingId::from_uuid(self.legacy_uuid())
+    }
+
+    /// Interpret a recovered v1 UUID only with explicit epoch context.
+    pub fn from_legacy_uuid(
+        legacy_uuid: uuid::Uuid,
+        epoch_id: EpochId,
+    ) -> Result<Self, WalIdentityError> {
+        if legacy_uuid != epoch_id.as_uuid() {
+            return Err(WalIdentityError::LegacyUuidMismatch);
+        }
+        Ok(Self::from_epoch_id(epoch_id))
+    }
+}
+
 pub const SEGMENT_HEADER_VERSION: u16 = 1;
 pub const SEGMENT_HEADER_LEN: usize = 64;
 const SEGMENT_HEADER_LEN_U32: u32 = 64;
@@ -53,6 +97,41 @@ pub const DEFAULT_MAX_WAL_BYTES: u64 = MAX_SEGMENT_BYTES;
 const SEGMENT_MAGIC: [u8; 4] = *b"CHS1";
 const ENVELOPE_MAGIC: [u8; 4] = *b"CHE1";
 
+#[cfg(test)]
+mod epoch_identity_tests {
+    use super::*;
+
+    #[test]
+    fn adapter_requires_explicit_matching_epoch_context() {
+        let epoch = EpochId::new();
+        let adapter = WalV1RecordingIdentity::from_epoch_id(epoch);
+        assert_eq!(adapter.epoch_id(), epoch);
+        assert_eq!(adapter.legacy_uuid(), epoch.as_uuid());
+        assert_eq!(adapter.legacy_recording_id().as_uuid(), epoch.as_uuid());
+        assert!(WalV1RecordingIdentity::from_legacy_uuid(epoch.as_uuid(), epoch).is_ok());
+        assert_eq!(
+            WalV1RecordingIdentity::from_legacy_uuid(uuid::Uuid::new_v4(), epoch),
+            Err(WalIdentityError::LegacyUuidMismatch)
+        );
+    }
+
+    #[test]
+    fn epoch_entrypoints_preserve_v1_identity_bytes() {
+        let epoch = EpochId::new();
+        let header = SegmentHeader::for_epoch(epoch, 0, 1, 2);
+        assert_eq!(header.epoch_id(), epoch);
+        let envelope = WalRecordEnvelope::unplaced_for_epoch(
+            epoch,
+            1,
+            RecordKind::CaptureEvent,
+            WAL_RECORD_SCHEMA_VERSION,
+            0,
+            vec![1, 2, 3],
+        );
+        assert_eq!(envelope.epoch_id(), epoch);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentHeader {
     pub recording_id: RecordingId,
@@ -62,6 +141,24 @@ pub struct SegmentHeader {
 }
 
 impl SegmentHeader {
+    pub fn for_epoch(
+        epoch_id: EpochId,
+        segment_ordinal: u64,
+        first_sequence: u64,
+        created_unix_nanos: i64,
+    ) -> Self {
+        Self {
+            recording_id: WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+            segment_ordinal,
+            first_sequence,
+            created_unix_nanos,
+        }
+    }
+
+    pub fn epoch_id(&self) -> EpochId {
+        EpochId::from_uuid(self.recording_id.as_uuid())
+    }
+
     pub fn validate_identity(
         &self,
         recording_id: RecordingId,
@@ -188,6 +285,28 @@ pub struct CommitAuthority {
 }
 
 impl WalRecordEnvelope {
+    pub fn unplaced_for_epoch(
+        epoch_id: EpochId,
+        sequence: u64,
+        kind: RecordKind,
+        schema_version: u16,
+        flags: u16,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self::unplaced(
+            WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+            sequence,
+            kind,
+            schema_version,
+            flags,
+            payload,
+        )
+    }
+
+    pub fn epoch_id(&self) -> EpochId {
+        EpochId::from_uuid(self.recording_id.as_uuid())
+    }
+
     pub fn unplaced(
         recording_id: RecordingId,
         sequence: u64,
@@ -1049,6 +1168,17 @@ pub fn discover_segments(
     Ok(discovered.into_iter().map(|(_, segment)| segment).collect())
 }
 
+/// Discover only the segments belonging to an explicitly supplied epoch.
+pub fn discover_segments_for_epoch(
+    directory: impl AsRef<Path>,
+    epoch_id: EpochId,
+) -> Result<Vec<DiscoveredSegment>, WalError> {
+    discover_segments(
+        directory,
+        WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+    )
+}
+
 pub struct RecordingLock {
     _file: File,
 }
@@ -1112,6 +1242,19 @@ pub fn scan_wal(
 ) -> Result<RecoveryScan, WalError> {
     let _lock = RecordingLock::acquire(&wal_directory)?;
     scan_wal_unlocked(wal_directory.as_ref(), recording_id, max_record_bytes)
+}
+
+/// Scan an epoch WAL through the explicit v1 compatibility adapter.
+pub fn scan_wal_for_epoch(
+    wal_directory: impl AsRef<Path>,
+    epoch_id: EpochId,
+    max_record_bytes: usize,
+) -> Result<RecoveryScan, WalError> {
+    scan_wal(
+        wal_directory,
+        WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+        max_record_bytes,
+    )
 }
 
 /// Hashes exact verified WAL v1 segment bytes through final authoritative commit marker.
@@ -1219,6 +1362,32 @@ pub fn read_committed_snapshot_with_records(
         snapshot,
         envelopes: scan.committed,
     })
+}
+
+/// Read an epoch snapshot through the explicit v1 compatibility adapter.
+pub fn read_committed_snapshot_for_epoch(
+    wal_directory: impl AsRef<Path>,
+    epoch_id: EpochId,
+    max_record_bytes: usize,
+) -> Result<CommittedSnapshot, WalError> {
+    read_committed_snapshot(
+        wal_directory,
+        WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+        max_record_bytes,
+    )
+}
+
+/// Read epoch records and snapshot authority through the explicit adapter.
+pub fn read_committed_snapshot_with_records_for_epoch(
+    wal_directory: impl AsRef<Path>,
+    epoch_id: EpochId,
+    max_record_bytes: usize,
+) -> Result<CommittedRecordSnapshot, WalError> {
+    read_committed_snapshot_with_records(
+        wal_directory,
+        WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+        max_record_bytes,
+    )
 }
 
 pub fn verified_segment_prefix_sha256(
@@ -1530,6 +1699,36 @@ pub struct SegmentedEnvelopeWriter {
 }
 
 impl SegmentedEnvelopeWriter {
+    pub fn create_for_epoch(
+        directory: impl AsRef<Path>,
+        epoch_id: EpochId,
+        max_segment_bytes: u64,
+    ) -> Result<Self, WalError> {
+        Self::create(
+            directory,
+            WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+            max_segment_bytes,
+        )
+    }
+
+    pub fn create_with_total_limit_for_epoch(
+        directory: impl AsRef<Path>,
+        epoch_id: EpochId,
+        max_segment_bytes: u64,
+        max_total_bytes: u64,
+    ) -> Result<Self, WalError> {
+        Self::create_with_total_limit(
+            directory,
+            WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+            max_segment_bytes,
+            max_total_bytes,
+        )
+    }
+
+    pub fn epoch_id(&self) -> EpochId {
+        EpochId::from_uuid(self.recording_id.as_uuid())
+    }
+
     pub fn create(
         directory: impl AsRef<Path>,
         recording_id: RecordingId,
@@ -1892,6 +2091,64 @@ pub struct GroupCommitWalWriter {
 }
 
 impl GroupCommitWalWriter {
+    pub fn create_for_epoch(
+        directory: impl AsRef<Path>,
+        epoch_id: EpochId,
+        max_segment_bytes: u64,
+        first_sequence: u64,
+        now_millis: u64,
+    ) -> Result<Self, WalError> {
+        Self::create(
+            directory,
+            WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+            max_segment_bytes,
+            first_sequence,
+            now_millis,
+        )
+    }
+
+    pub fn create_with_total_limit_for_epoch(
+        directory: impl AsRef<Path>,
+        epoch_id: EpochId,
+        max_segment_bytes: u64,
+        max_total_bytes: u64,
+        first_sequence: u64,
+        now_millis: u64,
+    ) -> Result<Self, WalError> {
+        Self::create_with_total_limit(
+            directory,
+            WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+            max_segment_bytes,
+            max_total_bytes,
+            first_sequence,
+            now_millis,
+        )
+    }
+
+    pub fn create_with_total_limit_and_age_for_epoch(
+        directory: impl AsRef<Path>,
+        epoch_id: EpochId,
+        max_segment_bytes: u64,
+        max_total_bytes: u64,
+        first_sequence: u64,
+        now_millis: u64,
+        max_segment_age_millis: u64,
+    ) -> Result<Self, WalError> {
+        Self::create_with_total_limit_and_age(
+            directory,
+            WalV1RecordingIdentity::from_epoch_id(epoch_id).legacy_recording_id(),
+            max_segment_bytes,
+            max_total_bytes,
+            first_sequence,
+            now_millis,
+            max_segment_age_millis,
+        )
+    }
+
+    pub fn epoch_id(&self) -> EpochId {
+        EpochId::from_uuid(self.recording_id.as_uuid())
+    }
+
     pub fn create(
         directory: impl AsRef<Path>,
         recording_id: RecordingId,

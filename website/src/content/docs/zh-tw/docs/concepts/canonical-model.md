@@ -19,7 +19,7 @@ canonical session 是 Chronicle 在擷取與重播之間交接的資料。它以
 - replay attribute 與明確的 blocker；
 - 與核心欄位分開保存的 protocol extension bytes。
 
-Timeline 是唯一的 operation order。Completeness map 具有權威性。若 endpoint evidence 遺失或互相衝突，ETL 會失敗；它絕不會儲存捏造的 `unknown:0` endpoint。
+Timeline 是唯一的 operation order。Completeness map 具有權威性。跨 epoch operation 會保留 completion owner 與 contributing epoch/WAL provenance；只有 continuation 或 incomplete outcome 不可重播。若 endpoint evidence 遺失或互相衝突，ETL 會失敗；它絕不會儲存捏造的 `unknown:0` endpoint。
 
 ## 唯一可變動的 v1 契約
 

@@ -13,7 +13,7 @@ Canonical endpoints come only from capture socket evidence:
 
 Ingress/egress selects byte direction only. ETL returns typed failure for missing or conflicting socket evidence and never stores `unknown:0` endpoints.
 
-Session-level `source_provenance`, `connection_completeness`, `operation_completeness`, and `replay_attributes` are ordinary v1 fields. Completeness maps are authoritative. `timeline` is sole operation order. `PayloadRef` supports bounded inline bytes, filesystem artifacts, S3-compatible references with checksum and size, redacted values, and explicit missing values. `BTreeMap` attributes keep serialization deterministic.
+Session-level `source_provenance`, `connection_completeness`, `operation_completeness`, and `replay_attributes` are ordinary v1 fields. Completeness maps are authoritative. `timeline` is sole operation order. Cross-epoch operations record their completion-owner epoch and ordered contributing epoch/WAL ranges; continuation-only or incomplete outcomes remain non-replayable. `PayloadRef` supports bounded inline bytes, filesystem artifacts, S3-compatible references with checksum and size, redacted values, and explicit missing values. `BTreeMap` attributes keep serialization deterministic.
 
 Protocol data declares `PROTOCOL_DATA_SCHEMA_VERSION = 1`; canonical validation rejects any other value. Protocol extension bytes remain narrow and typed by media type rather than replacing core canonical fields.
 

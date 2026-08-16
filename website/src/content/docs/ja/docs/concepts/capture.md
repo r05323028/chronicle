@@ -15,7 +15,7 @@ chronicle record --pid 12345
 chronicle record --cgroup /sys/fs/cgroup/my-service
 ```
 
-command mode はコマンドを監視します。PID mode と cgroup mode は既存のワークロードを観測するだけで、終了させません。`--name` で記録に安定した人間向けの名前を付け、`--duration` で短い上限付きの期間を指定できます。
+command mode はコマンドを監視します。PID mode と cgroup mode は既存のワークロードを観測するだけで、終了させません。`--name` で安定した名前を付け、`--duration` で recording 全体の deadline を任意に指定できます。省略すると、ソース完了、明示的な停止、または致命的な安全性失敗まで続きます。キャプチャはソースを再接続せず、境界付き epoch をロールオーバーします。
 
 ## 境界を越えるデータ
 
@@ -29,6 +29,6 @@ Chronicle はコマンド、プロセス、または cgroup の外側から接�
 
 ## 上限は契約の一部
 
-ワンショット記録のデフォルトは 600 秒、上限は 3600 秒です。WAL 全体の物理容量上限は 4 GiB です。キャプチャキューには上限があり、取り込めない証拠は黙って破棄せず、欠損として確認できるようにします。
+記録全体の duration は任意です。`10m` や `24h` などの検証済み値で deadline を指定でき、epoch のロールオーバーでリセットされません。各 epoch の WAL/segment 上限は維持され、parent 全体の WAL 上限はありません。キャプチャキューには上限があり、取り込めない証拠は黙って破棄せず欠損として確認できます。
 
 次の境界については [WAL](../wal/)、[ETL](../../architecture/etl/)、[ローカルデプロイ](../../deployment/local/) を読んでください。

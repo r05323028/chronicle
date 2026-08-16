@@ -62,16 +62,51 @@ impl RecordingIngestResult {
     }
 }
 
-/// Drives one already-preflighted production source through bounded WAL persistence.
-/// `requested_stop` supplies source completion or future signal handling; duration is enforced here.
-/// `on_ready` fires once capture is attached and the WAL writer is durable, before the
-/// poll loop: command-mode orchestration releases the bootstrap child there.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Legacy bounded one-shot wrapper retained for hidden 0.1.x entrypoints.
+#[allow(clippy::too_many_arguments)]
 pub fn record_production<S, Build, Now, Stop, Ready>(
     wal_directory: impl AsRef<Path>,
     metadata: &mut RecordingMetadata,
     capture_metadata: RecordingCaptureMetadata,
     bounds: ProductionRecordingBounds,
+    build_source: Build,
+    now_millis: Now,
+    requested_stop: Stop,
+    on_ready: Ready,
+) -> Result<ProductionRecordingResult, ApplicationError>
+where
+    S: CaptureSource,
+    Build: FnOnce() -> Result<S, ApplicationError>,
+    Now: FnMut() -> u64,
+    Stop: FnMut() -> Option<ShutdownReason>,
+    Ready: FnOnce() -> Result<(), ApplicationError>,
+{
+    validate_production_recording_bounds(bounds)?;
+    record_production_with_lifetime(
+        wal_directory,
+        metadata,
+        capture_metadata,
+        bounds,
+        RecordingLifetime {
+            deadline: Some(Duration::from_secs(bounds.duration_seconds)),
+            stop_policy: RunStopPolicy::AnyTerminalCondition,
+        },
+        build_source,
+        now_millis,
+        requested_stop,
+        on_ready,
+    )
+}
+
+/// Drives a production source through bounded epoch WAL persistence while the
+/// parent recording lifetime remains independently optional and whole-run.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn record_production_with_lifetime<S, Build, Now, Stop, Ready>(
+    wal_directory: impl AsRef<Path>,
+    metadata: &mut RecordingMetadata,
+    capture_metadata: RecordingCaptureMetadata,
+    bounds: ProductionRecordingBounds,
+    lifetime: RecordingLifetime,
     build_source: Build,
     mut now_millis: Now,
     mut requested_stop: Stop,
@@ -84,7 +119,7 @@ where
     Stop: FnMut() -> Option<ShutdownReason>,
     Ready: FnOnce() -> Result<(), ApplicationError>,
 {
-    validate_production_recording_bounds(bounds)?;
+    validate_epoch_recording_bounds(bounds)?;
     if metadata.status != RecordingStatus::Starting || metadata.shutdown_reason.is_some() {
         return Err(ApplicationError::RecordingMetadataValidation(
             "production recording must begin in starting state".into(),
@@ -118,6 +153,9 @@ where
     metadata.transition_to_recording(capture_metadata)?;
     write_recording_metadata(wal_directory, metadata)?;
     let started_at = now_millis();
+    let deadline_millis = lifetime
+        .deadline
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
     let writer = match GroupCommitWalWriter::create_with_total_limit(
         wal_directory,
         metadata.recording_id,
@@ -157,8 +195,9 @@ where
     let mut requested_reason = loop {
         let now = now_millis();
         if let Some(reason) = requested_stop().or_else(|| {
-            (now.saturating_sub(started_at) >= bounds.duration_seconds.saturating_mul(1_000))
-                .then_some(ShutdownReason::DurationLimit)
+            deadline_millis
+                .filter(|deadline| now.saturating_sub(started_at) >= *deadline)
+                .map(|_| ShutdownReason::DurationLimit)
         }) {
             break reason;
         }
@@ -1149,6 +1188,28 @@ pub struct RecordingEtlResult {
     pub recovery_sha256: [u8; 32],
 }
 
+fn continuation_file_ref(
+    wal_directory: &Path,
+    name: &str,
+) -> Result<Option<String>, ApplicationError> {
+    let path = wal_directory.join(name);
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            EpochContinuationCheckpointV1::load(&path).map_err(|error| {
+                ApplicationError::RecordingMetadataValidation(format!(
+                    "invalid continuation artifact {name}: {error}"
+                ))
+            })?;
+            Ok(Some(name.to_owned()))
+        }
+        Ok(_) => Err(ApplicationError::RecordingMetadataValidation(format!(
+            "continuation artifact is not a regular file: {name}"
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ApplicationError::Io(error)),
+    }
+}
+
 /// ETL one finalized production recording while holding its exclusive WAL lock.
 #[allow(clippy::too_many_lines)] // Validation and provenance share one recovery-authoritative boundary.
 pub fn process_recording_wal(
@@ -1229,6 +1290,10 @@ pub fn process_recording_wal(
         )?;
     let wal_snapshot_sha256 = verified_snapshot_sha256(wal_directory, &scan)?;
     let recovery_sha256 = recovery_sha256(&scan);
+    let continuation_in =
+        continuation_file_ref(wal_directory, chronicle_etl::EPOCH_CONTINUATION_IN_FILE)?;
+    let continuation_out =
+        continuation_file_ref(wal_directory, chronicle_etl::EPOCH_CONTINUATION_OUT_FILE)?;
     assign_recording_ids_with_snapshot(&mut output.session, wal_snapshot_sha256)?;
     let connection_evidence: Vec<_> = output
         .session
@@ -1295,6 +1360,11 @@ pub fn process_recording_wal(
     source_evidence.sort_by_key(|entry| entry.sequence_range);
     output.session.source_provenance = SourceProvenance {
         recording_id: Some(metadata.recording_id),
+        epoch_id: Some(chronicle_common::EpochId(metadata.recording_id.0)),
+        epoch_ordinal: None,
+        wal_sequence_range: wal_envelope_range,
+        continuation_in,
+        continuation_out,
         status: source_status,
         reason: metadata
             .shutdown_reason
@@ -1309,6 +1379,13 @@ pub fn process_recording_wal(
         pipeline_version: Some(ETL_PIPELINE_VERSION.to_string()),
         evidence: source_evidence,
     };
+    stamp_epoch_operation_provenance(
+        &mut output.session,
+        metadata.recording_id,
+        chronicle_common::EpochId(metadata.recording_id.0),
+        None,
+        wal_envelope_range,
+    );
     Ok(RecordingEtlResult {
         output,
         ignored_post_commit_records: u64::try_from(scan.uncommitted.len()).map_err(|_| {
@@ -1333,6 +1410,12 @@ pub const RECORDING_ETL_CHECKPOINT_VERSION: u16 = 1;
 pub struct RecordingEtlCheckpoint {
     pub version: u16,
     pub recording_id: RecordingId,
+    #[serde(default)]
+    pub parent_id: Option<RecordingId>,
+    #[serde(default)]
+    pub epoch_id: Option<chronicle_common::EpochId>,
+    #[serde(default)]
+    pub epoch_ordinal: Option<u64>,
     pub commit_marker_segment_ordinal: u64,
     pub commit_marker_byte_offset: u64,
     pub commit_marker_sequence: u64,
@@ -1391,6 +1474,36 @@ impl Drop for QuotaPublicationReservation<'_> {
     }
 }
 
+/// Parent-aware ETL adapter. WAL bytes remain epoch-local; the returned
+/// canonical session carries stable parent and explicit epoch provenance.
+pub fn process_recording_wal_with_parent(
+    wal_directory: impl AsRef<Path>,
+    registry: &ProtocolRegistry,
+    session_id: chronicle_common::SessionId,
+    parent_id: RecordingId,
+    epoch_id: chronicle_common::EpochId,
+    epoch_ordinal: u64,
+) -> Result<RecordingEtlResult, ApplicationError> {
+    let mut result = process_recording_wal(wal_directory, registry, session_id)?;
+    if result.recording_id.0 != epoch_id.as_uuid() {
+        return Err(ApplicationError::RecordingMetadataValidation(
+            "parent-aware ETL epoch identity does not match WAL identity".into(),
+        ));
+    }
+    result.output.session.source_provenance.recording_id = Some(parent_id);
+    result.output.session.source_provenance.epoch_id = Some(epoch_id);
+    result.output.session.source_provenance.epoch_ordinal = Some(epoch_ordinal);
+    let wal_sequence_range = result.output.session.source_provenance.wal_sequence_range;
+    stamp_epoch_operation_provenance(
+        &mut result.output.session,
+        parent_id,
+        epoch_id,
+        Some(epoch_ordinal),
+        wal_sequence_range,
+    );
+    Ok(result)
+}
+
 pub(crate) fn reserve_publication_peak(
     authority: &QuotaReservationAuthority,
     session_bytes: u64,
@@ -1428,7 +1541,27 @@ pub fn process_and_publish_recording_wal(
     root: impl AsRef<Path>,
     registry: &ProtocolRegistry,
 ) -> Result<PublishedRecordingResult, ApplicationError> {
-    process_and_publish_recording_wal_inner(wal_directory, root, registry, None, false)
+    process_and_publish_recording_wal_inner(wal_directory, root, registry, None, None, false)
+}
+
+/// Parent-aware ETL publication. The immutable session remains epoch-owned;
+/// parent identity is additive provenance and never replaces WAL authority.
+pub fn process_and_publish_recording_wal_with_parent(
+    wal_directory: impl AsRef<Path>,
+    root: impl AsRef<Path>,
+    registry: &ProtocolRegistry,
+    parent_id: RecordingId,
+    epoch_id: chronicle_common::EpochId,
+    epoch_ordinal: u64,
+) -> Result<PublishedRecordingResult, ApplicationError> {
+    process_and_publish_recording_wal_inner(
+        wal_directory,
+        root,
+        registry,
+        Some((parent_id, epoch_id, epoch_ordinal)),
+        None,
+        false,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1437,8 +1570,18 @@ pub(crate) fn process_and_publish_recording_wal_owned(
     root: impl AsRef<Path>,
     registry: &ProtocolRegistry,
     quota: &QuotaReservationAuthority,
+    parent_id: RecordingId,
+    epoch_id: chronicle_common::EpochId,
+    epoch_ordinal: u64,
 ) -> Result<PublishedRecordingResult, ApplicationError> {
-    process_and_publish_recording_wal_inner(wal_directory, root, registry, Some(quota), true)
+    process_and_publish_recording_wal_inner(
+        wal_directory,
+        root,
+        registry,
+        Some((parent_id, epoch_id, epoch_ordinal)),
+        Some(quota),
+        true,
+    )
 }
 
 #[allow(clippy::too_many_lines)] // transaction keeps publication-before-checkpoint ordering inline
@@ -1446,6 +1589,7 @@ fn process_and_publish_recording_wal_inner(
     wal_directory: impl AsRef<Path>,
     root: impl AsRef<Path>,
     registry: &ProtocolRegistry,
+    parent: Option<(RecordingId, chronicle_common::EpochId, u64)>,
     quota: Option<&QuotaReservationAuthority>,
     lease_owned: bool,
 ) -> Result<PublishedRecordingResult, ApplicationError> {
@@ -1465,16 +1609,34 @@ fn process_and_publish_recording_wal_inner(
             ApplicationError::RecordingMetadataValidation("recording metadata is missing".into())
         })?
         .recording_id;
-    let processed = process_recording_wal(
-        wal_directory,
-        registry,
-        chronicle_common::SessionId(recording_id.0),
-    )?;
-    if let Some(checkpoint) = load_recording_etl_checkpoint(wal_directory)?
-        && checkpoint.recording_id == processed.recording_id
-        && checkpoint.wal_snapshot_sha256 != sha256_string(&processed.wal_snapshot_sha256)
-    {
-        return Err(ApplicationError::CheckpointContradiction);
+    let processed = if let Some((parent_id, epoch_id, epoch_ordinal)) = parent {
+        process_recording_wal_with_parent(
+            wal_directory,
+            registry,
+            chronicle_common::SessionId(epoch_id.as_uuid()),
+            parent_id,
+            epoch_id,
+            epoch_ordinal,
+        )?
+    } else {
+        process_recording_wal(
+            wal_directory,
+            registry,
+            chronicle_common::SessionId(recording_id.0),
+        )?
+    };
+    if let Some(checkpoint) = load_recording_etl_checkpoint(wal_directory)? {
+        let identity_conflict = parent.is_some_and(|(parent_id, epoch_id, epoch_ordinal)| {
+            checkpoint.parent_id != Some(parent_id)
+                || checkpoint.epoch_id != Some(epoch_id)
+                || checkpoint.epoch_ordinal != Some(epoch_ordinal)
+        });
+        if checkpoint.recording_id == processed.recording_id
+            && (checkpoint.wal_snapshot_sha256 != sha256_string(&processed.wal_snapshot_sha256)
+                || identity_conflict)
+        {
+            return Err(ApplicationError::CheckpointContradiction);
+        }
     }
     let issues = issue_summaries(&processed.output.issues);
     let replayability = replayability_reasons(&processed.output);
@@ -1502,6 +1664,9 @@ fn process_and_publish_recording_wal_inner(
     let checkpoint = RecordingEtlCheckpoint {
         version: RECORDING_ETL_CHECKPOINT_VERSION,
         recording_id: processed.recording_id,
+        parent_id: parent.map(|(parent_id, _, _)| parent_id),
+        epoch_id: parent.map(|(_, epoch_id, _)| epoch_id),
+        epoch_ordinal: parent.map(|(_, _, epoch_ordinal)| epoch_ordinal),
         commit_marker_segment_ordinal: processed.commit_boundary.segment_ordinal,
         commit_marker_byte_offset: processed.commit_marker_byte_offset,
         commit_marker_sequence: processed.commit_boundary.marker_sequence,

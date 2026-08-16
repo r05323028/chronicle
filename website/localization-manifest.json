@@ -57,16 +57,16 @@
       "sourceSha256": "f453102e52517d59267048df59030e233d4b63c5573371cc3f135a2664b9539a"
     },
     "docs/architecture/recorder.md": {
-      "sourceSha256": "fd47f3cf595e700412957c6d7fdc5b16cdf45e38eb39282f33d6c1d9c73423d1"
+      "sourceSha256": "b52b3ba76d9b49ad1ea68e443b68c8047ad353a68f1188eb496c6494bd72ab06"
     },
     "docs/architecture/storage.md": {
       "sourceSha256": "49439924e4c25e420031f2c8a903572c8dd7c31be1b913d56ead661f7714eb93"
     },
     "docs/concepts/canonical-model.md": {
-      "sourceSha256": "ec7d0b0fc1d13f497b989847c62cc8f6fbfeaafc7ec8f87f402d1f9db1504cb6"
+      "sourceSha256": "dc4022dd87bb12123fbf5ddd73c870e3568fb8bc291388e512cc686a9a50521c"
     },
     "docs/concepts/capture.md": {
-      "sourceSha256": "a990e420951018d4106e3ed2a2b4962faf0acd736376b6b93000c348fa3414c2"
+      "sourceSha256": "4438ed5dbb8ad9bca4d15e9efc9c9746039541011a30050722deb22e4b868a5d"
     },
     "docs/concepts/replay.md": {
       "sourceSha256": "344329f2b356bf2a5c064b5dd1291afe4afe3395aee0d4cc3cc78f9b55909a68"
@@ -78,7 +78,7 @@
       "sourceSha256": "34f6af6e59e8306005e236b85e05de7ac845730763bb4d149d2fa379c5437c1b"
     },
     "docs/deployment/local.md": {
-      "sourceSha256": "3b5e5071963cea1ce6fe99a07b94ff337441d06a839e57989eb51a66dfc82130"
+      "sourceSha256": "e5876a4cc856afcf7cd91ce910bf8348ad7790d9ffe4b17c488711ce6a25a1f8"
     },
     "docs/getting-started/installation.md": {
       "sourceSha256": "d5dfc2089e4dd9a7dbe3a864b49b15bea8cf3e9ba61eac299aee5aaf646988b6"
@@ -90,7 +90,7 @@
       "sourceSha256": "6bbdc1923f837b7ea99aca8727683dc86bab11aac74eea6013da986f14873af1"
     },
     "docs/reference/cli.md": {
-      "sourceSha256": "94f1ec9de68612fab1d21030ea8d6423e8e2273441ec663695bd83febbe8e853"
+      "sourceSha256": "336fbfc81dedea3e870e047b676a4e9f8acdc542d40c038a9c52802a478cd9e0"
     },
     "docs/reference/terminology.md": {
       "sourceSha256": "e98e915a9eba14863210f189b26230c49ae2375dce595382a4f493cfa35b87a8"
