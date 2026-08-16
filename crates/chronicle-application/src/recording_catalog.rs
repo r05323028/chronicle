@@ -183,7 +183,9 @@ fn recording_for_summary(summary: &SessionSummary) -> RecordingId {
         .unwrap_or(RecordingId(summary.session_id.0))
 }
 
-/// Index sessions by the recording they belong to.
+/// Index sessions by the recording they belong to. Sessions published for
+/// a finalized epoch bind the parent recording id, so each epoch id is also
+/// indexed: public inspection of an epoch recording resolves to its session.
 fn summary_by_recording<'a>(
     summaries: impl Iterator<Item = &'a SessionSummary>,
 ) -> BTreeMap<RecordingId, &'a SessionSummary> {
@@ -192,6 +194,11 @@ fn summary_by_recording<'a>(
         index
             .entry(recording_for_summary(summary))
             .or_insert(summary);
+        if let Some(epoch_id) = summary.epoch_id {
+            index
+                .entry(RecordingId::from_uuid(epoch_id.as_uuid()))
+                .or_insert(summary);
+        }
     }
     index
 }

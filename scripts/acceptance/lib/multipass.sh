@@ -215,12 +215,22 @@ else
 	fi
 	if [[ "$PRE_STATUS" -eq 0 || "$PRE_STATUS" -eq 77 ]]; then
 		BOOT_ID_BEFORE=$(MULTIPASS_TIMEOUT=10 multipass exec "$VM" -- cat /proc/sys/kernel/random/boot_id)
-		if ! MULTIPASS_TIMEOUT=$MULTIPASS_STATUS_TIMEOUT multipass restart "$VM" 2>/dev/null; then
-			MULTIPASS_TIMEOUT=$MULTIPASS_STATUS_TIMEOUT multipass stop "$VM" >/dev/null
-			MULTIPASS_TIMEOUT=$MULTIPASS_STATUS_TIMEOUT multipass start "$VM" >/dev/null
+		if ! MULTIPASS_TIMEOUT=300 multipass stop "$VM" >/dev/null 2>&1; then
+			MULTIPASS_TIMEOUT=300 multipass restart "$VM" >/dev/null 2>&1
 		fi
+		MULTIPASS_TIMEOUT=300 multipass start "$VM" >/dev/null 2>&1 || {
+			printf 'VM restart failed: stop/start did not recover %s
+' "$VM" >&2
+			exit 1
+		}
 		wait_for_vm
-		BOOT_ID_AFTER=$(MULTIPASS_TIMEOUT=10 multipass exec "$VM" -- cat /proc/sys/kernel/random/boot_id)
+		# The readiness exec may succeed while ssh is still mid-handshake;
+		# poll the boot-identity probe until it actually answers.
+		BOOT_ID_AFTER=
+		for _attempt in $(seq 1 12); do
+			BOOT_ID_AFTER=$(MULTIPASS_TIMEOUT=30 multipass exec "$VM" -- cat /proc/sys/kernel/random/boot_id 2>/dev/null) && break
+			sleep 5
+		done
 		[[ -n $BOOT_ID_BEFORE && -n $BOOT_ID_AFTER && $BOOT_ID_BEFORE != "$BOOT_ID_AFTER" ]] || {
 			printf 'VM reboot was not proven: before=%s after=%s\n' "$BOOT_ID_BEFORE" "$BOOT_ID_AFTER" >&2
 			exit 1

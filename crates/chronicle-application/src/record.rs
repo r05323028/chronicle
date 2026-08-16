@@ -205,117 +205,6 @@ pub(crate) fn preflight_embedded_ebpf() -> Result<(), ApplicationError> {
     ))
 }
 
-/// Hidden bounded 0.1.x selector adapter.
-#[cfg(target_os = "linux")]
-pub fn record_live_ebpf(
-    selector: CgroupSelector,
-    allow_shared_cgroup: bool,
-    wal_directory: impl AsRef<Path>,
-    bounds: ProductionRecordingBounds,
-    stop: &ProductionSignalStop,
-    recording_id: RecordingId,
-) -> Result<ProductionRecordingResult, ApplicationError> {
-    preflight_wal_destination(wal_directory.as_ref(), bounds)?;
-    record_live_ebpf_with_lifetime(
-        selector,
-        allow_shared_cgroup,
-        wal_directory,
-        bounds,
-        RecordingLifetime {
-            deadline: Some(Duration::from_secs(bounds.duration_seconds)),
-            stop_policy: RunStopPolicy::AnyTerminalCondition,
-        },
-        stop,
-        recording_id,
-    )
-}
-
-/// Public selector path with an optional whole-recording deadline. Attached
-/// workloads remain alive when capture drains or the deadline expires.
-#[cfg(target_os = "linux")]
-pub fn record_live_ebpf_with_lifetime(
-    selector: CgroupSelector,
-    allow_shared_cgroup: bool,
-    wal_directory: impl AsRef<Path>,
-    bounds: ProductionRecordingBounds,
-    lifetime: RecordingLifetime,
-    stop: &ProductionSignalStop,
-    recording_id: RecordingId,
-) -> Result<ProductionRecordingResult, ApplicationError> {
-    let mode = match &selector {
-        CgroupSelector::Pid(_) => CaptureMode::Pid,
-        CgroupSelector::Explicit(_) => CaptureMode::Cgroup,
-    };
-    preflight_wal_destination_for_lifetime(wal_directory.as_ref(), bounds)?;
-    preflight_embedded_ebpf()?;
-    if matches!(&selector, CgroupSelector::Pid(_)) && allow_shared_cgroup {
-        return Err(ApplicationError::ProductionPreflight(
-            "shared cgroup acknowledgement requires explicit cgroup",
-        ));
-    }
-    let pid_baseline = match &selector {
-        CgroupSelector::Pid(pid) => {
-            Some(preflight_pid_cgroup_selection(*pid).map_err(|_| {
-                ApplicationError::ProductionPreflight("PID cgroup selection invalid")
-            })?)
-        }
-        CgroupSelector::Explicit(_) => None,
-    };
-    let selection = match &pid_baseline {
-        Some(baseline) => baseline.selection().clone(),
-        None => preflight_cgroup_selection(selector, allow_shared_cgroup)
-            .map_err(|_| ApplicationError::ProductionPreflight("cgroup selection invalid"))?,
-    };
-    let capture_metadata = live_capture_metadata(&selection, bounds)?;
-    let mut metadata = RecordingMetadata {
-        version: RECORDING_METADATA_SCHEMA_VERSION,
-        recording_id,
-        selector: Some(RecordingSelectorIdentity {
-            canonical_cgroup_path: selection.canonical_path.display().to_string(),
-            cgroup_id: selection.cgroup_id,
-        }),
-        status: RecordingStatus::Starting,
-        shutdown_reason: None,
-        last_valid_commit: None,
-        counters: RecordingCounters::default(),
-        terminal_wal_loss: None,
-        capture: None,
-    };
-    let mut coordinator = ContinuousRecordingCoordinator::new(mode, lifetime, Instant::now());
-    let mut requested_stop = move || {
-        if let Some(reason) = stop.shutdown_reason() {
-            coordinator.request_stop();
-            return Some(reason);
-        }
-        match coordinator.poll(Instant::now(), false, false) {
-            CoordinatorAction::Continue
-            | CoordinatorAction::Drain(
-                RunStopReason::SourceCompleted | RunStopReason::RestartRecovery,
-            ) => None,
-            CoordinatorAction::Drain(RunStopReason::Deadline) => {
-                Some(ShutdownReason::DurationLimit)
-            }
-            CoordinatorAction::Drain(RunStopReason::UserRequested) => {
-                Some(ShutdownReason::UserInterrupt)
-            }
-            CoordinatorAction::Drain(RunStopReason::FatalFailure) => {
-                Some(ShutdownReason::CaptureFailure)
-            }
-        }
-    };
-    record_production_with_lifetime(
-        wal_directory,
-        &mut metadata,
-        capture_metadata,
-        bounds,
-        lifetime,
-        || load_production_ebpf_source(&selection, pid_baseline.as_ref()),
-        monotonic_millis,
-        &mut requested_stop,
-        || Ok(()),
-    )
-}
-
 /// Runs capture through the continuous startup/rollover/drain runtime.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_lines)]
@@ -348,162 +237,6 @@ fn recover_cleanup_for_root(root: &Path) -> Result<(), RecorderStartupError> {
             }
         }
     }
-    Ok(())
-}
-
-#[cfg(test)]
-fn rollover_path_matches(expected: &str, actual: &Path) -> bool {
-    match (fs::canonicalize(expected), fs::canonicalize(actual)) {
-        (Ok(expected), Ok(actual)) => expected == actual,
-        _ => Path::new(expected) == actual,
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_lines)]
-pub(crate) fn recover_rollover_transition_for_root(
-    state_root: &Path,
-    root: &Path,
-    catalog: Option<&mut EpochCatalogV1>,
-    quotas: &[QuotaReservationAuthority],
-    configured_reservation_bytes: u64,
-) -> Result<(), RecorderStartupError> {
-    let Some(transition) = load_transition(state_root)
-        .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?
-    else {
-        return Ok(());
-    };
-    let successor = PathBuf::from(&transition.new_path);
-    if !successor.starts_with(root) {
-        return Err(RecorderStartupError::RecoveryDetail(
-            "rollover successor escaped catalog root".into(),
-        ));
-    }
-    if transition.reservation_bytes != configured_reservation_bytes {
-        return Err(RecorderStartupError::RecoveryDetail(
-            "rollover reservation does not match configured epoch limit".into(),
-        ));
-    }
-    if !quotas.is_empty() {
-        let authorities = quotas
-            .iter()
-            .filter(|quota| successor.starts_with(Path::new(&quota.quota().domain)))
-            .collect::<Vec<_>>();
-        if authorities.len() != 1
-            || transition.reservation_bytes > authorities[0].quota().quota_bytes
-        {
-            return Err(RecorderStartupError::RecoveryDetail(
-                "rollover successor quota domain or reservation mismatch".into(),
-            ));
-        }
-    }
-    let (catalog_old_matches, catalog_successor_matches) =
-        if let Some(catalog_view) = catalog.as_ref() {
-            let old = catalog_view.epochs.iter().any(|entry| {
-                entry.ordinal == transition.old_epoch_ordinal
-                    && entry.recording_id.0 == transition.old_recording_id
-                    && rollover_path_matches(&transition.old_path, &root.join(&entry.path))
-            });
-            let successor_entry = catalog_view.epochs.iter().any(|entry| {
-                entry.ordinal == transition.new_epoch_ordinal
-                    && entry.recording_id.0 == transition.new_recording_id
-                    && entry.predecessor
-                        == Some(chronicle_common::RecordingId(transition.old_recording_id))
-                    && rollover_path_matches(&transition.new_path, &root.join(&entry.path))
-            });
-            (old, successor_entry)
-        } else {
-            (true, false)
-        };
-    if !catalog_old_matches {
-        return Err(RecorderStartupError::RecoveryDetail(
-            "rollover transition predecessor identity mismatch".into(),
-        ));
-    }
-    let physical_bytes = if successor.exists() {
-        recording_physical_wal_bytes(&successor)
-            .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?
-    } else {
-        0
-    };
-    if physical_bytes > transition.reservation_bytes {
-        return Err(RecorderStartupError::RecoveryDetail(
-            "rollover successor exceeded reserved quota".into(),
-        ));
-    }
-    let metadata = load_recording_metadata(&successor)
-        .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
-    if let Some(metadata) = &metadata
-        && metadata.recording_id.0 != transition.new_recording_id
-    {
-        return Err(RecorderStartupError::RecoveryDetail(
-            "rollover successor metadata identity mismatch".into(),
-        ));
-    }
-    let committed = if successor.exists() && successor.join("segments").is_dir() {
-        match chronicle_wal::read_committed_snapshot_with_records(
-            &successor,
-            chronicle_common::RecordingId(transition.new_recording_id),
-            chronicle_wal::DEFAULT_MAX_RECORD_BYTES,
-        ) {
-            Ok(_) => true,
-            Err(chronicle_wal::WalError::NoPublishedSegments) => false,
-            Err(error) => {
-                return Err(RecorderStartupError::RecoveryDetail(error.to_string()));
-            }
-        }
-    } else {
-        false
-    };
-    if metadata.is_none() && committed {
-        return Err(RecorderStartupError::RecoveryDetail(
-            "rollover successor has committed evidence without metadata".into(),
-        ));
-    }
-    if metadata.is_some() && !catalog_successor_matches {
-        return Err(RecorderStartupError::RecoveryDetail(
-            "rollover transition successor identity mismatch".into(),
-        ));
-    }
-    if metadata.is_none() && successor.exists() {
-        fs::remove_dir_all(&successor).map_err(|error| {
-            RecorderStartupError::RecoveryDetail(format!(
-                "rollover successor rollback failed: {error}"
-            ))
-        })?;
-    }
-    let Some(catalog) = catalog else {
-        if metadata.is_some() {
-            return Err(RecorderStartupError::RecoveryDetail(
-                "rollover successor metadata has no catalog authority".into(),
-            ));
-        }
-        for quota in quotas {
-            quota
-                .rebuild_managed_usage()
-                .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
-        }
-        remove_transition(state_root)
-            .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
-        return Ok(());
-    };
-    catalog
-        .recover_prepared_tail(root)
-        .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
-    if metadata.is_some()
-        && catalog.active().map(|entry| entry.recording_id.0) != Some(transition.new_recording_id)
-    {
-        return Err(RecorderStartupError::RecoveryDetail(
-            "rollover successor was not activated".into(),
-        ));
-    }
-    for quota in quotas {
-        quota
-            .rebuild_managed_usage()
-            .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
-    }
-    remove_transition(state_root)
-        .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
     Ok(())
 }
 
@@ -594,7 +327,7 @@ pub(crate) fn compact_lifecycle_index(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn apply_retention_cleanup(
     root: &Path,
-    catalog: &EpochCatalogV2,
+    catalog: &EpochCatalog,
     config: &NormalizedRecorderConfig,
     quotas: &[QuotaReservationAuthority],
 ) -> Result<(), ApplicationError> {
@@ -782,10 +515,18 @@ fn reserve_recording_quota(
     Ok(())
 }
 
+/// True only when the directory contains durable WAL evidence. The epoch
+/// catalog write may create the directory before capture; an empty or
+/// catalog-only directory must be treated as a fresh WAL destination.
+#[cfg(target_os = "linux")]
+fn wal_evidence_present(directory: &Path) -> bool {
+    directory.join("recording.json").exists() || directory.join("segments").exists()
+}
+
 #[cfg(target_os = "linux")]
 fn persist_startup_recorder_metadata(
     config: &NormalizedRecorderConfig,
-    catalog: Option<&EpochCatalogV2>,
+    catalog: Option<&EpochCatalog>,
     quotas: &[QuotaReservationAuthority],
     lifecycle: RecorderLifecycleState,
     recorder_id: uuid::Uuid,
@@ -867,54 +608,27 @@ fn persist_startup_recorder_metadata(
 #[cfg(target_os = "linux")]
 fn load_runtime_epoch_catalog(
     root: &Path,
-) -> Result<Option<crate::EpochCatalogV2>, ApplicationError> {
+) -> Result<Option<crate::EpochCatalog>, ApplicationError> {
     let path = root.join(crate::EPOCH_CATALOG_FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ApplicationError::Io(error)),
     };
-    let version = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64));
-    match version {
-        Some(value) if value == u64::from(crate::EPOCH_CATALOG_V2_VERSION) => {
-            crate::EpochCatalogV2::decode(&bytes)
-                .map(Some)
-                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))
-        }
-        Some(1) => {
-            let legacy: crate::EpochCatalogV1 = serde_json::from_slice(&bytes)
-                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-            let parent_id = legacy
-                .epochs
-                .first()
-                .map(|entry| entry.recording_id)
-                .ok_or_else(|| {
-                    ApplicationError::InvalidConfig("legacy epoch catalog is empty".into())
-                })?;
-            let catalog = crate::EpochCatalogV2::from_legacy(parent_id, &legacy)
-                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-            catalog
-                .write_atomic(root)
-                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-            Ok(Some(catalog))
-        }
-        _ => Err(ApplicationError::InvalidConfig(
-            "unsupported epoch catalog version".into(),
-        )),
-    }
+    crate::EpochCatalog::decode(&bytes)
+        .map(Some)
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))
 }
 
 #[cfg(target_os = "linux")]
-fn recover_rollover_transition_v2_for_root(
+pub(crate) fn recover_rollover_transition_v2_for_root(
     state_root: &Path,
     root: &Path,
-    catalog: Option<&mut EpochCatalogV2>,
+    catalog: Option<&mut EpochCatalog>,
     quotas: &[QuotaReservationAuthority],
     configured_reservation_bytes: u64,
 ) -> Result<(), RecorderStartupError> {
-    let Some(transition) = load_transition_v2(state_root)
+    let Some(transition) = load_transition(state_root)
         .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?
     else {
         return Ok(());
@@ -937,17 +651,24 @@ fn recover_rollover_transition_v2_for_root(
     let successor_entry = catalog.epoch(transition.new_epoch_id).ok_or_else(|| {
         RecorderStartupError::RecoveryDetail("V2 transition successor absent from catalog".into())
     })?;
+    // The journal stores the successor path as given at transition creation
+    // (absolute), while the catalog stores the root-relative epoch path.
+    let successor_path = std::path::Path::new(&transition.new_path)
+        .strip_prefix(root)
+        .map_or(transition.new_path.as_str(), |relative| {
+            relative.to_str().unwrap_or(transition.new_path.as_str())
+        });
     if old_entry.ordinal != transition.old_epoch_ordinal
         || successor_entry.ordinal != transition.new_epoch_ordinal
         || successor_entry.predecessor != Some(transition.old_epoch_id)
-        || successor_entry.path != transition.new_path
+        || successor_entry.path != successor_path
     {
         return Err(RecorderStartupError::RecoveryDetail(
             "V2 transition topology mismatch".into(),
         ));
     }
     match transition.phase {
-        RolloverTransitionV2Phase::Prepared | RolloverTransitionV2Phase::SuccessorCreated => {
+        RolloverTransitionPhase::Prepared | RolloverTransitionPhase::SuccessorCreated => {
             let has_metadata = successor.join("recording.json").is_file();
             let has_committed = chronicle_wal::read_committed_snapshot_with_records(
                 &successor,
@@ -978,9 +699,9 @@ fn recover_rollover_transition_v2_for_root(
             crate::remove_transition(state_root)
                 .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
         }
-        RolloverTransitionV2Phase::BoundaryCommitted
-        | RolloverTransitionV2Phase::TopologyActivated
-        | RolloverTransitionV2Phase::Complete => {
+        RolloverTransitionPhase::BoundaryCommitted
+        | RolloverTransitionPhase::TopologyActivated
+        | RolloverTransitionPhase::Complete => {
             if successor_entry.state == EpochCatalogState::Prepared {
                 catalog
                     .activate_successor(transition.new_epoch_id)
@@ -990,17 +711,17 @@ fn recover_rollover_transition_v2_for_root(
                     .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
             }
             let mut completed = transition;
-            if completed.phase == RolloverTransitionV2Phase::BoundaryCommitted {
+            if completed.phase == RolloverTransitionPhase::BoundaryCommitted {
                 completed = completed
-                    .with_phase(RolloverTransitionV2Phase::TopologyActivated)
+                    .with_phase(RolloverTransitionPhase::TopologyActivated)
                     .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
             }
-            if completed.phase == RolloverTransitionV2Phase::TopologyActivated {
+            if completed.phase == RolloverTransitionPhase::TopologyActivated {
                 completed = completed
-                    .with_phase(RolloverTransitionV2Phase::Complete)
+                    .with_phase(RolloverTransitionPhase::Complete)
                     .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
             }
-            write_transition_v2_atomic(state_root, &completed)
+            write_transition_atomic(state_root, &completed)
                 .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
             crate::remove_transition(state_root)
                 .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
@@ -1023,6 +744,7 @@ pub fn record_continuous_ebpf(
         config,
         wal_directory,
         stop,
+        false,
         None,
         CaptureMode::Daemon,
         RecordingLifetime::default(),
@@ -1040,6 +762,7 @@ pub(crate) fn record_continuous_ebpf_with_source<S, Build, ExtraStop, Ready>(
     config: &NormalizedRecorderConfig,
     wal_directory: impl AsRef<Path>,
     stop: &ProductionSignalStop,
+    domain_lock_held: bool,
     parent_id_hint: Option<RecordingId>,
     capture_mode: CaptureMode,
     lifetime: RecordingLifetime,
@@ -1119,34 +842,69 @@ where
         .and_then(|catalog| catalog.active())
         .map_or(parent_id.0, |entry| entry.epoch_id.as_uuid());
     let startup_attempt_id = uuid::Uuid::new_v4();
-    let startup = RecorderStartup::prepare_foundation_with_metadata(
-        config,
-        |quotas, lifecycle| {
-            persist_startup_recorder_metadata(
-                config,
-                metadata_catalog.as_ref(),
-                quotas,
-                lifecycle,
-                startup_recorder_id,
-                startup_attempt_id,
-            )
-        },
-        |quotas| {
-            recover_cleanup_for_root(&root_wal_directory)?;
-            load_lifecycle_index(&root_wal_directory)
-                .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
-            recover_rollover_transition_v2_for_root(
-                &config.state_root,
-                &root_wal_directory,
-                epoch_catalog.as_mut(),
-                quotas,
-                config.epoch.max_bytes,
-            )?;
-            Ok(())
-        },
-        |quotas| reserve_recording_quota(config, &root_wal_directory, initial_wal_bytes, quotas),
-    )
+    let startup = if domain_lock_held {
+        RecorderStartup::prepare_foundation_with_metadata_holding_domain_lock(
+            config,
+            |quotas, lifecycle| {
+                persist_startup_recorder_metadata(
+                    config,
+                    metadata_catalog.as_ref(),
+                    quotas,
+                    lifecycle,
+                    startup_recorder_id,
+                    startup_attempt_id,
+                )
+            },
+            |quotas| {
+                recover_cleanup_for_root(&root_wal_directory)?;
+                load_lifecycle_index(&root_wal_directory)
+                    .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+                recover_rollover_transition_v2_for_root(
+                    &config.state_root,
+                    &root_wal_directory,
+                    epoch_catalog.as_mut(),
+                    quotas,
+                    config.epoch.max_bytes,
+                )?;
+                Ok(())
+            },
+            |quotas| {
+                reserve_recording_quota(config, &root_wal_directory, initial_wal_bytes, quotas)
+            },
+        )
+    } else {
+        RecorderStartup::prepare_foundation_with_metadata(
+            config,
+            |quotas, lifecycle| {
+                persist_startup_recorder_metadata(
+                    config,
+                    metadata_catalog.as_ref(),
+                    quotas,
+                    lifecycle,
+                    startup_recorder_id,
+                    startup_attempt_id,
+                )
+            },
+            |quotas| {
+                recover_cleanup_for_root(&root_wal_directory)?;
+                load_lifecycle_index(&root_wal_directory)
+                    .map_err(|error| RecorderStartupError::RecoveryDetail(error.to_string()))?;
+                recover_rollover_transition_v2_for_root(
+                    &config.state_root,
+                    &root_wal_directory,
+                    epoch_catalog.as_mut(),
+                    quotas,
+                    config.epoch.max_bytes,
+                )?;
+                Ok(())
+            },
+            |quotas| {
+                reserve_recording_quota(config, &root_wal_directory, initial_wal_bytes, quotas)
+            },
+        )
+    }
     .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+
     if let Some(catalog) = &epoch_catalog {
         let recovered_directory = catalog
             .resolve_active_path(&root_wal_directory)
@@ -1183,7 +941,7 @@ where
         .and_then(|entry| entry.predecessor)
         .map(|epoch_id| RecordingId::from_uuid(epoch_id.as_uuid()));
     let mut startup_successor: Option<(EpochId, EpochId)> = None;
-    let existing_recording_id = if wal_directory.exists() {
+    let existing_recording_id = if wal_evidence_present(&wal_directory) {
         let metadata = load_recording_metadata(&wal_directory)?.ok_or(
             ApplicationError::RecordingMetadataValidation(
                 "recording metadata missing during WAL recovery".into(),
@@ -1250,7 +1008,7 @@ where
         if epoch_catalog.is_none() {
             parent_id = RecordingId::from_uuid(predecessor_id.as_uuid());
             epoch_catalog = Some(
-                EpochCatalogV2::new(parent_id, predecessor_id, ".")
+                EpochCatalog::new(parent_id, predecessor_id, ".")
                     .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?,
             );
         }
@@ -1284,7 +1042,7 @@ where
                 .ok_or_else(|| ApplicationError::InvalidConfig("epoch path is not UTF-8".into()))?
         };
         epoch_catalog = Some(
-            EpochCatalogV2::new(parent_id, epoch_id, path)
+            EpochCatalog::new(parent_id, epoch_id, path)
                 .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?,
         );
         epoch_catalog
@@ -1293,7 +1051,7 @@ where
             .write_atomic(&root_wal_directory)
             .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
     }
-    let writer = if wal_directory.exists() {
+    let writer = if wal_evidence_present(&wal_directory) {
         match prepare_group_commit_reopen(
             &wal_directory,
             recording_id,
@@ -1408,7 +1166,7 @@ where
             service
                 .reserve_successor_quota(&next_wal_directory, config.epoch.max_bytes)
                 .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-            if let Err(error) = service.begin_rollover_transition_v2(
+            if let Err(error) = service.begin_rollover_transition(
                 parent_id,
                 &next_wal_directory,
                 next_epoch_id,
@@ -1470,7 +1228,7 @@ where
                     return Err(error.into());
                 }
             };
-            let boundary = match service.rollover_to_v2(
+            let boundary = match service.rollover_to(
                 &next_wal_directory,
                 next_writer,
                 now,

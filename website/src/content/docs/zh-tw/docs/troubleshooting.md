@@ -31,7 +31,7 @@ chronicle --format json doctor
 
 ## Finalization 停止，或 WAL 接近容量上限
 
-一次性錄製受 duration 與 4 GiB WAL 實體容量上限限制。檢查磁碟空間與 recording directory。如果 recording 可以復原，請在不重新擷取的情況下重試 finalization：
+錄製受 duration 與 4 GiB WAL 實體容量上限限制。檢查磁碟空間與 recording directory。如果 recording 可以復原，請在不重新擷取的情況下重試 finalization：
 
 ```bash
 chronicle record --retry checkout

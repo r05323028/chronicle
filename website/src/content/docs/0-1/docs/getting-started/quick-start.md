@@ -22,7 +22,7 @@ chronicle record --name checkout -- ./my-app
 
 Chronicle attaches capture first, then starts the application. Recording stops when the application exits, you press `Ctrl+C`, or the duration bound is reached. While it runs, send representative requests from another terminal.
 
-The public one-shot default is 600 seconds; the maximum is 3600 seconds. The physical WAL ceiling is 4 GiB.
+Without an explicit `--duration`, recording continues until the application exits or is stopped. The physical WAL ceiling is 4 GiB.
 
 :::caution
 The application must be reachable on a non-loopback address while recording. Command-mode replay starts a supervised copy on loopback and refuses to target the exact recorded destination.

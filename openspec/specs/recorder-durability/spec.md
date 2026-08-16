@@ -20,7 +20,7 @@ Recorder startup SHALL acquire the exclusive exact domain lease and quota author
 
 ### Requirement: Rollover is crash-recoverable
 
-Epoch rollover SHALL persist enough checksummed transition state to recover or roll back successor creation, epoch-local WAL appendability, admitted-observation outcome ranges, catalog activation, parent/epoch metadata publication, and quota reservations after any process interruption. The parent-aware `RolloverTransitionV2` SHALL bind stable parent `RecordingId`, old/new `EpochId`, old/new ordinals, paths, predecessor boundary/outcome digests, and reservation identity. Its monotonic capture/topology phases SHALL be `prepared`, `successor_created`, `boundary_committed`, `topology_activated`, and `complete`; it SHALL have no ETL-continuation completion phase or predicate.
+Epoch rollover SHALL persist enough checksummed transition state to recover or roll back successor creation, epoch-local WAL appendability, admitted-observation outcome ranges, catalog activation, parent/epoch metadata publication, and quota reservations after any process interruption. The parent-aware `RolloverTransition` SHALL bind stable parent `RecordingId`, old/new `EpochId`, old/new ordinals, paths, predecessor boundary/outcome digests, and reservation identity. Its monotonic capture/topology phases SHALL be `prepared`, `successor_created`, `boundary_committed`, `topology_activated`, and `complete`; it SHALL have no ETL-continuation completion phase or predicate.
 
 Exactly one successor may become active for one predecessor. A prepared/evidence-free successor may be rolled back; a successor or WAL/outcome artifact with committed evidence is never deleted by guesswork. Predecessor identity and committed WAL remain immutable after boundary proof. Successful capture rollover means predecessor boundary/outcome, successor WAL handoff, and authoritative topology activation are durable; continuation may still be pending in ETL. The transition journal is in-flight proof only; `epochs.json` remains topology authority.
 
@@ -176,7 +176,7 @@ At any durable point a parent run SHALL have zero or one prepared successor and 
 
 ### Requirement: Continuation handoff is ETL-owned and asynchronous
 
-The predecessor-to-successor continuation dependency SHALL be maintained separately from WAL/topology authority. Once the predecessor final marker and successor identity are durable, ETL SHALL create a bounded checksummed dependency record in `pending` state without requiring the predecessor decoder to have processed to that marker. ETL SHALL transition it to `ready` only after `IncrementalEtlCheckpointV2` catches up exactly to the predecessor final marker and emits one lineage-verified `EpochContinuationCheckpointV1`; successor ETL may then consume it once and record `consumed`. Unsupported, corrupt, over-limit, or retry-exhausted state uses explicit `unavailable`/`failed` processing semantics.
+The predecessor-to-successor continuation dependency SHALL be maintained separately from WAL/topology authority. Once the predecessor final marker and successor identity are durable, ETL SHALL create a bounded checksummed dependency record in `pending` state without requiring the predecessor decoder to have processed to that marker. ETL SHALL transition it to `ready` only after `IncrementalEtlCheckpoint` catches up exactly to the predecessor final marker and emits one lineage-verified `EpochContinuationCheckpoint`; successor ETL may then consume it once and record `consumed`. Unsupported, corrupt, over-limit, or retry-exhausted state uses explicit `unavailable`/`failed` processing semantics.
 
 Continuation state, checkpoint digests, and decoder progress SHALL never decide whether an epoch exists, whether `epochs.json` may activate a successor, or whether successor capture may write WAL. A pending continuation may make successor processing not-ready while capture remains ready. Invalid continuation preserves valid successor WAL/topology and produces explicit incomplete/loss provenance rather than a clean decoder reset.
 
@@ -193,7 +193,7 @@ Continuation state, checkpoint digests, and decoder progress SHALL never decide 
 #### Scenario: ETL crash while predecessor catches up
 
 - **WHEN** predecessor ETL crashes between checkpoint progress and continuation publication
-- **THEN** retry resumes from the last verified `IncrementalEtlCheckpointV2` cursor and emits the same continuation artifact at the same predecessor final marker or records explicit processing failure
+- **THEN** retry resumes from the last verified `IncrementalEtlCheckpoint` cursor and emits the same continuation artifact at the same predecessor final marker or records explicit processing failure
 
 #### Scenario: Continuation becomes ready after successor WAL exists
 

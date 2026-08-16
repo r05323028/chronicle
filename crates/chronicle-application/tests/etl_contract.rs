@@ -6,8 +6,11 @@
 //! No root, eBPF, systemd, or Multipass required.
 
 use chronicle_application::{
-    process_and_publish_recording_wal, production_wal_from_fixture, protocol_registry,
+    load_recording_metadata, process_and_publish_recording_wal,
+    process_and_publish_recording_wal_with_parent, production_wal_from_fixture, protocol_registry,
+    resolve_epoch_parent_context,
 };
+use chronicle_common::{EpochId, RecordingId};
 use std::path::{Path, PathBuf};
 
 fn fixture_path() -> PathBuf {
@@ -35,6 +38,82 @@ fn first_segment(wal: &Path) -> PathBuf {
         .collect();
     names.sort();
     names.into_iter().next().expect("at least one WAL segment")
+}
+
+#[test]
+fn parent_aware_etl_binds_one_parent_range_per_operation() {
+    let root = temp_root("parent-aware");
+    let wal = fixture_wal(&root);
+    let registry = protocol_registry().expect("protocol registry");
+    let output = root.join("out");
+    let parent_id = RecordingId::new();
+    let recording = load_recording_metadata(&wal)
+        .expect("fixture recording metadata")
+        .expect("metadata present");
+    let epoch_id = EpochId::from_uuid(recording.recording_id.0);
+
+    let published = process_and_publish_recording_wal_with_parent(
+        &wal, &output, &registry, parent_id, epoch_id, 3,
+    )
+    .expect("parent-aware publish");
+    let session_dir = output
+        .join("sessions")
+        .join(published.session_id.to_string());
+    let session: chronicle_canonical::CanonicalSession = serde_json::from_slice(
+        &std::fs::read(session_dir.join("session.json")).expect("session file"),
+    )
+    .expect("session parses");
+    session
+        .validate()
+        .expect("published parent-aware session validates");
+    assert_eq!(
+        session.source_provenance.recording_id,
+        Some(parent_id),
+        "session binds the stable parent"
+    );
+    for connection in &session.connections {
+        for operation in &connection.operations {
+            assert_eq!(
+                operation.provenance.epoch_ranges.len(),
+                1,
+                "operation must carry exactly one epoch range after parent binding"
+            );
+            assert_eq!(
+                operation.provenance.epoch_ranges[0].parent_id,
+                Some(parent_id),
+                "range parent must be the stable parent, never the epoch-local id"
+            );
+            assert_eq!(operation.provenance.epoch_ranges[0].epoch_id, epoch_id);
+        }
+    }
+    std::fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn resolve_epoch_parent_context_binds_catalog_lineage() {
+    let root = temp_root("parent-context");
+    let wal = fixture_wal(&root);
+    let recording = load_recording_metadata(&wal)
+        .expect("fixture recording metadata")
+        .expect("metadata present");
+    let parent_id = RecordingId::new();
+    let epoch_id = EpochId::from_uuid(recording.recording_id.0);
+    let catalog =
+        chronicle_application::EpochCatalog::new(parent_id, epoch_id, ".").expect("catalog");
+    catalog.write_atomic(&wal).expect("catalog write");
+
+    let context = resolve_epoch_parent_context(&wal).expect("resolve");
+    assert_eq!(context, Some((parent_id, epoch_id, 0)));
+
+    // A standalone WAL without a catalog resolves to None.
+    let standalone = temp_root("parent-context-standalone");
+    let wal2 = fixture_wal(&standalone);
+    assert_eq!(
+        resolve_epoch_parent_context(&wal2).expect("resolve standalone"),
+        None
+    );
+    std::fs::remove_dir_all(&root).expect("cleanup temp root");
+    std::fs::remove_dir_all(&standalone).expect("cleanup temp root");
 }
 
 #[test]

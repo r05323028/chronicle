@@ -1593,7 +1593,7 @@ class AcceptanceRunnerTests(unittest.TestCase):
         reboot = (
             ROOT / "scripts/acceptance/lib/scenarios/recorder/reboot-recovery.sh"
         ).read_text()
-        self.assertIn("incremental-etl-checkpoint.json", reboot)
+        self.assertIn("incremental-etl-checkpoint-v2.json", reboot)
         self.assertIn("committed(post)", reboot)
         self.assertIn("epoch(post)", reboot)
 

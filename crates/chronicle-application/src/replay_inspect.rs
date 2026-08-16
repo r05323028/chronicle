@@ -568,6 +568,7 @@ pub fn build_parent_replay_plan(
             .filter(|summary| {
                 summary.recording_id == Some(parent_id)
                     || (summary.recording_id.is_none() && summary.session_id.0 == parent_id.0)
+                    || summary.epoch_id == Some(EpochId::from_uuid(parent_id.0))
             })
             .collect();
         matches.sort_by_key(|summary| (summary.epoch_ordinal.unwrap_or(0), summary.session_id));

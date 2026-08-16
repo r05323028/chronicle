@@ -1,16 +1,16 @@
 ---
 title: レコーダー
-description: キャプチャと WAL の所有権を中心としたワンショットおよび継続記録のライフサイクル。
+description: キャプチャと WAL の所有権を中心とした記録のライフサイクル。
 slug: ja/0-1/docs/architecture/recorder
 ---
 
-recording lifecycle は 1 つの capture scope、1 つの WAL domain、1 つの finalization path を所有します。通常のユーザーはワンショットの command mode から始めます。
+recording lifecycle は 1 つの capture scope、1 つの WAL domain、1 つの finalization path を所有します。通常のユーザーは command mode から始めます。
 
 ```bash
 chronicle record --name checkout -- ./my-app
 ```
 
-## ワンショットのライフサイクル
+## コマンドモードのライフサイクル
 
 1. 公開 data directory を解決してロックします。
 2. recording identity と上限付きの WAL domain を準備します。

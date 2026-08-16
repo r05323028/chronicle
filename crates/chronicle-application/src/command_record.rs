@@ -2,8 +2,8 @@
 //!
 //! Sequence (design D2): non-mutating preflight first; exact domain lock +
 //! revalidation; supervised-scope creation before durable allocation;
-//! caller-allocated identity passed into the lower-level `record_production`
-//! path; hidden bootstrap blocked on a readiness pipe (fd 3); capture
+//! caller-allocated identity passed into the the continuous recording
+//! coordinator; hidden bootstrap blocked on a readiness pipe (fd 3); capture
 //! attached and WAL writer durable before the go byte releases the bootstrap
 //! to harden credentials and directly exec the target. Bounded scope cleanup,
 //! ETL, publication, and catalog update follow, with the domain lock released
@@ -14,7 +14,7 @@ use crate::{
     ApplicationError, CaptureMode, ChildExitResult, RecordingId, RecordingLifetime, RecordingStatus,
 };
 #[cfg(target_os = "linux")]
-use crate::{DomainLockGuard, FilesystemSessionStore, RecordingMetadata};
+use crate::{DomainLockGuard, FilesystemSessionStore};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -99,10 +99,9 @@ pub fn record_command(
     use crate::recording_catalog::RecordingIntentV1;
     use crate::supervised_scope::{RealClock, SCOPE_POLL_INTERVAL, create_supervised_scope};
     use crate::{
-        CgroupSelection, CgroupSelector, ProductionRecordingBounds, RecordingMetadata,
-        RecordingSelectorIdentity, ShutdownReason, acquire_domain_lock, claim_recording_name,
-        ensure_private_data_dir, reconcile_catalog, recordings_root, save_catalog,
-        write_recording_intent,
+        CgroupSelection, CgroupSelector, ProductionRecordingBounds, ShutdownReason,
+        acquire_domain_lock, claim_recording_name, ensure_private_data_dir, reconcile_catalog,
+        recordings_root, save_catalog, write_recording_intent,
     };
     use std::collections::BTreeSet;
     use std::process::Stdio;
@@ -181,21 +180,6 @@ pub fn record_command(
         segment_bytes: crate::DEFAULT_SEGMENT_BYTES,
         max_wal_bytes: 4 * 1024 * 1024 * 1024,
     };
-    let metadata = RecordingMetadata {
-        version: crate::RECORDING_METADATA_SCHEMA_VERSION,
-        recording_id,
-        selector: Some(RecordingSelectorIdentity {
-            canonical_cgroup_path: scope.identity().canonical_path.display().to_string(),
-            cgroup_id: scope.identity().cgroup_id,
-        }),
-        status: RecordingStatus::Starting,
-        shutdown_reason: None,
-        last_valid_commit: None,
-        counters: Default::default(),
-        terminal_wal_loss: None,
-        capture: None,
-    };
-
     // Watchdog: if capture attachment does not complete within the hard
     // deadline, kill the still-blocked bootstrap so no target runs and no
     // recording survives the hang.
@@ -223,6 +207,7 @@ pub fn record_command(
         &recorder_config,
         &wal_dir,
         &options.stop,
+        true,
         Some(recording_id),
         options.capture_mode,
         options.lifetime,
@@ -259,7 +244,6 @@ pub fn record_command(
                 &guard,
                 &options,
                 recording_id,
-                &metadata,
                 &result,
                 child_exit.as_ref(),
                 &cleanup,
@@ -279,8 +263,10 @@ pub fn record_command(
         Err(error) => {
             // Pre-attach failure: remove the recording dir (no durable
             // evidence worth keeping) and surface the typed error. Post-attach
-            // failures keep the WAL as recoverable via reconcile.
-            let _ = std::fs::remove_dir_all(&wal_dir);
+            // failures keep the WAL as recoverable via reconcile/retry.
+            if !released.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_dir_all(&wal_dir);
+            }
             Err(error)
         }
     }
@@ -362,7 +348,7 @@ pub fn record_command(
 }
 
 /// `record --pid PID` / `record --cgroup PATH`: record an already-running
-/// workload through the existing `record_live_ebpf` path, then run the same
+/// workload through the continuous recording coordinator, then run the same
 /// internal WAL -> ETL -> publish -> catalog workflow as command mode while
 /// holding the exact data-domain lock for the whole transaction. The workload
 /// is never terminated.
@@ -374,7 +360,7 @@ pub fn record_selector(
 ) -> Result<CommandRecordResult, ApplicationError> {
     use crate::recording_catalog::RecordingIntentV1;
     use crate::{
-        ProductionRecordingBounds, RecordingMetadata, acquire_domain_lock, claim_recording_name,
+        ProductionRecordingBounds, acquire_domain_lock, claim_recording_name,
         ensure_private_data_dir, preflight_cgroup_selection, preflight_pid_cgroup_selection,
         public_continuous_config, reconcile_catalog, recordings_root, save_catalog,
         write_recording_intent,
@@ -424,6 +410,7 @@ pub fn record_selector(
         &recorder_config,
         &wal_dir,
         &options.stop,
+        true,
         Some(recording_id),
         options.capture_mode,
         options.lifetime,
@@ -435,17 +422,6 @@ pub fn record_selector(
         &guard,
         &options,
         recording_id,
-        &RecordingMetadata {
-            version: crate::RECORDING_METADATA_SCHEMA_VERSION,
-            recording_id,
-            selector: None,
-            status: RecordingStatus::Completed,
-            shutdown_reason: None,
-            last_valid_commit: None,
-            counters: Default::default(),
-            terminal_wal_loss: None,
-            capture: None,
-        },
         &result,
         None,
         &crate::CleanupOutcome::Clean,
@@ -479,7 +455,7 @@ fn finalize_continuous_and_publish(
     guard: &DomainLockGuard,
     options: &CommandRecordOptions,
     recording_id: RecordingId,
-    mut catalog: crate::EpochCatalogV2,
+    mut catalog: crate::EpochCatalog,
     recording_result: &crate::ProductionRecordingResult,
     child_exit: Option<&ChildExitResult>,
     cleanup: &crate::CleanupOutcome,
@@ -492,22 +468,11 @@ fn finalize_continuous_and_publish(
     let wal_root = crate::recordings_root(&options.data_dir).join(recording_id.to_string());
     for entry in catalog.epochs.clone() {
         let directory = wal_root.join(&entry.path);
-        let metadata = crate::load_recording_metadata(&directory)?.ok_or(
-            ApplicationError::RecordingMetadataValidation(
-                "catalog epoch metadata missing during public finalization".into(),
-            ),
-        )?;
-        let commit = metadata.last_valid_commit.as_ref();
         catalog
             .update_summary(
                 entry.epoch_id,
-                crate::EpochCatalogSummaryV2 {
-                    committed_through: commit.map(|value| value.marker_sequence),
-                    committed_bytes: commit.map_or(0, |value| value.durable_payload_bytes),
-                    checkpoint_through: commit.map(|value| value.marker_sequence),
+                crate::EpochCatalogSummary {
                     published: crate::has_published_wal(&directory)?,
-                    retention_state: Some("retained".into()),
-                    ..crate::EpochCatalogSummaryV2::default()
                 },
             )
             .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
@@ -582,20 +547,15 @@ fn finalize_and_publish(
     guard: &DomainLockGuard,
     options: &CommandRecordOptions,
     recording_id: RecordingId,
-    metadata: &RecordingMetadata,
     recording_result: &crate::ProductionRecordingResult,
     child_exit: Option<&ChildExitResult>,
     cleanup: &crate::CleanupOutcome,
 ) -> Result<u64, ApplicationError> {
-    use crate::{
-        EpochCatalogSummaryV2, EpochCatalogV2, EpochId, RecordingCatalogStatus, RecordingRunV2,
-        RunLifecycleState, RunStopReason, process_and_publish_recording_wal, reconcile_catalog,
-        recordings_root, save_catalog,
-    };
+    use crate::{EpochCatalog, recordings_root};
     let wal_dir = recordings_root(&options.data_dir).join(recording_id.to_string());
     let catalog_path = wal_dir.join(crate::EPOCH_CATALOG_FILE);
     if catalog_path.is_file() {
-        let catalog = EpochCatalogV2::load(&wal_dir)
+        let catalog = EpochCatalog::load(&wal_dir)
             .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
         return finalize_continuous_and_publish(
             guard,
@@ -607,90 +567,12 @@ fn finalize_and_publish(
             cleanup,
         );
     }
-    let registry = chronicle_protocol_builtins::registry()?;
-    let published_session =
-        match process_and_publish_recording_wal(&wal_dir, &options.data_dir, &registry) {
-            Ok(published) => published.session_id,
-            Err(ApplicationError::Wal(chronicle_wal::WalError::NoPublishedSegments)) => {
-                // Zero-traffic recording: the target made no HTTP requests, so
-                // the WAL has no segments. Publish an empty canonical session
-                // so the recording is a normal published entry (0 operations).
-                publish_empty_session(&options.data_dir, recording_id)?
-            }
-            Err(error) => return Err(error),
-        };
-
-    let mut view = reconcile_catalog(&options.data_dir)?;
-    for entry in &mut view.entries {
-        if entry.recording_id == recording_id {
-            entry.status = RecordingCatalogStatus::Published;
-            entry.ended_at = Some(time::OffsetDateTime::now_utc());
-            entry.session_id = Some(published_session);
-            entry.child_exit = child_exit.cloned();
-        }
-    }
-    save_catalog(&options.data_dir, &view)?;
-
-    // Public one-shot paths still use legacy WAL identity bytes. Persist the
-    // parent/epoch DTOs with an explicit equal-byte compatibility mapping;
-    // future continuous roots supply distinct typed identities.
-    let epoch_id = EpochId::from_uuid(recording_id.0);
-    let mut epoch_catalog = EpochCatalogV2::new(recording_id, epoch_id, ".")
-        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-    epoch_catalog
-        .update_summary(
-            epoch_id,
-            EpochCatalogSummaryV2 {
-                committed_through: metadata
-                    .last_valid_commit
-                    .as_ref()
-                    .map(|boundary| boundary.marker_sequence),
-                committed_bytes: metadata
-                    .last_valid_commit
-                    .as_ref()
-                    .map_or(0, |boundary| boundary.durable_payload_bytes),
-                checkpoint_through: metadata
-                    .last_valid_commit
-                    .as_ref()
-                    .map(|boundary| boundary.marker_sequence),
-                published: true,
-                ..EpochCatalogSummaryV2::default()
-            },
-        )
-        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-    epoch_catalog
-        .write_atomic(&wal_dir)
-        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-    let run = RecordingRunV2::from_catalog(
-        &epoch_catalog,
-        options.name.clone(),
-        u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
-            .unwrap_or(0),
-        options.lifetime,
-        RunLifecycleState::Completed,
-        metadata.shutdown_reason.map(|reason| match reason {
-            crate::ShutdownReason::SourceCompleted => RunStopReason::SourceCompleted,
-            crate::ShutdownReason::DurationLimit => RunStopReason::Deadline,
-            crate::ShutdownReason::UserInterrupt | crate::ShutdownReason::TerminationSignal => {
-                RunStopReason::UserRequested
-            }
-            crate::ShutdownReason::ProcessCrashRecovered => RunStopReason::RestartRecovery,
-            crate::ShutdownReason::CaptureFailure
-            | crate::ShutdownReason::WalFailure
-            | crate::ShutdownReason::WalSizeLimit
-            | crate::ShutdownReason::ForcedTermination => RunStopReason::FatalFailure,
-        }),
-    )
-    .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-    run.write_atomic(&wal_dir)
-        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-
-    let operations = crate::list_recordings(&options.data_dir)?
-        .into_iter()
-        .find(|recording| recording.recording_id == recording_id)
-        .map_or(0, |recording| recording.operations);
-    let _ = (guard, cleanup);
-    Ok(u64::try_from(operations).unwrap_or(u64::MAX))
+    // The continuous coordinator always writes an epoch catalog before
+    // capture; a missing catalog is unrecoverable legacy evidence and
+    // must not be synthesized with equal parent/epoch identity bytes.
+    Err(ApplicationError::RecordingMetadataValidation(
+        "epoch catalog missing for public recording finalization".into(),
+    ))
 }
 
 /// Publish an empty canonical session for a zero-traffic recording.

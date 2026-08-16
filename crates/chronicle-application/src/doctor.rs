@@ -310,27 +310,27 @@ fn etl_checkpoint_doctor_probe(path: Option<&Path>) -> DoctorProbe {
             remediation: "supply --wal-dir".into(),
         };
     };
-    let checkpoint = path.join("etl-checkpoint.json");
-    match chronicle_etl::read_checkpoint(&checkpoint) {
-        Ok(_) => DoctorProbe {
+    let _checkpoint = path.join("etl-checkpoint.json");
+    match crate::load_recording_etl_checkpoint(path) {
+        Ok(Some(_)) => DoctorProbe {
             required: true,
             status: DoctorStatus::Supported,
             code: "etl.checkpoint".into(),
-            message: "incremental ETL checkpoint validates".into(),
+            message: "final-session ETL checkpoint validates".into(),
             remediation: "none".into(),
         },
-        Err(_) if !checkpoint.exists() => DoctorProbe {
+        Ok(None) => DoctorProbe {
             required: false,
             status: DoctorStatus::NotChecked,
             code: "etl.checkpoint".into(),
-            message: "incremental ETL checkpoint is not present".into(),
+            message: "final-session ETL checkpoint is not present".into(),
             remediation: "run recorder ETL before checking checkpoint".into(),
         },
         Err(error) => DoctorProbe {
             required: true,
             status: DoctorStatus::Unsupported,
             code: "etl.checkpoint".into(),
-            message: "incremental ETL checkpoint is invalid".into(),
+            message: "final-session ETL checkpoint is invalid".into(),
             remediation: error.to_string(),
         },
     }

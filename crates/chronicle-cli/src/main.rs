@@ -7,17 +7,17 @@ use chronicle_application::{
     RecorderConfigV1, RecorderLease, RecorderStatusV1, RecordingCounters, RecordingEtlCheckpoint,
     RecordingStatus, ShutdownReason, build_parent_replay_plan, data_dir_doctor_probe,
     inspect_session, list_parent_recording_views, list_recordings, load_recorder_metadata,
-    process_and_publish_recording_wal, record_fixture_file, render_inspect_human,
-    render_inspect_json, render_json, render_replay_human, replay_command,
-    replay_config_doctor_probe, replay_parent_session_with_plan, replay_session_with_plan,
-    resolve_data_dir, resolve_recording, resolve_session, retry_recording,
+    process_and_publish_recording_wal, process_and_publish_recording_wal_with_parent,
+    record_fixture_file, render_inspect_human, render_inspect_json, render_json,
+    render_replay_human, replay_command, replay_config_doctor_probe,
+    replay_parent_session_with_plan, replay_session_with_plan, resolve_data_dir, resolve_recording,
+    resolve_session, retry_recording,
 };
 #[cfg(target_os = "linux")]
 use chronicle_application::{
-    CaptureMode, CgroupSelector, CommandRecordOptions, ProductionRecordingBounds,
-    ProductionSignalStop, RecordingLifetime, RunStopPolicy, load_recording_metadata,
-    mark_recording_forced_termination, record_command, record_continuous_ebpf, record_live_ebpf,
-    recording_physical_wal_bytes,
+    CaptureMode, CgroupSelector, CommandRecordOptions, ProductionSignalStop, RecordingLifetime,
+    RunStopPolicy, load_recording_metadata, mark_recording_forced_termination, record_command,
+    record_continuous_ebpf, recording_physical_wal_bytes,
 };
 #[cfg(any(test, target_os = "linux"))]
 use chronicle_application::{ChildExitResult, CommandRecordResult};
@@ -220,7 +220,6 @@ struct DoctorArgs {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Source {
     Fixture,
-    Ebpf,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -241,7 +240,6 @@ enum LegacyInvocation {
     RecorderStatus,
     Etl,
     RecordFixture,
-    RecordEbpf,
     ReplayRoot,
     InspectRoot,
 }
@@ -253,7 +251,6 @@ impl LegacyInvocation {
             Self::RecorderStatus => "recorder_status",
             Self::Etl => "etl",
             Self::RecordFixture => "record_source_fixture",
-            Self::RecordEbpf => "record_source_ebpf",
             Self::ReplayRoot => "replay_root",
             Self::InspectRoot => "inspect_root",
         }
@@ -267,7 +264,6 @@ impl LegacyInvocation {
             Self::RecordFixture => {
                 "chronicle internal record-fixture --input FILE --root DIRECTORY"
             }
-            Self::RecordEbpf => "chronicle record --pid PID | chronicle record --cgroup PATH",
             Self::ReplayRoot => {
                 "chronicle replay RECORDING --target URL --allow-host HOST [--execute]"
             }
@@ -557,11 +553,9 @@ fn legacy_invocation(cli: &Cli) -> Option<LegacyInvocation> {
         Command::Recorder => Some(LegacyInvocation::Recorder),
         Command::RecorderStatus { .. } => Some(LegacyInvocation::RecorderStatus),
         Command::Etl { .. } => Some(LegacyInvocation::Etl),
-        Command::Record(args) => match args.source {
-            Some(Source::Fixture) => Some(LegacyInvocation::RecordFixture),
-            Some(Source::Ebpf) => Some(LegacyInvocation::RecordEbpf),
-            None => None,
-        },
+        Command::Record(args) => args
+            .source
+            .map(|Source::Fixture| LegacyInvocation::RecordFixture),
         Command::Replay(args) if args.root.is_some() => Some(LegacyInvocation::ReplayRoot),
         Command::Inspect(args) if args.root.is_some() => Some(LegacyInvocation::InspectRoot),
         _ => None,
@@ -609,26 +603,18 @@ fn legacy_invocation_from_raw_args(args: &[OsString]) -> Option<LegacyInvocation
 }
 
 fn raw_legacy_record(args: &[OsString]) -> Option<LegacyInvocation> {
-    for (index, argument) in args.iter().enumerate() {
+    for argument in args {
         let argument = argument.to_str()?;
         if argument == "--" {
             break;
         }
         if argument == "--source" {
-            return Some(
-                if args.get(index + 1).and_then(|value| value.to_str()) == Some("fixture") {
-                    LegacyInvocation::RecordFixture
-                } else {
-                    LegacyInvocation::RecordEbpf
-                },
-            );
+            return Some(LegacyInvocation::RecordFixture);
         }
-        if let Some(source) = argument.strip_prefix("--source=") {
-            return Some(if source == "fixture" {
-                LegacyInvocation::RecordFixture
-            } else {
-                LegacyInvocation::RecordEbpf
-            });
+        if let Some(source) = argument.strip_prefix("--source=")
+            && source == "fixture"
+        {
+            return Some(LegacyInvocation::RecordFixture);
         }
     }
     None
@@ -784,12 +770,6 @@ fn validate_record_arguments(cli: &Cli) -> Result<(), clap::Error> {
                 || args.duration_seconds.is_some()
                 || args.max_wal_bytes.is_some()
         }
-        Source::Ebpf => {
-            args.input.is_some()
-                || args.root.is_some()
-                || (args.pid.is_some() == args.cgroup.is_some())
-                || (args.allow_shared_cgroup && args.cgroup.is_none())
-        }
     };
     if invalid {
         return Err(Cli::command().error(
@@ -904,11 +884,20 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
         }
         Command::Etl { wal_dir, output }
         | Command::Internal(InternalCommand::Etl { wal_dir, output }) => {
-            let result = process_and_publish_recording_wal(
-                &wal_dir,
-                &output,
-                &chronicle_application::protocol_registry()?,
-            )?;
+            let registry = chronicle_application::protocol_registry()?;
+            let result = match chronicle_application::resolve_epoch_parent_context(&wal_dir)? {
+                Some((parent_id, epoch_id, epoch_ordinal)) => {
+                    process_and_publish_recording_wal_with_parent(
+                        &wal_dir,
+                        &output,
+                        &registry,
+                        parent_id,
+                        epoch_id,
+                        epoch_ordinal,
+                    )?
+                }
+                None => process_and_publish_recording_wal(&wal_dir, &output, &registry)?,
+            };
             let rendered = match format {
                 Format::Human => format!(
                     "session_id: {}\noutput: {}\nalready_processed: {}\nignored_post_commit_records: {}",
@@ -982,7 +971,6 @@ fn run_record(
 ) -> Result<(String, i32), ApplicationError> {
     match args.source {
         Some(Source::Fixture) => record_fixture_legacy(args, config, format),
-        Some(Source::Ebpf) => record_ebpf_legacy(args, config, format),
         None => public_record(args, cli_data_dir, config, format),
     }
 }
@@ -1026,105 +1014,6 @@ fn record_fixture_legacy(
     Ok((output, 0))
 }
 
-#[cfg(target_os = "linux")]
-fn record_ebpf_legacy(
-    args: RecordArgs,
-    config: &AppConfig,
-    format: Format,
-) -> Result<(String, i32), ApplicationError> {
-    if args.input.is_some() || args.root.is_some() {
-        return Err(ApplicationError::ProductionPreflight(
-            "fixture-only record options used with eBPF source",
-        ));
-    }
-    let selector = match (args.pid, args.cgroup) {
-        (Some(pid), None) => CgroupSelector::Pid(pid),
-        (None, Some(cgroup)) => CgroupSelector::Explicit(cgroup),
-        _ => {
-            return Err(ApplicationError::ProductionPreflight(
-                "select exactly one of PID or cgroup",
-            ));
-        }
-    };
-    let wal_dir = args.wal_dir.ok_or(ApplicationError::ProductionPreflight(
-        "WAL directory missing",
-    ))?;
-    let bounds = ProductionRecordingBounds {
-        duration_seconds: args.duration_seconds.unwrap_or(600),
-        segment_bytes: args.segment_bytes.unwrap_or(config.wal.segment_size_bytes),
-        max_wal_bytes: args.max_wal_bytes.unwrap_or(4 * 1024 * 1024 * 1024),
-    };
-    let stop = ProductionSignalStop::default();
-    spawn_signal_watcher(stop.clone(), wal_dir.clone());
-    let result = record_live_ebpf(
-        selector,
-        args.allow_shared_cgroup,
-        &wal_dir,
-        bounds,
-        &stop,
-        chronicle_application::RecordingId::new(),
-    )?;
-    let metadata =
-        load_recording_metadata(&wal_dir)?.ok_or(ApplicationError::RecordingMetadataValidation(
-            "recording metadata missing after finalization".into(),
-        ))?;
-    let capture =
-        metadata
-            .capture
-            .as_ref()
-            .ok_or(ApplicationError::RecordingMetadataValidation(
-                "capture metadata missing after finalization".into(),
-            ))?;
-    let physical_wal_bytes = recording_physical_wal_bytes(&wal_dir)?;
-    let output = match format {
-        Format::Human => format!(
-            "recording_id: {}\nstatus: {:?}\nshutdown_reason: {:?}\nlast_valid_commit: {:?}\nphysical_wal_bytes: {}\ndirect_tgid_count: {}\ndescendant_cgroup_count: {}\nselected_subtree: {}\nshared_scope_acknowledged: {}\ncommitted_records: {}",
-            result.recording_id,
-            result.status,
-            result.shutdown_reason,
-            result.last_valid_commit,
-            physical_wal_bytes,
-            capture.scope.direct_tgid_count,
-            capture.scope.descendant_cgroup_count,
-            capture.scope.selected_subtree,
-            capture.scope.shared_scope_acknowledged,
-            result.counters.committed.records,
-        ),
-        Format::Json => render_json(&ProductionRecordJson {
-            version: 1,
-            recording_id: result.recording_id.to_string(),
-            status: result.status,
-            shutdown_reason: result.shutdown_reason,
-            last_valid_commit: result.last_valid_commit.as_ref(),
-            physical_wal_bytes,
-            selector: metadata.selector.as_ref(),
-            direct_tgid_count: capture.scope.direct_tgid_count,
-            descendant_cgroup_count: capture.scope.descendant_cgroup_count,
-            selected_subtree: capture.scope.selected_subtree,
-            shared_scope_acknowledged: capture.scope.shared_scope_acknowledged,
-            configured_bounds: &capture.configured_bounds,
-            effective_bounds: &capture.effective_bounds,
-            counters: &result.counters,
-        })?,
-    };
-    Ok((output, 0))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn record_ebpf_legacy(
-    args: RecordArgs,
-    _config: &AppConfig,
-    _format: Format,
-) -> Result<(String, i32), ApplicationError> {
-    drop(args);
-    Err(ApplicationError::ProductionPreflight(
-        "live capture is unavailable on this platform",
-    ))
-}
-
-/// Public `record`: retry mode, selector mode, or command mode. Command-mode
-/// supervised scopes, selector ETL, and retry orchestration land in the
-/// record-orchestration tasks; dispatch is wired here.
 fn public_record(
     args: RecordArgs,
     cli_data_dir: Option<&Path>,
@@ -2080,36 +1969,22 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_production_record_options() {
-        let cli = Cli::try_parse_from([
-            "chronicle",
-            "record",
-            "--source",
-            "ebpf",
-            "--cgroup",
-            "/workload",
-            "--allow-shared-cgroup",
-            "--wal-dir",
-            "wal",
-            "--duration-seconds",
-            "60",
-            "--segment-bytes",
-            "16777216",
-            "--max-wal-bytes",
-            "33554432",
-        ])
-        .unwrap();
-        let Command::Record(args) = cli.command else {
-            panic!("record command expected");
-        };
-        assert!(matches!(args.source, Some(Source::Ebpf)));
-        assert!(args.input.is_none() && args.root.is_none() && args.pid.is_none());
-        assert_eq!(args.cgroup, Some(PathBuf::from("/workload")));
-        assert!(args.allow_shared_cgroup);
-        assert_eq!(args.wal_dir, Some(PathBuf::from("wal")));
-        assert_eq!(args.duration_seconds, Some(60));
-        assert_eq!(args.segment_bytes, Some(16_777_216));
-        assert_eq!(args.max_wal_bytes, Some(33_554_432));
+    fn legacy_ebpf_source_flag_is_rejected() {
+        // The hidden one-shot \`--source ebpf\` entrypoint was removed before
+        // 0.1.0; only the fixture source flag remains.
+        assert!(
+            Cli::try_parse_from([
+                "chronicle",
+                "record",
+                "--source",
+                "ebpf",
+                "--cgroup",
+                "/workload",
+                "--wal-dir",
+                "wal",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -2189,30 +2064,17 @@ mod tests {
         .unwrap();
         assert!(validate_record_arguments(&mixed).is_err());
 
-        let missing_selector = Cli::try_parse_from([
+        // Fixture source requires an input and root.
+        let missing_fixture = Cli::try_parse_from([
             "chronicle",
             "record",
             "--source",
-            "ebpf",
+            "fixture",
             "--wal-dir",
             "wal",
         ])
         .unwrap();
-        assert!(validate_record_arguments(&missing_selector).is_err());
-
-        let pid_with_acknowledgement = Cli::try_parse_from([
-            "chronicle",
-            "record",
-            "--source",
-            "ebpf",
-            "--pid",
-            "42",
-            "--allow-shared-cgroup",
-            "--wal-dir",
-            "wal",
-        ])
-        .unwrap();
-        assert!(validate_record_arguments(&pid_with_acknowledgement).is_err());
+        assert!(validate_record_arguments(&missing_fixture).is_err());
     }
 
     #[test]

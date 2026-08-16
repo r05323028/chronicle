@@ -3,7 +3,7 @@
 
 use crate::{
     DECODER_IMPLEMENTATION_VERSION, DECODER_KIND, DECODER_SNAPSHOT_VERSION,
-    DecoderReconstructionState, EpochContinuationCheckpointV1, EtlError, EtlEvidence, EtlIssue,
+    DecoderReconstructionState, EpochContinuationCheckpoint, EtlError, EtlEvidence, EtlIssue,
     EtlOutput, EtlPipeline, SegmentLineage,
 };
 use chronicle_canonical::CanonicalOperation;
@@ -349,7 +349,7 @@ impl IncrementalProcessor {
     /// lineage evidence, not successor snapshot sequence numbers.
     pub fn restore_continuation(
         &mut self,
-        checkpoint: &EpochContinuationCheckpointV1,
+        checkpoint: &EpochContinuationCheckpoint,
         parent_id: chronicle_common::RecordingId,
         predecessor_epoch_id: chronicle_common::EpochId,
         successor_epoch_id: chronicle_common::EpochId,

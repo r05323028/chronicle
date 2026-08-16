@@ -22,7 +22,7 @@ chronicle record --name checkout -- ./my-app
 
 Chronicle 會先掛接擷取，再啟動應用程式。應用程式結束、按下 `Ctrl+C`，或達到時間上限時，錄製就會停止。錄製期間，請從另一個終端機送出具代表性的請求。
 
-公開的一次性錄製預設為 600 秒，最大值為 3600 秒。WAL 的實體容量上限為 4 GiB。
+未指定 `--duration` 時，錄製會持續到應用程式結束或停止為止。WAL 的實體容量上限為 4 GiB。
 
 :::caution
 錄製期間，應用程式必須能透過非 loopback 位址連線。command mode replay 會在 loopback 上啟動受監督的複本，並拒絕將目標設為當初記錄的完全相同目的地。

@@ -36,3 +36,4 @@ target/validation-evidence/
 __pycache__
 .ruff_cache
 .pi-lens/
+.pytest_cache

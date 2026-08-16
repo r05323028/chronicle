@@ -30,7 +30,7 @@ chronicle --format json doctor
 
 ## Local data and capacity
 
-Recordings, WAL segments, manifests, checkpoints, and canonical payloads remain in the resolved local data directory. One-shot recordings default to 600 seconds, cap at 3600 seconds, and cannot exceed the 4 GiB physical WAL limit. Plan disk and file permissions around captured data, not just binary size.
+Recordings, WAL segments, manifests, checkpoints, and canonical payloads remain in the resolved local data directory. Recordings continue until exit or explicit stop, and cannot exceed the 4 GiB physical WAL limit. Plan disk and file permissions around captured data, not just binary size.
 
 ## Deployment boundaries
 

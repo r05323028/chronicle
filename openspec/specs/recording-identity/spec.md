@@ -137,19 +137,14 @@ Commands SHALL resolve references to stable parent recordings deterministically:
 - **WHEN** multiple published recordings exist with different start times
 - **THEN** `latest` resolves to the newest by start time, ties broken by recording ID
 
-### Requirement: Parent and epoch identity types have explicit compatibility boundaries
+### Requirement: Parent and epoch identity types stay distinct through the WAL v1 boundary
 
-`RecordingId` SHALL mean stable parent recording in application/common/canonical/CLI contracts. `EpochId` SHALL mean one bounded epoch in application/common/catalog/ETL/WAL adapter contracts. `chronicle-wal` MAY retain a private `WalV1RecordingIdentity` for the unchanged v1 `recording_id` field, but no public API may use that field as an untyped parent/epoch discriminator. New checkpoint/session/artifact schemas SHALL carry typed parent and epoch fields; legacy v1 UUID fields SHALL be read through an explicit one-epoch/WAL adapter. Equality of legacy UUID bytes SHALL not erase the semantic type distinction.
+`RecordingId` SHALL mean stable parent recording in application/common/canonical/CLI contracts. `EpochId` SHALL mean one bounded epoch in application/common/catalog/ETL/WAL adapter contracts. `chronicle-wal` SHALL retain `WalV1RecordingIdentity` as the narrow adapter for the unchanged v1 `recording_id` field, and no public API may use that field as an untyped parent/epoch discriminator. Checkpoint/session/artifact schemas SHALL carry typed parent and epoch fields. Equality of parent and epoch UUID bytes SHALL not erase the semantic type distinction.
 
 #### Scenario: Explicit WAL compatibility conversion
 
-- **WHEN** a legacy WAL v1 header exposes a UUID in `recording_id`
+- **WHEN** a WAL v1 header exposes a UUID in `recording_id`
 - **THEN** only the WAL compatibility adapter maps it to an `EpochId` using validated epoch context and never exposes it as parent `RecordingId`
-
-#### Scenario: Legacy one-epoch mapping
-
-- **WHEN** a legacy one-epoch recording has one UUID serving both public and WAL roles
-- **THEN** the compatibility reader creates distinct typed parent/epoch values with an explicit equality mapping and preserves legacy lookup
 
 #### Scenario: List long-running recording
 

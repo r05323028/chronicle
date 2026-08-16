@@ -75,7 +75,9 @@ PY
 		echo 'checkpoint pending artifact survived restart' >&2
 		exit 1
 	fi
-	CHECKPOINT_AFTER="$(dirname "$PENDING_BEFORE")/incremental-etl-checkpoint.json"
+	# The pending file is named ".$CHECKPOINT.pending"; derive the durable
+	# checkpoint path from the pending file name.
+	CHECKPOINT_AFTER="$(dirname "$PENDING_BEFORE")/$(basename "$PENDING_BEFORE" .pending | sed 's/^.//')"
 	test -f "$CHECKPOINT_AFTER"
 	python3 - "$CHECKPOINT_AFTER" "$DELTA_BEFORE" "$STORE_ROOT/artifacts" <<'PY'
 import json, sys

@@ -1089,6 +1089,61 @@ def reuse(args: argparse.Namespace) -> int:
     return 0
 
 
+def legacy_names_check(root: Path) -> dict[str, Any]:
+    """Reject production references to removed pre-release migration models.
+
+    Before 0.1.0, unreleased internal schemas are replaced rather than carried
+    through permanent runtime compatibility layers. Any production source that
+    names a removed legacy type or adapter is migration baggage and fails the
+    fast gate so it cannot return without an explicit OpenSpec change.
+    """
+    removed = [
+        "EpochCatalogV1",
+        "EpochCatalogV2",
+        "EpochCatalogEntryV2",
+        "EpochCatalogSummaryV2",
+        "LegacyOneEpochMapping",
+        "RolloverTransitionV1",
+        "RolloverTransitionV2",
+        "RolloverTransitionV2Phase",
+        "load_transition_v2",
+        "write_transition_v2_atomic",
+        "IncrementalEtlCheckpointV1",
+        "IncrementalEtlCheckpointV2",
+        "INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION",
+        "ContinuationDependencyV2",
+        "EpochContinuationCheckpointV1",
+        "RecoveryAuthoritativeSnapshot",
+        "reconcile_delta_checkpoint",
+        "recover_pending_checkpoint_v2",
+        "publish_delta_then_checkpoint_v2",
+        "read_checkpoint",
+        "write_checkpoint_atomic",
+        "CheckpointError",
+        "record_production",
+        "record_production_with_lifetime",
+        "record_live_ebpf",
+        "record_live_ebpf_with_lifetime",
+        "recover_rollover_transition_for_root",
+        "load_compatible",
+        "from_legacy",
+        "to_legacy",
+    ]
+    issues: list[str] = []
+    for path in sorted((root / "crates").rglob("*.rs")):
+        if any(part in {"target", "testdata", "fixtures"} for part in path.parts):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for name in removed:
+            # Word-boundary match so intentional adapters such as the WAL v1
+            # identity bridge (from_legacy_uuid) are not flagged.
+            if re.search(rf"\b{re.escape(name)}\b", text):
+                issues.append(
+                    f"{path.relative_to(root)}: references removed legacy {name}"
+                )
+    return {"issues": issues}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1100,6 +1155,8 @@ def main() -> int:
     environment_parser = sub.add_parser("environment")
     environment_parser.add_argument("--root", type=Path, required=True)
     ownership_parser = sub.add_parser("ownership")
+    legacy_parser = sub.add_parser("legacy-names")
+    legacy_parser.add_argument("--root", type=Path, required=True)
     architecture_parser = sub.add_parser("architecture")
     architecture_parser.add_argument("--root", type=Path, required=True)
     architecture_parser.add_argument("--config", type=Path)
@@ -1138,6 +1195,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "environment":
         print(json.dumps(environment(args.root), indent=2, sort_keys=True))
+    elif args.command == "legacy-names":
+        value = legacy_names_check(args.root)
+        print(json.dumps(value, indent=2, sort_keys=True))
+        return 1 if value["issues"] else 0
     elif args.command == "architecture":
         value = architecture_check(args.root, args.config)
         print(json.dumps(value, indent=2, sort_keys=True))

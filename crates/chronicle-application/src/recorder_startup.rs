@@ -84,6 +84,51 @@ impl RecorderStartup {
 
     pub(crate) fn prepare_foundation_with_metadata(
         config: &NormalizedRecorderConfig,
+        persist_metadata: impl FnMut(
+            &[QuotaReservationAuthority],
+            RecorderLifecycleState,
+        ) -> Result<(), RecorderStartupError>,
+        recover_foundation: impl FnOnce(
+            &[QuotaReservationAuthority],
+        ) -> Result<(), RecorderStartupError>,
+        reserve_quota: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
+    ) -> Result<Self, RecorderStartupError> {
+        Self::prepare_foundation_with_metadata_inner(
+            config,
+            false,
+            persist_metadata,
+            recover_foundation,
+            reserve_quota,
+        )
+    }
+
+    /// Same as [`Self::prepare_foundation_with_metadata`] for public recording
+    /// paths whose caller already holds the exact domain lock: the recorder
+    /// state lease must not re-lock the same domain file.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_foundation_with_metadata_holding_domain_lock(
+        config: &NormalizedRecorderConfig,
+        persist_metadata: impl FnMut(
+            &[QuotaReservationAuthority],
+            RecorderLifecycleState,
+        ) -> Result<(), RecorderStartupError>,
+        recover_foundation: impl FnOnce(
+            &[QuotaReservationAuthority],
+        ) -> Result<(), RecorderStartupError>,
+        reserve_quota: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
+    ) -> Result<Self, RecorderStartupError> {
+        Self::prepare_foundation_with_metadata_inner(
+            config,
+            true,
+            persist_metadata,
+            recover_foundation,
+            reserve_quota,
+        )
+    }
+
+    fn prepare_foundation_with_metadata_inner(
+        config: &NormalizedRecorderConfig,
+        domain_lock_held: bool,
         mut persist_metadata: impl FnMut(
             &[QuotaReservationAuthority],
             RecorderLifecycleState,
@@ -93,7 +138,11 @@ impl RecorderStartup {
         ) -> Result<(), RecorderStartupError>,
         reserve_quota: impl FnOnce(&[QuotaReservationAuthority]) -> Result<(), RecorderStartupError>,
     ) -> Result<Self, RecorderStartupError> {
-        let lease = RecorderLease::acquire(config)?;
+        let lease = if domain_lock_held {
+            RecorderLease::acquire_without_domain_lock(config)?
+        } else {
+            RecorderLease::acquire(config)?
+        };
         let mut lifecycle = RecorderLifecycle::new();
         let quotas = build_quota_authorities(config)?;
         if let Err(error) = persist_metadata(&quotas, RecorderLifecycleState::Starting) {

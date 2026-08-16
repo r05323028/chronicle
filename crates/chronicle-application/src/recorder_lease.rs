@@ -7,7 +7,7 @@
 
 use crate::NormalizedRecorderConfig;
 use crate::domain_lock::{DomainLockError, lock_is_held, open_lock};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -26,7 +26,7 @@ pub enum RecorderLeaseError {
     UnsupportedPlatform,
     #[error("recorder lease path is unsafe")]
     UnsafePath,
-    #[error("recorder lease I/O failed")]
+    #[error("recorder lease I/O failed: {0}")]
     Io(#[source] std::io::Error),
 }
 
@@ -41,9 +41,38 @@ pub struct RecorderLease {
 
 impl RecorderLease {
     pub fn acquire(config: &NormalizedRecorderConfig) -> Result<Self, RecorderLeaseError> {
+        Self::acquire_with_options(config, true)
+    }
+
+    /// Acquire the recorder state lease without re-locking the domain file.
+    /// Used by public recording paths whose caller already holds the exact
+    /// domain lock for the whole transaction (flock(2) treats a second fd of
+    /// the same file in the same process as a conflicting owner).
+    pub fn acquire_without_domain_lock(
+        config: &NormalizedRecorderConfig,
+    ) -> Result<Self, RecorderLeaseError> {
+        Self::acquire_with_options(config, false)
+    }
+
+    fn acquire_with_options(
+        config: &NormalizedRecorderConfig,
+        lock_domain: bool,
+    ) -> Result<Self, RecorderLeaseError> {
         let domain_path = &config.domain_lock_path;
-        let domain_file = open_lock(domain_path)
-            .map_err(|error| map_domain_error(error, RecorderLeaseError::DomainOwned))?;
+        let domain_file = if lock_domain {
+            open_lock(domain_path)
+                .map_err(|error| map_domain_error(error, RecorderLeaseError::DomainOwned))?
+        } else {
+            fs::create_dir_all(domain_path.parent().unwrap_or(Path::new(".")))
+                .map_err(RecorderLeaseError::Io)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(domain_path)
+                .map_err(RecorderLeaseError::Io)?
+        };
 
         if fs::create_dir_all(&config.state_root).is_err() {
             return Err(RecorderLeaseError::Io(std::io::Error::other(

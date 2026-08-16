@@ -122,7 +122,7 @@ PY
 	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" ps -eo pid,ppid,stat,etimes,cmd --forest 2>&1 | head -n 200 >"$root/process-list.txt" || true
 	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" df -P "$state_root" "$root" >"$root/disk-space.txt" 2>&1 || true
 	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" find "$state_root/wal" -maxdepth 3 -type f -printf '%p %s bytes\n' 2>/dev/null | head -n 200 | sort >"$root/wal-directory-listing.txt" || true
-	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" python3 - "$state_root/wal/incremental-etl-checkpoint.json" "$root/checkpoint-metadata.json" <<'PY'
+	bounded_readiness_command "$READINESS_COMMAND_TIMEOUT" python3 - "$state_root/wal/incremental-etl-checkpoint-v2.json" "$root/checkpoint-metadata.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -131,7 +131,7 @@ try:
     value = json.loads(source.read_text(encoding="utf-8"))
     value = {
         key: value.get(key)
-        for key in ("version", "owner", "lifecycle", "recording_id", "epoch_ordinal", "config_digest", "pipeline_version", "canonical_schema_version", "marker", "predecessor_digest")
+        for key in ("version", "owner", "lifecycle", "parent_id", "epoch_id", "epoch_ordinal", "config_digest", "pipeline_version", "canonical_schema_version", "marker", "continuation")
     }
     decoder = json.loads(source.read_text(encoding="utf-8")).get("decoder", {})
     value["decoder_state_bytes"] = len(decoder.get("state", []))

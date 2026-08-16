@@ -62,214 +62,6 @@ impl RecordingIngestResult {
     }
 }
 
-/// Legacy bounded one-shot wrapper retained for hidden 0.1.x entrypoints.
-#[allow(clippy::too_many_arguments)]
-pub fn record_production<S, Build, Now, Stop, Ready>(
-    wal_directory: impl AsRef<Path>,
-    metadata: &mut RecordingMetadata,
-    capture_metadata: RecordingCaptureMetadata,
-    bounds: ProductionRecordingBounds,
-    build_source: Build,
-    now_millis: Now,
-    requested_stop: Stop,
-    on_ready: Ready,
-) -> Result<ProductionRecordingResult, ApplicationError>
-where
-    S: CaptureSource,
-    Build: FnOnce() -> Result<S, ApplicationError>,
-    Now: FnMut() -> u64,
-    Stop: FnMut() -> Option<ShutdownReason>,
-    Ready: FnOnce() -> Result<(), ApplicationError>,
-{
-    validate_production_recording_bounds(bounds)?;
-    record_production_with_lifetime(
-        wal_directory,
-        metadata,
-        capture_metadata,
-        bounds,
-        RecordingLifetime {
-            deadline: Some(Duration::from_secs(bounds.duration_seconds)),
-            stop_policy: RunStopPolicy::AnyTerminalCondition,
-        },
-        build_source,
-        now_millis,
-        requested_stop,
-        on_ready,
-    )
-}
-
-/// Drives a production source through bounded epoch WAL persistence while the
-/// parent recording lifetime remains independently optional and whole-run.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub fn record_production_with_lifetime<S, Build, Now, Stop, Ready>(
-    wal_directory: impl AsRef<Path>,
-    metadata: &mut RecordingMetadata,
-    capture_metadata: RecordingCaptureMetadata,
-    bounds: ProductionRecordingBounds,
-    lifetime: RecordingLifetime,
-    build_source: Build,
-    mut now_millis: Now,
-    mut requested_stop: Stop,
-    on_ready: Ready,
-) -> Result<ProductionRecordingResult, ApplicationError>
-where
-    S: CaptureSource,
-    Build: FnOnce() -> Result<S, ApplicationError>,
-    Now: FnMut() -> u64,
-    Stop: FnMut() -> Option<ShutdownReason>,
-    Ready: FnOnce() -> Result<(), ApplicationError>,
-{
-    validate_epoch_recording_bounds(bounds)?;
-    if metadata.status != RecordingStatus::Starting || metadata.shutdown_reason.is_some() {
-        return Err(ApplicationError::RecordingMetadataValidation(
-            "production recording must begin in starting state".into(),
-        ));
-    }
-
-    let wal_directory = wal_directory.as_ref();
-    write_recording_metadata(wal_directory, metadata)?;
-    let mut source = match build_source() {
-        Ok(source) => source,
-        Err(error) => {
-            persist_pre_attach_failure(
-                wal_directory,
-                metadata,
-                capture_metadata,
-                RecordingCaptureErrorCode::Attach,
-            )?;
-            return Err(error);
-        }
-    };
-    if let Err(error) = source.start() {
-        persist_pre_attach_failure(
-            wal_directory,
-            metadata,
-            capture_metadata,
-            RecordingCaptureErrorCode::Source,
-        )?;
-        return Err(error.into());
-    }
-
-    metadata.transition_to_recording(capture_metadata)?;
-    write_recording_metadata(wal_directory, metadata)?;
-    let started_at = now_millis();
-    let deadline_millis = lifetime
-        .deadline
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-    let writer = match GroupCommitWalWriter::create_with_total_limit(
-        wal_directory,
-        metadata.recording_id,
-        bounds.segment_bytes,
-        bounds.max_wal_bytes,
-        1,
-        started_at,
-    ) {
-        Ok(writer) => writer,
-        Err(error) => {
-            let _ = shutdown_source_without_wal(&mut source);
-            return persist_live_failure(
-                wal_directory,
-                metadata,
-                RecordingCaptureErrorCode::Source,
-                ShutdownReason::WalFailure,
-                error.into(),
-            );
-        }
-    };
-    let mut ingest = RecordingIngest::new(writer);
-    // Capture is attached and the WAL writer is durable: release the
-    // bootstrap/target now. A failure here (e.g. the readiness pipe died) is a
-    // Chronicle launch failure, not a child exit.
-    if let Err(error) = on_ready() {
-        let _ = shutdown_source_without_wal(&mut source);
-        return persist_live_failure(
-            wal_directory,
-            metadata,
-            RecordingCaptureErrorCode::Attach,
-            ShutdownReason::CaptureFailure,
-            error,
-        );
-    }
-    let mut capture_failed = false;
-    let mut wal_failed = false;
-    let mut requested_reason = loop {
-        let now = now_millis();
-        if let Some(reason) = requested_stop().or_else(|| {
-            deadline_millis
-                .filter(|deadline| now.saturating_sub(started_at) >= *deadline)
-                .map(|_| ShutdownReason::DurationLimit)
-        }) {
-            break reason;
-        }
-        match source.poll() {
-            Ok(Some(event)) => match persist_capture_event(&mut ingest, &event, now) {
-                Ok(()) => {
-                    if let Some(reason) = ingest.stop_reason() {
-                        break reason;
-                    }
-                }
-                Err(error) => match recording_failure_reason(&error) {
-                    ShutdownReason::WalFailure => {
-                        wal_failed = true;
-                        break ShutdownReason::WalFailure;
-                    }
-                    ShutdownReason::CaptureFailure => {
-                        capture_failed = true;
-                        break ShutdownReason::CaptureFailure;
-                    }
-                    _ => unreachable!("recording failures have one of two terminal reasons"),
-                },
-            },
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!("chronicle: capture source error: {error}");
-                capture_failed = true;
-                break ShutdownReason::CaptureFailure;
-            }
-        }
-    };
-
-    let source_summary = match stop_and_finalize_source(&mut source, &mut ingest, &mut now_millis) {
-        Ok(summary) => summary,
-        Err(ApplicationError::Wal(_)) => {
-            requested_reason = ShutdownReason::WalFailure;
-            wal_failed = true;
-            CaptureSourceSummary::default()
-        }
-        Err(_) => {
-            requested_reason = ShutdownReason::CaptureFailure;
-            capture_failed = true;
-            CaptureSourceSummary::default()
-        }
-    };
-    let mut result = match ingest.finish(requested_reason, now_millis()) {
-        Ok(result) => result,
-        Err(failure) => {
-            wal_failed = true;
-            failure.result
-        }
-    };
-    if capture_failed {
-        result.status = RecordingStatus::Failed;
-        result.shutdown_reason = ShutdownReason::CaptureFailure;
-        append_capture_error(metadata, RecordingCaptureErrorCode::Source);
-    } else if wal_failed {
-        result.status = RecordingStatus::Failed;
-        result.shutdown_reason = ShutdownReason::WalFailure;
-    }
-    metadata.last_valid_commit = ingest.commit_boundary();
-    result.persist_metadata(wal_directory, metadata)?;
-    Ok(ProductionRecordingResult {
-        recording_id: metadata.recording_id,
-        status: result.status,
-        shutdown_reason: result.shutdown_reason,
-        last_valid_commit: metadata.last_valid_commit.clone(),
-        counters: result.counters,
-        terminal_wal_loss: result.terminal_wal_loss,
-        source_summary,
-    })
-}
-
 /// Counts every physical byte below the WAL segments directory.
 pub fn recording_physical_wal_bytes(
     wal_directory: impl AsRef<Path>,
@@ -341,173 +133,6 @@ pub fn load_production_ebpf_source(
         },
     )
     .map_err(ApplicationError::from)
-}
-
-pub(crate) fn persist_pre_attach_failure(
-    wal_directory: &Path,
-    metadata: &mut RecordingMetadata,
-    mut capture_metadata: RecordingCaptureMetadata,
-    error: RecordingCaptureErrorCode,
-) -> Result<(), ApplicationError> {
-    if capture_metadata.errors.len() < MAX_RECORDING_CAPTURE_ERRORS {
-        capture_metadata
-            .errors
-            .push(RecordingCaptureError { code: error });
-    }
-    metadata.capture = Some(capture_metadata);
-    metadata.fail_start(ShutdownReason::CaptureFailure)?;
-    write_recording_metadata(wal_directory, metadata)
-}
-
-pub(crate) fn persist_live_failure(
-    wal_directory: &Path,
-    metadata: &mut RecordingMetadata,
-    error: RecordingCaptureErrorCode,
-    reason: ShutdownReason,
-    original: ApplicationError,
-) -> Result<ProductionRecordingResult, ApplicationError> {
-    if reason == ShutdownReason::CaptureFailure {
-        append_capture_error(metadata, error);
-    }
-    metadata.finalize(RecordingStatus::Failed, reason)?;
-    write_recording_metadata(wal_directory, metadata)?;
-    Err(original)
-}
-
-pub(crate) fn recording_failure_reason(error: &ApplicationError) -> ShutdownReason {
-    if matches!(error, ApplicationError::Wal(_)) {
-        ShutdownReason::WalFailure
-    } else {
-        ShutdownReason::CaptureFailure
-    }
-}
-
-fn append_capture_error(metadata: &mut RecordingMetadata, error: RecordingCaptureErrorCode) {
-    if let Some(capture) = &mut metadata.capture
-        && capture.errors.len() < MAX_RECORDING_CAPTURE_ERRORS
-    {
-        capture.errors.push(RecordingCaptureError { code: error });
-    }
-}
-
-fn persist_capture_event(
-    ingest: &mut RecordingIngest,
-    event: &CaptureEvent,
-    now_millis: u64,
-) -> Result<(), ApplicationError> {
-    let (kind, capture_timestamp, kernel_drops) = match &event.kind {
-        CaptureEventKind::LossWindowObserved(window) => (
-            RecordKind::LossWindow,
-            Some(window.end.clone()),
-            window.drop_delta,
-        ),
-        CaptureEventKind::SocketConnectObserved(intent) => (
-            RecordKind::CaptureEvent,
-            Some(intent.timestamp.clone()),
-            None,
-        ),
-        CaptureEventKind::SocketConnected(evidence)
-        | CaptureEventKind::SocketClosedObserved(evidence)
-        | CaptureEventKind::SocketResetObserved(evidence) => (
-            RecordKind::CaptureEvent,
-            Some(evidence.timestamp.clone()),
-            None,
-        ),
-        CaptureEventKind::SocketStateChangedObserved(observed) => (
-            RecordKind::CaptureEvent,
-            Some(observed.socket.timestamp.clone()),
-            None,
-        ),
-        CaptureEventKind::PayloadFragment(fragment) => (
-            RecordKind::CaptureEvent,
-            Some(fragment.timestamp.clone()),
-            None,
-        ),
-    };
-    if let Some(drops) = kernel_drops {
-        ingest.record_kernel_or_backend_drop(drops, 0);
-    }
-    let mut record = QueuedWalRecord {
-        kind,
-        schema_version: event.schema_version,
-        flags: match &event.kind {
-            CaptureEventKind::PayloadFragment(fragment) => u16::try_from(fragment.flags.0)
-                .map_err(|_| ApplicationError::CaptureFlagsOutOfRange(fragment.flags.0))?,
-            _ => 0,
-        },
-        payload: encode_event(event)?,
-        capture_timestamp,
-    };
-    loop {
-        match ingest.admit(record) {
-            Ok(IngestAdmission::Accepted) => {
-                ingest.drain(now_millis)?;
-                return Ok(());
-            }
-            Ok(IngestAdmission::RejectedAfterStop) => return Ok(()),
-            Err(backpressured) => {
-                record = backpressured;
-                ingest.drain(now_millis)?;
-                if ingest.stop_reason().is_some() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-fn stop_and_finalize_source<Now>(
-    source: &mut impl CaptureSource,
-    ingest: &mut RecordingIngest,
-    now_millis: &mut Now,
-) -> Result<CaptureSourceSummary, ApplicationError>
-where
-    Now: FnMut() -> u64,
-{
-    let deadline = now_millis().saturating_add(RECORDING_FINALIZATION_GRACE_MILLIS);
-    let mut failure = source.request_shutdown().err().map(ApplicationError::from);
-    loop {
-        if now_millis() > deadline {
-            failure.get_or_insert(CaptureError::Drain("finalization grace exceeded".into()).into());
-            break;
-        }
-        match source.drain() {
-            Ok(Some(event)) => {
-                if let Err(error) = persist_capture_event(ingest, &event, now_millis()) {
-                    failure.get_or_insert(error);
-                }
-            }
-            Ok(None) => break,
-            Err(error) => {
-                failure.get_or_insert(error.into());
-                break;
-            }
-        }
-    }
-    let summary = source.finalize();
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    Ok(summary?)
-}
-
-fn shutdown_source_without_wal(source: &mut impl CaptureSource) -> Result<(), CaptureError> {
-    let mut failure = source.request_shutdown().err();
-    loop {
-        match source.drain() {
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(error) => {
-                failure.get_or_insert(error);
-                break;
-            }
-        }
-    }
-    let finalized = source.finalize();
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    finalized.map(|_| ())
 }
 
 pub(crate) fn validate_recording_metadata(
@@ -1195,7 +820,7 @@ fn continuation_file_ref(
     let path = wal_directory.join(name);
     match fs::metadata(&path) {
         Ok(metadata) if metadata.is_file() => {
-            EpochContinuationCheckpointV1::load(&path).map_err(|error| {
+            EpochContinuationCheckpoint::load(&path).map_err(|error| {
                 ApplicationError::RecordingMetadataValidation(format!(
                     "invalid continuation artifact {name}: {error}"
                 ))
@@ -1494,6 +1119,15 @@ pub fn process_recording_wal_with_parent(
     result.output.session.source_provenance.epoch_id = Some(epoch_id);
     result.output.session.source_provenance.epoch_ordinal = Some(epoch_ordinal);
     let wal_sequence_range = result.output.session.source_provenance.wal_sequence_range;
+    // The plain WAL adapter stamps ranges with the epoch-local recording id;
+    // clear that fallback provenance before binding the stable parent so no
+    // operation carries a conflicting parent range.
+    for connection in &mut result.output.session.connections {
+        for operation in &mut connection.operations {
+            operation.provenance.epoch_ranges.clear();
+            operation.provenance.completion_owner_epoch = None;
+        }
+    }
     stamp_epoch_operation_provenance(
         &mut result.output.session,
         parent_id,
@@ -1536,6 +1170,48 @@ impl QuotaPublicationReservation<'_> {
 }
 
 /// Processes one finalized recording and atomically publishes its deterministic session.
+/// Resolve the parent-aware epoch context for a WAL directory that belongs
+/// to an epoch catalog, when one can be proven locally. Returns None for
+/// standalone WAL directories without a catalog.
+pub fn resolve_epoch_parent_context(
+    wal_directory: &Path,
+) -> Result<Option<(RecordingId, EpochId, u64)>, ApplicationError> {
+    let mut root = None;
+    let mut ancestor = Some(wal_directory);
+    for _ in 0..3 {
+        let Some(candidate) = ancestor else { break };
+        if candidate.join(crate::EPOCH_CATALOG_FILE).is_file() {
+            root = Some(candidate.to_path_buf());
+            break;
+        }
+        ancestor = candidate.parent();
+    }
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let catalog = crate::EpochCatalog::load(&root)
+        .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
+    let entry = catalog
+        .epochs
+        .iter()
+        .find(|entry| root.join(&entry.path) == wal_directory)
+        .or_else(|| catalog.active());
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    let metadata = load_recording_metadata(wal_directory)?.ok_or_else(|| {
+        ApplicationError::RecordingMetadataValidation(
+            "epoch WAL directory is missing recording metadata".into(),
+        )
+    })?;
+    if metadata.recording_id.0 != entry.epoch_id.as_uuid() {
+        return Err(ApplicationError::RecordingMetadataValidation(
+            "epoch catalog identity does not match WAL identity".into(),
+        ));
+    }
+    Ok(Some((catalog.parent_id, entry.epoch_id, entry.ordinal)))
+}
+
 pub fn process_and_publish_recording_wal(
     wal_directory: impl AsRef<Path>,
     root: impl AsRef<Path>,

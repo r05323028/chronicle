@@ -1,16 +1,16 @@
 ---
 title: Recorder
-description: 圍繞擷取與 WAL 所有權的單次及持續錄製生命週期。
+description: 圍繞擷取與 WAL 所有權的錄製生命週期。
 slug: zh-tw/0-1/docs/architecture/recorder
 ---
 
-一次 recording lifecycle 會擁有一個 capture scope、一個 WAL domain 與一條 finalization path。一般使用者會從一次性的 command mode 開始：
+一次 recording lifecycle 會擁有一個 capture scope、一個 WAL domain 與一條 finalization path。一般使用者會從 command mode 開始：
 
 ```bash
 chronicle record --name checkout -- ./my-app
 ```
 
-## 一次性生命週期
+## 指令模式生命週期
 
 1. 解析並鎖定公開 data directory。
 2. 準備 recording identity 與有明確上限的 WAL domain。

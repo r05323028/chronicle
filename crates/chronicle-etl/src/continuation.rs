@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub const EPOCH_CONTINUATION_CHECKPOINT_VERSION: u16 = 1;
-pub const INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION: u16 = 2;
+pub const INCREMENTAL_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 pub const EPOCH_CONTINUATION_IN_FILE: &str = "continuation-in.json";
 pub const EPOCH_CONTINUATION_OUT_FILE: &str = "continuation-out.json";
 pub const EPOCH_CONTINUATION_STATE_FILE: &str = "continuation-state.json";
@@ -60,7 +60,7 @@ impl Default for ContinuationLimits {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EpochContinuationCheckpointV1 {
+pub struct EpochContinuationCheckpoint {
     pub version: u16,
     pub parent_id: RecordingId,
     pub predecessor_epoch_id: EpochId,
@@ -100,7 +100,7 @@ pub enum ContinuationError {
     InvalidTransition,
 }
 
-impl EpochContinuationCheckpointV1 {
+impl EpochContinuationCheckpoint {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         parent_id: RecordingId,
@@ -274,7 +274,7 @@ impl EpochContinuationCheckpointV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ContinuationDependencyV2 {
+pub struct ContinuationDependency {
     #[serde(default)]
     pub parent_id: Option<RecordingId>,
     pub state: ContinuationState,
@@ -285,7 +285,7 @@ pub struct ContinuationDependencyV2 {
     pub failure_code: Option<String>,
 }
 
-impl ContinuationDependencyV2 {
+impl ContinuationDependency {
     pub fn pending(predecessor_epoch_id: EpochId, successor_epoch_id: EpochId) -> Self {
         Self::pending_for_parent(None, predecessor_epoch_id, successor_epoch_id)
     }
@@ -311,7 +311,7 @@ impl ContinuationDependencyV2 {
     pub fn ready_from_checkpoint(
         parent_id: RecordingId,
         predecessor_epoch_id: EpochId,
-        checkpoint: &EpochContinuationCheckpointV1,
+        checkpoint: &EpochContinuationCheckpoint,
         pipeline_version: &str,
     ) -> Result<Self, ContinuationError> {
         if checkpoint.parent_id != parent_id
@@ -453,7 +453,7 @@ pub struct ContinuationCoordinator {
     predecessor_epoch_id: EpochId,
     successor_epoch_id: EpochId,
     pipeline_version: String,
-    dependency: ContinuationDependencyV2,
+    dependency: ContinuationDependency,
 }
 
 impl ContinuationCoordinator {
@@ -467,8 +467,7 @@ impl ContinuationCoordinator {
         if pipeline_version.is_empty() || pipeline_version.len() > 64 {
             return Err(ContinuationError::Invalid("continuation pipeline version"));
         }
-        let dependency =
-            ContinuationDependencyV2::pending(predecessor_epoch_id, successor_epoch_id);
+        let dependency = ContinuationDependency::pending(predecessor_epoch_id, successor_epoch_id);
         dependency.validate()?;
         if parent_id.as_uuid().is_nil() {
             return Err(ContinuationError::Invalid("continuation parent identity"));
@@ -483,7 +482,7 @@ impl ContinuationCoordinator {
     }
 
     pub fn restore_from_checkpoint(
-        checkpoint: &IncrementalEtlCheckpointV2,
+        checkpoint: &IncrementalEtlCheckpoint,
         parent_id: RecordingId,
         predecessor_epoch_id: EpochId,
         successor_epoch_id: EpochId,
@@ -509,13 +508,13 @@ impl ContinuationCoordinator {
 
     pub fn ready_from_checkpoint(
         &self,
-        checkpoint: &EpochContinuationCheckpointV1,
+        checkpoint: &EpochContinuationCheckpoint,
     ) -> Result<Self, ContinuationError> {
         if checkpoint.successor_epoch_id != self.successor_epoch_id {
             return Err(ContinuationError::LineageMismatch);
         }
         Ok(Self {
-            dependency: ContinuationDependencyV2::ready_from_checkpoint(
+            dependency: ContinuationDependency::ready_from_checkpoint(
                 self.parent_id,
                 self.predecessor_epoch_id,
                 checkpoint,
@@ -529,8 +528,8 @@ impl ContinuationCoordinator {
     /// before predecessor output can become ready.
     pub fn ready_from_incremental_checkpoint(
         &self,
-        checkpoint: &IncrementalEtlCheckpointV2,
-        handoff: &EpochContinuationCheckpointV1,
+        checkpoint: &IncrementalEtlCheckpoint,
+        handoff: &EpochContinuationCheckpoint,
     ) -> Result<Self, ContinuationError> {
         checkpoint.validate()?;
         if checkpoint.parent_id != self.parent_id
@@ -594,14 +593,14 @@ impl ContinuationCoordinator {
         self.dependency.state
     }
 
-    pub const fn dependency(&self) -> &ContinuationDependencyV2 {
+    pub const fn dependency(&self) -> &ContinuationDependency {
         &self.dependency
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct IncrementalEtlCheckpointV2 {
+pub struct IncrementalEtlCheckpoint {
     pub version: u16,
     pub owner: CheckpointOwner,
     pub lifecycle: CheckpointLifecycle,
@@ -613,7 +612,7 @@ pub struct IncrementalEtlCheckpointV2 {
     pub canonical_schema_version: u16,
     pub marker: MarkerLineage,
     pub segment_lineage: Vec<SegmentLineage>,
-    pub continuation: ContinuationDependencyV2,
+    pub continuation: ContinuationDependency,
     pub decoder: DecoderReconstructionState,
     pub outputs: Vec<DeltaBatchReference>,
     pub published_operation_keys: Vec<String>,
@@ -621,7 +620,7 @@ pub struct IncrementalEtlCheckpointV2 {
     pub checksum: String,
 }
 
-impl IncrementalEtlCheckpointV2 {
+impl IncrementalEtlCheckpoint {
     pub fn validate(&self) -> Result<(), ContinuationError> {
         self.validate_without_checksum()?;
         if self.checksum != self.compute_checksum()? {
@@ -698,7 +697,7 @@ impl IncrementalEtlCheckpointV2 {
     }
 
     fn validate_without_checksum(&self) -> Result<(), ContinuationError> {
-        if self.version != INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION
+        if self.version != INCREMENTAL_CHECKPOINT_SCHEMA_VERSION
             || self.owner != CheckpointOwner::Etl
             || self.parent_id.as_uuid().is_nil()
             || self.epoch_id.as_uuid().is_nil()
@@ -853,7 +852,7 @@ mod tests {
         let parent = RecordingId::new();
         let predecessor = EpochId::new();
         let successor = EpochId::new();
-        let value = EpochContinuationCheckpointV1::new(
+        let value = EpochContinuationCheckpoint::new(
             parent,
             predecessor,
             successor,
@@ -869,11 +868,20 @@ mod tests {
             .write_atomic(root.join(EPOCH_CONTINUATION_FILE))
             .unwrap();
         assert_eq!(
-            EpochContinuationCheckpointV1::load(root.join(EPOCH_CONTINUATION_FILE)).unwrap(),
+            EpochContinuationCheckpoint::load(root.join(EPOCH_CONTINUATION_FILE)).unwrap(),
             value
         );
         let mut corrupted = value.clone();
-        corrupted.checksum.replace_range(..1, "0");
+        // Flip the first hex digit so the corruption is guaranteed (a
+        // no-op replacement would make this test pass by accident).
+        corrupted.checksum.replace_range(
+            ..1,
+            if corrupted.checksum.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            },
+        );
         assert_eq!(
             corrupted.validate(),
             Err(ContinuationError::ChecksumMismatch)
@@ -883,7 +891,7 @@ mod tests {
             ..ContinuationLimits::default()
         };
         assert_eq!(
-            EpochContinuationCheckpointV1::new(
+            EpochContinuationCheckpoint::new(
                 parent,
                 predecessor,
                 successor,
@@ -897,7 +905,7 @@ mod tests {
             .with_counts([0, 0, 2, 0, 0, 0, 0]),
             Err(ContinuationError::Invalid("continuation fields"))
         );
-        let dependency = ContinuationDependencyV2::pending(predecessor, successor);
+        let dependency = ContinuationDependency::pending(predecessor, successor);
         let ready = dependency
             .transition(ContinuationState::Ready, Some("d".repeat(64)), None)
             .unwrap();
@@ -921,8 +929,8 @@ mod tests {
         let predecessor = EpochId::new();
         let epoch = EpochId::new();
         let state = ReconstructionAssembler::default().snapshot().unwrap();
-        let value = IncrementalEtlCheckpointV2 {
-            version: INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION,
+        let value = IncrementalEtlCheckpoint {
+            version: INCREMENTAL_CHECKPOINT_SCHEMA_VERSION,
             owner: CheckpointOwner::Etl,
             lifecycle: CheckpointLifecycle::Active,
             parent_id: parent,
@@ -933,7 +941,7 @@ mod tests {
             canonical_schema_version: 1,
             marker: marker(9),
             segment_lineage: segments(9),
-            continuation: ContinuationDependencyV2::pending(predecessor, epoch),
+            continuation: ContinuationDependency::pending(predecessor, epoch),
             decoder: DecoderReconstructionState {
                 kind: DECODER_KIND.into(),
                 implementation_version: DECODER_IMPLEMENTATION_VERSION,
@@ -959,12 +967,12 @@ mod tests {
             checksum: String::new(),
         };
         value.validate_without_checksum().unwrap();
-        let value = IncrementalEtlCheckpointV2 {
+        let value = IncrementalEtlCheckpoint {
             checksum: value.compute_checksum().unwrap(),
             ..value
         };
         assert!(value.validate().is_ok());
-        let handoff = EpochContinuationCheckpointV1::new(
+        let handoff = EpochContinuationCheckpoint::new(
             parent,
             predecessor,
             epoch,
@@ -1030,7 +1038,7 @@ mod tests {
         let predecessor = EpochId::new();
         let successor = EpochId::new();
         let state = ReconstructionAssembler::default().snapshot().unwrap();
-        let checkpoint = EpochContinuationCheckpointV1::new(
+        let checkpoint = EpochContinuationCheckpoint::new(
             parent,
             predecessor,
             successor,
@@ -1109,7 +1117,7 @@ mod tests {
                 .state(),
             ContinuationState::Failed
         );
-        let dependency = ContinuationDependencyV2::ready_from_checkpoint(
+        let dependency = ContinuationDependency::ready_from_checkpoint(
             parent,
             predecessor,
             &checkpoint,
@@ -1146,7 +1154,7 @@ mod tests {
         let mut predecessor = EpochId::new();
         for sequence in 1..=8 {
             let successor = EpochId::new();
-            let checkpoint = EpochContinuationCheckpointV1::new(
+            let checkpoint = EpochContinuationCheckpoint::new(
                 parent,
                 predecessor,
                 successor,

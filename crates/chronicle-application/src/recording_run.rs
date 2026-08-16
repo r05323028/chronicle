@@ -1,4 +1,4 @@
-use crate::{EpochCatalogState, EpochCatalogSummaryV2, EpochCatalogV2, EpochId, RecordingId};
+use crate::{EpochCatalog, EpochCatalogState, EpochCatalogSummary, EpochId, RecordingId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -145,7 +145,7 @@ pub struct RunEpochSummaryV2 {
     pub successor: Option<EpochId>,
     pub path: String,
     pub state: EpochCatalogState,
-    pub summary: EpochCatalogSummaryV2,
+    pub summary: EpochCatalogSummary,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,7 +182,7 @@ pub enum RunPersistenceError {
 
 impl RecordingRunV2 {
     pub fn from_catalog(
-        catalog: &EpochCatalogV2,
+        catalog: &EpochCatalog,
         name: Option<String>,
         created_at_unix_millis: u64,
         lifetime: RecordingLifetime,
@@ -220,7 +220,7 @@ impl RecordingRunV2 {
                     successor: entry.successor,
                     path: entry.path.clone(),
                     state: entry.state,
-                    summary: entry.summary.clone(),
+                    summary: entry.summary,
                 })
                 .collect(),
             warnings: Vec::new(),
@@ -240,7 +240,7 @@ impl RecordingRunV2 {
 
     pub fn regenerate_from_catalog(
         root: impl AsRef<Path>,
-        catalog: &EpochCatalogV2,
+        catalog: &EpochCatalog,
         name: Option<String>,
         created_at_unix_millis: u64,
         lifetime: RecordingLifetime,
@@ -614,7 +614,7 @@ mod tests {
         let parent = RecordingId::new();
         let first = EpochId::new();
         let second = EpochId::new();
-        let mut catalog = EpochCatalogV2::new(parent, first, ".").unwrap();
+        let mut catalog = EpochCatalog::new(parent, first, ".").unwrap();
         catalog.append_successor(second, "epochs/1").unwrap();
         let run = RecordingRunV2::from_catalog(
             &catalog,
@@ -637,7 +637,7 @@ mod tests {
             std::env::temp_dir().join(format!("chronicle-recording-run-{}", uuid::Uuid::new_v4()));
         let parent = RecordingId::new();
         let epoch = EpochId::new();
-        let catalog = EpochCatalogV2::new(parent, epoch, ".").unwrap();
+        let catalog = EpochCatalog::new(parent, epoch, ".").unwrap();
         let run = RecordingRunV2::from_catalog(
             &catalog,
             Some("restartable".into()),

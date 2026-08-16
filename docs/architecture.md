@@ -8,9 +8,9 @@
 
 ## MVP versioning policy
 
-Until explicit compatibility freeze, every internal artifact domain has one mutable schema or format: v1. Capture events, private eBPF ABI records, WAL, canonical sessions, manifests, recording metadata, ETL checkpoints, fixtures, and machine-readable reports evolve by updating current v1 plus repository fixtures, tests, and documentation in same change.
+Before the first public release, every internal artifact domain has one current runtime model, reader, and writer. Capture events, private eBPF ABI records, WAL, canonical sessions, manifests, recording metadata, epoch catalogs, rollover transitions, ETL checkpoints, continuations, fixtures, and machine-readable reports evolve by updating the current model plus repository fixtures, tests, and documentation in same change. Unreleased internal persisted schemas may be replaced rather than supported through permanent runtime compatibility layers; persisted structures may keep explicit schema version numbers (for example epochs.json version 2).
 
-Readers reject values other than 1. Chronicle does not retain V1/V2/V3 dispatch enums, migration adapters, dual writers, or compatibility readers for repository history. A version increase requires explicit OpenSpec change declaring compatibility freeze, frozen contract scope, supported reader/writer combinations, migration policy, and deprecation policy.
+Chronicle does not retain V1/V2/V3 dispatch enums, migration adapters, dual writers, or compatibility readers for repository history. Stable wire formats intentionally preserved by the project (WAL v1 framing and commit markers, Capture Event v1, Canonical Session v1, replay safety contracts) remain versioned separately. A freeze requires explicit OpenSpec change declaring compatibility freeze, frozen contract scope, supported reader/writer combinations, migration policy, and deprecation policy.
 
 ## Boundaries
 
@@ -40,7 +40,7 @@ A bounded 4096-event queue feeds segmented WAL v1. Each group appends data, one 
 
 `FilesystemSessionStore` atomically writes sole-v1 manifest, session JSON, and SHA-256-addressed payloads. Replay hydrates only persisted artifacts. Command mode infers one owned loopback listener for supervised target and grants only execution/read/host/target gates; explicit-target mode requires loopback target, matching allow-host, effect flag, and `--execute`. Fake protocol remains available for boundary tests.
 
-JSON is current capture-event payload encoding; WAL framing remains encoding-independent. Public recording lifetime has no implicit time deadline when `--duration` is omitted; explicit deadlines are checked independently from bounded epoch and segment WAL limits. A recording may own many finalized epoch sessions, and a WAL epoch boundary is not a protocol reconstruction boundary: cross-epoch state requires bounded, checksummed, lineage-verified continuation evidence. Hidden 0.1.x one-shot adapters retain old duration semantics only for compatibility.
+JSON is current capture-event payload encoding; WAL framing remains encoding-independent. Public recording lifetime has no implicit time deadline when `--duration` is omitted; explicit deadlines are checked independently from bounded epoch and segment WAL limits. A recording may own many finalized epoch sessions, and a WAL epoch boundary is not a protocol reconstruction boundary: cross-epoch state requires bounded, checksummed, lineage-verified continuation evidence.
 
 ## Public data directory and recording identity
 

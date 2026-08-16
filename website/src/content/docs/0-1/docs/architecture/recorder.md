@@ -1,17 +1,16 @@
 ---
 title: Recorder
-description: The one-shot and continuous recording lifecycle around capture and
-  WAL ownership.
+description: The recording lifecycle around capture and WAL ownership.
 slug: 0-1/docs/architecture/recorder
 ---
 
-A recording lifecycle owns one capture scope, one WAL domain, and one finalization path. Public users normally start with one-shot command mode:
+A recording lifecycle owns one capture scope, one WAL domain, and one finalization path. Public users normally start with command mode:
 
 ```bash
 chronicle record --name checkout -- ./my-app
 ```
 
-## One-shot lifecycle
+## Command-mode lifecycle
 
 1. Resolve and lock the public data directory.
 2. Prepare the recording identity and bounded WAL domain.
@@ -31,7 +30,7 @@ chronicle record --retry checkout
 
 ## Continuous recorder
 
-The repository also contains a bounded continuous recorder for supported deployments. Its foreground entrypoint remains hidden while the intent-oriented public CLI surface stabilizes. It owns one filesystem domain, epoch rotation, incremental ETL resume, liveness/health metadata, and shutdown cleanup.
+Command, PID, cgroup, and daemon modes share one continuous coordinator. It owns one filesystem domain, epoch rotation, incremental ETL resume, liveness/health metadata, and shutdown cleanup.
 
 This is not an always-on distributed capture service. Recorder state, WAL, manifests, checkpoints, and catalog facts remain local and bounded. Consult the repository's [continuous recorder runbook](https://github.com/r05323028/chronicle/blob/main/docs/continuous-recorder-runbook.md) before operating that advanced path.
 

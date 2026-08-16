@@ -6,27 +6,23 @@ mod delta;
 mod incremental;
 mod publication;
 pub use checkpoint::{
-    CheckpointError, CheckpointLifecycle, CheckpointOwner, CheckpointSummary,
-    DECODER_IMPLEMENTATION_VERSION, DECODER_KIND, DECODER_SNAPSHOT_VERSION,
-    DecoderReconstructionState, DeltaBatchReference, INCREMENTAL_CHECKPOINT_SCHEMA_VERSION,
-    IncrementalEtlCheckpointV1, MarkerLineage, RecoveryAuthoritativeSnapshot, SegmentLineage,
-    SourceStatus, read_checkpoint, write_checkpoint_atomic,
+    CheckpointLifecycle, CheckpointOwner, DECODER_IMPLEMENTATION_VERSION, DECODER_KIND,
+    DECODER_SNAPSHOT_VERSION, DecoderReconstructionState, DeltaBatchReference, MarkerLineage,
+    SegmentLineage, SourceStatus,
 };
 pub use continuation::{
-    ContinuationCoordinator, ContinuationDependencyV2, ContinuationError, ContinuationLimits,
+    ContinuationCoordinator, ContinuationDependency, ContinuationError, ContinuationLimits,
     ContinuationState, EPOCH_CONTINUATION_CHECKPOINT_VERSION, EPOCH_CONTINUATION_FILE,
     EPOCH_CONTINUATION_IN_FILE, EPOCH_CONTINUATION_OUT_FILE, EPOCH_CONTINUATION_STATE_FILE,
-    EpochContinuationCheckpointV1, INCREMENTAL_CHECKPOINT_V2_SCHEMA_VERSION,
-    IncrementalEtlCheckpointV2,
+    EpochContinuationCheckpoint, INCREMENTAL_CHECKPOINT_SCHEMA_VERSION, IncrementalEtlCheckpoint,
 };
 pub use delta::{CANONICAL_DELTA_SCHEMA_VERSION, CanonicalDeltaBatchV1, DeltaBatchError};
 pub use incremental::{CommittedWalSnapshot, IncrementalProcessor, IncrementalResult};
 pub use publication::{
     CheckpointFault, OneShotPublicationError, OneShotPublicationOutcome, PublicationError,
-    ReconcileOutcome, finalize_incremental_session, publish_continuation_then_checkpoint_v2,
-    publish_delta_then_checkpoint, publish_delta_then_checkpoint_v2,
-    publish_delta_then_checkpoint_with_fault, publish_final_session, reconcile_delta_checkpoint,
-    recover_pending_checkpoint, recover_pending_checkpoint_v2, verify_one_shot_equivalence,
+    ReconcileOutcome, finalize_incremental_session, publish_continuation_then_checkpoint,
+    publish_delta_then_checkpoint, publish_delta_then_checkpoint_with_fault, publish_final_session,
+    recover_pending_checkpoint, verify_one_shot_equivalence,
 };
 
 /// ETL input boundary before protocol-specific decoding.

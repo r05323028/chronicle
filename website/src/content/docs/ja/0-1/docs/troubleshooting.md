@@ -32,7 +32,7 @@ chronicle --format json doctor
 
 ## Finalization が停止した、または WAL が上限に近い
 
-ワンショット記録には期間の上限と 4 GiB の物理 WAL 容量上限があります。ディスク容量と recording directory を確認してください。recording が復旧可能なら、再キャプチャせずに finalization を再試行します。
+記録には期間の上限と 4 GiB の物理 WAL 容量上限があります。ディスク容量と recording directory を確認してください。recording が復旧可能なら、再キャプチャせずに finalization を再試行します。
 
 ```bash
 chronicle record --retry checkout
