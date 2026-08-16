@@ -54,4 +54,4 @@ Capture scope must be outside the recorder state/store subtree. Config files con
 
 ## Operations
 
-Use `chronicle internal recorder --config /etc/chronicle/recorder.toml` in foreground. Use `chronicle internal recorder-status --state-root /var/lib/chronicle` for read-only readiness. Top-level `recorder` and `recorder-status` remain hidden deprecated aliases through 0.1.x and are removed at the 0.2 boundary. See [`systemd/chronicle-recorder.service`](systemd/chronicle-recorder.service) and [`continuous-recorder-runbook.md`](./continuous-recorder-runbook.md).
+Use `chronicle internal recorder --config /etc/chronicle/recorder.toml` in foreground. Use `chronicle internal recorder-status --state-root /var/lib/chronicle` for read-only readiness. See [`systemd/chronicle-recorder.service`](systemd/chronicle-recorder.service) and [`continuous-recorder-runbook.md`](./continuous-recorder-runbook.md).

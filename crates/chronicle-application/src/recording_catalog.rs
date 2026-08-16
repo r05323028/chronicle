@@ -174,26 +174,26 @@ pub fn reconcile_entry_status(
     }
 }
 
-/// The recording a published session belongs to: `source_provenance.recording_id`
-/// when present (ETL-published sessions carry it), else id equality (legacy
-/// sessions).
-fn recording_for_summary(summary: &SessionSummary) -> RecordingId {
-    summary
-        .recording_id
-        .unwrap_or(RecordingId(summary.session_id.0))
+/// The recording a published session belongs to: explicit
+/// `source_provenance.recording_id` only. Sessions without explicit
+/// provenance are unresolved and are never associated with a recording;
+/// lineage is never inferred from identifier equality.
+fn recording_for_summary(summary: &SessionSummary) -> Option<RecordingId> {
+    summary.recording_id
 }
 
 /// Index sessions by the recording they belong to. Sessions published for
 /// a finalized epoch bind the parent recording id, so each epoch id is also
 /// indexed: public inspection of an epoch recording resolves to its session.
+/// Sessions without explicit recording provenance are not indexed.
 fn summary_by_recording<'a>(
     summaries: impl Iterator<Item = &'a SessionSummary>,
 ) -> BTreeMap<RecordingId, &'a SessionSummary> {
     let mut index = BTreeMap::new();
     for summary in summaries {
-        index
-            .entry(recording_for_summary(summary))
-            .or_insert(summary);
+        if let Some(recording_id) = recording_for_summary(summary) {
+            index.entry(recording_id).or_insert(summary);
+        }
         if let Some(epoch_id) = summary.epoch_id {
             index
                 .entry(RecordingId::from_uuid(epoch_id.as_uuid()))
@@ -254,7 +254,11 @@ fn resolve_latest(data_dir: &Path) -> Result<RecordingId, ApplicationError> {
         .map_err(ApplicationError::from)?;
     let mut candidates: Vec<_> = summaries
         .iter()
-        .filter(|summary| known.contains(&recording_for_summary(summary)))
+        .filter(|summary| {
+            summary
+                .recording_id
+                .is_some_and(|recording_id| known.contains(&recording_id))
+        })
         .collect();
     candidates.sort_by(|left, right| {
         left.started_at
@@ -263,7 +267,7 @@ fn resolve_latest(data_dir: &Path) -> Result<RecordingId, ApplicationError> {
     });
     candidates
         .pop()
-        .map(recording_for_summary)
+        .and_then(recording_for_summary)
         .ok_or_else(|| ApplicationError::RecordingNotFound("latest".to_owned()))
 }
 
@@ -591,7 +595,7 @@ pub struct ListedRecording {
     pub created_at: Timestamp,
     /// Canonical session duration in milliseconds when published.
     pub duration_ms: Option<u64>,
-    /// Number of published canonical sessions (one in the 0.1.x model).
+    /// Number of published canonical sessions (one in the current model).
     pub sessions: usize,
     /// Total canonical operation count.
     pub operations: usize,
@@ -1230,23 +1234,21 @@ mod tests {
     }
 
     fn publish_session(root: &Path, id: &str) {
-        let store = FilesystemSessionStore::new(root);
-        store
-            .publish(chronicle_storage::PublishSession {
-                session: minimal_session(id, Timestamp::UNIX_EPOCH),
-                checkpoint: Some("checkpoint".into()),
-                issues: vec![],
-                replayability: vec![],
-                complete: true,
-            })
-            .unwrap();
+        publish_session_at(root, id, Timestamp::UNIX_EPOCH);
     }
 
     fn publish_session_at(root: &Path, id: &str, started_at: Timestamp) {
         let store = FilesystemSessionStore::new(root);
+        let mut session = minimal_session(id, started_at);
+        // Explicit lineage: the session binds the recording and epoch identity
+        // directly. Identifier equality is never used as association.
+        session.source_provenance.recording_id = Some(RecordingId(Uuid::parse_str(id).unwrap()));
+        session.source_provenance.epoch_id =
+            Some(chronicle_common::EpochId(Uuid::parse_str(id).unwrap()));
+        session.source_provenance.epoch_ordinal = Some(0);
         store
             .publish(chronicle_storage::PublishSession {
-                session: minimal_session(id, started_at),
+                session,
                 checkpoint: Some("checkpoint".into()),
                 issues: vec![],
                 replayability: vec![],
@@ -1586,9 +1588,14 @@ mod tests {
         let started = Timestamp::UNIX_EPOCH;
         let ended = started + time::Duration::seconds(62);
         let store = FilesystemSessionStore::new(&root);
+        let mut session = minimal_session_ended(newer, started, Some(ended));
+        session.source_provenance.recording_id = Some(RecordingId(Uuid::parse_str(newer).unwrap()));
+        session.source_provenance.epoch_id =
+            Some(chronicle_common::EpochId(Uuid::parse_str(newer).unwrap()));
+        session.source_provenance.epoch_ordinal = Some(0);
         store
             .publish(chronicle_storage::PublishSession {
-                session: minimal_session_ended(newer, started, Some(ended)),
+                session,
                 checkpoint: Some("checkpoint".into()),
                 issues: vec![],
                 replayability: vec![],

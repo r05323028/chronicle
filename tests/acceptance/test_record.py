@@ -39,7 +39,9 @@ class RecordAcceptanceTests(unittest.TestCase):
         session_dir = self.root / "sessions" / session
         self.assertTrue((session_dir / "session.json").is_file())
         self.assertTrue((session_dir / "manifest.json").is_file())
-        segments = list((self.root / "wal" / session / "segments").glob("*.chwal"))
+        segments = list(
+            (self.root / "recordings" / session / "segments").glob("*.chwal")
+        )
         self.assertTrue(segments, "fixture record must persist WAL segments")
 
     def test_malformed_fixture_returns_safe_error(self):

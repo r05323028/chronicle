@@ -11,7 +11,6 @@ assertions move out (executed in tasks 3.2-3.6, 9.1-9.4).
 | --- | --- | --- | --- | --- |
 | capture-basic | ebpf, privileged | privileged capture integration + acceptance (split) | real eBPF load/attach, ring-buffer capture, process attribution | WAL/ingest cargo invocations -> unit (3.2); fmt/build -> fast/CI |
 | checkpoint-kill-restart | crash-recovery | privileged acceptance | real recorder kill/restart crash recovery | checkpoint matrix -> etl_contract + checkpoint unit |
-| cli-compatibility | compatibility, ebpf | split | privileged_signal (real signal handling) | CLI grammar/exit mapping -> cli_contract integration |
 | corruption-quarantine | corruption | privileged acceptance | real WAL corruption quarantine on recorded evidence | corruption matrices -> etl_contract + wal_matrix |
 | incremental-etl | etl | privileged acceptance | real recorded-WAL ETL | incremental/one-shot/checkpoint matrices -> etl_contract + incremental unit |
 | quota-pressure | quota | privileged acceptance | real quota enforcement under pressure | recorder_quota unit (portable) |

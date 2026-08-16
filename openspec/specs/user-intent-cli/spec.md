@@ -6,7 +6,7 @@ Public CLI designed around user intent: `record`, `replay`, `list`, `inspect`, `
 
 ### Requirement: Public command hierarchy
 
-CLI SHALL expose exactly five public top-level commands: `record`, `replay`, `list`, `inspect`, and `doctor`; hidden `internal` and deprecated aliases do not count as public. `record` and `replay` accept a trailing command after `--`; `record --retry RECORDING` is a mutually exclusive recovery/finalization mode. Global `--format human|json` and `--data-dir` remain public global options, default human. Help SHALL describe intent and hide WAL/segment/ETL/daemon mechanics. Replay help SHALL show that command mode infers Read authorization but still accepts/requires `--allow-write` when executable Write operations exist.
+CLI SHALL expose exactly five public top-level commands: `record`, `replay`, `list`, `inspect`, and `doctor`; hidden `internal` entrypoints do not count as public. `record` and `replay` accept a trailing command after `--`; `record --retry RECORDING` is a mutually exclusive recovery/finalization mode. Global `--format human|json` and `--data-dir` remain public global options, default human. Help SHALL describe intent and hide WAL/segment/ETL/daemon mechanics. Replay help SHALL show that command mode infers Read authorization but still accepts/requires `--allow-write` when executable Write operations exist.
 
 #### Scenario: Happy-path record help
 
@@ -250,44 +250,19 @@ In JSON mode child stdout/stderr SHALL be connected directly to the platform nul
 - **WHEN** child writes arbitrary-volume output in JSON mode
 - **THEN** bytes go to null sink, Chronicle emits one atomic JSON result, and no child-output file or unbounded buffer exists
 
-### Requirement: Deprecated and internal entrypoints
+### Requirement: Hidden internal operational entrypoints only
 
-Legacy forms SHALL remain hidden deprecated compatibility entrypoints through 0.1.x, including top-level `recorder`, `recorder-status`, `etl`, legacy `record --source ...`, legacy replay/inspect roots, and their old duration/WAL flags. They SHALL route into existing one-shot/continuous services without duplicate business logic and SHALL emit the existing deprecation diagnostics. The old 600-second default and 3,600-second recording-wide bound MAY remain only on the hidden legacy one-shot adapter during this window; they SHALL not constrain the public `record` run model. Removal remains targeted for 0.2 after documentation, deployment scripts, and acceptance flows migrate.
+Exactly five public top-level commands exist: `record`, `replay`, `list`, `inspect`, and `doctor`. The hidden `internal` namespace (`internal recorder`, `internal recorder-status`, `internal etl`, `internal record-fixture`, `internal bootstrap`) is the current operational surface for the continuous recorder, recorder status, standalone ETL, and deterministic fixture recording; it carries no deprecation machinery. No hidden pre-release CLI compatibility surface exists: top-level legacy `recorder`/`recorder-status`/`etl`, `record --source ...`, and session-root `--root` forms were removed before 0.1.0 and SHALL NOT be reintroduced without an explicit OpenSpec change.
 
-#### Scenario: Legacy record remains bounded and hidden
+#### Scenario: Legacy forms are rejected
 
-- **WHEN** a script invokes the deprecated `record --source ebpf` form with legacy duration flags
-- **THEN** it keeps its documented 0.1.x compatibility behavior and warning, while public `chronicle record` uses optional whole-run duration semantics
+- **WHEN** a script invokes `record --source fixture`, top-level `recorder`, or `inspect SESSION --root ROOT`
+- **THEN** the CLI rejects the invocation as a usage error (exit 2) and no deprecation diagnostic exists
 
-#### Scenario: Legacy JSON stays atomic
+#### Scenario: Internal forms remain operational
 
-- **WHEN** a successful deprecated command runs with `--format json`
-- **THEN** stdout remains one unchanged valid JSON object and the structured deprecation diagnostic remains on stderr
-
-#### Scenario: Legacy failure points forward
-
-- **WHEN** a deprecated invocation fails
-- **THEN** its safe error names the public replacement and does not expose raw argv, credentials, or payload values
-
-#### Scenario: Legacy help hidden
-
-- **WHEN** user inspects normal help
-- **THEN** deprecated entrypoints and one-shot implementation bounds do not appear as the public record model
-
-#### Scenario: Legacy record with warning
-
-- **WHEN** a script invokes legacy `chronicle record --source ebpf --cgroup /w --wal-dir /x`
-- **THEN** the command still works, prints a deprecation warning to stderr in human mode, and continues to produce the same recording semantics
-
-#### Scenario: Legacy JSON failure with hint
-
-- **WHEN** a legacy command with `--format json` fails
-- **THEN** stderr carries the single normal error JSON whose message includes the new-syntax hint, and no separate warning object is emitted
-
-#### Scenario: New syntax error hint
-
-- **WHEN** a compatibility entrypoint receives an invalid legacy invocation
-- **THEN** error output points to the equivalent new syntax
+- **WHEN** an operator invokes `internal recorder --config FILE`, `internal recorder-status --state-root DIR`, `internal etl --wal-dir WAL --output ROOT`, or `internal record-fixture --input FILE --root ROOT`
+- **THEN** the command runs with no warning and emits the documented machine-readable output
 
 ### Requirement: Human and JSON output contract
 

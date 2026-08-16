@@ -6,7 +6,7 @@ Minimal record, inspect, and replay command contracts plus end-to-end runnable H
 
 ### Requirement: Minimal record command
 
-CLI SHALL retain the legacy record forms as hidden deprecated 0.1.x compatibility entrypoints (see `user-intent-cli`): fixture form `record --source fixture --input FILE --root ROOT` and production form `record --source ebpf (--pid PID | --cgroup PATH [--allow-shared-cgroup]) --wal-dir DIR [--segment-bytes N] [--duration-seconds N] [--max-wal-bytes N]`. Shared acknowledgement SHALL be invalid with `--pid`, fixture source, or no explicit `--cgroup`. Duration SHALL default 600 seconds/max 3600; total WAL SHALL default/hard-cap 4 GiB and be at least segment size. Source-specific/conflicting options SHALL be validated. The compatibility production form SHALL show effective cgroup path/ID/direct TGID count/descendant cgroup count/selected-subtree scope/acknowledgement before attach, perform preflight, create/finalize metadata, run eBPF plus bounded in-WAL-marker group commit, handle limits/signals, and print safe categorized summary; it SHALL NOT run ETL implicitly — the public `record` command runs ETL/finalization automatically per `user-intent-cli`. CLI help and diagnostics SHALL use **direct cgroup TGID set** for distinct host-visible TGIDs resolved from numeric PIDs listed directly in selected node's `cgroup.procs`; they SHALL NOT call it a POSIX process group, thread count, container ID, or descendant union.
+CLI record SHALL expose the public forms per `user-intent-cli`: `record -- COMMAND...`, `record --pid PID`, `record --cgroup PATH [--allow-shared-cgroup]`, and `record --retry RECORDING`, with optional `--name` and `--duration`, and global `--data-dir` resolution. Shared acknowledgement SHALL be invalid with `--pid` or no explicit `--cgroup`. Conflicting options SHALL be validated; `record` requires exactly one mode. The pre-0.1 `--source`/`--wal-dir`/`--segment-bytes`/`--duration-seconds`/`--max-wal-bytes` forms were removed before 0.1.0 and SHALL NOT be reintroduced. Public selector forms SHALL show effective cgroup path/ID/direct TGID count/descendant cgroup count/selected-subtree scope/acknowledgement before attach, perform preflight, create/finalize metadata, run eBPF plus bounded in-WAL-marker group commit, handle limits/signals, and print safe categorized summary; ETL/finalization runs automatically per `user-intent-cli`. CLI help and diagnostics SHALL use **direct cgroup TGID set** for distinct host-visible TGIDs resolved from numeric PIDs listed directly in selected node's `cgroup.procs`; they SHALL NOT call it a POSIX process group, thread count, container ID, or descendant union.
 
 #### Scenario: Fixture record uses current artifacts
 
@@ -18,10 +18,10 @@ CLI SHALL retain the legacy record forms as hidden deprecated 0.1.x compatibilit
 - **WHEN** supported privileged Linux host records valid dedicated workload selector
 - **THEN** command writes bounded group-committed WAL/metadata, stops gracefully, and outputs recording ID/status/reason/last valid commit boundary/categorized counters
 
-#### Scenario: Compatibility form does not run ETL implicitly
+#### Scenario: Public record finalizes automatically
 
-- **WHEN** the hidden compatibility production form completes capture
-- **THEN** it preserves the ETL-ready WAL and does not run ETL, while the public `record` command finalizes and publishes automatically
+- **WHEN** the public `record` command completes capture
+- **THEN** it finalizes and publishes automatically; no hidden compatibility form exists
 
 #### Scenario: Record argument validation
 
@@ -60,7 +60,7 @@ CLI SHALL retain the legacy record forms as hidden deprecated 0.1.x compatibilit
 
 ### Requirement: Minimal inspect command
 
-CLI SHALL retain legacy `inspect SESSION_ID --root ROOT` as a hidden deprecated 0.1.x compatibility entrypoint. The public `inspect <RECORDING>` and `inspect latest` SHALL resolve recordings from default or configured storage per `recording-identity` and SHALL NOT require `--root`. It SHALL support global `--format human|json`, default human, and delegate to application/storage service.
+CLI inspect SHALL expose `inspect <RECORDING>` and `inspect latest` per `user-intent-cli`, resolving recordings from the data directory per `recording-identity` with global `--data-dir`; the pre-0.1 session-root `inspect SESSION --root ROOT` form was removed before 0.1.0 and SHALL NOT be reintroduced. It SHALL support global `--format human|json`, default human, and delegate to application/storage service.
 
 #### Scenario: Inspect happy path
 
@@ -79,7 +79,7 @@ CLI SHALL retain legacy `inspect SESSION_ID --root ROOT` as a hidden deprecated 
 
 ### Requirement: Minimal replay command
 
-CLI SHALL retain legacy `replay SESSION_ID --root ROOT --target ORIGIN --allow-host IP [--allow-read] [--allow-write] [--timing asap] [--execute]` as a hidden deprecated 0.1.x compatibility entrypoint whose defaults SHALL remain human output, immediate timing, dry-run, no effect authorization, no target default, and no network. The public forms SHALL be `replay <RECORDING> -- COMMAND...` (spawned target with inferred local target and authorization per `safe-local-http-replay`) and `replay <RECORDING> --target URL` (explicit target requiring full authorization), mutually exclusive per `user-intent-cli`. Human/JSON output SHALL include exact replay outcome, fully/partially/not replayable classification, aggregate executable/non-executable counts, and one result per operation.
+CLI replay SHALL expose the public forms per `user-intent-cli` and `safe-local-http-replay`: `replay <RECORDING> -- COMMAND...` (spawned target with inferred local target and authorization) and `replay <RECORDING> --target URL` (explicit target requiring full authorization), mutually exclusive, resolving recordings with global `--data-dir`. Defaults SHALL remain human output, dry-run, no effect authorization, no target default, and no network. The pre-0.1 session-root `replay SESSION --root ROOT` form was removed before 0.1.0 and SHALL NOT be reintroduced. Human/JSON output SHALL include exact replay outcome, fully/partially/not replayable classification, aggregate executable/non-executable counts, and one result per operation.
 
 #### Scenario: Replay dry-run
 

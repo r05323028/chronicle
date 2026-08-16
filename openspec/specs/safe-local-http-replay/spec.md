@@ -468,7 +468,7 @@ Replay SHALL retain five-second connect/operation timeout, 8 MiB observed body b
 
 ### Requirement: Parent and epoch replay selection is explicit and deterministic
 
-CLI/application replay selection SHALL distinguish stable parent `RecordingId`, `EpochId`, and session ID. Selecting a parent resolves verified terminal operations and continuation dependencies from authoritative `epochs.json`; selecting an epoch resolves only that session. No selection uses newest directory, publication time, or filesystem mtime.
+CLI/application replay selection SHALL distinguish stable parent `RecordingId`, `EpochId`, and session ID. Selecting a parent resolves verified terminal operations and continuation dependencies from authoritative `epochs.json`; selecting an epoch resolves only that session. No selection uses newest directory, publication time, or filesystem mtime. Parent replay selection SHALL use only explicit `source_provenance.recording_id` / `epoch_id`; a session without explicit provenance is invalid/unresolved and fails closed with a typed error rather than synthesizing identity from identifier equality. A session matched by recording provenance without an explicit epoch identity fails closed.
 
 #### Scenario: Explicit epoch selection
 

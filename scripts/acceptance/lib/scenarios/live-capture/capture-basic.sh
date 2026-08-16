@@ -158,14 +158,15 @@ PY
 	assert_json "$WAL_DIR/recording.json" 'value["version"] == 1 and value["status"] == "completed" and value["capture"]["scope"]["selected_subtree"] is True and value["capture"]["scope"]["direct_tgid_count"] >= 0 and value["capture"]["scope"]["descendant_cgroup_count"] == 0'
 
 	if full_mode; then
-		phase 15 "Run privileged capture feasibility"
-		# Portable WAL fault + ingest matrices are separately selected gate
-		# prerequisites (task 8.1); the privileged scenario proves only the
-		# real capture/feasibility invariant.
-		cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture >"$ARTIFACT_ROOT/privileged-feasibility.log" 2>&1
-		grep -q 'test result: ok' "$ARTIFACT_ROOT/privileged-feasibility.log"
+		phase 15 "Run privileged kernel-behavior acceptance"
+		# The retired feasibility harness proved kernel semantics with a
+		# separate experiment probe. The production eBPF adapter is the only
+		# validation authority now: this runs the production-object kernel
+		# suite (hook matrix, identity, truncation, ring/loss accounting).
+		cargo test -p chronicle-capture-ebpf --test privileged_kernel --locked -- --ignored --nocapture >"$ARTIFACT_ROOT/privileged-kernel.log" 2>&1
+		grep -q 'test result: ok' "$ARTIFACT_ROOT/privileged-kernel.log"
 	else
-		skip_phase 15 "Run privileged capture feasibility" privileged-feasibility.log
+		skip_phase 15 "Run privileged kernel-behavior acceptance" privileged-kernel.log
 	fi
 
 }

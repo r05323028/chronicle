@@ -18,7 +18,7 @@ matches, not daemon or full-system lifecycle.
 | `application/tests/fixtures_http_vertical.rs` | stay (integration) | rootless deterministic fixture pipeline |
 | `application/tests/http_test_server.rs` + `support/mod.rs` | stay (integration) | crate-local test support, one consumer |
 | `capture-ebpf/tests/privileged_adapter.rs` | remain privileged (integration) | real eBPF attach/capture requires supported kernel |
-| `capture-ebpf/tests/privileged_feasibility.rs` | split | state-machine proof is rootless; kernel feasibility stays privileged |
+| `capture-ebpf/tests/privileged_kernel.rs` | split | state-machine proof is rootless; production-object kernel acceptance stays privileged |
 | `cli/tests/cli_contract.rs` | split | arg/exit/rendering stays CLI integration; liveness -> smoke; features -> acceptance; composition -> E2E; no new lower dev deps |
 | `cli/tests/privileged_signal.rs` | remain privileged (integration) | real cgroup/signal behavior |
 
@@ -27,12 +27,12 @@ matches, not daemon or full-system lifecycle.
 Stay as portable tooling tests; they prove selector/orchestrator contracts,
 never product correctness.
 
-## Privileged acceptance scenarios (14)
+## Privileged acceptance scenarios (13)
 
 - `remain_privileged`: recorder-readiness, quota-pressure, reboot-recovery.
 - `make_rootless`: wal-recovery, incremental-etl, corruption-quarantine.
-- `split`: capture-basic, replay, user-intent-lifecycle, cli-compatibility,
-  resource-cleanup, checkpoint-kill-restart, retention-interruption.
+- `split`: capture-basic, replay, user-intent-lifecycle, resource-cleanup,
+  checkpoint-kill-restart, retention-interruption.
 
 Per-scenario classification details are in `path-classification.md`.
 
@@ -42,7 +42,7 @@ Every portable WAL/ETL/replay/CLI/fmt/workspace cargo invocation was removed
 from scenario bodies into portable prerequisites and repository checks. The
 only embedded cargo that remains is genuinely privileged: building release and
 eBPF artifacts and executing the `--ignored` privileged test suites (kernel
-feasibility, signal handling). `scripts/tests/validation/test_validation_architecture.py`
+kernel acceptance, signal handling). `scripts/tests/validation/test_validation_architecture.py`
 enforces this deny-by-default via a documented allowlist.
 
 ## New root black-box suites (tasks 4.1/4.2/5.1/6.2)

@@ -202,8 +202,9 @@ fn decode_manifest(bytes: &[u8]) -> Result<SessionManifest, StorageError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionSummary {
     pub session_id: SessionId,
-    /// Recording this session belongs to, from `source_provenance.recording_id`
-    /// (legacy sessions without provenance link by id equality).
+    /// Recording this session belongs to, from `source_provenance.recording_id`.
+    /// Sessions without explicit provenance are unresolved and never linked
+    /// by identifier equality.
     pub recording_id: Option<chronicle_common::RecordingId>,
     pub epoch_id: Option<chronicle_common::EpochId>,
     pub epoch_ordinal: Option<u64>,

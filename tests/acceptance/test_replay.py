@@ -52,7 +52,10 @@ class ReplayAcceptanceTests(unittest.TestCase):
             self.binary, session, self.root, "http://127.0.0.1:9", execute=True
         )
         self.assertEqual(result.returncode, 4)
-        self.assertIn(b"Hint", result.stderr)
+        # Policy denial is a rendered replay outcome, not an error hint.
+        self.assertEqual(result.stderr, b"")
+        report = json.loads(result.stdout.decode())
+        self.assertEqual(report["result"]["outcome"], "stopped_policy")
 
     def test_replay_execute_verifies_against_loopback_target(self):
         session = self.record()

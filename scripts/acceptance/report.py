@@ -7,10 +7,12 @@ import json
 import os
 import platform
 import subprocess
-import tomllib
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+import tomllib
 
 SCHEMA_VERSION = 3
 FINGERPRINT_VERSION = 2
@@ -477,8 +479,7 @@ def _classified_coverage(
         if isinstance(value, str)
         and value == "passed"
         and (
-            name
-            in {"privileged_acceptance", "privileged_signal", "privileged_feasibility"}
+            name in {"privileged_acceptance", "privileged_signal", "privileged_kernel"}
             or "privileged" in name
         )
     ]

@@ -100,18 +100,18 @@ def portable_repo_commands(
 
 # Privileged scenario orchestration may invoke cargo only for genuinely
 # privileged work: building release/eBPF artifacts and executing the
-# `--ignored` privileged test suites (kernel feasibility, signal handling).
-# Deny-by-default: any other embedded cargo invocation fails the guard below
-# until it is added here with a privileged justification.
+# `--ignored` privileged test suites (production-object kernel acceptance,
+# signal handling). Deny-by-default: any other embedded cargo invocation fails
+# the guard below until it is added here with a privileged justification.
 PRIVILEGED_EMBEDDED_CARGO_ALLOWLIST = {
     "cargo build --release --locked",
     'CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build --release -p chronicle-cli --locked >>"$ARTIFACT_ROOT/build.log" 2>&1',
     'CHRONICLE_EBPF_TARGET_DIR="$EBPF_TARGET_DIR" cargo build -p chronicle-cli --locked',
     'cargo +nightly build -Z build-std=core --manifest-path "$ROOT/ebpf/Cargo.toml" --target bpfel-unknown-none --release --locked',
-    'cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture >"$ARTIFACT_ROOT/privileged-feasibility.log" 2>&1',
+    'cargo test -p chronicle-capture-ebpf --test privileged_kernel --locked -- --ignored --nocapture >"$ARTIFACT_ROOT/privileged-kernel.log" 2>&1',
     'cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture >"$ARTIFACT_ROOT/signal-tests.log" 2>&1',
     "if run_compat_command signal cargo test -p chronicle-cli --all-features --locked --test privileged_signal -- --ignored --nocapture; then",
-    "run_compat_command wal-feasibility cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture || set_check privileged_feasibility failed",
+    "run_compat_command kernel-acceptance cargo test -p chronicle-capture-ebpf --test privileged_kernel --locked -- --ignored --nocapture || set_check privileged_kernel failed",
 }
 
 
@@ -232,7 +232,7 @@ class CatalogSemanticsTests(unittest.TestCase):
     def test_real_catalog_and_scenarios_valid(self):
         value = validation.catalog_check(ROOT)
         self.assertEqual(value["issues"], [])
-        self.assertEqual(value["scenarios"], 15)
+        self.assertEqual(value["scenarios"], 14)
         self.assertGreater(value["recorder_required"], value["live_capture_required"])
 
     def test_planned_required_is_reported_not_silent(self):

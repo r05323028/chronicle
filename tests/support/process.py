@@ -149,10 +149,14 @@ def inspect_session(
     *,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict:
-    """Inspect a session through the public inspect command (--root form)."""
+    """Inspect a recording through the public inspect command.
+
+    Fixture recordings are single-epoch recordings whose session id equals the
+    recording id; resolution goes through explicit provenance with --data-dir.
+    """
     return run_json(
         binary,
-        ["inspect", session_id, "--root", str(root)],
+        ["inspect", session_id],
         timeout=timeout,
         data_dir=root,
     )
@@ -168,12 +172,14 @@ def replay(
     allow_read: bool = False,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[bytes]:
-    """Replay a session against a target through the public replay command."""
+    """Replay a recording against a target through the public replay command.
+
+    Explicit-target mode with --data-dir; the recording resolves through
+    explicit provenance (no legacy --root form).
+    """
     arguments = [
         "replay",
         session_id,
-        "--root",
-        str(root),
         "--target",
         target,
         "--allow-host",

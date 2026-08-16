@@ -4,7 +4,7 @@
 
 WAL and published sessions can contain production headers and bodies, including credentials and personal data. Chronicle uses private Unix modes and safe default output, but does **not** provide encryption at rest, secret discovery, comprehensive redaction, or tenant isolation. Inspect and reports omit bodies and arbitrary header values.
 
-Live recording is bounded plaintext TCP capture, not always-on capture. It supports Linux 6.1+, cgroup v2, readable BTF, x86_64/aarch64, and required eBPF hooks/capabilities. macOS and ordinary CI use rootless fixtures, ETL, inspect, replay, and eBPF compile checks. Runtime evidence comes only from the opt-in privileged profile.
+Live recording is bounded plaintext TCP capture, not always-on capture. It supports Linux 6.1+, cgroup v2, readable BTF, x86_64/aarch64, and required eBPF hooks/capabilities. macOS and ordinary CI use rootless fixtures, ETL, inspect, replay, and eBPF compile checks. Runtime evidence comes only from the opt-in privileged profile. Verified capture matrix: Ubuntu 24.04, Linux 6.8, aarch64, cgroup v2, readable BTF (production-object privileged acceptance; see `validation/test-architecture/README.md`). Other kernels, architectures, cloud-provider kernels, and offload characteristics are not verified and require their own privileged acceptance run. Verified capture matrix: Ubuntu 24.04, Linux 6.8, aarch64, cgroup v2, readable BTF (production-object privileged acceptance; see `validation/test-architecture/README.md`). Other kernels, architectures, cloud-provider kernels, and offload characteristics are not verified and require their own privileged acceptance run.
 
 ## Quick start
 
@@ -78,7 +78,7 @@ After capture, public command/PID/cgroup modes process only recovery-authoritati
 chronicle --data-dir /var/lib/chronicle record --retry RECORDING
 ```
 
-Hidden `chronicle internal etl --wal-dir DIR --output DIR` remains deployment/compatibility mechanism, not normal user workflow. Rerunning unchanged input in same root reports `already_processed`; another output root is allowed. No `output-binding.json` is used.
+Hidden `chronicle internal etl --wal-dir DIR --output DIR` is the deployment mechanism for standalone WAL recovery, not normal user workflow. Rerunning unchanged input in same root reports `already_processed`; another output root is allowed. No `output-binding.json` is used.
 
 ## Inspect and replay
 
@@ -133,19 +133,20 @@ Previous blocker root cause: the recorder treated `processing_readiness=not_read
 
 The profile uses local upstream/replay targets and dedicated/shared cgroups. It verifies capture, sampling, one-marker/one-sync WAL behavior, crash/recovery authority, hard-cap queue discard, ETL idempotency across roots, cgroup safety, signal/limit finalization, mixed replay, and original-destination isolation. Unsupported hosts must report skipped/not-checked rather than passing runtime coverage.
 
-## Legacy 0.1.x syntax migration
+## Artifact and rollback compatibility
 
-Hidden aliases remain through 0.1.x and emit deprecation warnings; removal occurs at 0.2:
+Authoritative WAL v1, canonical session v1, and session-manifest v1 formats are intentionally stable. `recording-catalog.json` v1 and per-recording `recording-intent.json` v1 are additive advisory artifacts; older releases ignore them. Rollback requires coordinated Chronicle binaries/crates, not a CLI-only downgrade: a previous release can still inspect an explicit canonical root and process an explicit WAL directory, but does not understand recording names, `latest`, intent sidecars, catalog reconciliation, or `record --retry`.
 
-| Deprecated form | Replacement |
-| --- | --- |
-| `chronicle recorder --config FILE` | `chronicle internal recorder --config FILE` |
-| `chronicle recorder-status --state-root DIR` | `chronicle internal recorder-status --state-root DIR` |
-| `chronicle etl --wal-dir WAL --output ROOT` | `chronicle internal etl --wal-dir WAL --output ROOT` |
-| `chronicle record --source fixture ...` | `chronicle internal record-fixture --input FILE --root ROOT` |
-| `chronicle record --source ebpf ...` | `chronicle record -- COMMAND...`, `--pid`, or `--cgroup` |
-| `chronicle inspect SESSION --root ROOT` | `chronicle inspect RECORDING` |
-| `chronicle replay SESSION --root ROOT ...` | `chronicle replay RECORDING -- COMMAND...` or explicit `--target` mode |
+Cross-version check:
+
+```bash
+cargo build -p chronicle-cli
+CHRONICLE_PREVIOUS_RELEASE_BIN=/path/to/controlled-previous-chronicle \
+CHRONICLE_CURRENT_WAL_DIR=/path/to/current-production-wal \
+  ./scripts/tests/test-user-intent-cli-rollback.sh
+```
+
+The harness proves a controlled older binary reads current WAL/canonical artifacts. Current binaries are not required to read artifacts produced by unreleased older builds (pre-0.1 single-model policy).
 
 Docker and Kubernetes packaging are future follow-up only; no container orchestrator integration is implemented.
 

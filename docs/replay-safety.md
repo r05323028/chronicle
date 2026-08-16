@@ -38,7 +38,7 @@ Writes, authentication, publication, and unknown effects are denied by default i
 
 Command mode executes only after target-independent denial checks and owned-listener discovery. Explicit-target mode is dry-run until full gates are supplied. Exit 0 covers dry-run and successful complete/partial execution; 3 covers cleanup/orphan or launch failure; 4 covers policy, invalid-session, unsupported scope, or listener-readiness denial; 5 transport stop; 6 executed verification failure. Human output retains detailed plan/result and adds operation counts, `✓ passed`/`✗ failed`, and final `Replay passed.`/`Replay failed.`. JSON is rendered once after bounded result completes, so render failure never retries network traffic.
 
-## Planned MVP controls
+## Planned controls
 
 - explicit confirmation/flag for non-dry-run;
 - operation filters and protocol-specific classification;
@@ -48,6 +48,6 @@ Command mode executes only after target-independent denial checks and owned-list
 - protocol-specific normalization policies with no broad hidden exclusions;
 - response capture and persisted verification summaries.
 
-Recorded credentials must never be replayed blindly. Adapters establish fresh sessions using replay-environment credentials and restore only permitted session state. Secret management integration remains outside MVP.
+Recorded credentials must never be replayed blindly. Adapters establish fresh sessions using replay-environment credentials and restore only permitted session state. Secret management integration remains outside the current scope.
 
 Database writes and message publication can be irreversible. Unknown operations stay denied until a protocol canonicalizer classifies them or operator creates an explicit narrow policy.

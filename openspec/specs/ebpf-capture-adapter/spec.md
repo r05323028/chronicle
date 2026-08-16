@@ -209,12 +209,12 @@ The adapter SHALL expose typed failures for unsupported kernel capability, eBPF 
 - **AND** it does not report clean completion
 
 ### Requirement: Compatibility evidence distinguishes verified and target environments
-Every feasibility report artifact and doctor result SHALL record architecture, kernel version, Linux distribution, BTF availability, and per-hook capability result. Reports SHALL separate `verified_environment` from `target_compatibility_matrix` and SHALL NOT infer compatibility from architecture or kernel family alone.
+Every privileged acceptance evidence artifact and doctor result SHALL record architecture, kernel series and exact patch release, Linux distribution, BTF availability, and per-hook capability result. Reports SHALL separate `verified_environment` from `target_compatibility_matrix` and SHALL NOT infer compatibility from architecture or kernel family alone.
 
 #### Scenario: Verified environment is labeled exactly
-- **WHEN** privileged acceptance passes on Ubuntu 24.04, exact kernel release Linux 6.8.0-136-generic, aarch64, with cgroup v2, BTF, and all required hooks
-- **THEN** the evidence artifact labels only that exact environment verified
-- **AND** records exact kernel release, optional kernel-family label, and capability results
+- **WHEN** privileged acceptance passes on Ubuntu 24.04, a kernel release of the verified Linux 6.8 series (exact patch recorded in the artifact), aarch64, with cgroup v2, BTF, and all required hooks
+- **THEN** the evidence artifact labels that environment verified
+- **AND** records exact kernel patch release, kernel-series label, and capability results
 
 #### Scenario: x86_64 remains unverified
 - **WHEN** the only retained acceptance evidence is from the verified aarch64 environment
@@ -234,7 +234,7 @@ Unit tests SHALL cover `RawKernelObservation` conversion, sole Capture Event v1 
 - **THEN** required endpoint, role, identity, ordering, lifecycle, loss ambiguity, cache, and typed rejection paths are asserted
 
 ### Requirement: Privileged acceptance proves only adapter stream
-Privileged Linux tests SHALL be clearly marked and SHALL validate real kernel behavior only on the known verified environment. Acceptance SHALL create a dedicated cgroup, attach the adapter, generate IPv4 and IPv6 plaintext TCP traffic, observe multiple payload fragments and forced loss, stop capture, verify cleanup, and generate compatibility evidence. It MUST NOT write WAL data or invoke ETL, protocol parsing, canonicalization, or replay.
+Privileged Linux tests SHALL be clearly marked and SHALL validate real kernel behavior only on the known verified environment. Acceptance SHALL create a dedicated cgroup, attach the production probe, generate IPv4 and IPv6 plaintext TCP traffic, observe multiple payload fragments and forced loss, stop capture, verify cleanup, and generate compatibility evidence. It MUST NOT write WAL data or invoke ETL, protocol parsing, canonicalization, or replay. The production eBPF object is the only privileged kernel validation authority: the retired standalone feasibility harness is not a validation path, and kernel-behavior coverage SHALL live in `crates/chronicle-capture-ebpf/tests/` against the production probe.
 
 #### Scenario: IPv4 capture stream
 - **WHEN** a TCP workload in the dedicated cgroup opens an IPv4 connection on the verified environment
@@ -259,7 +259,7 @@ Privileged Linux tests SHALL be clearly marked and SHALL validate real kernel be
 
 #### Scenario: Acceptance report stays bounded
 - **WHEN** validated-environment acceptance completes
-- **THEN** its report identifies Ubuntu 24.04, exact kernel release Linux 6.8.0-136-generic, aarch64 as verified
+- **THEN** its report identifies Ubuntu 24.04, kernel series Linux 6.8 (exact patch recorded), aarch64 as verified
 - **AND** identifies x86_64 and all other unevaluated matrix entries as not verified
 
 ### Requirement: Adapter slice excludes recorder behavior
@@ -267,5 +267,5 @@ The implementation slice SHALL end at a `CaptureEvent` stream. It MUST NOT add W
 
 #### Scenario: End-to-end slice stops at stream
 - **WHEN** validated kernel observations are converted successfully
-- **THEN** the observable result is a `CaptureEvent` stream plus feasibility evidence
+- **THEN** the observable result is a `CaptureEvent` stream plus privileged acceptance evidence
 - **AND** no WAL writer, ETL pipeline, protocol decoder, canonicalizer, replay component, or always-on daemon is started

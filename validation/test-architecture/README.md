@@ -68,7 +68,9 @@ Repeated helpers are language-local and crate-local or root-suite-local (`tests/
 
 ### Embedded portable commands in privileged orchestration
 
-Privileged scenario bodies may invoke cargo only for genuinely privileged work: building release/eBPF artifacts and executing the `--ignored` privileged test suites (kernel feasibility, signal handling). Deny-by-default — any other embedded cargo invocation fails the guard in `scripts/tests/validation/test_validation_architecture.py` until it is added to the documented allowlist with a privileged justification.
+Privileged scenario bodies may invoke cargo only for genuinely privileged work: building release/eBPF artifacts and executing the `--ignored` privileged test suites (production-object kernel acceptance in `crates/chronicle-capture-ebpf/tests/privileged_kernel.rs` plus `privileged_adapter.rs`, signal handling). Deny-by-default — any other embedded cargo invocation fails the guard in `scripts/tests/validation/test_validation_architecture.py` until it is added to the documented allowlist with a privileged justification.
+
+The production eBPF object is the only privileged kernel validation authority: `crates/chronicle-capture-ebpf/tests/privileged_kernel.rs` asserts hook availability, connect/sockops/cgroup-skb evidence, PID/TGID and cgroup identity, truncation, ring behavior, and loss accounting against the production probe (built from `ebpf/` or the tracked fallback object). The retired `ebpf-feasibility/` experiment harness is not a validation path.
 
 ### Crate-boundary constraints
 

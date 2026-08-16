@@ -17,7 +17,6 @@ commands = ["portable"]
 description = "eBPF build, decoder tests, and minimal privileged smoke"
 paths = [
   "ebpf/**",
-  "ebpf-feasibility/**",
   "crates/chronicle-capture-ebpf/**",
   "crates/chronicle-capture/src/**",
 ]
@@ -106,7 +105,7 @@ acceptance_paths = [
   "scripts/run-with-timeout.sh",
   "validation/groups.toml",
 ]
-build_inputs = ["ebpf/**", "ebpf-feasibility/**"]
+build_inputs = ["ebpf/**"]
 checks = ["live-capture complete privileged acceptance"]
 
 [gates.recorder]
@@ -117,7 +116,7 @@ acceptance_paths = [
   "scripts/run-with-timeout.sh",
   "validation/groups.toml",
 ]
-build_inputs = ["ebpf/**", "ebpf-feasibility/**"]
+build_inputs = ["ebpf/**"]
 checks = [
   "recorder complete privileged acceptance",
   "reboot recovery",

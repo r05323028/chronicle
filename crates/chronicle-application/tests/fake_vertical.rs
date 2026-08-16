@@ -90,7 +90,13 @@ async fn fake_capture_wal_etl_storage_replay_verify() {
         TransportProtocol::Tcp,
     );
     let mut source = InMemoryCaptureSource::new(capture_events(&connection));
-    let recorded = write_capture_to_wal(&mut source, &directory, 1024 * 1024).unwrap();
+    let recorded = write_capture_to_wal(
+        &mut source,
+        &directory,
+        chronicle_common::RecordingId::new(),
+        1024 * 1024,
+    )
+    .unwrap();
     let registry = chronicle_protocol_builtins::registry().unwrap();
     let (output, _) = process_fixture_wal(
         &directory,

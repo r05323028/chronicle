@@ -61,8 +61,6 @@ chronicle --format json doctor
 
 這三個命令都可以安全地用於診斷。`doctor` 不會修改系統；`inspect` 不會列出 body 與任意 header 值。
 
-## 隱藏的相容性與進階 entrypoint
+## 進階 entrypoint
 
-0.1.x 保留 continuous recorder、recorder status、internal ETL、fixture recording 與舊版 session-root 語法的隱藏相容路徑。它們會發出棄用警告，不是建議使用的公開 surface。Docker／Kubernetes 命令不存在。
-
-要遷移隱藏的 0.1.x invocation，請使用[發行說明](https://github.com/r05323028/chronicle/blob/main/docs/release-notes.md)與儲存庫的[操作指南](https://github.com/r05323028/chronicle/blob/main/docs/operations.md)。
+隱藏的 `internal` namespace 是 continuous recorder、recorder status、獨立 ETL 與確定性 fixture recording 的作業 surface；不是建議使用的公開 surface。Docker／Kubernetes 命令不存在。

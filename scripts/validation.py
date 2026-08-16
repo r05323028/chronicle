@@ -1128,6 +1128,25 @@ def legacy_names_check(root: Path) -> dict[str, Any]:
         "load_compatible",
         "from_legacy",
         "to_legacy",
+        # Removed pre-0.1 CLI compatibility surface (crates/chronicle-cli).
+        "LegacyInvocation",
+        "DeprecationJson",
+        "record_fixture_legacy",
+        "run_replay_legacy",
+        "raw_legacy_record",
+        "legacy_invocation_from_raw_args",
+        "legacy_error_message",
+        "exit_legacy_error",
+        "format_from_raw_args",
+        "write_deprecation_warning",
+    ]
+    removed_paths = [
+        # Retired standalone eBPF feasibility harness (Gate A).
+        "ebpf-feasibility",
+        # Retired historical feasibility documentation area.
+        "docs/feasibility",
+        # Retired harness loader test.
+        "crates/chronicle-capture-ebpf/tests/privileged_feasibility.rs",
     ]
     issues: list[str] = []
     for path in sorted((root / "crates").rglob("*.rs")):
@@ -1141,6 +1160,30 @@ def legacy_names_check(root: Path) -> dict[str, Any]:
                 issues.append(
                     f"{path.relative_to(root)}: references removed legacy {name}"
                 )
+    for relative in removed_paths:
+        if (root / relative).exists():
+            issues.append(
+                f"{relative}: retired pre-release path must not return "
+                "(historical stages live in Git history and archived OpenSpec changes)"
+            )
+    scenarios = root / "scripts/acceptance/scenarios.toml"
+    if scenarios.is_file():
+        text = scenarios.read_text(encoding="utf-8", errors="replace")
+        if "cli-compatibility" in text:
+            issues.append(
+                "scripts/acceptance/scenarios.toml: removed cli-compatibility "
+                "scenario must not return"
+            )
+    for spec in sorted((root / "openspec/specs").glob("*/spec.md")):
+        text = spec.read_text(encoding="utf-8", errors="replace")
+        # The exact mandate that kept the removed pre-release surface alive in
+        # specs (runnable-http-cli). Descriptive uses of "legacy" (for
+        # example "removed before 0.1.0") are not flagged.
+        if "SHALL retain the legacy" in text:
+            issues.append(
+                f"{spec.relative_to(root)}: spec mandates a removed pre-release "
+                "CLI compatibility surface"
+            )
     return {"issues": issues}
 
 

@@ -39,7 +39,7 @@ async fn fixture_wal_http_artifact_replay_and_verification_vertical_slice() {
     let recorded = record_fixture(&mut source, &root, 1024 * 1024).expect("record fixture");
 
     let segment = root
-        .join("wal")
+        .join("recordings")
         .join(recorded.session_id.to_string())
         .join("segments")
         .join(segment_file_name(1));
@@ -47,7 +47,7 @@ async fn fixture_wal_http_artifact_replay_and_verification_vertical_slice() {
     assert_eq!(recorded.checkpoint.next_sequence, 6);
 
     std::fs::remove_file(fixture_path).expect("remove fixture copy");
-    std::fs::remove_dir_all(root.join("wal")).expect("remove WAL");
+    std::fs::remove_dir_all(root.join("recordings")).expect("remove WAL");
     let inspected = inspect_session(&root, recorded.session_id).expect("inspect persisted session");
     assert!(inspected.replayable);
 

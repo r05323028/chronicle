@@ -40,7 +40,7 @@ tests = [
   "integration:chronicle-wal-matrix",
   "integration:cli-contract",
   "integration:capture-ebpf-privileged-adapter",
-  "integration:capture-ebpf-privileged-feasibility",
+  "integration:capture-ebpf-privileged-kernel",
   "integration:cli-privileged-signal",
   "tooling:validation-tests",
   "tooling:acceptance-tests",
@@ -59,7 +59,6 @@ tests = [
   "e2e:privileged-capture-pipeline",
   "tooling:privileged-preflight",
   "acceptance:user-intent-lifecycle-privileged",
-  "acceptance:cli-compat-privileged-sample",
   "smoke:documented-commands",
   "acceptance:documented-quickstart-privileged",
 ]
@@ -87,7 +86,7 @@ tests = [
   "integration:chronicle-wal-matrix",
   "integration:cli-contract",
   "integration:capture-ebpf-privileged-adapter",
-  "integration:capture-ebpf-privileged-feasibility",
+  "integration:capture-ebpf-privileged-kernel",
   "integration:cli-privileged-signal",
   "tooling:validation-tests",
   "tooling:acceptance-tests",
@@ -112,7 +111,6 @@ tests = [
   "acceptance:reboot-recovery",
   "tooling:privileged-preflight",
   "acceptance:user-intent-lifecycle-privileged",
-  "acceptance:cli-compat-privileged-sample",
   "smoke:documented-commands",
   "acceptance:documented-quickstart-privileged",
 ]
@@ -139,7 +137,7 @@ tests = [
   "integration:chronicle-wal-matrix",
   "integration:cli-contract",
   "integration:capture-ebpf-privileged-adapter",
-  "integration:capture-ebpf-privileged-feasibility",
+  "integration:capture-ebpf-privileged-kernel",
   "integration:cli-privileged-signal",
   "tooling:validation-tests",
   "tooling:acceptance-tests",
@@ -164,7 +162,6 @@ tests = [
   "e2e:privileged-capture-pipeline",
   "tooling:privileged-preflight",
   "acceptance:user-intent-lifecycle-privileged",
-  "acceptance:cli-compat-privileged-sample",
   "smoke:documented-commands",
   "acceptance:documented-quickstart-privileged",
 ]
@@ -354,11 +351,11 @@ status = "existing"
 gates = ["live-capture", "recorder", "release"]
 
 [[test]]
-id = "integration:capture-ebpf-privileged-feasibility"
+id = "integration:capture-ebpf-privileged-kernel"
 layer = "integration"
 environment = "privileged"
 owner = "chronicle-capture-ebpf"
-command = "cargo test -p chronicle-capture-ebpf --test privileged_feasibility -- --ignored"
+command = "cargo test -p chronicle-capture-ebpf --test privileged_kernel -- --ignored"
 status = "existing"
 gates = ["live-capture", "recorder", "release"]
 
@@ -596,15 +593,6 @@ command = "privileged acceptance scenario user-intent-lifecycle (real cgroup sel
 status = "existing"
 gates = ["live-capture", "recorder", "release"]
 
-[[test]]
-id = "acceptance:cli-compat-privileged-sample"
-layer = "acceptance"
-environment = "privileged"
-owner = "chronicle-cli"
-command = "privileged acceptance sample: real capture output consumed by cli-compatibility forms"
-status = "existing"
-gates = ["live-capture", "recorder", "release"]
-
 # ---------------------------------------------------------------------------
 # Scenario obligations: every scenario id in scripts/acceptance/scenarios.toml
 # must be covered by at least one classified test (no-coverage-loss).
@@ -616,7 +604,7 @@ capture-basic = [
   "unit:chronicle-wal",
   "integration:chronicle-wal-matrix",
   "integration:capture-ebpf-privileged-adapter",
-  "integration:capture-ebpf-privileged-feasibility",
+  "integration:capture-ebpf-privileged-kernel",
   "smoke:recorder-basic-startup",
   "e2e:rootless-synthetic-pipeline",
   "e2e:privileged-capture-pipeline",
@@ -640,12 +628,6 @@ user-intent-lifecycle = [
   "acceptance:record-basic",
   "integration:cli-privileged-signal",
   "acceptance:user-intent-lifecycle-privileged",
-]
-cli-compatibility = [
-  "integration:cli-contract",
-  "acceptance:record-basic",
-  "acceptance:inspect-display",
-  "acceptance:cli-compat-privileged-sample",
 ]
 resource-cleanup = [
   "unit:chronicle-application",
@@ -700,7 +682,7 @@ documented-quickstart = [
 [legacy_check_tests]
 privileged_acceptance = [
   "integration:capture-ebpf-privileged-adapter",
-  "integration:capture-ebpf-privileged-feasibility",
+  "integration:capture-ebpf-privileged-kernel",
 ]
 privileged_signal = ["integration:cli-privileged-signal"]
 systemd_type_simple = ["acceptance:recorder-readiness"]
@@ -760,11 +742,6 @@ user_intent_lifecycle = [
   "unit:chronicle-application",
   "acceptance:record-basic",
   "acceptance:user-intent-lifecycle-privileged",
-]
-cli_compatibility = [
-  "integration:cli-contract",
-  "acceptance:record-basic",
-  "acceptance:cli-compat-privileged-sample",
 ]
 resource_cleanup = [
   "unit:chronicle-application",

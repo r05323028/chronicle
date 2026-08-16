@@ -45,7 +45,9 @@ class RootlessPipelineTests(unittest.TestCase):
     def test_synthetic_capture_to_replay_verification(self):
         # Stage 1: synthetic capture -> WAL + canonical publication.
         session = process.record_fixture(self.binary, process.FIXTURE_BASIC, self.root)
-        segments = list((self.root / "wal" / session / "segments").glob("*.chwal"))
+        segments = list(
+            (self.root / "recordings" / session / "segments").glob("*.chwal")
+        )
         self.assertTrue(segments, "capture must persist WAL segments")
         session_json = self.root / "sessions" / session / "session.json"
         self.assertTrue(session_json.is_file(), "ETL must publish canonical session")

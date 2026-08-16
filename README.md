@@ -279,7 +279,6 @@ No checked-in configuration contains secrets: `postgres.connection_url_env` name
 - [Crate boundaries](docs/architecture/crate-boundaries.md) — per-crate responsibility and dependency rules.
 - [Operations](docs/operations.md) — quick start, bounds, cgroup selection, record/recover/publish, inspect/replay, doctor, and validation.
 - [Replay safety](docs/replay-safety.md) — the replay safety model and authorization semantics.
-- [Release notes](docs/release-notes.md) — version history and deprecation schedule.
 - [Contributing](CONTRIBUTING.md) — how to contribute.
 - [Website product brief](docs/PRODUCT.md) — website scope and product truth.
 - [Website design brief](docs/DESIGN.md) — website visual system and responsive rules.

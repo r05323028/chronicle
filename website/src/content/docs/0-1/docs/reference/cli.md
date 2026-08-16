@@ -61,8 +61,6 @@ chronicle --format json doctor
 
 All three are safe to use for diagnosis. `doctor` is non-destructive; `inspect` avoids printing bodies and arbitrary header values.
 
-## Hidden compatibility and advanced entrypoints
+## Advanced entrypoints
 
-0.1.x retains hidden compatibility paths for the continuous recorder, recorder status, internal ETL, fixture recording, and legacy session-root syntax. They emit deprecation warnings and are not the recommended public surface. Docker/Kubernetes commands do not exist.
-
-Use [release notes](https://github.com/r05323028/chronicle/blob/main/docs/release-notes.md) and the repository [operations guide](https://github.com/r05323028/chronicle/blob/main/docs/operations.md) when migrating a hidden 0.1.x invocation.
+The hidden `internal` namespace is the operational surface for the continuous recorder, recorder status, standalone ETL, and deterministic fixture recording; it is not the recommended public surface. Docker/Kubernetes commands do not exist.

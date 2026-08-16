@@ -19,8 +19,10 @@ Before the first public release, each internal artifact domain SHALL have exactl
 - **THEN** both emit the same active Capture Event model
 - **AND** source type does not select schema version
 
-### Requirement: MVP readers have no obsolete compatibility dispatch
+### Requirement: Readers have no obsolete compatibility dispatch
 Each internal artifact domain SHALL expose one current reader/writer path. V1/V2/V3 dispatch enums, legacy readers, migration adapters, fallback defaults for obsolete models, and dual-write paths MUST NOT be retained solely for repository history. Superseded repository-only formats SHALL be rejected with typed unsupported-schema or unsupported-format error.
+
+
 
 #### Scenario: Obsolete repository artifact
 - **WHEN** bytes or JSON from superseded repository-only format are presented
@@ -30,6 +32,19 @@ Each internal artifact domain SHALL expose one current reader/writer path. V1/V2
 #### Scenario: Repository source inspection
 - **WHEN** schema implementation is reviewed
 - **THEN** no active V1/V2/V3 dispatch enum or legacy compatibility reader exists for internal artifacts
+
+### Requirement: No pre-release CLI compatibility surface and explicit lineage
+
+Unreleased CLI compatibility surfaces SHALL be removed before 0.1.0, not carried into a release: hidden legacy entrypoints, deprecation-warning machinery, and session-root syntax SHALL NOT be reintroduced without an explicit OpenSpec change. Runtime lineage SHALL be explicit: session-to-recording association uses `source_provenance` fields only, and identifier equality is never used to infer lineage. Feasibility-only implementations SHALL NOT be reintroduced when production validation paths exist; privileged kernel validation runs only against the production probe.
+#### Scenario: Reintroduced legacy entrypoint fails validation
+
+- **WHEN** a change reintroduces a hidden pre-release CLI entrypoint or deprecation-warning machinery without an explicit OpenSpec change
+- **THEN** strict spec validation and the legacy-names gate reject the change
+
+#### Scenario: Provenance-less session is unresolved
+
+- **WHEN** a canonical session lacks explicit source_provenance recording_id or epoch_id
+- **THEN** the session is not associated with any recording and is not resolvable for parent replay
 
 ### Requirement: Repository artifacts migrate atomically
 Schema edits SHALL migrate checked-in fixtures, golden files, embedded objects, documentation, tests, and active planning artifacts in same change. Repository tests MUST exercise only current models except explicit rejection tests for unsupported versions.

@@ -60,9 +60,8 @@ class SmokeTests(unittest.TestCase):
         result = process.run(
             self.binary,
             [
-                "record",
-                "--source",
-                "fixture",
+                "internal",
+                "record-fixture",
                 "--input",
                 str(missing),
                 "--root",
@@ -83,7 +82,7 @@ class SmokeTests(unittest.TestCase):
         self.assertTrue(session)
         self.assertTrue((self.root / "sessions" / session / "session.json").is_file())
         self.assertTrue(
-            list((self.root / "wal" / session / "segments").glob("*.chwal"))
+            list((self.root / "recordings" / session / "segments").glob("*.chwal"))
         )
 
     def test_inspect_liveness_minimal_recording(self):

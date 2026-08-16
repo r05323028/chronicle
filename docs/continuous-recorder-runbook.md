@@ -48,8 +48,6 @@ Retain machine-readable status, recovery reports, manifests, checkpoints, tombst
 
 Stop recorder, retain state/store/WAL, deploy exact artifact, run doctor, then start. Roll back binary/config only after schema and lineage validation. Do not mix state from different configuration digests.
 
-Top-level `recorder` and `recorder-status` are hidden deprecated 0.1.x aliases. Migrate automation to `chronicle internal ...`; aliases are removed at 0.2.
-
 ## Ownership
 
 - Platform owner: kernel, cgroup v2, BTF, capabilities, systemd, disk.

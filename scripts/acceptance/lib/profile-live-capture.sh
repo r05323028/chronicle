@@ -85,7 +85,6 @@ SIGNAL_RESULT="not_checked"
 SIGNAL_SHARED_RUNTIME_RESULT="not_checked"
 SHARED_RUNTIME_RESULT="not_checked"
 USER_INTENT_RESULT="not_checked"
-CLI_COMPATIBILITY_RESULT="not_checked"
 EXPECTED_SHA=${CHRONICLE_ACCEPTANCE_EXPECTED_SHA:-}
 START_SHA="not_checked"
 END_SHA="not_checked"
@@ -182,7 +181,7 @@ write_summary() {
 	if [[ -f "$EBPF_OBJECT" ]]; then
 		EBPF_OBJECT_SHA256=$(sha256sum "$EBPF_OBJECT" | awk '{print $1}')
 	fi
-	python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$working_tree_dirty" "$COMMAND_LOG" "$ACCEPTANCE_MODE" "$SIGNAL_RESULT" "$USER_INTENT_RESULT" "$CLI_COMPATIBILITY_RESULT" "$RELEASE_MODE" "$EXPECTED_SHA" "$START_SHA" "$END_SHA" "$TREE_CLEAN" "$SIGNAL_SHARED_RUNTIME_RESULT" <<'PY'
+	python3 - "$SUMMARY" "$status" "$CURRENT_PHASE" "$commit_sha" "$kernel" "$architecture" "$cgroup_status" "$btf_status" "$cap_eff" "$EBPF_OBJECT_SHA256" "$working_tree_dirty" "$COMMAND_LOG" "$ACCEPTANCE_MODE" "$SIGNAL_RESULT" "$USER_INTENT_RESULT" "$RELEASE_MODE" "$EXPECTED_SHA" "$START_SHA" "$END_SHA" "$TREE_CLEAN" "$SIGNAL_SHARED_RUNTIME_RESULT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -191,9 +190,9 @@ summary = Path(sys.argv[1])
 status, phase = sys.argv[2:4]
 commit, kernel, architecture, cgroup, btf, cap_eff, object_sha, dirty, command_log = sys.argv[4:13]
 mode, signal = sys.argv[13:15]
-user_intent, cli_compatibility = sys.argv[15:17]
-release, expected, start_sha, end_sha, tree_clean = sys.argv[17:22]
-signal_shared_runtime = sys.argv[22]
+user_intent = sys.argv[15]
+release, expected, start_sha, end_sha, tree_clean = sys.argv[16:21]
+signal_shared_runtime = sys.argv[21]
 summary.parent.mkdir(parents=True, exist_ok=True)
 result = "passed" if status == "0" else ("not_checked" if status == "77" else "failed")
 commands = []
@@ -209,7 +208,6 @@ retained = (
     and result == "passed"
     and identity_ok
     and user_intent == "passed"
-    and cli_compatibility == "passed"
     and all(value == "passed" for value in scenarios.values())
 )
 # Portable WAL/ingest/replay/cgroup/fmt/workspace matrices are separately
@@ -218,7 +216,6 @@ retained = (
 required_matrix = {
     "privileged_signal": signal,
     "user_intent_lifecycle": user_intent,
-    "cli_compatibility": cli_compatibility,
 }
 if result == "passed" and (mode == "full" and (
     not retained or any(value != "passed" for value in required_matrix.values())
@@ -250,7 +247,6 @@ summary.write_text(json.dumps({
         "privileged_scenarios": scenarios,
         "privileged_signal": signal,
         "user_intent_lifecycle": user_intent,
-        "cli_compatibility": cli_compatibility,
     },
     "status": result,
     "exit_code": int(status),

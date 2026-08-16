@@ -3,12 +3,12 @@
 ## Status labels
 
 - **Current:** compiled and tested now.
-- **Planned MVP:** intended before MVP acceptance.
+- **Planned:** intended for a future milestone.
 - **Future:** explicit extension point, not a current promise.
 
-## MVP versioning policy
+## Pre-0.1 versioning policy
 
-Before the first public release, every internal artifact domain has one current runtime model, reader, and writer. Capture events, private eBPF ABI records, WAL, canonical sessions, manifests, recording metadata, epoch catalogs, rollover transitions, ETL checkpoints, continuations, fixtures, and machine-readable reports evolve by updating the current model plus repository fixtures, tests, and documentation in same change. Unreleased internal persisted schemas may be replaced rather than supported through permanent runtime compatibility layers; persisted structures may keep explicit schema version numbers (for example epochs.json version 2).
+Before the first public release, every internal artifact domain has one current runtime model, reader, and writer. Capture events, private eBPF ABI records, WAL, canonical sessions, manifests, recording metadata, epoch catalogs, rollover transitions, ETL checkpoints, continuations, fixtures, and machine-readable reports evolve by updating the current model plus repository fixtures, tests, and documentation in same change. Unreleased internal persisted schemas may be replaced rather than supported through permanent runtime compatibility layers; persisted structures may keep explicit schema version numbers (for example epochs.json version 2). No hidden pre-release CLI compatibility surface is retained, and runtime lineage is never inferred from identifier equality.
 
 Chronicle does not retain V1/V2/V3 dispatch enums, migration adapters, dual writers, or compatibility readers for repository history. Stable wire formats intentionally preserved by the project (WAL v1 framing and commit markers, Capture Event v1, Canonical Session v1, replay safety contracts) remain versioned separately. A freeze requires explicit OpenSpec change declaring compatibility freeze, frozen contract scope, supported reader/writer combinations, migration policy, and deprecation policy.
 
@@ -32,9 +32,9 @@ Arrows point from dependent crate to its compile-time dependencies. No crate dep
 
 Thirteen crates consolidate real protocol modules into `chronicle-protocol-builtins`; one empty crate per protocol would add coupling and maintenance without behavior. Modules remain independent registration boundaries. Future independently distributed plugins require a versioned ABI/process boundary, not Rust trait objects across dynamic libraries.
 
-## One-shot recording pipeline
+## Recording pipeline
 
-Fixture and eBPF sources emit same `CaptureEvent` v1 model. `SocketConnected` carries stable socket identity, local/remote IP endpoints, and active/passive role before endpoint-free payload fragments. Capture adapter caches complete evidence by socket identity and rejects conflicting tuple or role.
+Fixture and eBPF sources emit the same `CaptureEvent` v1 model. `SocketConnected` carries stable socket identity, local/remote IP endpoints, and active/passive role before endpoint-free payload fragments. Capture adapter caches complete evidence by socket identity and rejects conflicting tuple or role.
 
 A bounded 4096-event queue feeds segmented WAL v1. Each group appends data, one in-WAL `CommitMarker`, flushes, and performs one `fdatasync`; recording metadata is non-authoritative and reconciled from validated markers. Recovery mutates only a verified incomplete final tail. ETL consumes the final recovery-authoritative prefix, reconstructs socket generations/TCP positions, decodes bounded HTTP/1.1, and publishes one deterministic Canonical Session v1. Active maps local→client and remote→server; passive maps remote→client and local→server. Ingress/egress controls byte direction only. Missing or conflicting evidence is typed failure; production never fabricates `unknown:0` endpoints.
 
@@ -56,7 +56,7 @@ Public commands resolve data directory in fixed precedence: `--data-dir`, config
 
 `RecordingId` is user-facing stable identity rendered `rec_<uuid>`; `latest` and exact names resolve through bounded reconciled catalog view. Catalog and `recording-intent.json` sidecars are advisory. Recovery-authoritative WAL metadata and canonical session facts win contradictions. One exact normalized `.chronicle-domain.lock` path protects name claim, capture, ETL, publication, and catalog update as one transaction.
 
-Canonical `SessionId` is independently deterministic and may differ from recording ID. Association uses `source_provenance.recording_id`; ID equality remains legacy fallback only. Public users operate on recording references, while hidden compatibility paths may still address session IDs and explicit roots through 0.1.x.
+Canonical `SessionId` is independently deterministic and may differ from recording ID. Association uses `source_provenance.recording_id` / `epoch_id` only; identifier equality is never lineage, and sessions without explicit provenance are unresolved. Public users operate on recording references; the hidden `internal` namespace is the operational surface for recorder, recorder-status, ETL, and deterministic fixture recording.
 
 ## Ownership and backpressure
 

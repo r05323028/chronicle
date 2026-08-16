@@ -1,6 +1,6 @@
 # Canonical Session Model
 
-## Mutable MVP v1
+## Mutable v1
 
 Canonical Session has one active schema: `CANONICAL_SCHEMA_VERSION = 1`. Writer and reader accept only schema value 1. Rust model is unversioned `CanonicalSession`; no DTO dispatch, migration defaults, or compatibility reader exists. Contract remains mutable until explicit compatibility-freeze OpenSpec change.
 
@@ -29,7 +29,7 @@ Operations are `complete`, `incomplete`, `truncated`, `malformed`, `unmatched`, 
 
 WAL and payload artifacts can contain sensitive production headers and bodies. Private filesystem modes and value-safe output are safeguards, not encryption, secret detection, comprehensive redaction, or tenant isolation.
 
-## Planned MVP
+## Planned
 
 PostgreSQL stores session/connection/operation indexes, replay metadata, verification summaries, ETL checkpoints, and artifact references. Large bodies, raw capture artifacts, BSON, compressed frames, and replay artifacts move to S3-compatible storage after redaction.
 

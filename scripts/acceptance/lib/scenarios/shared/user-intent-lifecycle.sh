@@ -92,18 +92,14 @@ PY
 	[[ $after_segments == "$before_segments" ]]
 
 	# Deterministic write-only recording separates policy denial from capture loss.
-	local fixture_root="$root/write-fixture" replay_data="$root/replay-data" replay_uuid replay_ref
+	local fixture_root="$root/write-fixture" replay_uuid replay_ref
 	"$CHRONICLE" --format json internal record-fixture --input "$ROOT/fixtures/http/binary-body.json" --root "$fixture_root" >"$root/write-fixture.json"
-	replay_uuid=$(basename "$(find "$fixture_root/wal" -mindepth 1 -maxdepth 1 -type d -print -quit)")
+	replay_uuid=$(basename "$(find "$fixture_root/recordings" -mindepth 1 -maxdepth 1 -type d -print -quit)")
 	replay_ref="rec_$replay_uuid"
-	install -d -m 0700 "$replay_data"
-	mkdir -p "$replay_data/recordings" "$replay_data/sessions"
-	cp -a "$fixture_root/wal/$replay_uuid" "$replay_data/recordings/$replay_uuid"
-	cp -a "$fixture_root/sessions/." "$replay_data/sessions/"
-	"$CHRONICLE" --format json --data-dir "$replay_data" inspect "$replay_ref" >"$root/write-inspect.json"
+	"$CHRONICLE" --format json --data-dir "$fixture_root" inspect "$replay_ref" >"$root/write-inspect.json"
 	assert_json "$root/write-inspect.json" 'value["replayability"] == "fully_replayable" and value["connections"][0]["operations"][0]["effect"] == "write"'
 
-	local v6_fixture="$root/write-v6-fixture.json" v6_fixture_root="$root/write-v6-fixture" v6_data="$root/replay-v6-data" v6_uuid v6_ref
+	local v6_fixture="$root/write-v6-fixture.json" v6_fixture_root="$root/write-v6-fixture" v6_uuid v6_ref
 	python3 - "$ROOT/fixtures/http/binary-body.json" "$v6_fixture" <<'PY'
 import json, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -112,12 +108,8 @@ value["connections"][0]["remote_endpoint"]["host"] = "2001:db8::20"
 json.dump(value, open(sys.argv[2], "w", encoding="utf-8"))
 PY
 	"$CHRONICLE" --format json internal record-fixture --input "$v6_fixture" --root "$v6_fixture_root" >"$root/write-v6-fixture-output.json"
-	v6_uuid=$(basename "$(find "$v6_fixture_root/wal" -mindepth 1 -maxdepth 1 -type d -print -quit)")
+	v6_uuid=$(basename "$(find "$v6_fixture_root/recordings" -mindepth 1 -maxdepth 1 -type d -print -quit)")
 	v6_ref="rec_$v6_uuid"
-	install -d -m 0700 "$v6_data"
-	mkdir -p "$v6_data/recordings" "$v6_data/sessions"
-	cp -a "$v6_fixture_root/wal/$v6_uuid" "$v6_data/recordings/$v6_uuid"
-	cp -a "$v6_fixture_root/sessions/." "$v6_data/sessions/"
 
 	# PID and cgroup selectors attach to existing workloads and never terminate them.
 	sleep 600 >"$root/pid-target.log" 2>&1 &
@@ -140,7 +132,7 @@ PY
 
 	# Write denial is target-independent: target marker must never be created.
 	set +e
-	separated_chronicle "$CHRONICLE" --format json --data-dir "$replay_data" replay "$replay_ref" -- \
+	separated_chronicle "$CHRONICLE" --format json --data-dir "$fixture_root" replay "$replay_ref" -- \
 		/usr/bin/touch "$runtime/denied-target-started" >"$root/replay-denied.json" 2>"$root/replay-denied.error.json"
 	local denied_status=$?
 	set -e
@@ -148,20 +140,20 @@ PY
 	assert_json "$root/replay-denied.json" 'value["version"] == 1 and value["plan"]["preflight_denied"] is True and value["result"]["counts"]["attempted"] == 0 and value["cleanup"]["status"] == "clean"'
 
 	# Inferred IPv4 and IPv6 listeners both replay; mismatch remains factual exit 6.
-	separated_chronicle "$CHRONICLE" --format json --data-dir "$replay_data" replay "$replay_ref" --allow-write -- \
+	separated_chronicle "$CHRONICLE" --format json --data-dir "$fixture_root" replay "$replay_ref" --allow-write -- \
 		bash -c 'if printf "%s\n" "$$" >/sys/fs/cgroup/cgroup.procs 2>/dev/null; then exit 90; fi; id -u >"$1"; exec python3 "$2" serve --port 8080 --port-file "$3" --requests "$4"' \
 		bash "$runtime/replay-v4.uid" "$DRIVER" "$runtime/replay-v4.port" "$runtime/replay-v4-requests.jsonl" \
 		>"$root/replay-v4.json" 2>"$root/replay-v4.log"
 	assert_json "$root/replay-v4.json" 'value["version"] == 1 and value["result"]["outcome"] in ("completed", "completed_with_skips") and value["cleanup"]["status"] in ("clean", "killed")'
 	[[ "$(<"$runtime/replay-v4.uid")" == "$target_uid" ]]
 
-	separated_chronicle "$CHRONICLE" --format json --data-dir "$v6_data" replay "$v6_ref" --allow-write -- \
+	separated_chronicle "$CHRONICLE" --format json --data-dir "$v6_fixture_root" replay "$v6_ref" --allow-write -- \
 		python3 "$DRIVER" serve --host ::1 --port 8080 --port-file "$runtime/replay-v6.port" --requests "$runtime/replay-v6-requests.jsonl" \
 		>"$root/replay-v6.json" 2>"$root/replay-v6.log"
 	assert_json "$root/replay-v6.json" 'value["version"] == 1 and value["result"]["outcome"] in ("completed", "completed_with_skips") and value["cleanup"]["status"] in ("clean", "killed")'
 
 	set +e
-	separated_chronicle "$CHRONICLE" --format json --data-dir "$replay_data" replay "$replay_ref" --allow-write -- \
+	separated_chronicle "$CHRONICLE" --format json --data-dir "$fixture_root" replay "$replay_ref" --allow-write -- \
 		python3 "$DRIVER" serve --mismatch --port 8080 --port-file "$runtime/replay-fail.port" --requests "$runtime/replay-fail-requests.jsonl" \
 		>"$root/replay-fail.json" 2>"$root/replay-fail.log"
 	local replay_fail_status=$?

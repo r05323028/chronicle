@@ -10,7 +10,6 @@ scenarios = [
   "wal-recovery",
   "replay",
   "user-intent-lifecycle",
-  "cli-compatibility",
   "documented-quickstart",
   "resource-cleanup",
 ]
@@ -19,7 +18,6 @@ execution_order = [
   "wal-recovery",
   "replay",
   "user-intent-lifecycle",
-  "cli-compatibility",
   "documented-quickstart",
   "resource-cleanup",
 ]
@@ -39,7 +37,6 @@ scenarios = [
   "corruption-quarantine",
   "reboot-recovery",
   "user-intent-lifecycle",
-  "cli-compatibility",
   "documented-quickstart",
 ]
 execution_order = [
@@ -55,7 +52,6 @@ execution_order = [
   "replay",
   "retention-interruption",
   "user-intent-lifecycle",
-  "cli-compatibility",
   "documented-quickstart",
   "resource-cleanup",
 ]
@@ -91,12 +87,6 @@ timeout_seconds = 600
 capabilities = ["privileged", "ebpf", "cgroup-v2", "replay"]
 phases = ["record", "retry", "selectors", "replay", "cleanup"]
 legacy_live_capture_checks = ["user_intent_lifecycle"]
-
-[scenarios.cli-compatibility]
-timeout_seconds = 300
-capabilities = ["privileged", "ebpf", "compatibility"]
-phases = ["cli_compatibility"]
-legacy_live_capture_checks = ["cli_compatibility"]
 
 [scenarios.documented-quickstart]
 timeout_seconds = 600

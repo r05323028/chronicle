@@ -16,7 +16,7 @@ Core ETL/replay dispatches through registration capabilities and contains no pro
 
 `chronicle-protocol-builtins` contains HTTP/1.1, PostgreSQL, MySQL-family, MySQL, MariaDB, Oracle, MongoDB, Kafka, NATS, and fake module boundaries. Fake and bounded plaintext HTTP/1.1 have all five capabilities available; every other protocol retains its declared non-Available status.
 
-## Planned MVP
+## Planned
 
 Real implementations remain ordinary Rust modules/crates linked at compile time. Detectors combine ports, signatures, validated framing, metadata, confidence, and need-more-data states. Malformed/truncated/unknown bytes produce issues and opaque preservation rather than process crashes.
 
@@ -24,4 +24,8 @@ Oracle code must not invent undocumented semantics. Opaque TNS frames remain val
 
 ## Future distribution
 
-Separately distributed plugins require an explicit versioned ABI, subprocess/RPC, WebAssembly component boundary, or another safe contract. Rust trait-object layouts are not stable ABI and must never cross a dynamic-library boundary directly. Dynamic loading is not part of MVP.
+Separately distributed plugins require an explicit versioned ABI, subprocess/RPC, WebAssembly component boundary, or another safe contract. Rust trait-object layouts are not stable ABI and must never cross a dynamic-library boundary directly. Dynamic loading is not part of the current scope.
+
+## Decision history
+
+The compile-time registry decision (formerly ADR 0001) is captured here and in `docs/architecture/crate-boundaries.md`; the historical decision record lives in OpenSpec archives and Git history.

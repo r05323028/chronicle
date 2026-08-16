@@ -57,7 +57,7 @@ class InspectAcceptanceTests(unittest.TestCase):
         session = self.record()
         result = process.run(
             self.binary,
-            ["inspect", session, "--root", str(self.root)],
+            ["inspect", session],
             data_dir=self.root,
         )
         self.assertEqual(result.returncode, 0)

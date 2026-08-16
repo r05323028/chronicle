@@ -8,10 +8,9 @@ use chronicle_application::{
     RecordingStatus, ShutdownReason, build_parent_replay_plan, data_dir_doctor_probe,
     inspect_session, list_parent_recording_views, list_recordings, load_recorder_metadata,
     process_and_publish_recording_wal, process_and_publish_recording_wal_with_parent,
-    record_fixture_file, render_inspect_human, render_inspect_json, render_json,
-    render_replay_human, replay_command, replay_config_doctor_probe,
-    replay_parent_session_with_plan, replay_session_with_plan, resolve_data_dir, resolve_recording,
-    resolve_session, retry_recording,
+    record_fixture_file, render_inspect_human, render_json, render_replay_human, replay_command,
+    replay_config_doctor_probe, replay_parent_session_with_plan, replay_session_with_plan,
+    resolve_data_dir, resolve_recording, resolve_session, retry_recording,
 };
 #[cfg(target_os = "linux")]
 use chronicle_application::{
@@ -24,7 +23,6 @@ use chronicle_application::{ChildExitResult, CommandRecordResult};
 use chronicle_application::{ReplayRequest, ReplayTiming};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde::Serialize;
-use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -64,26 +62,12 @@ enum Command {
     Inspect(InspectArgs),
     /// Diagnose environment and storage readiness with actionable remediation.
     Doctor(DoctorArgs),
-    /// Hidden internal entrypoints (0.1.x compatibility; removal targeted 0.2).
+    /// Hidden internal operational namespace: `internal recorder`, `internal
+    /// recorder-status`, `internal etl`, `internal record-fixture`, and
+    /// `internal bootstrap` (foreground operation and deterministic fixture
+    /// support; not user-facing product commands).
     #[command(subcommand, hide = true)]
     Internal(InternalCommand),
-    /// Run continuous recorder in foreground until shutdown or configured limit.
-    #[command(hide = true)]
-    Recorder,
-    /// Read recorder metadata without mutating recorder state.
-    #[command(hide = true)]
-    RecorderStatus {
-        #[arg(long)]
-        state_root: PathBuf,
-    },
-    /// Canonicalize and publish one finalized recording WAL.
-    #[command(hide = true)]
-    Etl {
-        #[arg(long)]
-        wal_dir: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-    },
 }
 
 /// Hidden explicit internal namespace: `chronicle internal recorder`, etc.
@@ -143,23 +127,9 @@ struct RecordArgs {
     /// Record an already-running cgroup subtree (never terminated).
     #[arg(long)]
     cgroup: Option<PathBuf>,
-    // Hidden 0.1.x compatibility form: `record --source fixture|ebpf ...`.
-    #[arg(long, hide = true)]
-    source: Option<Source>,
-    #[arg(long, hide = true)]
-    input: Option<PathBuf>,
-    #[arg(long, hide = true)]
-    root: Option<PathBuf>,
-    #[arg(long, hide = true)]
-    wal_dir: Option<PathBuf>,
+    /// Acknowledge a shared cgroup subtree (more than one direct TGID).
     #[arg(long, hide = true)]
     allow_shared_cgroup: bool,
-    #[arg(long, hide = true)]
-    segment_bytes: Option<u64>,
-    #[arg(long, hide = true)]
-    duration_seconds: Option<u64>,
-    #[arg(long, hide = true)]
-    max_wal_bytes: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -190,9 +160,7 @@ struct ReplayArgs {
     /// Execute (explicit target mode only).
     #[arg(long)]
     execute: bool,
-    // Hidden 0.1.x compatibility form: `replay SESSION --root ROOT --target ...`.
-    #[arg(long, hide = true)]
-    root: Option<PathBuf>,
+    /// Replay timing control (advanced).
     #[arg(long, hide = true, value_enum)]
     timing: Option<Timing>,
 }
@@ -201,25 +169,17 @@ struct ReplayArgs {
 struct InspectArgs {
     /// Recording to inspect: `latest`, `rec_<uuid>`, bare UUID, or exact name.
     recording: String,
-    // Hidden 0.1.x compatibility form: `inspect SESSION --root ROOT`.
-    #[arg(long, hide = true)]
-    root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct DoctorArgs {
-    // Hidden 0.1.x compatibility/advanced probes.
+    // Hidden advanced diagnostic probes.
     #[arg(long, hide = true)]
     wal_dir: Option<PathBuf>,
     #[arg(long, hide = true)]
     output: Option<PathBuf>,
     #[arg(long, hide = true)]
     state_root: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Source {
-    Fixture,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -232,53 +192,6 @@ enum Format {
 enum Timing {
     Preserve,
     Asap,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LegacyInvocation {
-    Recorder,
-    RecorderStatus,
-    Etl,
-    RecordFixture,
-    ReplayRoot,
-    InspectRoot,
-}
-
-impl LegacyInvocation {
-    const fn id(self) -> &'static str {
-        match self {
-            Self::Recorder => "recorder",
-            Self::RecorderStatus => "recorder_status",
-            Self::Etl => "etl",
-            Self::RecordFixture => "record_source_fixture",
-            Self::ReplayRoot => "replay_root",
-            Self::InspectRoot => "inspect_root",
-        }
-    }
-
-    const fn replacement(self) -> &'static str {
-        match self {
-            Self::Recorder => "chronicle internal recorder --config FILE",
-            Self::RecorderStatus => "chronicle internal recorder-status --state-root DIRECTORY",
-            Self::Etl => "chronicle internal etl --wal-dir DIRECTORY --output DIRECTORY",
-            Self::RecordFixture => {
-                "chronicle internal record-fixture --input FILE --root DIRECTORY"
-            }
-            Self::ReplayRoot => {
-                "chronicle replay RECORDING --target URL --allow-host HOST [--execute]"
-            }
-            Self::InspectRoot => "chronicle inspect RECORDING",
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct DeprecationJson {
-    version: u8,
-    level: &'static str,
-    code: &'static str,
-    invocation: &'static str,
-    replacement: &'static str,
 }
 
 #[derive(Serialize)]
@@ -481,43 +394,17 @@ async fn async_main() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
-    let raw_args: Vec<OsString> = std::env::args_os().collect();
-    let parse_format = format_from_raw_args(&raw_args);
-    let raw_legacy = legacy_invocation_from_raw_args(&raw_args);
-    let cli = match Cli::try_parse_from(&raw_args) {
+    let cli = match Cli::try_parse_from(std::env::args_os()) {
         Ok(cli) => cli,
-        Err(error) => {
-            if let Some(legacy) = raw_legacy {
-                exit_legacy_error(parse_format, 2, "invalid deprecated CLI invocation", legacy);
-            }
-            error.exit();
-        }
+        Err(error) => error.exit(),
     };
-    let legacy = legacy_invocation(&cli);
     if let Err(error) = validate_record_arguments(&cli) {
-        if let Some(legacy) = legacy {
-            exit_legacy_error(cli.format, 2, "invalid deprecated CLI invocation", legacy);
-        }
         error.exit();
     }
     let format = cli.format;
     match run(cli).await {
         Ok((output, code)) => {
-            if code != 0
-                && let Some(legacy) = legacy
-            {
-                exit_legacy_error(format, code, "deprecated CLI invocation failed", legacy);
-            }
             if let Err(error) = write_output(io::stdout().lock(), &output) {
-                let _ = write_output(
-                    io::stderr().lock(),
-                    &format!("CLI output I/O failed: {error}"),
-                );
-                std::process::exit(3);
-            }
-            if let Some(legacy) = legacy
-                && let Err(error) = write_deprecation_warning(format, legacy)
-            {
                 let _ = write_output(
                     io::stderr().lock(),
                     &format!("CLI output I/O failed: {error}"),
@@ -528,164 +415,20 @@ async fn async_main() {
         }
         Err(error) => {
             let code = error_code(&error);
-            let message = legacy.map_or_else(
-                || error.to_string(),
-                |legacy| legacy_error_message(&error.to_string(), legacy),
-            );
             let output = if matches!(format, Format::Json) {
                 render_json(&ErrorJson {
                     version: 1,
                     code,
-                    message,
+                    message: error.to_string(),
                 })
                 .unwrap_or_else(|render_error| render_error.to_string())
             } else {
-                message
+                error.to_string()
             };
             let _ = write_output(io::stderr().lock(), &output);
             std::process::exit(code);
         }
     }
-}
-
-fn legacy_invocation(cli: &Cli) -> Option<LegacyInvocation> {
-    match &cli.command {
-        Command::Recorder => Some(LegacyInvocation::Recorder),
-        Command::RecorderStatus { .. } => Some(LegacyInvocation::RecorderStatus),
-        Command::Etl { .. } => Some(LegacyInvocation::Etl),
-        Command::Record(args) => args
-            .source
-            .map(|Source::Fixture| LegacyInvocation::RecordFixture),
-        Command::Replay(args) if args.root.is_some() => Some(LegacyInvocation::ReplayRoot),
-        Command::Inspect(args) if args.root.is_some() => Some(LegacyInvocation::InspectRoot),
-        _ => None,
-    }
-}
-
-fn legacy_invocation_from_raw_args(args: &[OsString]) -> Option<LegacyInvocation> {
-    let mut skip_value = false;
-    for (index, argument) in args.iter().enumerate().skip(1) {
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
-        let Some(argument) = argument.to_str() else {
-            continue;
-        };
-        if argument == "--" {
-            break;
-        }
-        if matches!(argument, "--format" | "--config" | "--data-dir") {
-            skip_value = true;
-            continue;
-        }
-        if argument.starts_with("--format=")
-            || argument.starts_with("--config=")
-            || argument.starts_with("--data-dir=")
-        {
-            continue;
-        }
-        let remaining = &args[index + 1..];
-        let legacy = match argument {
-            "recorder" => Some(LegacyInvocation::Recorder),
-            "recorder-status" => Some(LegacyInvocation::RecorderStatus),
-            "etl" => Some(LegacyInvocation::Etl),
-            "record" => raw_legacy_record(remaining),
-            "replay" if raw_has_flag(remaining, "--root") => Some(LegacyInvocation::ReplayRoot),
-            "inspect" if raw_has_flag(remaining, "--root") => Some(LegacyInvocation::InspectRoot),
-            _ => None,
-        };
-        if legacy.is_some() {
-            return legacy;
-        }
-    }
-    None
-}
-
-fn raw_legacy_record(args: &[OsString]) -> Option<LegacyInvocation> {
-    for argument in args {
-        let argument = argument.to_str()?;
-        if argument == "--" {
-            break;
-        }
-        if argument == "--source" {
-            return Some(LegacyInvocation::RecordFixture);
-        }
-        if let Some(source) = argument.strip_prefix("--source=")
-            && source == "fixture"
-        {
-            return Some(LegacyInvocation::RecordFixture);
-        }
-    }
-    None
-}
-
-fn raw_has_flag(args: &[OsString], flag: &str) -> bool {
-    args.iter()
-        .map_while(|argument| argument.to_str())
-        .take_while(|argument| *argument != "--")
-        .any(|argument| argument == flag || argument.starts_with(&format!("{flag}=")))
-}
-
-fn format_from_raw_args(args: &[OsString]) -> Format {
-    for (index, argument) in args.iter().enumerate().skip(1) {
-        if argument == OsStr::new("--") {
-            break;
-        }
-        if argument == OsStr::new("--format")
-            && args
-                .get(index + 1)
-                .is_some_and(|value| value == OsStr::new("json"))
-            || argument
-                .to_str()
-                .is_some_and(|value| value == "--format=json")
-        {
-            return Format::Json;
-        }
-    }
-    Format::Human
-}
-
-fn legacy_error_message(message: &str, legacy: LegacyInvocation) -> String {
-    format!("{message}\nHint: use {}", legacy.replacement())
-}
-
-fn exit_legacy_error(format: Format, code: i32, message: &str, legacy: LegacyInvocation) -> ! {
-    let message = legacy_error_message(message, legacy);
-    let output = if matches!(format, Format::Json) {
-        serde_json::to_string(&ErrorJson {
-            version: 1,
-            code,
-            message,
-        })
-        .expect("static legacy error is serializable")
-    } else {
-        message
-    };
-    let _ = write_output(io::stderr().lock(), &output);
-    std::process::exit(code);
-}
-
-fn write_deprecation_warning(
-    format: Format,
-    legacy: LegacyInvocation,
-) -> Result<(), std::io::Error> {
-    let warning = match format {
-        Format::Human => format!(
-            "warning: deprecated CLI form '{}'; use: {} (removal in 0.2)",
-            legacy.id(),
-            legacy.replacement()
-        ),
-        Format::Json => serde_json::to_string(&DeprecationJson {
-            version: 1,
-            level: "warning",
-            code: "deprecated_cli",
-            invocation: legacy.id(),
-            replacement: legacy.replacement(),
-        })
-        .expect("static deprecation warning is serializable"),
-    };
-    write_output(io::stderr().lock(), &warning)
 }
 
 #[cfg(target_os = "linux")]
@@ -729,52 +472,32 @@ fn validate_record_arguments(cli: &Cli) -> Result<(), clap::Error> {
     let Command::Record(args) = &cli.command else {
         return Ok(());
     };
-    let Some(source) = args.source else {
-        // New public form: require exactly one mode, and enforce retry
-        // mutual exclusion with capture options (usage errors exit 2).
-        if args.retry.is_some() {
-            if !args.command.is_empty()
-                || args.pid.is_some()
-                || args.cgroup.is_some()
-                || args.name.is_some()
-                || args.duration.is_some()
-            {
-                return Err(Cli::command().error(
-                    ErrorKind::ArgumentConflict,
-                    "--retry conflicts with command, PID, cgroup, name, and duration options",
-                ));
-            }
-            return Ok(());
-        }
-        if args.pid.is_some() && args.cgroup.is_some() {
+    // Public form: require exactly one mode, and enforce retry mutual
+    // exclusion with capture options (usage errors exit 2).
+    if args.retry.is_some() {
+        if !args.command.is_empty()
+            || args.pid.is_some()
+            || args.cgroup.is_some()
+            || args.name.is_some()
+            || args.duration.is_some()
+        {
             return Err(Cli::command().error(
                 ErrorKind::ArgumentConflict,
-                "--pid and --cgroup are mutually exclusive",
-            ));
-        }
-        if args.command.is_empty() && args.pid.is_none() && args.cgroup.is_none() {
-            return Err(Cli::command().error(
-                ErrorKind::MissingRequiredArgument,
-                "record requires one of: -- COMMAND..., --pid PID, --cgroup PATH, or --retry RECORDING",
+                "--retry conflicts with command, PID, cgroup, name, and duration options",
             ));
         }
         return Ok(());
-    };
-    let invalid = match source {
-        Source::Fixture => {
-            args.wal_dir.is_some()
-                || args.pid.is_some()
-                || args.cgroup.is_some()
-                || args.allow_shared_cgroup
-                || args.segment_bytes.is_some()
-                || args.duration_seconds.is_some()
-                || args.max_wal_bytes.is_some()
-        }
-    };
-    if invalid {
+    }
+    if args.pid.is_some() && args.cgroup.is_some() {
         return Err(Cli::command().error(
             ErrorKind::ArgumentConflict,
-            "record source options conflict",
+            "--pid and --cgroup are mutually exclusive",
+        ));
+    }
+    if args.command.is_empty() && args.pid.is_none() && args.cgroup.is_none() {
+        return Err(Cli::command().error(
+            ErrorKind::MissingRequiredArgument,
+            "record requires one of: -- COMMAND..., --pid PID, --cgroup PATH, or --retry RECORDING",
         ));
     }
     Ok(())
@@ -783,10 +506,7 @@ fn validate_record_arguments(cli: &Cli) -> Result<(), clap::Error> {
 #[allow(clippy::too_many_lines)]
 async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
     let recorder_config_path = cli.config.clone();
-    let is_recorder = matches!(
-        &cli.command,
-        Command::Recorder | Command::Internal(InternalCommand::Recorder)
-    );
+    let is_recorder = matches!(&cli.command, Command::Internal(InternalCommand::Recorder));
     let is_doctor = matches!(&cli.command, Command::Doctor(_));
     let config = if is_recorder || is_doctor {
         AppConfig::default()
@@ -799,8 +519,7 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
     let format = cli.format;
     let cli_data_dir = cli.data_dir.clone();
     match cli.command {
-        Command::RecorderStatus { state_root }
-        | Command::Internal(InternalCommand::RecorderStatus { state_root }) => {
+        Command::Internal(InternalCommand::RecorderStatus { state_root }) => {
             let metadata = load_recorder_metadata(&state_root)
                 .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
             let owner_live = RecorderLease::state_is_owned(&state_root)?;
@@ -816,7 +535,7 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
             };
             Ok((output, 0))
         }
-        Command::Recorder | Command::Internal(InternalCommand::Recorder) => {
+        Command::Internal(InternalCommand::Recorder) => {
             let path = recorder_config_path.ok_or(ApplicationError::ProductionPreflight(
                 "recorder requires --config FILE",
             ))?;
@@ -882,8 +601,7 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
                 ))
             }
         }
-        Command::Etl { wal_dir, output }
-        | Command::Internal(InternalCommand::Etl { wal_dir, output }) => {
+        Command::Internal(InternalCommand::Etl { wal_dir, output }) => {
             let registry = chronicle_application::protocol_registry()?;
             let result = match chronicle_application::resolve_epoch_parent_context(&wal_dir)? {
                 Some((parent_id, epoch_id, epoch_ordinal)) => {
@@ -943,7 +661,7 @@ async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
         Command::Record(args) => run_record(args, cli_data_dir.as_deref(), &config, format),
         Command::Replay(args) => run_replay(args, cli_data_dir.as_deref(), &config, format).await,
         Command::List => run_list(cli_data_dir.as_deref(), &config, format),
-        Command::Inspect(args) => run_inspect(args, cli_data_dir.as_deref(), &config, format),
+        Command::Inspect(args) => run_inspect(&args, cli_data_dir.as_deref(), &config, format),
         Command::Doctor(args) => {
             run_doctor(args, cli_data_dir.as_deref(), format, recorder_config_path)
         }
@@ -969,49 +687,7 @@ fn run_record(
     config: &AppConfig,
     format: Format,
 ) -> Result<(String, i32), ApplicationError> {
-    match args.source {
-        Some(Source::Fixture) => record_fixture_legacy(args, config, format),
-        None => public_record(args, cli_data_dir, config, format),
-    }
-}
-
-fn record_fixture_legacy(
-    args: RecordArgs,
-    config: &AppConfig,
-    format: Format,
-) -> Result<(String, i32), ApplicationError> {
-    if args.wal_dir.is_some()
-        || args.pid.is_some()
-        || args.cgroup.is_some()
-        || args.allow_shared_cgroup
-        || args.segment_bytes.is_some()
-        || args.duration_seconds.is_some()
-        || args.max_wal_bytes.is_some()
-    {
-        return Err(ApplicationError::ProductionPreflight(
-            "eBPF-only record options used with fixture source",
-        ));
-    }
-    let input = args.input.ok_or(ApplicationError::ProductionPreflight(
-        "fixture input missing",
-    ))?;
-    let root = args.root.ok_or(ApplicationError::ProductionPreflight(
-        "fixture root missing",
-    ))?;
-    let result = record_fixture_file(input, &root, config.wal.segment_size_bytes)?;
-    let output = match format {
-        Format::Human => format!(
-            "session_id: {}\nroot: {}",
-            result.session_id,
-            root.display()
-        ),
-        Format::Json => render_json(&RecordJson {
-            version: 1,
-            session_id: result.session_id.to_string(),
-            root,
-        })?,
-    };
-    Ok((output, 0))
+    public_record(args, cli_data_dir, config, format)
 }
 
 fn public_record(
@@ -1350,9 +1026,6 @@ async fn run_replay(
     config: &AppConfig,
     format: Format,
 ) -> Result<(String, i32), ApplicationError> {
-    if args.root.is_some() {
-        return run_replay_legacy(args, config, format).await;
-    }
     let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
     let recording_id = resolve_recording(&data_dir, &args.recording)?;
     let parent_plan = build_parent_replay_plan(&data_dir, recording_id)?;
@@ -1464,53 +1137,6 @@ async fn run_replay(
     let plan = plan.expect("replay plan callback must run");
     let output = match format {
         Format::Human => render_public_replay_human(&plan, &result, None),
-        Format::Json => render_json(&ReplayJson {
-            version: REPLAY_REPORT_VERSION,
-            plan: &plan,
-            result: &result,
-        })?,
-    };
-    Ok((output, replay_exit_code(&result)))
-}
-
-async fn run_replay_legacy(
-    args: ReplayArgs,
-    config: &AppConfig,
-    format: Format,
-) -> Result<(String, i32), ApplicationError> {
-    let root = args.root.expect("legacy replay has root");
-    let target = args.target.ok_or(ApplicationError::ProductionPreflight(
-        "legacy replay requires --target",
-    ))?;
-    if args.allow_hosts.is_empty() {
-        return Err(ApplicationError::ProductionPreflight(
-            "legacy replay requires --allow-host",
-        ));
-    }
-    let request = ReplayRequest {
-        target: Some(target),
-        allow_hosts: args.allow_hosts,
-        execute: args.execute,
-        allow_reads: args.allow_read,
-        allow_writes: args.allow_write,
-        timing: args.timing.unwrap_or(Timing::Asap).into(),
-    };
-    let mut plan = None;
-    let result = replay_session_with_plan(
-        root,
-        &args.recording,
-        &config.replay,
-        &request,
-        |next_plan| plan = Some(next_plan.clone()),
-    )
-    .await?;
-    let plan = plan.expect("replay plan callback must run");
-    let output = match format {
-        Format::Human => format!(
-            "plan:\n{}\nresult:\n{}",
-            render_replay_human(&plan),
-            render_replay_human(&result)
-        ),
         Format::Json => render_json(&ReplayJson {
             version: REPLAY_REPORT_VERSION,
             plan: &plan,
@@ -1711,20 +1337,11 @@ fn run_list(
 }
 
 fn run_inspect(
-    args: InspectArgs,
+    args: &InspectArgs,
     cli_data_dir: Option<&Path>,
     config: &AppConfig,
     format: Format,
 ) -> Result<(String, i32), ApplicationError> {
-    if let Some(root) = args.root {
-        let id = parse_session_id(&args.recording)?;
-        let result = inspect_session(root, id)?;
-        let output = match format {
-            Format::Human => render_inspect_human(&result),
-            Format::Json => render_inspect_json(&result)?,
-        };
-        return Ok((output, 0));
-    }
     let data_dir = resolve_public_data_dir(cli_data_dir, config)?;
     let recording_id = resolve_recording(&data_dir, &args.recording)?;
     let recording = list_recordings(&data_dir)?
@@ -1825,12 +1442,6 @@ fn run_doctor(
     Ok((rendered, report.exit_code()))
 }
 
-fn parse_session_id(value: &str) -> Result<chronicle_application::SessionId, ApplicationError> {
-    uuid::Uuid::parse_str(value)
-        .map(chronicle_application::SessionId)
-        .map_err(|_| ApplicationError::InvalidConfig("session ID must be a UUID".into()))
-}
-
 /// Parse checked optional whole-recording duration. Public parsing imposes no
 /// arbitrary recording-wide maximum; epoch/WAL bounds remain separate.
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -1900,40 +1511,59 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_recorder_status_command() {
-        let cli =
-            Cli::try_parse_from(["chronicle", "recorder-status", "--state-root", "state"]).unwrap();
+    fn cli_parses_internal_recorder_status_command() {
+        let cli = Cli::try_parse_from([
+            "chronicle",
+            "internal",
+            "recorder-status",
+            "--state-root",
+            "state",
+        ])
+        .unwrap();
         assert!(matches!(
             cli.command,
-            Command::RecorderStatus { state_root } if state_root.as_path() == std::path::Path::new("state")
+            Command::Internal(InternalCommand::RecorderStatus { state_root })
+                if state_root.as_path() == std::path::Path::new("state")
         ));
     }
 
     #[test]
-    fn cli_parses_foreground_recorder_command() {
-        let cli =
-            Cli::try_parse_from(["chronicle", "recorder", "--config", "recorder.toml"]).unwrap();
-        assert!(matches!(cli.command, Command::Recorder));
+    fn cli_parses_internal_foreground_recorder_command() {
+        let cli = Cli::try_parse_from([
+            "chronicle",
+            "internal",
+            "recorder",
+            "--config",
+            "recorder.toml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Internal(InternalCommand::Recorder)
+        ));
         assert_eq!(cli.config, Some(PathBuf::from("recorder.toml")));
     }
 
     #[test]
-    fn cli_parses_required_runnable_commands() {
+    fn cli_parses_internal_record_fixture_and_etl() {
         let record = Cli::try_parse_from([
             "chronicle",
-            "record",
-            "--source",
-            "fixture",
+            "internal",
+            "record-fixture",
             "--input",
             "fixture.json",
             "--root",
             "root",
         ])
         .unwrap();
-        assert!(matches!(record.command, Command::Record { .. }));
+        assert!(matches!(
+            record.command,
+            Command::Internal(InternalCommand::RecordFixture { .. })
+        ));
 
         let etl = Cli::try_parse_from([
             "chronicle",
+            "internal",
             "etl",
             "--wal-dir",
             "recording",
@@ -1943,35 +1573,29 @@ mod tests {
         .unwrap();
         assert!(matches!(
             etl.command,
-            Command::Etl { wal_dir, output }
+            Command::Internal(InternalCommand::Etl { wal_dir, output })
                 if wal_dir.as_path() == std::path::Path::new("recording")
                     && output.as_path() == std::path::Path::new("output")
         ));
-
-        let replay = Cli::try_parse_from([
-            "chronicle",
-            "replay",
-            "00000000-0000-0000-0000-000000000000",
-            "--root",
-            "root",
-            "--target",
-            "http://127.0.0.1:8080",
-            "--allow-host",
-            "127.0.0.1",
-        ])
-        .unwrap();
-        let Command::Replay(args) = replay.command else {
-            panic!("replay command expected")
-        };
-        assert!(args.timing.is_none());
-        assert!(!args.execute);
-        assert_eq!(args.root, Some(PathBuf::from("root")));
     }
 
     #[test]
-    fn legacy_ebpf_source_flag_is_rejected() {
-        // The hidden one-shot \`--source ebpf\` entrypoint was removed before
-        // 0.1.0; only the fixture source flag remains.
+    fn record_source_flag_is_rejected() {
+        // The pre-0.1 record --source entrypoints were removed entirely;
+        // clap rejects any --source form.
+        assert!(
+            Cli::try_parse_from([
+                "chronicle",
+                "record",
+                "--source",
+                "fixture",
+                "--input",
+                "fixture.json",
+                "--root",
+                "root",
+            ])
+            .is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "chronicle",
@@ -1980,56 +1604,10 @@ mod tests {
                 "ebpf",
                 "--cgroup",
                 "/workload",
-                "--wal-dir",
-                "wal",
             ])
             .is_err()
         );
     }
-
-    #[test]
-    fn legacy_invocations_use_fixed_non_secret_diagnostics() {
-        let raw: Vec<OsString> = [
-            "chronicle",
-            "--format",
-            "json",
-            "replay",
-            "session",
-            "--root",
-            "root",
-            "--target",
-            "http://user:super-secret@127.0.0.1:9",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
-        let legacy = legacy_invocation_from_raw_args(&raw).unwrap();
-        assert_eq!(legacy, LegacyInvocation::ReplayRoot);
-        assert!(matches!(format_from_raw_args(&raw), Format::Json));
-        let warning = serde_json::to_string(&DeprecationJson {
-            version: 1,
-            level: "warning",
-            code: "deprecated_cli",
-            invocation: legacy.id(),
-            replacement: legacy.replacement(),
-        })
-        .unwrap();
-        assert!(!warning.contains("super-secret"));
-        assert!(!warning.contains("user:"));
-
-        let internal = Cli::try_parse_from([
-            "chronicle",
-            "internal",
-            "etl",
-            "--wal-dir",
-            "wal",
-            "--output",
-            "output",
-        ])
-        .unwrap();
-        assert_eq!(legacy_invocation(&internal), None);
-    }
-
     #[test]
     fn production_record_help_hides_mechanics_and_shows_intent_options() {
         let mut command = Cli::command();
@@ -2048,33 +1626,20 @@ mod tests {
     }
 
     #[test]
-    fn production_record_arguments_reject_source_mixes_and_bad_selectors() {
+    fn production_record_arguments_reject_bad_selectors() {
         let mixed = Cli::try_parse_from([
             "chronicle",
             "record",
-            "--source",
-            "fixture",
-            "--input",
-            "fixture.json",
-            "--root",
-            "root",
-            "--wal-dir",
-            "wal",
+            "--pid",
+            "42",
+            "--cgroup",
+            "/workload",
         ])
         .unwrap();
         assert!(validate_record_arguments(&mixed).is_err());
 
-        // Fixture source requires an input and root.
-        let missing_fixture = Cli::try_parse_from([
-            "chronicle",
-            "record",
-            "--source",
-            "fixture",
-            "--wal-dir",
-            "wal",
-        ])
-        .unwrap();
-        assert!(validate_record_arguments(&missing_fixture).is_err());
+        let no_mode = Cli::try_parse_from(["chronicle", "record", "--name", "x"]).unwrap();
+        assert!(validate_record_arguments(&no_mode).is_err());
     }
 
     #[test]

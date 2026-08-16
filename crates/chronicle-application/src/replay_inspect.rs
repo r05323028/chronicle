@@ -101,15 +101,27 @@ pub fn record_fixture(
     max_segment_bytes: u64,
 ) -> Result<RecordFixtureResult, ApplicationError> {
     let root = root.as_ref();
-    let session_id = chronicle_common::SessionId::new();
-    let wal_directory = root.join("wal").join(session_id.to_string());
-    let recorded = write_capture_to_wal(source, &wal_directory, max_segment_bytes)?;
-    let (output, checkpoint) = process_fixture_wal(
+    // A fixture recording is one deterministic single-epoch recording: the
+    // WAL identity is the epoch identity and the canonical session id derives
+    // from it (matching production SessionId(epoch_id) derivation). Explicit
+    // provenance is stamped below; lineage is never inferred from identifier
+    // equality. The root is a public data-directory shape (recordings/ +
+    // sessions/) so the current --data-dir surface resolves fixture output.
+    let recording_id = RecordingId::new();
+    let session_id = chronicle_common::SessionId(recording_id.0);
+    let wal_directory = root.join("recordings").join(recording_id.to_string());
+    let recorded = write_capture_to_wal(source, &wal_directory, recording_id, max_segment_bytes)?;
+    let (mut output, checkpoint) = process_fixture_wal(
         &wal_directory,
         recorded.recording_id,
         &chronicle_protocol_builtins::registry()?,
         session_id,
     )?;
+    output.session.source_provenance.recording_id = Some(recorded.recording_id);
+    output.session.source_provenance.epoch_id = Some(chronicle_common::EpochId::from_uuid(
+        recorded.recording_id.0,
+    ));
+    output.session.source_provenance.epoch_ordinal = Some(0);
     let issues = issue_summaries(&output.issues);
     let replayability = replayability_reasons(&output);
     let complete = session_complete(&output);
@@ -567,7 +579,6 @@ pub fn build_parent_replay_plan(
             .into_iter()
             .filter(|summary| {
                 summary.recording_id == Some(parent_id)
-                    || (summary.recording_id.is_none() && summary.session_id.0 == parent_id.0)
                     || summary.epoch_id == Some(EpochId::from_uuid(parent_id.0))
             })
             .collect();
@@ -579,16 +590,24 @@ pub fn build_parent_replay_plan(
         }
         let epochs = matches
             .iter()
-            .map(|summary| ParentReplayEpochPlan {
-                ordinal: summary.epoch_ordinal.unwrap_or(0),
-                epoch_id: summary
-                    .epoch_id
-                    .unwrap_or(chronicle_common::EpochId(parent_id.0)),
-                session_id: Some(summary.session_id),
-                selected: true,
-                reason: None,
+            .map(|summary| {
+                Ok(ParentReplayEpochPlan {
+                    ordinal: summary.epoch_ordinal.unwrap_or(0),
+                    // Explicit epoch identity only: a session matched by
+                    // recording provenance without an epoch identity is
+                    // invalid lineage and fails closed rather than
+                    // synthesizing an epoch from the parent id.
+                    epoch_id: summary.epoch_id.ok_or_else(|| {
+                        ApplicationError::RecordingMetadataValidation(
+                            "session lacks explicit epoch identity".into(),
+                        )
+                    })?,
+                    session_id: Some(summary.session_id),
+                    selected: true,
+                    reason: None,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ApplicationError>>()?;
         let selected_session_ids = matches.iter().map(|summary| summary.session_id).collect();
         return Ok(ParentReplayPlan {
             parent_id,
@@ -1456,24 +1475,45 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_id_provides_parent_replay_identity() {
+    fn session_without_explicit_provenance_is_unresolved_for_parent_replay() {
         let root = std::env::temp_dir().join(format!(
-            "chronicle-parent-replay-legacy-{}",
+            "chronicle-parent-replay-unprovenanced-{}",
             uuid::Uuid::new_v4()
         ));
         let parent_id = chronicle_common::RecordingId::new();
-        let mut legacy = session(parent_id);
-        legacy.id = chronicle_common::SessionId(parent_id.0);
-        legacy.source_provenance.recording_id = None;
-        legacy.source_provenance.epoch_id = None;
-        publish(&root, legacy);
+        let mut orphan = session(chronicle_common::RecordingId::new());
+        orphan.id = chronicle_common::SessionId(parent_id.0);
+        orphan.source_provenance.recording_id = None;
+        orphan.source_provenance.epoch_id = None;
+        publish(&root, orphan);
+
+        // Identifier equality between the session id and the parent id is
+        // not lineage: a session without explicit provenance is unresolved.
+        assert!(matches!(
+            build_parent_replay_plan(&root, parent_id),
+            Err(ApplicationError::RecordingNotFound(_))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_with_explicit_epoch_identity_resolves_for_parent_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "chronicle-parent-replay-explicit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let parent_id = chronicle_common::RecordingId::new();
+        let epoch_id = chronicle_common::EpochId::new();
+        let mut explicit = session(parent_id);
+        explicit.id = chronicle_common::SessionId(epoch_id.as_uuid());
+        explicit.source_provenance.recording_id = Some(parent_id);
+        explicit.source_provenance.epoch_id = Some(epoch_id);
+        explicit.source_provenance.epoch_ordinal = Some(0);
+        publish(&root, explicit);
 
         let plan = build_parent_replay_plan(&root, parent_id).unwrap();
-        assert_eq!(
-            plan.selected_session_ids,
-            vec![chronicle_common::SessionId(parent_id.0)]
-        );
         assert_eq!(plan.epochs.len(), 1);
+        assert_eq!(plan.epochs[0].epoch_id, epoch_id);
         assert!(plan.epochs[0].selected);
         std::fs::remove_dir_all(root).unwrap();
     }

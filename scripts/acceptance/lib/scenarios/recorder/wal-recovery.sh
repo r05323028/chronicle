@@ -196,8 +196,8 @@ PY
 
 	# Portable WAL fault + ingest matrices are separately selected gate
 	# prerequisites (task 8.1); the privileged scenario keeps only the real
-	# feasibility invariant.
-	run_compat_command wal-feasibility cargo test -p chronicle-capture-ebpf --test privileged_feasibility --locked -- --ignored --nocapture || set_check privileged_feasibility failed
-	set_check privileged_feasibility passed
+	# production-object kernel invariant.
+	run_compat_command kernel-acceptance cargo test -p chronicle-capture-ebpf --test privileged_kernel --locked -- --ignored --nocapture || set_check privileged_kernel failed
+	set_check privileged_kernel passed
 
 }

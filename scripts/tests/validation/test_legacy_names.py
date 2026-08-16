@@ -56,6 +56,70 @@ class LegacyNamesCheckTests(unittest.TestCase):
         # guard must match whole identifiers only.
         self.assertEqual(self.issues_for("fn from_legacy_uuid() {}\n"), [])
 
+    def test_removed_cli_compatibility_names_are_rejected(self):
+        for name in [
+            "LegacyInvocation",
+            "DeprecationJson",
+            "record_fixture_legacy",
+            "run_replay_legacy",
+            "raw_legacy_record",
+            "legacy_invocation_from_raw_args",
+            "legacy_error_message",
+            "exit_legacy_error",
+            "format_from_raw_args",
+            "write_deprecation_warning",
+        ]:
+            self.assertEqual(len(self.issues_for(f"fn {name}() {{}}\n")), 1, name)
+
+    def test_retired_feasibility_paths_are_rejected(self):
+        (self.temp / "ebpf-feasibility").mkdir()
+        (self.temp / "docs").mkdir()
+        (self.temp / "docs" / "feasibility").mkdir()
+        harness_test = self.temp / "crates" / "chronicle-capture-ebpf" / "tests"
+        harness_test.mkdir(parents=True)
+        (harness_test / "privileged_feasibility.rs").write_text("")
+        issues = validation.legacy_names_check(self.temp)["issues"]
+        self.assertEqual(len(issues), 3, issues)
+        for expected in (
+            "ebpf-feasibility",
+            "docs/feasibility",
+            "privileged_feasibility",
+        ):
+            self.assertTrue(any(expected in issue for issue in issues), issues)
+
+    def test_retired_scenario_id_is_rejected(self):
+        scenarios = self.temp / "scripts" / "acceptance"
+        scenarios.mkdir(parents=True)
+        (scenarios / "scenarios.toml").write_text(
+            'scenarios = ["cli-compatibility"]\n', encoding="utf-8"
+        )
+        issues = validation.legacy_names_check(self.temp)["issues"]
+        self.assertTrue(any("cli-compatibility" in issue for issue in issues), issues)
+
+    def test_spec_mandating_removed_surface_is_rejected(self):
+        spec = self.temp / "openspec" / "specs" / "some-cli" / "spec.md"
+        spec.parent.mkdir(parents=True)
+        spec.write_text(
+            "CLI SHALL retain the legacy record forms as hidden deprecated "
+            "0.1.x compatibility entrypoints.",
+            encoding="utf-8",
+        )
+        issues = validation.legacy_names_check(self.temp)["issues"]
+        self.assertTrue(
+            any("spec mandates a removed pre-release" in issue for issue in issues),
+            issues,
+        )
+
+    def test_spec_describing_removed_surface_is_allowed(self):
+        spec = self.temp / "openspec" / "specs" / "current-cli" / "spec.md"
+        spec.parent.mkdir(parents=True)
+        spec.write_text(
+            "The pre-0.1 forms were removed before 0.1.0 and SHALL NOT be "
+            "reintroduced.",
+            encoding="utf-8",
+        )
+        self.assertEqual(validation.legacy_names_check(self.temp)["issues"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -687,6 +687,7 @@ pub struct RecordedWal {
 pub fn write_capture_to_wal(
     source: &mut impl CaptureSource,
     directory: impl AsRef<Path>,
+    recording_id: RecordingId,
     max_segment_bytes: u64,
 ) -> Result<RecordedWal, ApplicationError> {
     let directory = directory.as_ref();
@@ -696,7 +697,6 @@ pub fn write_capture_to_wal(
         ));
     }
 
-    let recording_id = RecordingId::new();
     let mut records = Vec::new();
     let mut encoded_bytes =
         u64::try_from(SEGMENT_HEADER_LEN + COMMIT_MARKER_FRAME_LEN).unwrap_or(u64::MAX);
@@ -1295,11 +1295,18 @@ fn process_and_publish_recording_wal_inner(
             epoch_ordinal,
         )?
     } else {
-        process_recording_wal(
+        let mut processed = process_recording_wal(
             wal_directory,
             registry,
             chronicle_common::SessionId(recording_id.0),
-        )?
+        )?;
+        // Standalone single-epoch ETL stamps explicit provenance from the WAL
+        // identity. Lineage is never inferred from identifier equality.
+        processed.output.session.source_provenance.recording_id = Some(recording_id);
+        processed.output.session.source_provenance.epoch_id =
+            Some(chronicle_common::EpochId::from_uuid(recording_id.0));
+        processed.output.session.source_provenance.epoch_ordinal = Some(0);
+        processed
     };
     if let Some(checkpoint) = load_recording_etl_checkpoint(wal_directory)? {
         let identity_conflict = parent.is_some_and(|(parent_id, epoch_id, epoch_ordinal)| {

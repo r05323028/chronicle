@@ -61,8 +61,6 @@ chronicle --format json doctor
 
 3 つとも診断に安全に使えます。`doctor` は非破壊で、`inspect` は body と任意の header value を表示しません。
 
-## 非公開の互換性用および高度な entrypoint
+## 高度な entrypoint
 
-0.1.x には continuous recorder、recorder status、internal ETL、fixture recording、旧来の session-root 構文向けの非公開互換経路が残っています。これらは deprecation warning を出すため、推奨される公開 surface ではありません。Docker／Kubernetes コマンドは存在しません。
-
-非公開の 0.1.x invocation から移行する場合は、[リリースノート](https://github.com/r05323028/chronicle/blob/main/docs/release-notes.md)とリポジトリの[運用ガイド](https://github.com/r05323028/chronicle/blob/main/docs/operations.md)を使ってください。
+非公開の `internal` namespace は、continuous recorder、recorder status、standalone ETL、決定論的 fixture recording の運用 surface です。推奨される公開 surface ではありません。Docker／Kubernetes コマンドは存在しません。

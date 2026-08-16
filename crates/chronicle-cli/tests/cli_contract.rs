@@ -1,3 +1,7 @@
+//! CLI black-box contract: current public commands plus the hidden `internal`
+//! operational namespace. No pre-release compatibility surface is exercised;
+//! legacy forms are rejected by clap and covered by rejection tests only.
+
 #![allow(unsafe_code)] // pre_exec dup2 of the readiness pipe onto fd 3
 use std::{
     io::{Read, Write},
@@ -22,21 +26,6 @@ fn output_text(output: &Output) -> (String, String) {
     )
 }
 
-fn deprecation_warning(stderr: &str, invocation: &str) -> serde_json::Value {
-    assert_eq!(stderr.lines().count(), 1, "one deprecation diagnostic");
-    let warning: serde_json::Value = serde_json::from_str(stderr).expect("deprecation JSON");
-    assert_eq!(warning["version"], 1);
-    assert_eq!(warning["level"], "warning");
-    assert_eq!(warning["code"], "deprecated_cli");
-    assert_eq!(warning["invocation"], invocation);
-    assert!(
-        warning["replacement"]
-            .as_str()
-            .is_some_and(|text| !text.is_empty())
-    );
-    warning
-}
-
 fn record(root: &std::path::Path) -> String {
     record_fixture(
         root,
@@ -51,7 +40,12 @@ fn record_fixture(root: &std::path::Path, fixture: &std::path::Path) -> String {
     let fixture = fixture.to_str().expect("fixture path is UTF-8");
     let root = root.to_str().expect("test root is UTF-8");
     let output = command(&[
-        "record", "--source", "fixture", "--input", fixture, "--root", root,
+        "internal",
+        "record-fixture",
+        "--input",
+        fixture,
+        "--root",
+        root,
     ]);
     assert!(output.status.success());
     let (stdout, _) = output_text(&output);
@@ -157,10 +151,10 @@ fn replay_arguments<'a>(
     allow_read: bool,
 ) -> Vec<&'a str> {
     let mut arguments = vec![
+        "--data-dir",
+        root,
         "replay",
         session_id,
-        "--root",
-        root,
         "--target",
         target,
         "--allow-host",
@@ -184,13 +178,14 @@ fn cli_record_inspect_replay_and_exit_contract() {
     let inspect = command(&[
         "--format",
         "json",
+        "--data-dir",
+        root_text,
         "inspect",
         &session_id,
-        "--root",
-        root_text,
     ]);
     assert!(inspect.status.success());
-    let (inspect_stdout, _) = output_text(&inspect);
+    let (inspect_stdout, inspect_stderr) = output_text(&inspect);
+    assert!(inspect_stderr.is_empty());
     let inspected: serde_json::Value = serde_json::from_str(&inspect_stdout).expect("inspect JSON");
     assert_eq!(inspected["version"], 1);
     let connection = &inspected["connections"][0];
@@ -217,10 +212,10 @@ fn cli_record_inspect_replay_and_exit_contract() {
     let json_dry_run = command(&[
         "--format",
         "json",
+        "--data-dir",
+        root_text,
         "replay",
         &session_id,
-        "--root",
-        root_text,
         "--target",
         "http://127.0.0.1:9",
         "--allow-host",
@@ -228,7 +223,7 @@ fn cli_record_inspect_replay_and_exit_contract() {
     ]);
     assert_eq!(json_dry_run.status.code(), Some(0));
     let (stdout, stderr) = output_text(&json_dry_run);
-    deprecation_warning(&stderr, "replay_root");
+    assert!(stderr.is_empty());
     assert_eq!(stdout.matches('\n').count(), 1);
     let report: serde_json::Value = serde_json::from_str(&stdout).expect("replay JSON");
     assert_eq!(report["version"], 1);
@@ -270,7 +265,7 @@ fn cli_record_inspect_replay_and_exit_contract() {
 }
 
 #[test]
-fn denied_legacy_replay_emits_one_hint_error_and_no_result() {
+fn denied_replay_emits_error_and_no_result() {
     let root = std::env::temp_dir().join(format!("chronicle-cli-denied-{}", uuid::Uuid::new_v4()));
     let session_id = record(&root);
     let root = root.to_str().unwrap();
@@ -280,10 +275,10 @@ fn denied_legacy_replay_emits_one_hint_error_and_no_result() {
             arguments.extend(["--format", format]);
         }
         arguments.extend([
+            "--data-dir",
+            root,
             "replay",
             &session_id,
-            "--root",
-            root,
             "--target",
             "http://127.0.0.1:9",
             "--allow-host",
@@ -293,15 +288,15 @@ fn denied_legacy_replay_emits_one_hint_error_and_no_result() {
         let denied = command(&arguments);
         assert_eq!(denied.status.code(), Some(4));
         let (stdout, stderr) = output_text(&denied);
-        assert!(stdout.is_empty());
-        assert!(stderr.contains("Hint: use"));
-        assert!(!stderr.contains("deprecated_cli"));
+        // Policy denial is a rendered replay outcome (exit 4), never a raw
+        // error diagnostic and never a deprecated-CLI hint.
+        assert!(!stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert!(!stdout.contains("deprecated_cli"));
         if format == Some("json") {
-            assert_eq!(stderr.lines().count(), 1);
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&stderr).unwrap()["code"],
-                4
-            );
+            assert_eq!(stdout.lines().count(), 1);
+            let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(report["result"]["outcome"], "stopped_policy");
         }
     }
     std::fs::remove_dir_all(root).unwrap();
@@ -326,8 +321,8 @@ fn public_explicit_replay_requires_gates_and_never_contacts_recorded_target() {
     ))
     .expect("read fixture")
     .replace(
-        "\"host\": \"192.0.2.20\", \"port\": 8080",
-        &format!("\"host\": \"127.0.0.1\", \"port\": {recorded_port}"),
+        "\"\"host\": \"192.0.2.20\", \"port\": 8080",
+        &format!("\"\"host\": \"127.0.0.1\", \"port\": {recorded_port}"),
     );
     std::fs::write(&fixture, fixture_json).expect("write fixture");
     let (recording_id, _) = publish_public_recording(&root, &fixture);
@@ -395,10 +390,10 @@ fn cli_json_replay_error_has_no_partial_stdout() {
         "json",
         "--config",
         config.to_str().unwrap(),
+        "--data-dir",
+        root.to_str().unwrap(),
         "replay",
         &session_id,
-        "--root",
-        root.to_str().unwrap(),
         "--target",
         "http://127.0.0.1:9",
         "--allow-host",
@@ -426,10 +421,10 @@ fn cli_dry_run_ignores_unneeded_missing_runtime_credential() {
     let output = command(&[
         "--config",
         config.to_str().unwrap(),
+        "--data-dir",
+        root.to_str().unwrap(),
         "replay",
         &session_id,
-        "--root",
-        root.to_str().unwrap(),
         "--target",
         "http://127.0.0.1:9",
         "--allow-host",
@@ -452,6 +447,7 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
     let first = command(&[
         "--format",
         "json",
+        "internal",
         "etl",
         "--wal-dir",
         wal,
@@ -460,7 +456,7 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
     ]);
     assert!(first.status.success());
     let (stdout, stderr) = output_text(&first);
-    deprecation_warning(&stderr, "etl");
+    assert!(stderr.is_empty());
     let first: serde_json::Value = serde_json::from_str(&stdout).expect("ETL JSON");
     assert_eq!(first["already_processed"], false);
     assert!(first["recording_id"].is_string());
@@ -501,6 +497,7 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
     let second = command(&[
         "--format",
         "json",
+        "internal",
         "etl",
         "--wal-dir",
         wal,
@@ -509,7 +506,7 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
     ]);
     assert!(second.status.success());
     let (stdout, stderr) = output_text(&second);
-    deprecation_warning(&stderr, "etl");
+    assert!(stderr.is_empty());
     let second: serde_json::Value = serde_json::from_str(&stdout).expect("ETL JSON");
     assert_eq!(second["session_id"], session_id);
     assert_eq!(second["already_processed"], false);
@@ -521,6 +518,7 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
     let corrupt = command(&[
         "--format",
         "json",
+        "internal",
         "etl",
         "--wal-dir",
         wal,
@@ -537,10 +535,10 @@ fn cli_etl_publishes_repairs_checkpoint_and_rejects_corruption() {
 
 #[test]
 fn cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch() {
-    // CLI-owned Integration contract for the internal ETL seam (task 4.3):
-    // fail-closed behavior before any processing. Application ETL correctness
-    // stays in integration:etl-contract (chronicle-application); this test
-    // proves only the internal-command CLI contract.
+    // CLI-owned integration contract for the internal ETL seam: fail-closed
+    // behavior before any processing. Application ETL correctness stays in
+    // integration:etl-contract (chronicle-application); this test proves only
+    // the internal-command CLI contract.
     let root = std::env::temp_dir().join(format!(
         "chronicle-cli-etl-failclosed-{}",
         uuid::Uuid::new_v4()
@@ -555,7 +553,7 @@ fn cli_internal_etl_rejects_metadata_less_wal_and_identity_mismatch() {
             "/../../fixtures/http/basic-session.json"
         )),
     );
-    let fixture_wal = root.join("wal").join(session);
+    let fixture_wal = root.join("recordings").join(session);
     let first = command(&[
         "--format",
         "json",
@@ -623,9 +621,8 @@ fn cli_reports_usage_and_data_errors_as_safe_json() {
     std::fs::write(&malformed, b"{}").expect("write malformed fixture");
 
     let malformed_output = command(&[
-        "record",
-        "--source",
-        "fixture",
+        "internal",
+        "record-fixture",
         "--input",
         malformed.to_str().expect("fixture path is UTF-8"),
         "--root",
@@ -636,10 +633,10 @@ fn cli_reports_usage_and_data_errors_as_safe_json() {
     let unknown = command(&[
         "--format",
         "json",
-        "inspect",
-        "00000000-0000-0000-0000-000000000000",
-        "--root",
+        "--data-dir",
         root.to_str().expect("root is UTF-8"),
+        "inspect",
+        "rec_00000000-0000-0000-0000-000000000000",
     ]);
     assert_eq!(unknown.status.code(), Some(3));
     let (unknown_stdout, unknown_stderr) = output_text(&unknown);
@@ -708,39 +705,31 @@ fn doctor_config_failure_keeps_independent_probes_and_human_remediation() {
 }
 
 #[test]
-fn legacy_warnings_and_failure_hints_are_atomic_and_non_secret() {
+fn errors_are_atomic_and_non_secret() {
     let secret = "super-secret-cli-value";
     let root =
         std::env::temp_dir().join(format!("chronicle-cli-{secret}-{}", uuid::Uuid::new_v4()));
-    let fixture = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../fixtures/http/basic-session.json"
-    ));
-    let success = command(&[
+    std::fs::create_dir_all(&root).expect("create test root");
+
+    // A failed data lookup reports one atomic JSON error that never echoes
+    // the data-directory path or the recorded secret.
+    let failed = command(&[
         "--format",
         "json",
-        "record",
-        "--source",
-        "fixture",
-        "--input",
-        fixture.to_str().unwrap(),
-        "--root",
-        root.to_str().unwrap(),
+        "--data-dir",
+        root.join(secret).to_str().unwrap(),
+        "inspect",
+        "rec_00000000-0000-0000-0000-000000000000",
     ]);
-    assert_eq!(success.status.code(), Some(0));
-    let (stdout, stderr) = output_text(&success);
-    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let session_id = result["session_id"].as_str().unwrap();
-    let warning = deprecation_warning(&stderr, "record_source_fixture");
-    assert!(!warning.to_string().contains(secret));
+    assert_eq!(failed.status.code(), Some(3));
+    let (failed_stdout, failed_stderr) = output_text(&failed);
+    assert!(failed_stdout.is_empty());
+    assert_eq!(failed_stderr.lines().count(), 1);
+    let error: serde_json::Value = serde_json::from_str(&failed_stderr).unwrap();
+    assert_eq!(error["code"], 3);
+    assert!(!failed_stderr.contains(secret));
 
-    let human = command(&["inspect", session_id, "--root", root.to_str().unwrap()]);
-    assert_eq!(human.status.code(), Some(0));
-    let (_, human_stderr) = output_text(&human);
-    assert_eq!(human_stderr.lines().count(), 1);
-    assert!(human_stderr.contains("deprecated CLI form 'inspect_root'"));
-    assert!(!human_stderr.contains(secret));
-
+    // Parse failures are usage errors (exit 2) and never echo argv secrets.
     let invalid = command(&[
         "--format",
         "json",
@@ -753,63 +742,26 @@ fn legacy_warnings_and_failure_hints_are_atomic_and_non_secret() {
     assert_eq!(invalid.status.code(), Some(2));
     let (invalid_stdout, invalid_stderr) = output_text(&invalid);
     assert!(invalid_stdout.is_empty());
-    assert_eq!(invalid_stderr.lines().count(), 1);
-    let error: serde_json::Value = serde_json::from_str(&invalid_stderr).unwrap();
-    assert_eq!(error["code"], 2);
-    assert!(error["message"].as_str().unwrap().contains("Hint: use"));
-    assert!(!invalid_stderr.contains("deprecated_cli"));
     assert!(!invalid_stderr.contains(secret));
-
-    let failed = command(&[
-        "--format",
-        "json",
-        "inspect",
-        "00000000-0000-0000-0000-000000000000",
-        "--root",
-        root.join(secret).to_str().unwrap(),
-    ]);
-    assert_eq!(failed.status.code(), Some(3));
-    let (failed_stdout, failed_stderr) = output_text(&failed);
-    assert!(failed_stdout.is_empty());
-    assert_eq!(failed_stderr.lines().count(), 1);
-    let error: serde_json::Value = serde_json::from_str(&failed_stderr).unwrap();
-    assert!(error["message"].as_str().unwrap().contains("Hint: use"));
-    assert!(!failed_stderr.contains("deprecated_cli"));
-    assert!(!failed_stderr.contains(secret));
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn malformed_legacy_parse_error_has_safe_new_syntax_hint() {
+fn malformed_parse_error_is_safe() {
     for arguments in [
         vec!["--format", "json", "record", "--source"],
-        vec![
-            "--format",
-            "json",
-            "--bogus",
-            "super-secret",
-            "etl",
-            "--wal-dir",
-            "wal",
-            "--output",
-            "output",
-        ],
+        vec!["--format", "json", "replay", "--root"],
     ] {
         let output = command(&arguments);
         assert_eq!(output.status.code(), Some(2));
         let (stdout, stderr) = output_text(&output);
         assert!(stdout.is_empty());
-        assert_eq!(stderr.lines().count(), 1);
-        let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
-        assert_eq!(error["code"], 2);
-        assert!(error["message"].as_str().unwrap().contains("Hint: use"));
-        assert!(!stderr.contains("deprecated_cli"));
         assert!(!stderr.contains("super-secret"));
     }
 }
 
 #[test]
-fn empty_list_and_legacy_inspect_contract() {
+fn empty_list_and_fixture_inspect_contract() {
     let empty_dir =
         std::env::temp_dir().join(format!("chronicle-cli-empty-{}", uuid::Uuid::new_v4()));
     let empty = command(&["--data-dir", empty_dir.to_str().unwrap(), "list"]);
@@ -837,13 +789,16 @@ fn empty_list_and_legacy_inspect_contract() {
     let inspect = command(&[
         "--format",
         "json",
+        "--data-dir",
+        root.to_str().unwrap(),
         "inspect",
         &session_id,
-        "--root",
-        root.to_str().unwrap(),
     ]);
     assert_eq!(inspect.status.code(), Some(0));
+    let (inspect_stdout, inspect_stderr) = output_text(&inspect);
+    assert!(inspect_stderr.is_empty());
     assert!(serde_json::from_slice::<serde_json::Value>(&inspect.stdout).is_ok());
+    assert!(inspect_stdout.contains(&session_id));
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(empty_dir).ok();
 }

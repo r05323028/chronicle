@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "connections": [
+    {
+      "id": "hello",
+      "socket_cookie": 1,
+      "first_seen_ns": 0,
+      "network_namespace": null,
+      "local_endpoint": {
+        "host": "127.0.0.1",
+        "port": 41001
+      },
+      "remote_endpoint": {
+        "host": "127.0.0.1",
+        "port": 18080
+      },
+      "role": "active",
+      "transport": "tcp",
+      "process": {
+        "pid": 4242,
+        "tid": null,
+        "executable": "fixture-client"
+      }
+    },
+    {
+      "id": "echo",
+      "socket_cookie": 2,
+      "first_seen_ns": 0,
+      "network_namespace": null,
+      "local_endpoint": {
+        "host": "127.0.0.1",
+        "port": 41002
+      },
+      "remote_endpoint": {
+        "host": "127.0.0.1",
+        "port": 18080
+      },
+      "role": "active",
+      "transport": "tcp",
+      "process": {
+        "pid": 4242,
+        "tid": null,
+        "executable": "fixture-client"
+      }
+    }
+  ],
+  "events": [
+    {
+      "sequence": 1,
+      "timestamp": "2026-01-01T00:00:00Z",
+      "connection_id": "hello",
+      "direction": "client_to_server",
+      "payload_hex": "474554202f68656c6c6f20485454502f312e310d0a486f73743a203132372e302e302e313a31383038300d0a0d0a",
+      "truncated": false,
+      "flags": 0
+    },
+    {
+      "sequence": 2,
+      "timestamp": "2026-01-01T00:00:00Z",
+      "connection_id": "hello",
+      "direction": "server_to_client",
+      "payload_hex": "485454502f312e3120323030204f4b0d0a436f6e74656e742d547970653a20746578742f706c61696e3b636861727365743d5554462d380d0a436f6e74656e742d4c656e6774683a2031370d0a0d0a48656c6c6f2c204368726f6e69636c6521",
+      "truncated": false,
+      "flags": 0
+    },
+    {
+      "sequence": 3,
+      "timestamp": "2026-01-01T00:00:00Z",
+      "connection_id": "echo",
+      "direction": "client_to_server",
+      "payload_hex": "504f5354202f6563686f20485454502f312e310d0a486f73743a203132372e302e302e313a31383038300d0a436f6e74656e742d547970653a20746578742f706c61696e0d0a436f6e74656e742d4c656e6774683a20370d0a0d0a6563686f2d6d65",
+      "truncated": false,
+      "flags": 0
+    },
+    {
+      "sequence": 4,
+      "timestamp": "2026-01-01T00:00:00Z",
+      "connection_id": "echo",
+      "direction": "server_to_client",
+      "payload_hex": "485454502f312e3120323030204f4b0d0a436f6e74656e742d547970653a20746578742f706c61696e3b636861727365743d5554462d380d0a436f6e74656e742d4c656e6774683a20370d0a0d0a6563686f2d6d65",
+      "truncated": false,
+      "flags": 0
+    }
+  ]
+}

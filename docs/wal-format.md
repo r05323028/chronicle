@@ -1,6 +1,6 @@
 # WAL Format
 
-Chronicle has one mutable MVP WAL format: v1. Readers reject every other declared format, envelope, and record-schema version. No legacy reader or format dispatch remains.
+Chronicle has one mutable pre-0.1 WAL format: v1. Readers reject every other declared format, envelope, and record-schema version. No legacy reader or format dispatch remains.
 
 All integers are little-endian. Recording WAL lives under `segments/`; segment files are named `{first_sequence:020}.chwal`.
 

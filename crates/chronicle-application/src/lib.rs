@@ -1289,7 +1289,7 @@ mod tests {
         .unwrap();
         let mut source = FixtureCaptureSource::from_json(&fixture).unwrap();
         let recorded = record_fixture(&mut source, &root, 1024 * 1024).unwrap();
-        std::fs::remove_dir_all(root.join("wal")).unwrap();
+        std::fs::remove_dir_all(root.join("recordings")).unwrap();
 
         let inspected = inspect_session(&root, recorded.session_id).unwrap();
         assert!(inspected.complete);
@@ -1467,7 +1467,8 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("chronicle-app-wal-{}", uuid::Uuid::new_v4()));
         let mut source = InMemoryCaptureSource::new(test_capture_events(b"fixture".to_vec()));
-        let recorded = write_capture_to_wal(&mut source, &directory, 2048).unwrap();
+        let recorded =
+            write_capture_to_wal(&mut source, &directory, RecordingId::new(), 2048).unwrap();
         assert_eq!(recorded.record_count, 2);
         assert_eq!(recorded.first_sequence, Some(1));
 
@@ -1502,6 +1503,7 @@ mod tests {
         let recorded = write_capture_to_wal(
             &mut InMemoryCaptureSource::new(events),
             &wal_directory,
+            RecordingId::new(),
             8192,
         )
         .unwrap();
@@ -1567,6 +1569,7 @@ mod tests {
                 b"GET / HTTP/1.1\r\n\r\n".to_vec(),
             )),
             &wal_directory,
+            RecordingId::new(),
             2048,
         )
         .unwrap();
@@ -1594,7 +1597,8 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("chronicle-app-wal-limit-{}", uuid::Uuid::new_v4()));
         let mut source = InMemoryCaptureSource::new(test_capture_events(vec![0; 128]));
-        let error = write_capture_to_wal(&mut source, &directory, 64).unwrap_err();
+        let error =
+            write_capture_to_wal(&mut source, &directory, RecordingId::new(), 64).unwrap_err();
         assert!(matches!(error, ApplicationError::FixtureWalTooLarge { .. }));
         assert!(!directory.exists());
     }
@@ -1606,7 +1610,8 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("chronicle-app-etl-{}", uuid::Uuid::new_v4()));
         let mut source = InMemoryCaptureSource::new(test_capture_events(b"FAKE request".to_vec()));
-        let recorded = write_capture_to_wal(&mut source, &directory, 2048).unwrap();
+        let recorded =
+            write_capture_to_wal(&mut source, &directory, RecordingId::new(), 2048).unwrap();
         let (output, checkpoint) = process_fixture_wal(
             &directory,
             recorded.recording_id,

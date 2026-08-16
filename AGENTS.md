@@ -127,6 +127,17 @@ test architecture; privileged acceptance semantics; release qualification guaran
 Before 0.1.0, prefer one current domain model over compatibility layers for unreleased internal
 formats; preserve only intentional wire/storage compatibility boundaries.
 
+Durable pre-0.1 rules:
+
+- Do not add migration adapters for unreleased formats.
+- Do not add compatibility aliases before a public contract exists.
+- Do not add feasibility-only implementations when production validation paths exist.
+- Historical behavior belongs in Git history and archived OpenSpec changes.
+- Runtime lineage must be explicit; never infer from identifiers.
+- The hidden `internal` namespace is current operational surface; hidden pre-release CLI
+  compatibility entrypoints must not return (the legacy-names guard in
+  `scripts/validation.py` covers removed identifiers, retired paths, and scenario ids).
+
 Recording lifetime may be unbounded while epochs and segments remain bounded. A WAL epoch boundary is not a protocol reconstruction boundary; cross-epoch state requires bounded, versioned, checksummed, lineage-verified continuation evidence.
 
 ## Crate Architecture (mandatory)

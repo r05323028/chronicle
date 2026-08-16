@@ -6,9 +6,9 @@ Stable recording identity as the primary user-facing abstraction: `rec_<uuid>` I
 
 ### Requirement: Stable recording identity
 
-The primary public recording reference SHALL remain `rec_<full-uuid>`, and one public `RecordingId` SHALL identify an entire recording/capture run across every epoch and recorder restart. Public input SHALL accept `rec_<full-uuid>` and, for compatibility only, bare UUID; prefixes SHALL be rejected and resolution exact. Each epoch SHALL additionally have a unique `EpochId` and stable ordinal. Epoch IDs are operational lineage identities, not additional user-visible recordings.
+The primary public recording reference SHALL remain `rec_<full-uuid>`, and one public `RecordingId` SHALL identify an entire recording/capture run across every epoch and recorder restart. Public input SHALL accept `rec_<full-uuid>` and bare UUID as ordinary accepted input forms; prefixes SHALL be rejected and resolution exact. Each epoch SHALL additionally have a unique `EpochId` and stable ordinal. Epoch IDs are operational lineage identities, not additional user-visible recordings.
 
-New parent/run metadata and catalog entries SHALL retain the stable typed `RecordingId`; epoch WAL directories and existing WAL v1 UUID fields SHALL retain their epoch-local identity without rewriting WAL bytes. A finalized epoch's `SessionId` MAY differ from the parent `RecordingId` and SHALL be deterministic from parent ID, epoch identity/ordinal, pipeline version, verified epoch snapshot, and continuation seed. A legacy one-epoch recording remains resolvable when parent and epoch UUID bytes are equal through an explicit compatibility adapter. Public human/JSON output SHALL render the parent ID with `rec_` and expose epoch IDs only in epoch-scoped views; epoch IDs SHALL render as `epoch_<full-uuid>` operationally.
+New parent/run metadata and catalog entries SHALL retain the stable typed `RecordingId`; epoch WAL directories and existing WAL v1 UUID fields SHALL retain their epoch-local identity without rewriting WAL bytes. A finalized epoch's `SessionId` MAY differ from the parent `RecordingId` and SHALL be deterministic from parent ID, epoch identity/ordinal, pipeline version, verified epoch snapshot, and continuation seed. Public human/JSON output SHALL render the parent ID with `rec_` and expose epoch IDs only in epoch-scoped views; epoch IDs SHALL render as `epoch_<full-uuid>` operationally.
 
 `chronicle-common` owns the two newtypes. `chronicle-wal` owns only its private legacy v1 wire adapter. New checkpoint/session/artifact schemas SHALL carry parent and epoch fields separately; no untyped UUID field may select between them.
 
@@ -22,9 +22,9 @@ New parent/run metadata and catalog entries SHALL retain the stable typed `Recor
 - **WHEN** an epoch rolls over because of age or bytes
 - **THEN** the successor receives a new `EpochId` but the parent `RecordingId`, name, and created timestamp remain unchanged
 
-#### Scenario: Parse bare UUID for compatibility
+#### Scenario: Parse bare UUID
 
-- **WHEN** a script passes a bare full UUID from the legacy surface
+- **WHEN** a script passes a bare full UUID
 - **THEN** it resolves to the same parent recording
 
 #### Scenario: Short prefix rejected
@@ -39,7 +39,9 @@ New parent/run metadata and catalog entries SHALL retain the stable typed `Recor
 
 ### Requirement: Default data directory
 
-Chronicle SHALL resolve the public data directory in this precedence: explicit global `--data-dir`, configured `AppConfig.data_dir`, `CHRONICLE_DATA_DIR`, then platform default — `$XDG_DATA_HOME/chronicle` (or `~/.local/share/chronicle`) on Linux and `~/Library/Application Support/chronicle` on macOS. Unsupported platforms without explicit/configured/environment path SHALL return a typed unsupported resolution rather than guess. Creation SHALL be lazy/private and SHALL reject symlinked roots or children. Legacy `--root` behavior remains exact and is not a data-directory alias.
+Chronicle SHALL resolve the public data directory in this precedence: explicit global `--data-dir`, configured `AppConfig.data_dir`, `CHRONICLE_DATA_DIR`, then platform default — `$XDG_DATA_HOME/chronicle` (or `~/.local/share/chronicle`) on Linux and `~/Library/Application Support/chronicle` on macOS. Unsupported platforms without explicit/configured/environment path SHALL return a typed unsupported resolution rather than guess. Creation SHALL be lazy/private and SHALL reject symlinked roots or children. `--data-dir` is the only root resolution path.
+
+Session-to-recording association SHALL use explicit `source_provenance.recording_id` / `epoch_id` / `epoch_ordinal` only. Identifier equality (for example `recording_id == session_id`) is not lineage: sessions without explicit provenance are unresolved, are never associated with a recording in catalog/list/latest, and are not resolvable for parent replay. The WAL v1 identity adapter remains the narrow bridge from the unchanged v1 `recording_id` field to a typed `EpochId`; it is not a parent/epoch compatibility mapping.
 
 #### Scenario: Default resolution
 
