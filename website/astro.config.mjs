@@ -204,7 +204,9 @@ export default defineConfig({
       plugins: [
         starlightVersions({
           current: { label: "Latest", redirect: "same-page" },
-          versions: [{ slug: "0-1", label: "0.1", redirect: "same-page" }],
+          versions: [
+            { slug: "0-1", label: "0.1", redirect: "same-page" },
+          ],
         }),
         siteTranslations,
       ],
