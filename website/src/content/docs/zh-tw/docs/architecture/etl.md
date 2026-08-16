@@ -1,6 +1,6 @@
 ---
 title: ETL
-description: 復原後的證據如何成為一個結果固定的 canonical session。
+description: 復原後的證據如何成為結果固定的 canonical session——每個完成定稿的 epoch 各一個。
 ---
 
 ETL 是完整的 Extract–Transform–Load，不只是 decoder。它負責從復原後的 WAL 證據一路處理到 session reconstruction、protocol handling、canonical validation，以及 atomic storage publication。

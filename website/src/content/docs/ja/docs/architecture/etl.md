@@ -1,6 +1,6 @@
 ---
 title: ETL
-description: 復旧した証拠を 1 つの再現可能な canonical session に変換する方法。
+description: 復旧した証拠を、完成した epoch ごとに再現可能な canonical session へ変換する方法。
 ---
 
 ETL は単なる decoder ではなく、完全な Extract–Transform–Load です。復旧した WAL evidence から、session reconstruction、protocol handling、canonical validation、atomic storage publication までの経路を所有します。

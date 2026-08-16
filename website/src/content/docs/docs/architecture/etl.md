@@ -1,6 +1,6 @@
 ---
 title: ETL
-description: How recovered evidence becomes one deterministic canonical session.
+description: How recovered evidence becomes deterministic canonical sessions — one per finalized epoch.
 ---
 
 ETL is complete Extract–Transform–Load, not just a decoder. It owns the path from recovered WAL evidence through session reconstruction, protocol handling, canonical validation, and atomic storage publication.

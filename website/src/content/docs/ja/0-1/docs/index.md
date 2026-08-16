@@ -19,7 +19,7 @@ Chronicle は実際のアプリケーション通信を記録し、決定論的�
 - Linux 上で eBPF によるライブキャプチャを行い、上限付きの平文 HTTP/1.1 通信を取得します。
 - コマンド、既存プロセス、または cgroup の周辺で記録します。
 - WAL 内の commit marker を備えた、セグメント化されたクラッシュ復旧可能な WAL。
-- ETL により、再現可能な 1 つの canonical session をローカルファイルシステムストレージへ公開します。
+- ETL により、完成した epoch ごとに再現可能な canonical session をローカルファイルシステムストレージへ公開します。
 - loopback 認可を備えた安全な command mode と explicit-target replay。
 - すべてのプラットフォームで fixture の記録、検査、catalog の一覧表示、非破壊の readiness check。
 

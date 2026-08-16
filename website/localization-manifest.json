@@ -3,7 +3,7 @@
   "algorithm": "sha256",
   "sources": {
     "0-1/architecture/etl.md": {
-      "sourceSha256": "8e7e50ef7b640be452595eda27d65e68b027b1f8d67710fa13d6261993d4970b"
+      "sourceSha256": "632a7a43eed461f0cc44059b1c25e624cbfb0352a29c811150b5357714cc3a04"
     },
     "0-1/architecture/overview.md": {
       "sourceSha256": "894c17d528b9ab92929bb40ccb051cea76b88d9dc8be68200894e811f2605200"
@@ -36,10 +36,10 @@
       "sourceSha256": "20761cdce971ed467e8e332cd4354ed1564901417e46a285024c948d82cb1077"
     },
     "0-1/getting-started/quick-start.md": {
-      "sourceSha256": "5783b586bb983ab81c3fd1b6ad997779ce1938caaef8cfafdbd31a0d3eaf14c0"
+      "sourceSha256": "f9707ab2e10e1583762540ed3ccaaec8a51efa0343ea1b5c73e0ff30ac8bacdb"
     },
     "0-1/index.md": {
-      "sourceSha256": "d4beca3516f31424e4ec30262981e9786c066d3fa5a176454977d51a7220053c"
+      "sourceSha256": "f68d626da79f52f3a763708afc652a0b4d41f83a03d174acbe0705ac2432ee60"
     },
     "0-1/reference/cli.md": {
       "sourceSha256": "fc2a1ed22aafb36c59d437ebe23fcc5bce75cd9f91c2e772efa33a136657dbe0"
@@ -51,7 +51,7 @@
       "sourceSha256": "338fbfdeb8ffba4193515b957982294929a26626332a8050c6e1339028604a96"
     },
     "docs/architecture/etl.md": {
-      "sourceSha256": "d2e09b29daa9b3f3e0cd87751639b26931ac9920086595c4429e540c85305542"
+      "sourceSha256": "e0fa7e3e769cb74e4ea9248248d0fb204f8a0d8c9280ef4913a704eb558f0237"
     },
     "docs/architecture/overview.md": {
       "sourceSha256": "f453102e52517d59267048df59030e233d4b63c5573371cc3f135a2664b9539a"
@@ -84,10 +84,10 @@
       "sourceSha256": "d5dfc2089e4dd9a7dbe3a864b49b15bea8cf3e9ba61eac299aee5aaf646988b6"
     },
     "docs/getting-started/quick-start.md": {
-      "sourceSha256": "0920dae8f91077f55168a419c066ef54f494e4ab9eb156402fce265e240db58e"
+      "sourceSha256": "8dbba41c22960e88433210699d0068db08647b6705c5fd8e914a34211b1beb28"
     },
     "docs/index.md": {
-      "sourceSha256": "6bbdc1923f837b7ea99aca8727683dc86bab11aac74eea6013da986f14873af1"
+      "sourceSha256": "32b882d0b76ff57b3fb4451fdbd6b7ff3342a960827de73cdba8a81c0fb0df39"
     },
     "docs/reference/cli.md": {
       "sourceSha256": "ba5af9cc181a552847503496f63c6941fe4fcefbd7f41b819676328de502b92d"

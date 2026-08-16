@@ -1,6 +1,6 @@
 ---
 title: ETL
-description: 復原後的證據如何成為一個結果固定的 canonical session。
+description: 復原後的證據如何成為結果固定的 canonical session——每個完成定稿的 epoch 各一個。
 slug: zh-tw/0-1/docs/architecture/etl
 ---
 

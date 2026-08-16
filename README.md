@@ -10,7 +10,7 @@ Capture attaches to a supervised command, a running process, or a cgroup with no
 
 ## What is Chronicle?
 
-Chronicle turns real application behavior into regression tests. Instead of hand-writing fixtures or coupling tests to a service's internals, you record what an application actually does in production or staging, store it as a durable local recording, and replay that behavior later to verify the application still behaves the same way.
+Chronicle turns real application behavior into durable, replayable evidence for regression testing. Instead of hand-writing fixtures or coupling tests to a service's internals, you record what an application actually does in production or staging, store it as a durable local recording, and replay that behavior later to verify the application still behaves the same way.
 
 The design follows four principles:
 
@@ -25,14 +25,14 @@ Chronicle is early but runnable software. See [Current capabilities](#current-ca
 
 Chronicle 0.1.x exposes five intent-oriented commands: `record`, `replay`, `list`, `inspect`, and `doctor`. Today it supports:
 
-- **Live capture of plaintext HTTP/1.1 traffic with eBPF on Linux** — attach to a supervised command (`record -- ./my-app`), a running process (`record --pid PID`), or a cgroup (`record --cgroup PATH`). Capture is bounded (10 minutes by default, 60 maximum; a 4 GiB physical WAL ceiling).
+- **Live capture of plaintext HTTP/1.1 traffic with eBPF on Linux** — attach to a supervised command (`record -- ./my-app`), a running process (`record --pid PID`), or a cgroup (`record --cgroup PATH`). Recording has an optional whole-recording `--duration`; when omitted it runs until the source completes, an explicit stop, or a fatal failure. WAL storage is bounded by segments and epochs (4 GiB physical ceiling per epoch by default).
 - **Bounded, crash-recoverable recording** — a segmented WAL with in-WAL commit markers, recovery, and restartable ETL. Failures during finalization can be retried without recapturing (`record --retry RECORDING`).
 - **Deterministic canonical sessions** — ETL reconstructs bounded HTTP/1.1 sessions and publishes them atomically to local storage with stable recording identities (`rec_<uuid>`, names, `latest`).
 - **Safe replay** — dry-run by default with every effect denied. Command mode replays into a supervised copy of the application and infers its loopback listener; explicit-target mode requires a loopback target, matching `--allow-host`, effect authorization, and `--execute`. Writes always require `--allow-write`. Recorded production destinations are never contacted.
 - **`chronicle doctor`** — non-destructive readiness checks with actionable remediation for platform, kernel, cgroup, BTF, embedded capture programs, and privileges.
 - **Fixture recording** — deterministic, credential-free test input for development and CI on any platform.
 
-Not implemented (planned or out of scope, not silently supported): PostgreSQL/S3 persistence, TLS decryption, HTTP/2+, protocols other than bounded plaintext HTTP/1.1, always-on/rotating/distributed capture, encryption at rest, redaction, and container-orchestration packaging.
+Not implemented (planned or out of scope, not silently supported): PostgreSQL/S3 persistence, TLS decryption, HTTP/2+, protocols other than bounded plaintext HTTP/1.1, multi-host distributed capture, encryption at rest, redaction, and container-orchestration packaging.
 
 ## Installation
 
@@ -128,7 +128,7 @@ This walks through the common command-mode workflow with an installed `chronicle
 chronicle doctor
 
 # 2. Record the application. Chronicle attaches capture first, then starts
-#    the app; recording stops on exit, Ctrl+C, or the duration bound.
+#    the app; recording stops on exit, Ctrl+C, an explicit `--duration`, or a fatal failure.
 chronicle record --name checkout -- ./my-app
 
 # 3. While recording runs, send representative traffic to the application
@@ -147,9 +147,9 @@ chronicle replay checkout -- ./my-app
 
 The application must be reachable on a **non-loopback address** while recording: command-mode replay starts a supervised copy that listens on loopback and refuses to target the exact recorded destination (replay never contacts recorded production destinations). If your application only listens on `127.0.0.1`, record traffic to it through the machine's network address instead, or use explicit `--target` replay mode (see the [operations guide](docs/operations.md)).
 
-`record -- COMMAND...` finalizes the WAL, runs ETL, and publishes a canonical session automatically when the application exits or the duration bound is reached. `latest` resolves to the newest published recording; recordings can also be addressed by `rec_<uuid>`, bare UUID, or exact name. `replay RECORDING -- COMMAND...` plans first, starts the application in a supervised cgroup, discovers its unique loopback listener, and replays — dry-run by default, with writes still requiring `--allow-write`.
+`record -- COMMAND...` finalizes the WAL, runs ETL, and publishes a canonical session for each finalized epoch automatically when the application exits, an explicit `--duration` expires, or a fatal failure occurs. `latest` resolves to the newest published recording; recordings can also be addressed by `rec_<uuid>`, bare UUID, or exact name. `replay RECORDING -- COMMAND...` plans first, starts the application in a supervised cgroup, discovers its unique loopback listener, and replays — dry-run by default, with writes still requiring `--allow-write`.
 
-Advanced workflows — recording an already-running workload with `--pid`/`--cgroup`, explicit `--target` replay, `--allow-host` and effect gates, `--retry`, recovery and WAL-sizing details, the continuous recorder, and hidden compatibility commands — are documented in the [operations guide](docs/operations.md).
+Advanced workflows — recording an already-running workload with `--pid`/`--cgroup`, explicit `--target` replay, `--allow-host` and effect gates, `--retry`, recovery and WAL-sizing details, the continuous recorder, and the hidden `internal` namespace — are documented in the [operations guide](docs/operations.md).
 
 ## How It Works
 
@@ -179,7 +179,7 @@ Replay
 
 - **eBPF Capture** observes socket lifecycles and byte flows at the kernel level for the recorded scope — a supervised command, a process, or a cgroup. Only plaintext TCP payloads are capturable; TLS ciphertext stays opaque.
 - **WAL** persists the captured evidence to a bounded, segmented, crash-recoverable write-ahead log before anything is interpreted. Commit markers and recovery make the durable prefix authoritative.
-- **ETL** reads the recovery-authoritative WAL prefix, reconstructs bounded HTTP/1.1 sessions with explicit loss accounting, and produces one deterministic canonical session.
+- **ETL** reads the recovery-authoritative WAL prefix, reconstructs bounded HTTP/1.1 sessions with explicit loss accounting, and produces one deterministic canonical session per finalized epoch.
 - **Canonical Session** is the protocol- and storage-independent model of the recording: connections, operations, integrity, and replayability, with no capture or WAL mechanics inside.
 - **Storage** publishes canonical sessions atomically to local filesystem artifacts.
 - **Inspect** reads the canonical session to summarize endpoints, operations, loss warnings, and replay eligibility.
@@ -227,7 +227,7 @@ See [docs/replay-safety.md](docs/replay-safety.md) for the complete safety model
 
 - **Live capture is Linux-only** — cgroup v2, kernel 6.1+, BTF, x86_64/aarch64, and eBPF privileges are required. Other platforms get the portable surface only.
 - **Plaintext HTTP/1.1 only** — TLS ciphertext is opaque and cannot be decoded; HTTP/2+ is not supported.
-- **Bounded recording** — duration (10 minutes default, 60 maximum) and a 4 GiB physical WAL ceiling. Not always-on, rotating, incremental, or distributed.
+- **Bounded, epoch-rolled recording** — an optional whole-recording `--duration`; when omitted, recording runs until the source completes, an explicit stop, or a fatal failure. WAL storage is bounded by segments and epochs (4 GiB physical ceiling per epoch by default), and epochs roll over without terminating the parent recording. Not a multi-host distributed capture platform.
 - **Sensitive local artifacts** — no encryption at rest, no comprehensive redaction, no tenant isolation.
 - **Local filesystem storage only** — PostgreSQL/S3 persistence is not implemented.
 - **Loss windows are temporal and unattributed** — capture or WAL-limit loss can make overlapping operations incomplete.
@@ -243,7 +243,7 @@ See [docs/replay-safety.md](docs/replay-safety.md) for the complete safety model
 | `replay` | Replay a recording into an authorized loopback target: `replay RECORDING -- COMMAND...` or explicit `--target`. |
 | `doctor` | Non-destructive platform, capture, WAL/output, protocol, and replay-policy readiness probes with remediation. |
 
-Global options: `--format human|json` and `--data-dir DIR` (also `--config FILE` for configured deployments). Advanced operational forms — shared-cgroup acknowledgement, explicit target/host/effect gates, retry and recovery, WAL sizing, the continuous recorder, and hidden compatibility commands — are documented in the [operations guide](docs/operations.md).
+Global options: `--format human|json` and `--data-dir DIR` (also `--config FILE` for configured deployments). Advanced operational forms — shared-cgroup acknowledgement, explicit target/host/effect gates, retry and recovery, WAL sizing, the continuous recorder, and the hidden `internal` namespace — are documented in the [operations guide](docs/operations.md).
 
 ## Development
 

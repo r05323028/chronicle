@@ -18,7 +18,7 @@ Chronicle 會記錄真實的應用程式流量，將其轉為結果固定、可�
 - Linux 上透過 eBPF 進行 live capture，擷取有明確上限的明文 HTTP/1.1 流量。
 - 針對命令、既有程序或 cgroup 進行錄製。
 - 具備 WAL 內 commit marker、可在當機後復原的分段 WAL。
-- ETL 將一個結果固定的 canonical session 發佈到本機檔案系統儲存空間。
+- ETL 針對每個完成定稿的 epoch，將一個結果固定的 canonical session 發佈到本機檔案系統儲存空間。
 - 具備 loopback 授權的安全 command mode 與 explicit-target replay。
 - 所有平台都支援 fixture 錄製、檢查、列出 catalog，以及非破壞性的就緒檢查。
 

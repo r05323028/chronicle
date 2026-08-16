@@ -1,6 +1,6 @@
 ---
 title: ETL
-description: How recovered evidence becomes one deterministic canonical session.
+description: How recovered evidence becomes deterministic canonical sessions — one per finalized epoch.
 slug: 0-1/docs/architecture/etl
 ---
 

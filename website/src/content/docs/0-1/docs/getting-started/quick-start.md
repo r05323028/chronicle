@@ -20,7 +20,7 @@ Fix reported platform, cgroup, BTF, capability, or embedded-program issues befor
 chronicle record --name checkout -- ./my-app
 ```
 
-Chronicle attaches capture first, then starts the application. Recording stops when the application exits, you press `Ctrl+C`, or the duration bound is reached. While it runs, send representative requests from another terminal.
+Chronicle attaches capture first, then starts the application. Recording stops when the application exits, you press `Ctrl+C`, or an explicit `--duration` expires. While it runs, send representative requests from another terminal.
 
 Without an explicit `--duration`, recording continues until the application exits or is stopped. The physical WAL ceiling is 4 GiB.
 

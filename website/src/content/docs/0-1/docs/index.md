@@ -20,7 +20,7 @@ The current 0.1.x surface is intentionally narrow:
 * Live eBPF capture on Linux for bounded plaintext HTTP/1.1 traffic.
 * Recording around a command, an existing process, or a cgroup.
 * A segmented, crash-recoverable WAL with in-WAL commit markers.
-* ETL that publishes one deterministic canonical session to local filesystem storage.
+* ETL that publishes one deterministic canonical session per finalized epoch to local filesystem storage.
 * Safe command-mode and explicit-target replay with loopback authorization.
 * Fixture recording, inspection, catalog listing, and non-destructive readiness checks on any platform.
 
