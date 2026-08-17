@@ -1,29 +1,30 @@
+use super::internal;
 #[cfg(target_os = "linux")]
-use super::signals::{spawn_command_signal_watcher, spawn_signal_watcher};
+use super::render::render_command_record;
+use super::render::{
+    CommandReplayJson, InspectRecordingJson, ListJson, ListRecordingJson, ReplayJson,
+    format_created_at, format_duration_millis, parent_status_human, render_json,
+    render_public_replay_human, render_recording_inspect_human, replay_cleanup_json,
+};
+#[cfg(target_os = "linux")]
+use super::signals::spawn_command_signal_watcher;
 use super::{
     AppConfig, ApplicationError, ChildStdio, CleanupOutcome, Cli, Command, CommandFactory,
-    CommandReplayJson, CommandReplayOptions, DoctorArgs, DoctorProbe, DoctorReport, DoctorStatus,
-    Duration, ErrorKind, EtlJson, Format, InspectArgs, InspectSessionResult, InternalCommand,
-    ListedRecording, Path, PathBuf, REPLAY_REPORT_VERSION, RecordArgs, RecordJson,
-    RecorderConfigV1, RecorderLease, RecorderStatusV1, ReplayArgs, ReplayJson, ReplayRequest,
-    Serialize, Timing, Write, build_parent_replay_plan, data_dir_doctor_probe, escape_control,
-    inspect_session, io, list_parent_recording_views, list_recordings, load_recorder_metadata,
-    process_and_publish_recording_wal, process_and_publish_recording_wal_with_parent,
-    record_fixture_file, render_inspect_human, render_json, render_public_replay_human,
-    replay_cleanup_json, replay_command, replay_config_doctor_probe,
-    replay_parent_session_with_plan, replay_session_with_plan, resolve_data_dir, resolve_recording,
-    resolve_session, retry_recording,
+    CommandReplayOptions, DoctorArgs, DoctorProbe, DoctorReport, DoctorStatus, Duration, ErrorKind,
+    Format, InspectArgs, InternalCommand, Path, PathBuf, REPLAY_REPORT_VERSION, RecordArgs,
+    ReplayArgs, ReplayRequest, Timing, Write, build_parent_replay_plan, data_dir_doctor_probe,
+    escape_control, inspect_session, io, list_parent_recording_views, list_recordings,
+    replay_command, replay_config_doctor_probe, replay_parent_session_with_plan,
+    replay_session_with_plan, resolve_data_dir, resolve_recording, resolve_session,
+    retry_recording,
 };
 #[cfg(target_os = "linux")]
 use super::{
-    CaptureMode, CgroupSelector, CommandRecordOptions, ProductionRecordJson, ProductionSignalStop,
-    RecordingLifetime, RunStopPolicy, load_recording_metadata, record_command,
-    record_continuous_ebpf, record_selector, recording_physical_wal_bytes,
+    CaptureMode, CgroupSelector, CommandRecordOptions, ProductionSignalStop, RecordingLifetime,
+    RunStopPolicy, record_command, record_selector,
 };
-#[cfg(any(test, target_os = "linux"))]
-use super::{
-    ChildExitResult, CommandRecordResult, RecordingCounters, RecordingStatus, ShutdownReason,
-};
+#[cfg(target_os = "linux")]
+use chronicle_application::RecordingStatus;
 
 pub(super) fn write_output(mut writer: impl Write, output: &str) -> io::Result<()> {
     let mut bytes = Vec::with_capacity(output.len() + 1);
@@ -84,145 +85,7 @@ pub(super) async fn run(cli: Cli) -> Result<(String, i32), ApplicationError> {
     let format = cli.format;
     let cli_data_dir = cli.data_dir.clone();
     match cli.command {
-        Command::Internal(InternalCommand::RecorderStatus { state_root }) => {
-            let metadata = load_recorder_metadata(&state_root)
-                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-            let owner_live = RecorderLease::state_is_owned(&state_root)?;
-            let status = RecorderStatusV1::from_metadata(&metadata, owner_live)
-                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-            let output = match format {
-                Format::Human => status
-                    .render_human()
-                    .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?,
-                Format::Json => status
-                    .render_json()
-                    .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?,
-            };
-            Ok((output, 0))
-        }
-        Command::Internal(InternalCommand::Recorder) => {
-            let path = recorder_config_path.ok_or(ApplicationError::ProductionPreflight(
-                "recorder requires --config FILE",
-            ))?;
-            let recorder_config = RecorderConfigV1::from_file(path)
-                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?
-                .normalize()
-                .map_err(|error| ApplicationError::InvalidConfig(error.to_string()))?;
-            #[cfg(target_os = "linux")]
-            {
-                let wal_dir = recorder_config.state_root.join("wal");
-                let stop = ProductionSignalStop::default();
-                spawn_signal_watcher(stop.clone(), wal_dir.clone());
-                let result = record_continuous_ebpf(
-                    CgroupSelector::Explicit(recorder_config.scope.cgroup_path.clone()),
-                    recorder_config.scope.shared_scope_acknowledged,
-                    &recorder_config,
-                    &wal_dir,
-                    &stop,
-                )?;
-                let metadata = load_recording_metadata(&wal_dir)?.ok_or(
-                    ApplicationError::RecordingMetadataValidation(
-                        "recording metadata missing after finalization".into(),
-                    ),
-                )?;
-                let capture = metadata.capture.as_ref().ok_or(
-                    ApplicationError::RecordingMetadataValidation(
-                        "capture metadata missing after finalization".into(),
-                    ),
-                )?;
-                let physical_wal_bytes = recording_physical_wal_bytes(&wal_dir)?;
-                let output = match format {
-                    Format::Human => format!(
-                        "recording_id: {}\nstatus: {:?}\nshutdown_reason: {:?}\nphysical_wal_bytes: {}",
-                        result.recording_id,
-                        result.status,
-                        result.shutdown_reason,
-                        physical_wal_bytes
-                    ),
-                    Format::Json => render_json(&ProductionRecordJson {
-                        version: 1,
-                        recording_id: result.recording_id.to_string(),
-                        status: result.status,
-                        shutdown_reason: result.shutdown_reason,
-                        last_valid_commit: result.last_valid_commit.as_ref(),
-                        physical_wal_bytes,
-                        selector: metadata.selector.as_ref(),
-                        direct_tgid_count: capture.scope.direct_tgid_count,
-                        descendant_cgroup_count: capture.scope.descendant_cgroup_count,
-                        selected_subtree: capture.scope.selected_subtree,
-                        shared_scope_acknowledged: capture.scope.shared_scope_acknowledged,
-                        configured_bounds: &capture.configured_bounds,
-                        effective_bounds: &capture.effective_bounds,
-                        counters: &result.counters,
-                    })?,
-                };
-                Ok((output, 0))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = recorder_config;
-                Err(ApplicationError::ProductionPreflight(
-                    "live capture is unavailable on this platform",
-                ))
-            }
-        }
-        Command::Internal(InternalCommand::Etl { wal_dir, output }) => {
-            let registry = chronicle_application::protocol_registry()?;
-            let result = match chronicle_application::resolve_epoch_parent_context(&wal_dir)? {
-                Some((parent_id, epoch_id, epoch_ordinal)) => {
-                    process_and_publish_recording_wal_with_parent(
-                        &wal_dir,
-                        &output,
-                        &registry,
-                        parent_id,
-                        epoch_id,
-                        epoch_ordinal,
-                    )?
-                }
-                None => process_and_publish_recording_wal(&wal_dir, &output, &registry)?,
-            };
-            let rendered = match format {
-                Format::Human => format!(
-                    "session_id: {}\noutput: {}\nalready_processed: {}\nignored_post_commit_records: {}",
-                    result.session_id,
-                    output.display(),
-                    result.already_published,
-                    result.ignored_post_commit_records,
-                ),
-                Format::Json => render_json(&EtlJson {
-                    version: 1,
-                    session_id: result.session_id.to_string(),
-                    recording_id: result.checkpoint.recording_id.to_string(),
-                    status: result.checkpoint.status,
-                    shutdown_reason: result.checkpoint.shutdown_reason,
-                    output,
-                    already_processed: result.already_published,
-                    ignored_post_commit_records: result.ignored_post_commit_records,
-                    counters: &result.checkpoint.counters,
-                    checkpoint: &result.checkpoint,
-                })?,
-            };
-            Ok((rendered, 0))
-        }
-        Command::Internal(InternalCommand::RecordFixture { input, root }) => {
-            let result = record_fixture_file(input, &root, config.wal.segment_size_bytes)?;
-            let output = match format {
-                Format::Human => format!(
-                    "session_id: {}\nroot: {}",
-                    result.session_id,
-                    root.display()
-                ),
-                Format::Json => render_json(&RecordJson {
-                    version: 1,
-                    session_id: result.session_id.to_string(),
-                    root,
-                })?,
-            };
-            Ok((output, 0))
-        }
-        Command::Internal(InternalCommand::Bootstrap { .. }) => {
-            unreachable!("bootstrap is handled synchronously before the runtime")
-        }
+        Command::Internal(command) => internal::run(command, format, &config, recorder_config_path),
         Command::Record(args) => run_record(args, cli_data_dir.as_deref(), &config, format),
         Command::Replay(args) => run_replay(args, cli_data_dir.as_deref(), &config, format).await,
         Command::List => run_list(cli_data_dir.as_deref(), &config, format),
@@ -448,114 +311,6 @@ fn record_command_mode(
     ))
 }
 
-/// Human/JSON public record completion summary v1. Raw argv never appears.
-#[cfg(any(test, target_os = "linux"))]
-pub(super) fn render_command_record(
-    result: &CommandRecordResult,
-    format: Format,
-) -> Result<String, ApplicationError> {
-    let id = result.recording_id.to_cli_string();
-    let dropped = dropped_records(&result.counters);
-    match format {
-        Format::Human => {
-            let heading = match result.status {
-                RecordingStatus::Completed => "Recording complete.",
-                RecordingStatus::Failed => "Recording failed.",
-                RecordingStatus::Aborted => "Recording aborted.",
-                _ => "Recording interrupted.",
-            };
-            let mut lines = vec![heading.to_owned()];
-            lines.push(format!("  id: {id}"));
-            lines.push(format!(
-                "  duration: {}",
-                format_duration_millis(result.duration_ms)
-            ));
-            lines.push(format!("  operations: {}", result.operations));
-            lines.push(format!("  dropped: {dropped}"));
-            if let Some(child_exit) = &result.child_exit {
-                lines.push(match child_exit {
-                    ChildExitResult::ExitCode { code } => {
-                        format!("  child: exit_code {code}")
-                    }
-                    ChildExitResult::Signal { signal } => format!("  child: signal {signal}"),
-                });
-            }
-            if matches!(result.cleanup, CleanupOutcome::TimedOut { .. }) {
-                lines.push(
-                    "  warning: supervised scope still populated; orphan processes may remain"
-                        .to_owned(),
-                );
-            }
-            lines.push("Try:".to_owned());
-            lines.push(format!("  chronicle inspect {id}"));
-            lines.push(format!("  chronicle replay {id} -- COMMAND..."));
-            Ok(lines.join("\n"))
-        }
-        Format::Json => {
-            #[derive(Serialize)]
-            struct RecordResultJson<'a> {
-                version: u8,
-                recording_id: String,
-                name: Option<&'a str>,
-                status: &'static str,
-                shutdown_reason: Option<&'static str>,
-                duration_ms: u64,
-                operations: u64,
-                dropped: u64,
-                counters: &'a RecordingCounters,
-                child_exit: Option<&'a ChildExitResult>,
-            }
-            render_json(&RecordResultJson {
-                version: 1,
-                recording_id: id,
-                name: result.name.as_deref(),
-                status: recording_status_json(result.status),
-                shutdown_reason: result.shutdown_reason.map(shutdown_reason_json),
-                duration_ms: result.duration_ms,
-                operations: result.operations,
-                dropped,
-                counters: &result.counters,
-                child_exit: result.child_exit.as_ref(),
-            })
-        }
-    }
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn dropped_records(counters: &RecordingCounters) -> u64 {
-    counters
-        .discarded_from_queue_due_to_wal_limit
-        .records
-        .saturating_add(counters.kernel_or_backend_dropped.records)
-        .saturating_add(counters.rejected_after_stop.records)
-        .saturating_add(counters.rejected_due_to_quota.records)
-}
-
-#[cfg(any(test, target_os = "linux"))]
-const fn recording_status_json(status: RecordingStatus) -> &'static str {
-    match status {
-        RecordingStatus::Completed => "completed",
-        RecordingStatus::Failed => "failed",
-        RecordingStatus::Aborted => "aborted",
-        _ => "in_progress",
-    }
-}
-
-#[cfg(any(test, target_os = "linux"))]
-const fn shutdown_reason_json(reason: ShutdownReason) -> &'static str {
-    match reason {
-        ShutdownReason::UserInterrupt => "user_interrupt",
-        ShutdownReason::TerminationSignal => "termination_signal",
-        ShutdownReason::SourceCompleted => "source_completed",
-        ShutdownReason::DurationLimit => "duration_limit",
-        ShutdownReason::WalSizeLimit => "wal_size_limit",
-        ShutdownReason::CaptureFailure => "capture_failure",
-        ShutdownReason::WalFailure => "wal_failure",
-        ShutdownReason::ProcessCrashRecovered => "process_crash_recovered",
-        ShutdownReason::ForcedTermination => "forced_termination",
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 async fn run_replay(
     args: ReplayArgs,
@@ -681,131 +436,6 @@ async fn run_replay(
         })?,
     };
     Ok((output, replay_exit_code(&result)))
-}
-
-#[derive(Serialize)]
-struct ListRecordingJson {
-    recording_id: String,
-    name: Option<String>,
-    created_at: String,
-    duration: Option<u64>,
-    sessions: usize,
-    operations: usize,
-    epoch_count: usize,
-    active_epoch: Option<u64>,
-    published_epoch_count: usize,
-    status: chronicle_application::RunLifecycleState,
-    warnings: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct ListJson {
-    version: u8,
-    recordings: Vec<ListRecordingJson>,
-}
-
-#[derive(Serialize)]
-struct InspectRecordingJson<'a> {
-    version: u8,
-    recording_id: String,
-    name: Option<&'a str>,
-    created_at: String,
-    duration_ms: Option<u64>,
-    sessions: usize,
-    operations: usize,
-    status: chronicle_application::RecordingCatalogStatus,
-    epoch_count: usize,
-    active_epoch: Option<u64>,
-    published_epoch_count: usize,
-    warnings: &'a [String],
-    epochs: Vec<chronicle_application::ParentReplayEpochPlan>,
-    #[serde(flatten)]
-    result: &'a InspectSessionResult,
-}
-
-fn render_recording_inspect_human(
-    recording: &ListedRecording,
-    parent: &chronicle_application::ParentRecordingViewV2,
-    epochs: &[chronicle_application::ParentReplayEpochPlan],
-    inspected: &InspectSessionResult,
-) -> String {
-    let name = recording
-        .name
-        .as_deref()
-        .map_or_else(|| "none".to_owned(), escape_control);
-    let duration = recording
-        .duration_ms
-        .map_or_else(|| "unknown".to_owned(), format_duration_millis);
-    let epoch_lines = epochs
-        .iter()
-        .map(|epoch| {
-            format!(
-                "epoch: ordinal={} id={} session={} selected={} reason={}",
-                epoch.ordinal,
-                epoch.epoch_id.to_cli_string(),
-                epoch
-                    .session_id
-                    .map_or_else(|| "none".to_owned(), |id| id.to_string()),
-                epoch.selected,
-                epoch.reason.as_deref().unwrap_or("none"),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "recording_id: {}\nname: {}\ncreated_at: {}\nduration: {}\nsessions: {}\noperations: {}\nstatus: {}\nepoch_count: {}\nactive_epoch: {:?}\npublished_epoch_count: {}\nparent_state: {}\nwarnings: {}\nepochs:\n{}\n{}",
-        recording.recording_id.to_cli_string(),
-        name,
-        format_created_at(&recording.created_at),
-        duration,
-        recording.sessions,
-        recording.operations,
-        recording_status_human(recording.status),
-        parent.epoch_count,
-        parent.active_epoch,
-        parent.published_epoch_count,
-        parent_status_human(parent.state),
-        parent.warnings.len(),
-        epoch_lines,
-        render_inspect_human(inspected),
-    )
-}
-
-fn recording_status_human(status: chronicle_application::RecordingCatalogStatus) -> &'static str {
-    match status {
-        chronicle_application::RecordingCatalogStatus::InProgress => "in_progress",
-        chronicle_application::RecordingCatalogStatus::Recoverable => "recoverable",
-        chronicle_application::RecordingCatalogStatus::Published => "published",
-        chronicle_application::RecordingCatalogStatus::Failed => "failed",
-        chronicle_application::RecordingCatalogStatus::Inconsistent => "inconsistent",
-    }
-}
-
-fn parent_status_human(status: chronicle_application::RunLifecycleState) -> &'static str {
-    match status {
-        chronicle_application::RunLifecycleState::Starting => "starting",
-        chronicle_application::RunLifecycleState::Running => "running",
-        chronicle_application::RunLifecycleState::Draining => "draining",
-        chronicle_application::RunLifecycleState::Completed => "completed",
-        chronicle_application::RunLifecycleState::Stopped => "stopped",
-        chronicle_application::RunLifecycleState::Failed => "failed",
-        chronicle_application::RunLifecycleState::Inconsistent => "inconsistent",
-    }
-}
-
-fn format_duration_millis(millis: u64) -> String {
-    let seconds = millis.div_ceil(1000);
-    let minutes = seconds / 60;
-    let remainder = seconds % 60;
-    if minutes == 0 {
-        format!("{remainder}s")
-    } else {
-        format!("{minutes}m {remainder}s")
-    }
-}
-
-fn format_created_at(timestamp: &chronicle_application::Timestamp) -> String {
-    timestamp.to_string()
 }
 
 fn run_list(

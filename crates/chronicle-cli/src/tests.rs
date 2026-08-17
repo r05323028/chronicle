@@ -1,6 +1,12 @@
 use super::*;
 use crate::args::parse_duration;
-use chronicle_application::{ReplayStatus, ReplayabilityStatus};
+use crate::render::{
+    render_command_record, render_public_replay_human, replay_cleanup_human, replay_cleanup_json,
+};
+use chronicle_application::{
+    ChildExitResult, CommandRecordResult, RecordingCounters, RecordingStatus, ReplayStatus,
+    ReplayabilityStatus, ShutdownReason,
+};
 
 #[derive(Default)]
 struct TestWriter {

@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
-use super::{PathBuf, ProductionSignalStop, mark_recording_forced_termination};
+use chronicle_application::{ProductionSignalStop, mark_recording_forced_termination};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
 pub(super) fn spawn_signal_watcher(stop: ProductionSignalStop, wal_directory: PathBuf) {

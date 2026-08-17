@@ -1992,26 +1992,6 @@ fn replay_report_v1_serializes_outcome_and_operation_state() {
 }
 
 #[test]
-fn application_errors_map_to_stable_exit_family() {
-    let transport = ApplicationError::Protocol(ProtocolError::Transport {
-        category: TransportErrorCategory::Timeout,
-        message: "timeout".into(),
-    });
-    for (error, expected) in [
-        (
-            ApplicationError::InvalidRecordingName("name".into(), "invalid".into()),
-            2,
-        ),
-        (ApplicationError::RecordingNotFound("missing".into()), 3),
-        (ApplicationError::TargetLaunchFailed, 3),
-        (ApplicationError::UnsupportedLivePreflight("unsupported"), 4),
-        (transport, 5),
-    ] {
-        assert_eq!(application_error_exit_code(&error), expected);
-    }
-}
-
-#[test]
 fn replay_results_map_to_stable_exit_codes() {
     let result = |outcome| ReplaySessionResult {
         session_id: "session".into(),
