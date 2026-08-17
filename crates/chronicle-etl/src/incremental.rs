@@ -510,6 +510,7 @@ mod tests {
             digest: [digest; 32],
             first_sequence: 1,
             last_sequence,
+            created_unix_nanos: 0,
         }]
     }
 
@@ -752,6 +753,7 @@ mod tests {
             digest: [1; 32],
             first_sequence: 0,
             last_sequence: 0,
+            created_unix_nanos: 0,
         }];
         processor
             .process_snapshot(

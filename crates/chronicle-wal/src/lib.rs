@@ -1265,6 +1265,7 @@ pub struct CommittedSnapshot {
     pub durable_through_sequence: u64,
     pub marker_segment_ordinal: u64,
     pub marker_byte_offset: u64,
+    pub marker_segment_created_unix_nanos: i64,
     pub marker_digest: [u8; 32],
     pub input_digest: [u8; 32],
     pub segment_count: usize,
@@ -1283,6 +1284,7 @@ pub struct CommittedSegment {
     pub digest: [u8; 32],
     pub first_sequence: u64,
     pub last_sequence: u64,
+    pub created_unix_nanos: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1328,6 +1330,12 @@ fn committed_snapshot_from_scan(
         .ok()
         .and_then(|ordinal| ordinal.checked_add(1))
         .ok_or(WalError::CommitArithmeticOverflow)?;
+    let marker_segment_created_unix_nanos =
+        discover_segments(wal_directory.join("segments"), recording_id)?
+            .into_iter()
+            .find(|segment| segment.header.segment_ordinal == provenance.segment_ordinal)
+            .map(|segment| segment.header.created_unix_nanos)
+            .ok_or(WalError::CommitSegmentMismatch)?;
     Ok(CommittedSnapshot {
         recording_id,
         marker_sequence: marker.sequence,
@@ -1337,6 +1345,7 @@ fn committed_snapshot_from_scan(
             .ok_or(WalError::NoAuthoritativeCommit)?,
         marker_segment_ordinal: provenance.segment_ordinal,
         marker_byte_offset: provenance.byte_offset,
+        marker_segment_created_unix_nanos,
         marker_digest,
         input_digest,
         segment_count,
@@ -1507,6 +1516,7 @@ fn committed_segment_lineage(
             digest: Sha256::digest(bytes).into(),
             first_sequence: first,
             last_sequence: last,
+            created_unix_nanos: segment.header.created_unix_nanos,
         });
     }
     Ok(lineage)

@@ -34,6 +34,8 @@ The production pipeline separates distinct logical boundaries:
 
 Recorder and ETL may be co-located in the current local deployment, but correctness does not depend on sharing a process, memory, capture ownership, or a local filesystem namespace; ETL remains independently deployable. WAL segment, epoch, object-store object, and ETL batch boundaries are not protocol or logical interaction boundaries.
 
+The current 0.1 runtime detail is explicit: `ContinuousRecorderService` co-locates capture, WAL reading, `chronicle-etl::CommittedWalSnapshot` processing, and filesystem publication. Incremental passes consume complete commit-marker ranges up to the soft `batch_records` bound; lag is committed-marker counters minus the checkpoint, and `backoff_millis` is a non-blocking retry deadline. These are current filesystem adapters, not future deployment guarantees.
+
 ## Ownership
 
 | Boundary | Responsibility |

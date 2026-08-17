@@ -32,6 +32,8 @@ Application crate 會組合各個 use case。CLI 會解析引數、呈現 applic
 
 目前的本機部署可以將 Recorder 與 ETL 放在同一程序中，但正確性不得依賴共用程序、記憶體、擷取所有權或本機檔案系統命名空間。ETL 仍可獨立部署。WAL segment、epoch、object-store object、ETL batch 的邊界不是協定或邏輯互動邊界。
 
+0.1 目前的 runtime 細節：`ContinuousRecorderService` 在同一程序中組合 capture、WAL 讀取、`chronicle-etl::CommittedWalSnapshot` 處理與檔案系統 publication。Incremental pass 只處理到 soft `batch_records` 上限的完整 commit-marker range；lag 是 committed marker counter 與 checkpoint 的差值；`backoff_millis` 是不阻塞的 retry deadline。這些是目前的檔案系統 adapter，不是未來部署保證。
+
 ## 責任歸屬
 
 | Boundary | Responsibility |

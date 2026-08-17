@@ -38,7 +38,7 @@ One mutating recorder per filesystem domain; standalone ETL, cleanup, or store m
 
 ## Readiness and health
 
-`liveness` means process exists. `capture_readiness` becomes ready only after durable WAL appendability and capture attachment. `processing_readiness` is independent and can be unknown/degraded while capture remains ready. Stale ownership reports failed health with crash-recovery remediation.
+`liveness` means process exists. `capture_readiness` becomes ready only after durable WAL appendability and capture attachment. `processing_readiness` is independent and can be unknown/degraded while capture remains ready. Incremental ETL processes complete commit-marker ranges up to the soft `batch_records` bound; lag is derived from committed WAL counters minus the checkpoint marker, and `backoff_millis` delays only the next ETL attempt without sleeping. Restart resets transient retry deadlines but reconstructs lag from WAL/checkpoint evidence. Stale ownership reports failed health with crash-recovery remediation.
 
 Acceptance polls machine-readable status for at most `CHRONICLE_ACCEPTANCE_READINESS_TIMEOUT_SECONDS` (default 180), while each status command defaults to 10s. Ordinary scenarios use 300s; quota/retention use 600s; cargo-heavy scenarios use 900s. Scenario cleanup gets an independent 180s grace before forced kill. Validation runs acceptance profile at 3300s beneath 3600s gate. Timeout retains readiness transitions, recorder status/journal, process, disk, WAL, and checkpoint diagnostics before bounded cleanup.
 

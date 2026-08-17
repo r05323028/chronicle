@@ -33,6 +33,8 @@ application crate が use case を組み立てます。CLI は引数を解析し
 
 現在のローカルデプロイでは Recorder と ETL を同一プロセスに配置できますが、正しさがプロセス、メモリ、キャプチャ所有権、ローカルファイルシステム名前空間の共有に依存することはありません。ETL は独立してデプロイ可能なままです。WAL segment、epoch、object-store object、ETL batch の境界は、プロトコルまたは論理的な相互作用の境界ではありません。
 
+0.1 の現在のランタイムでは、`ContinuousRecorderService` が capture、WAL 読み取り、`chronicle-etl::CommittedWalSnapshot` 処理、filesystem publication を同一プロセスで組み合わせます。incremental pass は soft `batch_records` 上限までの完全な commit-marker range を処理し、lag は committed marker counter と checkpoint の差分です。`backoff_millis` はブロッキングしない retry deadline です。これは現在の filesystem adapter の実装であり、将来のデプロイ形態を保証するものではありません。
+
 ## 責務の分担
 
 | Boundary | Responsibility |

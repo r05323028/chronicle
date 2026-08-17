@@ -130,7 +130,6 @@ impl RecorderMetadataV1 {
         } else if let Some(checkpoint) = &self.incremental_checkpoint {
             checkpoint.validate()?;
         }
-        self.lag.validate(self.incremental_checkpoint.is_some())?;
         if self.checksum.len() != 64 || !self.checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(RecorderMetadataError::InvalidField("checksum"));
@@ -265,15 +264,6 @@ pub struct LagSummary {
     pub records: u64,
     pub bytes: u64,
     pub age_seconds: u64,
-}
-
-impl LagSummary {
-    fn validate(&self, checkpoint_exists: bool) -> Result<(), RecorderMetadataError> {
-        if !checkpoint_exists && (self.records != 0 || self.bytes != 0 || self.age_seconds != 0) {
-            return Err(RecorderMetadataError::Contradiction);
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
