@@ -24,7 +24,7 @@ CONFIG = tomllib.loads((ROOT / "validation" / "groups.toml").read_text())
 ALL_GROUPS = sorted(CONFIG["groups"])
 
 FIXTURES = {
-    "docs_only": (["docs/architecture.md"], ["cli_docs"]),
+    "docs_only": (["docs/architecture/overview.md"], ["cli_docs"]),
     "etl_only": (["crates/chronicle-etl/src/publication.rs"], ["etl", "portable"]),
     "wal_only": (["crates/chronicle-wal/src/lib.rs"], ["portable", "wal"]),
     "ebpf": (["ebpf/main.bpf.c"], ["ebpf"]),
@@ -67,7 +67,7 @@ class SelectFixtureTests(unittest.TestCase):
         self.assertNotIn("portable", result["selected"])
 
     def test_report_carries_layer_environment_owner_and_coverage(self):
-        result = VALIDATION.select(ROOT, ["docs/architecture.md"], CONFIG)
+        result = VALIDATION.select(ROOT, ["docs/architecture/overview.md"], CONFIG)
         self.assertIn("layers_covered", result)
         self.assertIn("environments_covered", result)
         self.assertIn("owners_covered", result)

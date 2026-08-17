@@ -7,8 +7,9 @@ Replay is the highest-risk Chronicle boundary. It consumes canonical sessions an
 
 ## Safe defaults
 
-- Dry-run is the default.
-- Reads, writes, authentication, publication, and unknown effects are denied until policy allows them.
+- Command mode grants execution and read effects only for the Chronicle-owned supervised listener, after target-independent planning finishes.
+- Explicit-target mode stays dry-run until `--execute` and all required target/effect gates are supplied.
+- Writes always require explicit authorization (`--allow-write`); authentication, publication, and unknown effects remain denied.
 - Every canonical connection needs a target mapping.
 - Recorded destinations are never a fallback.
 - Incomplete, malformed, unmatched, unsupported, pipelined, or ambiguous-loss operations remain visible and are not attempted.

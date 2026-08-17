@@ -3,7 +3,7 @@ title: Storage
 description: The local filesystem publication boundary for canonical sessions and payloads.
 ---
 
-Chronicle currently stores recordings and canonical sessions on the local filesystem. Storage owns persistence and atomic publication; replay reads persisted canonical artifacts rather than WAL internals.
+Chronicle currently stores recordings and canonical sessions on the local filesystem. Storage owns durable persistence and publication primitives; ETL owns the publication decision, publication verification, and checkpoint advancement ordering. Replay reads persisted canonical artifacts rather than WAL internals.
 
 ## Public data directory
 
@@ -24,7 +24,7 @@ A mutating command lazily creates a private directory and rejects unsafe root or
   sessions/<session-uuid>/
 ```
 
-One normalized `.chronicle-domain.lock` protects name claim, capture, ETL, publication, and catalog update as one transaction.
+Within one local filesystem deployment, one normalized `.chronicle-domain.lock` protects name claim, capture, ETL, publication, and catalog update as one transaction. The lock is a local deployment coordination mechanism, not the architectural ownership mechanism between Recorder and ETL.
 
 ## Canonical publication
 

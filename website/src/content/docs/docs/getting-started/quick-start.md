@@ -21,7 +21,7 @@ chronicle record --name checkout -- ./my-app
 
 Chronicle attaches capture first, then starts the application. Recording stops when the application exits, you press `Ctrl+C`, or an explicit `--duration` expires. While it runs, send representative requests from another terminal.
 
-Without an explicit `--duration`, recording continues until the application exits or is stopped. The physical WAL ceiling is 4 GiB.
+Without an explicit `--duration`, recording continues until the application exits or is stopped. Per epoch, the physical WAL ceiling is 4 GiB; a parent recording has no total-WAL cap.
 
 :::caution
 The application must be reachable on a non-loopback address while recording. Command-mode replay starts a supervised copy on loopback and refuses to target the exact recorded destination.
@@ -42,7 +42,7 @@ Recordings can be addressed by `latest`, `rec_<uuid>`, a bare UUID, or an exact 
 chronicle replay checkout -- ./my-app
 ```
 
-Command mode plans before spawning the target, discovers one owned loopback listener, and replays only after target-independent policy checks pass. It is dry-run by default; writes and other effects stay denied unless the relevant policy is explicitly authorized.
+Command mode plans before spawning the target, discovers one owned loopback listener, and replays only after target-independent policy checks pass. It automatically grants execution and read effects for the owned listener; writes and other effects stay denied unless explicitly authorized.
 
 For an already-running application, use explicit target mode only with a loopback IP literal and all required gates:
 

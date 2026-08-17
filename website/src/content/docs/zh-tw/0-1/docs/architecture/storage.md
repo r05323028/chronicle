@@ -4,7 +4,7 @@ description: canonical session 與 payload 在本機檔案系統中的發佈邊�
 slug: zh-tw/0-1/docs/architecture/storage
 ---
 
-Chronicle 目前會將 recording 與 canonical session 儲存在本機檔案系統。Storage 負責持久化與 atomic publication；replay 讀取已持久化的 canonical artifact，而不是 WAL 內部細節。
+Chronicle 目前會將 recording 與 canonical session 儲存在本機檔案系統。Storage 負責持久化與發佈的基礎原語；發佈決定、發佈驗證與 checkpoint advancement ordering 由 ETL 擁有。replay 讀取已持久化的 canonical artifact，而不是 WAL 內部細節。
 
 ## 公開 data directory
 
@@ -25,7 +25,7 @@ Chronicle 目前會將 recording 與 canonical session 儲存在本機檔案系�
   sessions/<session-uuid>/
 ```
 
-一個標準化的 `.chronicle-domain.lock` 會保護 name claim、capture、ETL、publication 與 catalog update，將它們視為一個 transaction。
+在本機檔案系統部署內，標準化的 `.chronicle-domain.lock` 會保護 name claim、capture、ETL、publication 與 catalog update，將它們視為一個 transaction。此 lock 是本地部署的協調機制，不是 Recorder 與 ETL 之間的架構性所有權機制。
 
 ## canonical session 的發佈
 

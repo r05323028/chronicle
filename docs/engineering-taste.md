@@ -34,15 +34,12 @@ future enforcement**. Only rules with strong signal and low false-positive rates
    duplicated across application, CLI, tests, and scripts. Concrete case: exit-code mapping is
    application logic, so its unit tests live in `chronicle-application`; CLI tests only verify
    wiring. — *document-only*; duplication detection is fuzzy and not worth automating yet.
-5. **Code remains agent-legible.** Evidence from the current source distribution (largest files:
-   `chronicle-wal/src/lib.rs` 4668 lines, `chronicle-application/src/lib.rs` 2994,
-   `chronicle-cli/src/main.rs` 2382, `chronicle-application/src/record.rs` 2227). No hard
-   file-size limit is introduced: a threshold would have to exceed today's largest file to pass, so
+5. **Code remains agent-legible.** File size is a human review signal, not a hard rule: no
+   size limit is introduced because a threshold would have to exceed today's largest file to pass, so
    it would not catch anything. Size distribution stays a human review signal; revisit if a file
    grows far beyond the current maximum. — *document-only*; potential future enforcement only with
    a justified evidence-based threshold.
-6. **Observability is structured on production paths.** No `tracing` in library crates today;
-   `chronicle-cli` (outer adapter) initializes `tracing-subscriber` once; production
+6. **Observability is structured on production paths.** Library crates never initialize `tracing`; `chronicle-cli` (outer adapter) initializes `tracing-subscriber` once; production
    observability flows through owned status artifacts (recorder status, checkpoints, machine-readable
    reports). Prefer owned status artifacts and structured output; keep payloads redacted. Do not
    introduce a new logging abstraction without a demonstrated recurring problem. — *document-only*.

@@ -19,7 +19,7 @@ catalog 只提供參考。WAL 中由復原流程認定為權威的事實，以�
 
 ## Session 識別資訊
 
-canonical `SessionId` 是獨立且 deterministic 的識別值，可能與 recording ID 不同。關聯會使用 source provenance；只有舊版相容路徑才會以 ID 相等作為後備。使用者應指定 recording，不要依賴內部 session ID。
+canonical `SessionId` 是獨立且 deterministic 的識別值，可能與 recording ID 不同。Session 關聯需要明確的 source provenance（`recording_id`／`epoch_id`）。識別碼相等永遠不代表 lineage；缺少充分 provenance 的 session 視為未解決。使用者應指定 recording，不要依賴內部 session ID。
 
 ## 完整性是明確定義的
 

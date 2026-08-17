@@ -10,7 +10,7 @@ Chronicle records real application traffic and turns it into deterministic, repl
 It attaches around a supervised command, a running process, or a cgroup instead of requiring application instrumentation. Captured evidence is written to a local write-ahead log (WAL) before interpretation, reconstructed into a protocol-independent canonical session, and replayed only against an explicitly authorized loopback target.
 
 :::caution
-Captured traffic can contain credentials and personal data. Replay can have side effects. Chronicle defaults to dry-run with every effect denied, and never falls back to the recorded production destination.
+Captured traffic can contain credentials and personal data. Replay can have side effects. Command mode executes only permitted reads against a Chronicle-owned supervised copy; explicit-target mode defaults to dry-run until `--execute` and all required gates are supplied. Chronicle never falls back to the recorded production destination.
 :::
 
 ## What is supported now?

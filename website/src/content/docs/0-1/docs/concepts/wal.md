@@ -28,7 +28,7 @@ Reopening a recording resumes after the last authoritative marker, removes only 
 
 ## Physical bounds
 
-Segment size is bounded between 16 MiB and 4 GiB. Total bytes under `segments/` default to and never exceed 4 GiB. The writer reserves room for a complete data frame and its final marker before writing; rotation also reserves the next header and temporary publication peak.
+Segment size is bounded between 16 MiB and 4 GiB. Within one epoch, total bytes under `segments/` default to 4 GiB and never exceed it; the parent recording has no total-WAL cap. The writer reserves room for a complete data frame and its final marker before writing; rotation also reserves the next header and temporary publication peak.
 
 Queue admission loss and WAL-limit loss remain typed evidence. They are not hidden as successful capture.
 

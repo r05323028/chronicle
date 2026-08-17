@@ -28,7 +28,7 @@ ETL 只會讀取由復原流程認定為權威的已提交前綴。最後一個�
 
 ## 實體容量上限
 
-Segment 大小限制在 16 MiB 到 4 GiB 之間。`segments/` 下的總容量預設為 4 GiB，且絕不會超過 4 GiB。寫入器會在寫入前預留完整 data frame 與最後 marker 的空間；輪替時也會預留下一個 header 與暫時的 publication peak。
+Segment 大小限制在 16 MiB 到 4 GiB 之間。在單一 epoch 內，`segments/` 下的總容量預設為 4 GiB，且絕不會超過 4 GiB；父 recording 沒有總容量上限。寫入器會在寫入前預留完整 data frame 與最後 marker 的空間；輪替時也會預留下一個 header 與暫時的 publication peak。
 
 佇列納入失敗與 WAL limit 失敗都會保留為具型別的證據，不會被隱藏成成功的擷取。
 

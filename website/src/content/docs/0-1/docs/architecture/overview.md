@@ -21,6 +21,19 @@ capture-ebpf → capture events → WAL → session reconstruction → ETL
 
 The application crate composes the use cases. The CLI parses arguments, renders application results, and maps exit codes; it does not decode protocols, scan WALs, load eBPF, or own replay policy.
 
+## Logical service boundaries
+
+The production pipeline separates distinct logical boundaries:
+
+- **Recorder** — capture, protocol-neutral evidence, local WAL append/commit/recovery, segment and epoch rollover, loss accounting, and future durable evidence shipping. It does not decode protocols or own canonical storage layout.
+- **Local WAL** — the capture durability and recovery authority.
+- **Durable Evidence Store** — immutable evidence handoff between Recorder and ETL: checksums, parent/epoch lineage, idempotent publication, and independent lifecycles. A future S3-compatible store is a durable handoff/distribution boundary; it does not replace local WAL durability in the capture hot path.
+- **ETL** — reconstruction, protocol decoding, canonicalization, incremental and final publication, verification, and checkpoint advancement ordering.
+- **Canonical Store** — persisted canonical sessions and payload artifacts consumed by inspect and replay.
+- **Replay** — consumes canonical evidence and stays independent from Recorder, WAL, ETL, and evidence-store internals.
+
+Recorder and ETL may be co-located in the current local deployment, but correctness does not depend on sharing a process, memory, capture ownership, or a local filesystem namespace; ETL remains independently deployable. WAL segment, epoch, object-store object, and ETL batch boundaries are not protocol or logical interaction boundaries.
+
 ## Ownership
 
 | Boundary | Responsibility |

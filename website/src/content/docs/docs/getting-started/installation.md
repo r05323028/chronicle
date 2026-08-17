@@ -3,9 +3,13 @@ title: Installation
 description: Install the released Chronicle binary or build the workspace from source.
 ---
 
-## Recommended: release installer
+## Build from source (currently usable)
 
-Chronicle release binaries are supported on Linux `x86_64` and `aarch64`/`arm64`. The repository installer resolves the latest stable GitHub Release, selects the matching archive, verifies `SHA256SUMS`, and installs only after verification succeeds.
+A public release does not exist yet, so building from source is the currently usable installation path. The release installer below becomes the recommended path starting with the first public release.
+
+## Release installer (from the first public release)
+
+Chronicle release binaries will be supported on Linux `x86_64` and `aarch64`/`arm64`. The repository installer will resolve the configured stable GitHub Release, select the matching archive, verify `SHA256SUMS`, and install only after verification succeeds.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh | sh

@@ -4,7 +4,7 @@ This document enumerates one primary responsibility, owned public concepts, allo
 
 ## Current graph
 
-Bounded `cargo metadata --format-version 1 --no-deps` captures 13 root-workspace crates, 38 normal path-dependency declarations, 2 dev declarations, 0 build declarations, and no dependency cycle. This is the actual current graph and equals the target graph; earlier problem edges (`chronicle-session -> chronicle-wal`, `chronicle-cli` to lower-layer crates) were removed and belong to Git history and archived OpenSpec changes, not the current architecture contract.
+The following graph is the current root-workspace Chronicle dependency graph. `validation/architecture.toml` is the executable dependency-policy authority.
 
 ```text
 chronicle-common -> {}

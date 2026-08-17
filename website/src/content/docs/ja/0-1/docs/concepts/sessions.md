@@ -4,7 +4,7 @@ description: Chronicle の recording における identity と完全性のモデ
 slug: ja/0-1/docs/concepts/sessions
 ---
 
-Chronicle がユーザーに公開するのは **recording** です。recording は上限付きのキャプチャライフサイクル、その WAL、metadata、catalog identity、公開済みの canonical result から成ります。canonical result は **session**、つまり `inspect` と `replay` が利用するポータブルな単位です。
+Chronicle がユーザーに公開するのは **recording** です。recording は上限付きの epoch から構成されるユーザーから見えるキャプチャライフサイクルであり、その WAL、metadata、catalog identity、公開済みの canonical result を含みます。canonical result は **session**、つまり `inspect` と `replay` が利用するポータブルな単位です。
 
 ## recording の識別情報
 
@@ -19,7 +19,7 @@ catalog は参考情報です。復旧の権威が持つ WAL の事実と canoni
 
 ## session の識別情報
 
-canonical `SessionId` は recording ID とは独立して再現可能に生成されるため、両者は異なる場合があります。関連付けには source provenance を使い、ID の一致は旧来のフォールバックに限ります。ユーザーは内部の session ID に依存せず、recording を指定してください。
+canonical `SessionId` は recording ID とは独立して再現可能に生成されるため、両者は異なる場合があります。session の関連付けには明示的な source provenance（`recording_id`／`epoch_id`）が必要です。識別子の一致は lineage ではありません。十分な provenance がない session は未解決です。ユーザーは内部の session ID に依存せず、recording を指定してください。
 
 ## 完全性は明示される
 

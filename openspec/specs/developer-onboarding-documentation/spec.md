@@ -15,7 +15,7 @@ The README is the primary developer onboarding entry point for Chronicle: produc
 
 #### Scenario: Reclassified implementation detail
 
-- **WHEN** the README is reviewed against docs/operations.md, docs/architecture.md, and docs/replay-safety.md
+- **WHEN** the README is reviewed against docs/operations/overview.md, docs/architecture/overview.md, and docs/replay-safety.md
 - **THEN** operations, architecture, and safety semantics are referenced, not duplicated, and hidden compatibility commands are not presented as a product interface
 
 ### Requirement: Product positioning
@@ -52,7 +52,7 @@ The README SHALL present installation through an installed `chronicle` binary as
 
 ### Requirement: Quick Start contract
 
-The public Quick Start SHALL operate on an installed binary, remain short, and cover the common command-mode workflow: `chronicle doctor`; `chronicle record --name checkout -- ./my-app`; representative traffic to the application; `chronicle list`; `chronicle inspect checkout`; `chronicle replay checkout -- ./my-app`. Each command SHALL match the validated CLI contract. Advanced forms (PID recording, explicit cgroup recording, explicit replay target, `--allow-host`, explicit effect gates, `--retry`, recovery behavior, WAL sizing, continuous-recorder internals, hidden compatibility commands, deprecated syntax) SHALL NOT appear in the initial Quick Start and SHALL link to `docs/operations.md`.
+The public Quick Start SHALL operate on an installed binary, remain short, and cover the common command-mode workflow: `chronicle doctor`; `chronicle record --name checkout -- ./my-app`; representative traffic to the application; `chronicle list`; `chronicle inspect checkout`; `chronicle replay checkout -- ./my-app`. Each command SHALL match the validated CLI contract. Advanced forms (PID recording, explicit cgroup recording, explicit replay target, `--allow-host`, explicit effect gates, `--retry`, recovery behavior, WAL sizing, continuous-recorder internals, hidden compatibility commands, deprecated syntax) SHALL NOT appear in the initial Quick Start and SHALL link to `docs/operations/overview.md`.
 
 #### Scenario: Quick Start executes
 
@@ -70,12 +70,12 @@ The README SHALL expose only the prerequisites a user needs before live capture:
 
 #### Scenario: Requirements match doctor
 
-- **WHEN** the Requirements section is compared to doctor probe codes and docs/operations.md
+- **WHEN** the Requirements section is compared to doctor probe codes and docs/operations/overview.md
 - **THEN** the stated prerequisites match the implemented probe set without duplicating its internals
 
 ### Requirement: Architecture overview preserves the replay boundary
 
-The README SHALL present a developer-friendly flow and architecture responsibilities: eBPF capture, WAL, ETL/session reconstruction, the canonical session model, storage, protocol adapters, and replay. The presentation SHALL preserve the boundary that replay consumes canonical sessions and protocol interfaces and does not depend on capture, eBPF, WAL, or ETL; this boundary SHALL NOT be oversimplified away. The README SHALL link `docs/architecture.md` and `docs/architecture/crate-boundaries.md` and SHALL NOT duplicate the full compile-time crate dependency graph.
+The README SHALL present a developer-friendly flow and architecture responsibilities: eBPF capture, WAL, ETL/session reconstruction, the canonical session model, storage, protocol adapters, and replay. The presentation SHALL preserve the boundary that replay consumes canonical sessions and protocol interfaces and does not depend on capture, eBPF, WAL, or ETL; this boundary SHALL NOT be oversimplified away. The README SHALL link `docs/architecture/overview.md` and `docs/architecture/crate-boundaries.md` and SHALL NOT duplicate the full compile-time crate dependency graph.
 
 #### Scenario: Replay boundary explicit
 
@@ -93,7 +93,7 @@ The README SHALL present a compact capability matrix with honest statuses: suppo
 
 ### Requirement: Safety and limitations presentation
 
-The README SHALL keep prominent, concise safety guidance: captured data may contain sensitive production information; replay may have side effects and defaults to dry-run with effects denied; replay SHALL NOT automatically target the recorded production destination; explicit authorization and policy gates remain visible to users; and current security limitations (no encryption at rest, no comprehensive redaction, no tenant isolation) SHALL NOT be hidden. The README SHALL keep a compact public limitations list (Linux-only live capture; plaintext HTTP/1.1 only with no TLS decryption or HTTP/2+; bounded recording; sensitive local artifacts; local-filesystem storage; unsupported stateful/multiplexed protocols; preserve-timing modeled not executed) and SHALL link detailed semantics to `docs/replay-safety.md` and `docs/operations.md`.
+The README SHALL keep prominent, concise safety guidance: captured data may contain sensitive production information; replay may have side effects and defaults to dry-run with effects denied; replay SHALL NOT automatically target the recorded production destination; explicit authorization and policy gates remain visible to users; and current security limitations (no encryption at rest, no comprehensive redaction, no tenant isolation) SHALL NOT be hidden. The README SHALL keep a compact public limitations list (Linux-only live capture; plaintext HTTP/1.1 only with no TLS decryption or HTTP/2+; bounded recording; sensitive local artifacts; local-filesystem storage; unsupported stateful/multiplexed protocols; preserve-timing modeled not executed) and SHALL link detailed semantics to `docs/replay-safety.md` and `docs/operations/overview.md`.
 
 #### Scenario: Safety summary complete
 
@@ -102,7 +102,7 @@ The README SHALL keep prominent, concise safety guidance: captured data may cont
 
 ### Requirement: CLI overview
 
-The README SHALL include a concise public command overview centered on `record`, `list`, `inspect`, `replay`, and `doctor`, explaining intent without replicating `--help` output, plus global options. Advanced operational forms SHALL link to `docs/operations.md`.
+The README SHALL include a concise public command overview centered on `record`, `list`, `inspect`, `replay`, and `doctor`, explaining intent without replicating `--help` output, plus global options. Advanced operational forms SHALL link to `docs/operations/overview.md`.
 
 #### Scenario: CLI overview intent-only
 
@@ -111,7 +111,7 @@ The README SHALL include a concise public command overview centered on `record`,
 
 ### Requirement: Development section and documentation links
 
-The README SHALL keep contributor instructions separate from installation: pinned toolchain (`rust-toolchain.toml`), workspace build/test/gate commands, and the canonical layered validation entry point (`./scripts/validate.sh fast`, with targeted/gate/release when required); privileged acceptance SHALL be mentioned as opt-in Linux evidence, not part of normal onboarding. The README SHALL link the documentation that exists and remains accurate: `docs/architecture.md`, `docs/operations.md`, `docs/replay-safety.md`, `docs/release-notes.md`, and `CONTRIBUTING.md`; every README relative link SHALL resolve.
+The README SHALL keep contributor instructions separate from installation: pinned toolchain (`rust-toolchain.toml`), workspace build/test/gate commands, and the canonical layered validation entry point (`./scripts/validate.sh fast`, with targeted/gate/release when required); privileged acceptance SHALL be mentioned as opt-in Linux evidence, not part of normal onboarding. The README SHALL link the documentation that exists and remains accurate: `docs/architecture/overview.md`, `docs/operations/overview.md`, `docs/replay-safety.md`, `docs/release-notes.md`, and `CONTRIBUTING.md`; every README relative link SHALL resolve.
 
 #### Scenario: Links resolve
 

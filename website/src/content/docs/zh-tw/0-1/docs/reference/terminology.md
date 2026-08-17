@@ -35,4 +35,4 @@ slug: zh-tw/0-1/docs/reference/terminology
 - 面向使用者的有明確上限的擷取生命週期使用 **recording**；canonical replay 單位使用 **session**。
 - 描述持久化 model 時使用 **canonical session**，不要寫成「normalized recording」。
 - 描述 ETL 輸入時使用 **recovered committed prefix**，不要寫成「WAL 裡有什麼就用什麼」。
-- 討論 replay 時要說明 **dry-run by default**，並列出需要通過的 gates。
+- 討論 replay 時要說明模式：command mode 在規劃後會對所擁有的受監督 target 授予執行與讀取；explicit-target mode 在提供 `--execute` 與所有必要 gate 之前維持 dry-run；寫入一律需要明確授權。

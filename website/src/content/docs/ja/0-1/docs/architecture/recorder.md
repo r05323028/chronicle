@@ -32,7 +32,7 @@ chronicle record --retry checkout
 
 リポジトリには対応するデプロイ向けの上限付き continuous recorder も含まれています。意図指向の公開 CLI surface が安定するまで、foreground entrypoint は非公開のままです。1 つの filesystem domain、epoch rotation、incremental ETL resume、liveness／health metadata、shutdown cleanup を所有します。
 
-これは常時稼働する分散キャプチャサービスではありません。recorder state、WAL、manifest、checkpoint、catalog fact はローカルに保持され、上限もあります。この高度な経路を運用する前に、リポジトリの [continuous recorder runbook](https://github.com/r05323028/chronicle/blob/main/docs/continuous-recorder-runbook.md)を確認してください。
+これは常時稼働する分散キャプチャサービスではありません。recorder state、WAL、manifest、checkpoint、catalog fact はローカルに保持され、上限もあります。この高度な経路を運用する前に、リポジトリの [recorder runbook](https://github.com/r05323028/chronicle/blob/main/docs/operations/recorder-runbook.md)を確認してください。現在のローカルデプロイでは recorder runtime と incremental ETL を同一プロセスに配置しています。これはトポロジーの選択であり、論理的な所有権ではありません。ETL は独立した境界のままです（[ETL](../etl/) を参照）。1 つの `.chronicle-domain.lock` がローカル filesystem の調整ドメインを保護しますが、Recorder と ETL の間のアーキテクチャ上の所有メカニズムではありません。
 
 ## 停止と復旧
 

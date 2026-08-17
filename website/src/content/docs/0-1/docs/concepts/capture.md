@@ -31,6 +31,6 @@ Chronicle attaches around a command, process, or cgroup. The application does no
 
 ## Bounds are part of the contract
 
-Recording continues until the application exits or is stopped unless an explicit duration is given. The physical WAL ceiling is 4 GiB. Capture queues are bounded; when evidence cannot be admitted, the loss is visible rather than silently dropped.
+Recording continues until the application exits or is stopped unless an explicit duration is given. Per epoch, the physical WAL ceiling is 4 GiB; the parent recording has no total-WAL cap. Capture queues are bounded; when evidence cannot be admitted, the loss is visible rather than silently dropped.
 
 Read [WAL](../wal/), [ETL](../../architecture/etl/), and [local deployment](../../deployment/local/) for the next boundaries.

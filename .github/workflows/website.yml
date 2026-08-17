@@ -6,8 +6,6 @@ on:
     paths:
       - "website/**"
       - "README.md"
-      - "docs/PRODUCT.md"
-      - "docs/DESIGN.md"
       - "docs/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -19,8 +17,6 @@ on:
     paths:
       - "website/**"
       - "README.md"
-      - "docs/PRODUCT.md"
-      - "docs/DESIGN.md"
       - "docs/**"
       - "Cargo.toml"
       - "Cargo.lock"

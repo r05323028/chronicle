@@ -35,4 +35,4 @@ slug: ja/0-1/docs/reference/terminology
 - ユーザー向けの上限付きキャプチャライフサイクルには **recording**、canonical replay unit には **session** を使います。
 - 永続化された model には **canonical session** を使い、「normalized recording」とは書きません。
 - ETL 入力には **recovered committed prefix** を使い、「WAL に入っていたもの」とは書きません。
-- replay については **dry-run by default** と、必要な gate を明記します。
+- replay について説明するときは、モードを明記します。command mode は計画の後に、所有する監視対象 target に対する実行と読み取りを認可します。explicit-target mode は、`--execute` と必要なすべての gate が指定されるまで dry-run のままです。書き込みには常に明示的な認可が必要です。

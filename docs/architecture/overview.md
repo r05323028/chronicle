@@ -14,21 +14,7 @@ Chronicle does not retain V1/V2/V3 dispatch enums, migration adapters, dual writ
 
 ## Boundaries
 
-```text
-chronicle-capture-ebpf -> chronicle-capture -> chronicle-common
-chronicle-wal (local standalone durability)
-chronicle-session -> chronicle-capture + chronicle-common
-chronicle-canonical -> chronicle-common
-chronicle-protocol -> chronicle-canonical + chronicle-common
-chronicle-protocol-builtins -> chronicle-protocol + chronicle-canonical + chronicle-common
-chronicle-storage -> chronicle-canonical
-chronicle-replay -> chronicle-canonical + chronicle-protocol
-chronicle-etl -> capture + WAL + session + protocol + canonical + storage
-chronicle-application -> capture + WAL + ETL + protocol + storage + replay
-chronicle-cli -> chronicle-application
-```
-
-Arrows point from dependent crate to its compile-time dependencies. No crate depends on CLI. Protocol-owned stream views keep replay free of capture, session, WAL, ETL, and eBPF dependencies.
+The exact root-workspace Cargo dependency graph is owned by [`docs/architecture/crate-boundaries.md`](architecture/crate-boundaries.md); `validation/architecture.toml` is its executable authority. This overview intentionally does not maintain a second copy of that graph. No crate depends on the CLI, and protocol-owned stream views keep replay free of capture, session, WAL, ETL, and eBPF dependencies.
 
 Thirteen crates consolidate real protocol modules into `chronicle-protocol-builtins`; one empty crate per protocol would add coupling and maintenance without behavior. Modules remain independent registration boundaries. Future independently distributed plugins require a versioned ABI/process boundary, not Rust trait objects across dynamic libraries.
 

@@ -21,7 +21,7 @@ chronicle record --name checkout -- ./my-app
 
 Chronicle 會先掛接擷取，再啟動應用程式。應用程式結束、按下 `Ctrl+C`，或明確的 `--duration` 到期時，錄製就會停止。錄製期間，請從另一個終端機送出具代表性的請求。
 
-未指定 `--duration` 時，錄製會持續到應用程式結束或停止為止。WAL 的實體容量上限為 4 GiB。
+未指定 `--duration` 時，錄製會持續到應用程式結束或停止為止。WAL 的實體容量上限為每個 epoch 4 GiB；父 recording 沒有總容量上限。
 
 :::caution
 錄製期間，應用程式必須能透過非 loopback 位址連線。command mode replay 會在 loopback 上啟動受監督的複本，並拒絕將目標設為當初記錄的完全相同目的地。
@@ -42,7 +42,7 @@ chronicle inspect checkout
 chronicle replay checkout -- ./my-app
 ```
 
-command mode 會在啟動 target 前完成規劃，找出一個由該 scope 擁有的 loopback listener；只有通過與 target 無關的 policy checks 後才會重播。預設為 dry-run；除非明確授權相關 policy，否則寫入與其他操作都會維持拒絕。
+command mode 會在啟動 target 前完成規劃，找出一個由該 scope 擁有的 loopback listener；只有通過與 target 無關的 policy checks 後才會重播。對所擁有的 listener 的執行與讀取會自動授權；除非明確授權，否則寫入與其他操作都會維持拒絕。
 
 對於已經執行中的應用程式，只能在 target 使用 loopback IP 字面值，並提供所有必要的 gates：
 

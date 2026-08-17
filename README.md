@@ -6,7 +6,7 @@ Chronicle records real application traffic with eBPF and turns it into determini
 
 Capture attaches to a supervised command, a running process, or a cgroup with no application instrumentation. Evidence is persisted durably to a local write-ahead log before any interpretation, reconstructed into a protocol-independent canonical session, and later replayed against an explicitly authorized loopback target — never automatically against the recorded production destination.
 
-> **Safety:** captured traffic can contain credentials and personal data. Replay can have side effects and defaults to dry-run with every effect denied. Never point replay at a recorded production destination.
+> **Safety:** captured traffic can contain credentials and personal data. Replay can have side effects. Command mode executes permitted reads only against a Chronicle-owned supervised copy; explicit-target mode stays dry-run until `--execute` and all target/effect gates are supplied; writes always require explicit authorization. Never point replay at a recorded production destination.
 
 ## What is Chronicle?
 
@@ -28,7 +28,7 @@ Chronicle 0.1.x exposes five intent-oriented commands: `record`, `replay`, `list
 - **Live capture of plaintext HTTP/1.1 traffic with eBPF on Linux** — attach to a supervised command (`record -- ./my-app`), a running process (`record --pid PID`), or a cgroup (`record --cgroup PATH`). Recording has an optional whole-recording `--duration`; when omitted it runs until the source completes, an explicit stop, or a fatal failure. WAL storage is bounded by segments and epochs (4 GiB physical ceiling per epoch by default).
 - **Bounded, crash-recoverable recording** — a segmented WAL with in-WAL commit markers, recovery, and restartable ETL. Failures during finalization can be retried without recapturing (`record --retry RECORDING`).
 - **Deterministic canonical sessions** — ETL reconstructs bounded HTTP/1.1 sessions and publishes them atomically to local storage with stable recording identities (`rec_<uuid>`, names, `latest`).
-- **Safe replay** — dry-run by default with every effect denied. Command mode replays into a supervised copy of the application and infers its loopback listener; explicit-target mode requires a loopback target, matching `--allow-host`, effect authorization, and `--execute`. Writes always require `--allow-write`. Recorded production destinations are never contacted.
+- **Safe replay** — mode-aware defaults. Command mode replays into a supervised copy of the application and automatically grants execution/read for its owned loopback listener; explicit-target mode stays dry-run until a loopback target, matching `--allow-host`, effect authorization, and `--execute` are supplied. Writes always require `--allow-write`. Recorded production destinations are never contacted.
 - **`chronicle doctor`** — non-destructive readiness checks with actionable remediation for platform, kernel, cgroup, BTF, embedded capture programs, and privileges.
 - **Fixture recording** — deterministic, credential-free test input for development and CI on any platform.
 
@@ -36,15 +36,17 @@ Not implemented (planned or out of scope, not silently supported): PostgreSQL/S3
 
 ## Installation
 
-### Install a released binary (recommended)
+Chronicle has not published its first stable release yet; the currently usable path is to [build from source](#build-from-source). A release installer becomes the recommended path starting with the first public release.
 
-On a supported Linux host (`x86_64` or `aarch64`), install the latest release with a single command:
+### Release installer (from the first public release)
+
+On a supported Linux host (`x86_64` or `aarch64`), the installer will resolve the configured stable release and install it with a single command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh | sh
 ```
 
-The installer detects the platform, resolves the latest stable release, downloads the matching `chronicle-<version>-<target>.tar.gz` archive, verifies it against the release's `SHA256SUMS`, and installs the `chronicle` binary into `$HOME/.local/bin` (created if missing). If that directory is not on your `PATH`, the installer prints the `export PATH` line to add. It requires only `sh`, `curl`, `tar`, and a SHA-256 utility; no Rust toolchain.
+The installer detects the platform, downloads the matching `chronicle-<version>-<target>.tar.gz` archive, verifies it against the release's `SHA256SUMS`, and installs the `chronicle` binary into `$HOME/.local/bin` (created if missing). If that directory is not on your `PATH`, the installer prints the `export PATH` line to add. It requires only `sh`, `curl`, `tar`, and a SHA-256 utility; no Rust toolchain.
 
 Verify the install:
 
@@ -67,7 +69,7 @@ curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh
   | CHRONICLE_INSTALL_DIR=/some/path sh
 ```
 
-Release binaries are built on Linux with live capture included automatically, so it works out of the box on a supported Linux host. Prefer releases over building from source unless you are developing Chronicle itself.
+Release binaries are built on Linux with live capture included automatically, so it works out of the box on a supported Linux host. Prefer the installer over building from source once releases exist, unless you are developing Chronicle itself.
 
 ### Manual installation (advanced/fallback)
 
@@ -145,11 +147,11 @@ chronicle inspect checkout
 chronicle replay checkout -- ./my-app
 ```
 
-The application must be reachable on a **non-loopback address** while recording: command-mode replay starts a supervised copy that listens on loopback and refuses to target the exact recorded destination (replay never contacts recorded production destinations). If your application only listens on `127.0.0.1`, record traffic to it through the machine's network address instead, or use explicit `--target` replay mode (see the [operations guide](docs/operations.md)).
+The application must be reachable on a **non-loopback address** while recording: command-mode replay starts a supervised copy that listens on loopback and refuses to target the exact recorded destination (replay never contacts recorded production destinations). If your application only listens on `127.0.0.1`, record traffic to it through the machine's network address instead, or use explicit `--target` replay mode (see the [operations guide](docs/operations/overview.md)).
 
-`record -- COMMAND...` finalizes the WAL, runs ETL, and publishes a canonical session for each finalized epoch automatically when the application exits, an explicit `--duration` expires, or a fatal failure occurs. `latest` resolves to the newest published recording; recordings can also be addressed by `rec_<uuid>`, bare UUID, or exact name. `replay RECORDING -- COMMAND...` plans first, starts the application in a supervised cgroup, discovers its unique loopback listener, and replays — dry-run by default, with writes still requiring `--allow-write`.
+`record -- COMMAND...` finalizes the WAL, runs ETL, and publishes a canonical session for each finalized epoch automatically when the application exits, an explicit `--duration` expires, or a fatal failure occurs. `latest` resolves to the newest published recording; recordings can also be addressed by `rec_<uuid>`, bare UUID, or exact name. `replay RECORDING -- COMMAND...` plans first, starts the application in a supervised cgroup, discovers its unique loopback listener, and replays — command mode grants execution/read for the owned copy only, and writes always require `--allow-write`; explicit-target mode stays dry-run until `--execute` and all gates are supplied.
 
-Advanced workflows — recording an already-running workload with `--pid`/`--cgroup`, explicit `--target` replay, `--allow-host` and effect gates, `--retry`, recovery and WAL-sizing details, the continuous recorder, and the hidden `internal` namespace — are documented in the [operations guide](docs/operations.md).
+Advanced workflows — recording an already-running workload with `--pid`/`--cgroup`, explicit `--target` replay, `--allow-host` and effect gates, `--retry`, recovery and WAL-sizing details, the continuous recorder, and the hidden `internal` namespace — are documented in the [operations guide](docs/operations/overview.md).
 
 ## How It Works
 
@@ -196,7 +198,7 @@ Replay
 - **Replay (`chronicle-replay`)** — replay planning, execution, and verification. Depends only on canonical sessions and protocol interfaces; it has no capture, WAL, ETL, or eBPF knowledge.
 - **Application and CLI (`chronicle-application`, `chronicle-cli`)** — user-facing use-case composition and argument/rendering/exit mapping. The CLI is a thin outer adapter.
 
-Replay consumes canonical sessions and protocol interfaces, not the production capture pipeline — this boundary is deliberate and preserved. For the full dependency graph, one-responsibility rules, and forbidden edges, see [docs/architecture.md](docs/architecture.md) and [docs/architecture/crate-boundaries.md](docs/architecture/crate-boundaries.md).
+Replay consumes canonical sessions and protocol interfaces, not the production capture pipeline — this boundary is deliberate and preserved. For the full dependency graph, one-responsibility rules, and forbidden edges, see [docs/architecture/overview.md](docs/architecture/overview.md) and [docs/architecture/crate-boundaries.md](docs/architecture/crate-boundaries.md).
 
 ## Supported Protocols
 
@@ -217,11 +219,11 @@ HTTP/1.1 support is deliberately narrow: origin-form requests, exact `Content-Le
 ## Safety
 
 - **Captured data is sensitive.** WAL and session files can contain production headers, bodies, credentials, and personal data. Chronicle uses private file modes and safe default output, but does not promise encryption at rest, secret discovery, comprehensive redaction, or tenant isolation.
-- **Replay can have side effects.** Replay defaults to dry-run and denies every operation — reads, writes, authentication, publication. Explicit authorization is required: loopback target, matching host, effect gates, and `--execute`. Writes require `--allow-write`.
+- **Replay can have side effects.** Command mode executes only permitted reads against the owned supervised copy; explicit-target mode defaults to dry-run and denies operations until loopback target, matching host, effect gates, and `--execute` are supplied. Writes always require `--allow-write`.
 - **Replay never targets the production destination.** Recorded destinations are never a fallback, and mapping back to a recorded endpoint is blocked by default.
 - **Gates stay visible.** Authorization and policy gates are explicit user inputs, never hidden defaults.
 
-See [docs/replay-safety.md](docs/replay-safety.md) for the complete safety model and [docs/operations.md](docs/operations.md) for operational bounds.
+See [docs/replay-safety.md](docs/replay-safety.md) for the complete safety model and [docs/operations/overview.md](docs/operations/overview.md) for operational bounds.
 
 ## Current Limitations
 
@@ -243,7 +245,7 @@ See [docs/replay-safety.md](docs/replay-safety.md) for the complete safety model
 | `replay` | Replay a recording into an authorized loopback target: `replay RECORDING -- COMMAND...` or explicit `--target`. |
 | `doctor` | Non-destructive platform, capture, WAL/output, protocol, and replay-policy readiness probes with remediation. |
 
-Global options: `--format human|json` and `--data-dir DIR` (also `--config FILE` for configured deployments). Advanced operational forms — shared-cgroup acknowledgement, explicit target/host/effect gates, retry and recovery, WAL sizing, the continuous recorder, and the hidden `internal` namespace — are documented in the [operations guide](docs/operations.md).
+Global options: `--format human|json` and `--data-dir DIR` (also `--config FILE` for configured deployments). Advanced operational forms — shared-cgroup acknowledgement, explicit target/host/effect gates, retry and recovery, WAL sizing, the continuous recorder, and the hidden `internal` namespace — are documented in the [operations guide](docs/operations/overview.md).
 
 ## Development
 
@@ -275,13 +277,13 @@ No checked-in configuration contains secrets: `postgres.connection_url_env` name
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — components, boundaries, versioning policy, and deferred implementations.
+- [Architecture](docs/architecture/overview.md) — components, boundaries, versioning policy, and deferred implementations.
 - [Crate boundaries](docs/architecture/crate-boundaries.md) — per-crate responsibility and dependency rules.
-- [Operations](docs/operations.md) — quick start, bounds, cgroup selection, record/recover/publish, inspect/replay, doctor, and validation.
+- [Operations](docs/operations/overview.md) — quick start, bounds, cgroup selection, record/recover/publish, inspect/replay, doctor, and validation.
 - [Replay safety](docs/replay-safety.md) — the replay safety model and authorization semantics.
 - [Contributing](CONTRIBUTING.md) — how to contribute.
-- [Website product brief](docs/PRODUCT.md) — website scope and product truth.
-- [Website design brief](docs/DESIGN.md) — website visual system and responsive rules.
+- [Website product brief](website/PRODUCT.md) — website scope and product truth.
+- [Website design brief](website/DESIGN.md) — website visual system and responsive rules.
 - [Website maintainers](website/MAINTAINERS.md) — deployment and documentation version workflow.
 
 ## License

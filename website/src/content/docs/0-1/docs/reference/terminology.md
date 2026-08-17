@@ -23,4 +23,4 @@ English is the canonical documentation language. Localized pages preserve CLI co
 * Use **recording** for the user-facing bounded capture lifecycle and **session** for the canonical replay unit.
 * Say **canonical session**, not “normalized recording,” when referring to the persisted model.
 * Say **recovered committed prefix**, not “whatever was in the WAL,” when describing ETL input.
-* Say **dry-run by default** and name the gates when discussing replay.
+* When discussing replay, describe the mode: command mode grants execution/read for the owned supervised target after planning; explicit-target mode stays dry-run until `--execute` and all required gates are supplied; writes always require explicit authorization.

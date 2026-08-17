@@ -47,12 +47,16 @@ Rules:
 
 | Need | Go to |
 | --- | --- |
+| High-level runtime/service architecture | `docs/architecture/overview.md` |
+| Runtime/operator guidance | `docs/operations/overview.md` |
+| Internal recorder runtime | `docs/operations/recorder.md` |
+| Recorder runbook | `docs/operations/recorder-runbook.md` |
 | Crate ownership, dependency direction, semantic boundaries | `docs/architecture/crate-boundaries.md`; policy `validation/architecture.toml` |
 | Engineering taste + feedback loop | `docs/engineering-taste.md` |
 | Test layers, gates, preflight, content-addressed evidence | `validation/test-architecture/README.md` |
 | Validation modes + timeouts | `CONTRIBUTING.md` |
 | Replay safety / WAL format | `docs/replay-safety.md` / `docs/wal-format.md` |
-| Product/operations docs | `docs/` (architecture, operations, recorder runbooks) |
+| Product/operations docs | `docs/operations/overview.md`, `docs/operations/recorder.md`, `docs/operations/recorder-runbook.md` |
 | OpenSpec SDD workflow | `openspec/` |
 
 ## Mandatory workflow entrypoints

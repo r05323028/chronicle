@@ -3,7 +3,7 @@ title: Sessions
 description: The identity and completeness model for Chronicle recordings.
 ---
 
-Chronicle exposes a **recording** to users. A recording is the bounded capture lifecycle, its WAL, metadata, catalog identity, and published canonical result. The canonical result is a **session**: the portable unit consumed by inspect and replay.
+Chronicle exposes a **recording** to users. A recording is a user-visible capture lifecycle composed of bounded epochs, together with its WAL, metadata, catalog identity, and published canonical results. The canonical result is a **session**: the portable unit consumed by inspect and replay.
 
 ## Recording identity
 
@@ -18,7 +18,7 @@ The catalog is advisory. Recovery-authoritative WAL facts and canonical session 
 
 ## Session identity
 
-A canonical `SessionId` is independently deterministic and may differ from the recording ID. Association uses source provenance; ID equality is only a legacy fallback. Users should address recordings rather than depending on internal session IDs.
+A canonical `SessionId` is independently deterministic and may differ from the recording ID. Session association requires explicit source provenance (`recording_id` / `epoch_id`). Identifier equality is never lineage; sessions without sufficient provenance are unresolved. Users should address recordings rather than depending on internal session IDs.
 
 ## Completeness is explicit
 

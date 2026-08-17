@@ -35,6 +35,14 @@ canonical validation
 atomic filesystem publication
 ```
 
+## Incremental processing
+
+During recording, ETL runs incrementally over the recovery-authoritative committed WAL prefix: it publishes canonical delta batches and advances a durable incremental checkpoint only after publication. Epoch rollover persists bounded, checksummed, lineage-verified continuation evidence so cross-epoch state remains processable; a WAL epoch boundary is not a protocol reconstruction boundary. Finalization performs the final authoritative publication of one deterministic canonical session per finalized epoch.
+
+## Deployment independence
+
+Recorder and ETL may be co-located in the current local deployment, but ETL consumes recovery-authoritative evidence through a durable evidence contract and does not require capture ownership, the Recorder process, or a shared filesystem namespace. ETL owns canonical publication, publication verification, and checkpoint advancement ordering.
+
 ## Restartability
 
 A failed finalization can resume from the persisted WAL and checkpoint/publication state. The checkpoint is progress evidence, not a replacement for WAL durability and not an identity binding to arbitrary output. Contradictory metadata fails closed and remains available for diagnosis.

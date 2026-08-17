@@ -7,8 +7,9 @@ description: 明示的な loopback 安全 gate によって recording を計画�
 
 ## 安全なデフォルト
 
-- デフォルトは dry-run です。
-- 読み取り、書き込み、認証、公開、未知の操作は、policy が認可するまで拒否されます。
+- command mode は、target に依存しない計画の完了後にのみ、Chronicle が所有する監視対象 listener に対して実行と読み取りの効果を認可します。
+- explicit-target mode は、`--execute` と必要なすべての target／effect gate が指定されるまで dry-run のままです。
+- 書き込みには常に明示的な認可（`--allow-write`）が必要です。認証、公開、未知の効果は拒否されたままです。
 - すべての canonical connection に target mapping が必要です。
 - 記録された宛先はフォールバックに使いません。
 - incomplete、malformed、unmatched、unsupported、pipelined、または曖昧な欠損を含む操作は表示されたままになり、実行しません。

@@ -32,7 +32,7 @@ chronicle record --retry checkout
 
 Command, PID, cgroup, and daemon modes share one continuous coordinator. It owns one filesystem domain, epoch rotation, incremental ETL resume, liveness/health metadata, and shutdown cleanup.
 
-This is not an always-on distributed capture service. Recorder state, WAL, manifests, checkpoints, and catalog facts remain local and bounded. Consult the repository's [continuous recorder runbook](https://github.com/r05323028/chronicle/blob/main/docs/continuous-recorder-runbook.md) before operating that advanced path.
+This is not an always-on distributed capture service. Recorder state, WAL, manifests, checkpoints, and catalog facts remain local and bounded. Consult the repository's [recorder runbook](https://github.com/r05323028/chronicle/blob/main/docs/operations/recorder-runbook.md) before operating that advanced path. The current local deployment co-locates the recorder runtime with incremental ETL; that is a topology choice, not logical ownership — ETL remains an independent boundary (see [ETL](../etl/)). One `.chronicle-domain.lock` protects the local filesystem coordination domain; it is not the architectural ownership mechanism between Recorder and ETL.
 
 ## Stop and recovery
 

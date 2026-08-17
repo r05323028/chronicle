@@ -7,8 +7,9 @@ description: 透過明確的 loopback 安全閘門規劃並執行 recording。
 
 ## 安全預設值
 
-- 預設為 dry-run。
-- 讀取、寫入、驗證、發佈與未知操作在 policy 授權前都會拒絕。
+- Command mode 只有在完成與 target 無關的規劃後，才會對 Chronicle 擁有的受監督 listener 授予執行與讀取效果。
+- Explicit-target mode 在提供 `--execute` 與所有必要的 target／effect gate 之前，維持 dry-run。
+- 寫入一律需要明確授權（`--allow-write`）；驗證、發佈與未知效果維持拒絕。
 - 每個 canonical connection 都需要 target mapping。
 - 記錄中的 destination 永遠不是 fallback。
 - incomplete、malformed、unmatched、unsupported、pipelined 或涉及有歧義遺失的操作，都會保持可見且不會嘗試執行。

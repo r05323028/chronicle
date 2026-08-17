@@ -19,6 +19,19 @@ capture-ebpf → capture events → WAL → session reconstruction → ETL
 
 application crate が use case を組み立てます。CLI は引数を解析し、application result を表示し、exit code を対応付けます。プロトコルのデコード、WAL の走査、eBPF のロード、replay policy の所有は行いません。
 
+## 論理的なサービス境界
+
+本番パイプラインは次の論理境界に分かれます。
+
+- **Recorder** — キャプチャ、プロトコルに依存しない証拠、ローカル WAL の append／commit／復旧、segment と epoch の rollover、欠損の記録、将来の durable evidence shipping。プロトコルのデコードや canonical storage のレイアウトは所有しません。
+- **ローカル WAL** — キャプチャの durability と復旧の権威。
+- **Durable Evidence Store** — Recorder と ETL の間の不変な証拠の handoff。checksum、parent／epoch lineage、冪等な publication、独立したライフサイクルを保持します。将来の S3 互換ストアは durable な handoff／distribution 境界であり、キャプチャのホットパスでローカル WAL durability を置き換えません。
+- **ETL** — reconstruction、プロトコルのデコード、canonicalization、incremental／final publication、検証、checkpoint advancement ordering。
+- **Canonical Store** — inspect と replay が利用する、永続化された canonical session と payload artifact。
+- **Replay** — canonical evidence を消費し、Recorder、WAL、ETL、evidence store の内部実装から独立しています。
+
+現在のローカルデプロイでは Recorder と ETL を同一プロセスに配置できますが、正しさがプロセス、メモリ、キャプチャ所有権、ローカルファイルシステム名前空間の共有に依存することはありません。ETL は独立してデプロイ可能なままです。WAL segment、epoch、object-store object、ETL batch の境界は、プロトコルまたは論理的な相互作用の境界ではありません。
+
 ## 責務の分担
 
 | Boundary | Responsibility |

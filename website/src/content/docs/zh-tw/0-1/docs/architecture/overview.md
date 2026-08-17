@@ -20,6 +20,19 @@ capture-ebpf → capture events → WAL → session reconstruction → ETL
 
 Application crate 會組合各個 use case。CLI 會解析引數、呈現 application result 並對應 exit code；它不會解碼協定、掃描 WAL、載入 eBPF，也不擁有 replay policy。
 
+## 邏輯服務邊界
+
+生產管線分為下列邏輯邊界。
+
+- **Recorder** — 擷取、與協定無關的證據、本機 WAL 的 append／commit／復原、segment 與 epoch rollover、遺失記錄、未來的 durable evidence shipping。不擁有協定解碼或 canonical storage 配置。
+- **本機 WAL** — 擷取的 durable 與復原權威。
+- **Durable Evidence Store** — Recorder 與 ETL 之間不可變證據的 handoff。保留 checksum、parent／epoch lineage、冪等發佈與獨立生命週期。未來的 S3 相容儲存是 durable handoff／distribution 邊界，不會在擷取熱路徑上取代本機 WAL durability。
+- **ETL** — reconstruction、協定解碼、canonicalization、incremental／final publication、驗證與 checkpoint advancement ordering。
+- **Canonical Store** — 供 inspect 與 replay 使用的已持久化 canonical session 與 payload artifact。
+- **Replay** — 消費 canonical evidence，並與 Recorder、WAL、ETL、evidence store 的內部實作保持獨立。
+
+目前的本機部署可以將 Recorder 與 ETL 放在同一程序中，但正確性不得依賴共用程序、記憶體、擷取所有權或本機檔案系統命名空間。ETL 仍可獨立部署。WAL segment、epoch、object-store object、ETL batch 的邊界不是協定或邏輯互動邊界。
+
 ## 責任歸屬
 
 | Boundary | Responsibility |

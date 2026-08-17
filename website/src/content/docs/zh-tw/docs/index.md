@@ -8,7 +8,7 @@ Chronicle 會記錄真實的應用程式流量，將其轉為結果固定、可�
 它會從受監督的命令、執行中的程序或 cgroup 外部掛接，不要求在應用程式中加入 instrumentation。擷取到的證據會先寫入本機 write-ahead log（WAL），再重建為不依賴協定的 canonical session；重播只會針對明確授權的 loopback target。
 
 :::caution
-擷取到的流量可能包含憑證與個人資料。重播可能產生副作用。Chronicle 預設以 dry-run 執行，所有操作都拒絕，也永遠不會改用記錄中的 production 目的地。
+擷取到的流量可能包含憑證與個人資料。重播可能產生副作用。Command mode 只會對 Chronicle 擁有的受監督複本執行允許的讀取；explicit-target mode 在提供 `--execute` 與所有必要 gate 之前維持 dry-run。Chronicle 永遠不會改用記錄中的 production 目的地。
 :::
 
 ## 目前支援的範圍

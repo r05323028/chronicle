@@ -4,9 +4,13 @@ description: 安裝 Chronicle 發行版本的二進位檔，或從原始碼建�
 slug: zh-tw/0-1/docs/getting-started/installation
 ---
 
-## 建議：安裝發行版本
+## 目前的安裝方式
 
-Chronicle 發行版本的二進位檔支援 Linux `x86_64` 與 `aarch64`／`arm64`。儲存庫提供的安裝器會取得 GitHub Release 的最新穩定版本、選擇相符的封存檔、驗證 `SHA256SUMS`，只有驗證成功後才會安裝。
+目前尚未發布第一個穩定版本；從原始碼建置是現在可用的安裝路徑。下列發行版本安裝器會在首次公開版本發布後成為建議路徑。
+
+## 發行版本安裝器（自首次公開版本起）
+
+Chronicle 發行版本的二進位檔將支援 Linux `x86_64` 與 `aarch64`／`arm64`。儲存庫提供的安裝器會取得 GitHub Release 的設定穩定版本、選擇相符的封存檔、驗證 `SHA256SUMS`，只有驗證成功後才會安裝。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh | sh

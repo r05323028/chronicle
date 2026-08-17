@@ -1,4 +1,4 @@
-# Continuous recorder runbook
+# Recorder runbook
 
 ## Preflight
 

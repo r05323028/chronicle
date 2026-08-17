@@ -27,7 +27,7 @@ ETL が読むのは、復旧の権威が認めた commit 済み prefix だけで
 
 ## 物理容量の上限
 
-セグメントサイズは 16 MiB 以上 4 GiB 以下です。`segments/` 配下の合計バイト数はデフォルトで 4 GiB、4 GiB を超えることはありません。writer は書き込む前に完全な data frame と最後の marker のための容量を予約します。ローテーションでは次の header と一時的な publication peak も予約します。
+セグメントサイズは 16 MiB 以上 4 GiB 以下です。epoch 内では、`segments/` 配下の合計バイト数はデフォルトで 4 GiB、4 GiB を超えることはありません。親 recording には合計上限はありません。writer は書き込む前に完全な data frame と最後の marker のための容量を予約します。ローテーションでは次の header と一時的な publication peak も予約します。
 
 キューへの取り込み失敗と WAL limit による失敗は、型付きの evidence として残ります。キャプチャ成功として隠すことはありません。
 

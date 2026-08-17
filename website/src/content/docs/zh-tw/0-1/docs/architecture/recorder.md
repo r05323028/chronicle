@@ -32,7 +32,7 @@ chronicle record --retry checkout
 
 儲存庫也包含適用於支援部署的、有明確上限的 continuous recorder。當面向意圖的公開 CLI surface 尚在穩定時，它的 foreground entrypoint 仍保持隱藏。它負責一個 filesystem domain、epoch rotation、incremental ETL resume、liveness／health metadata 與 shutdown cleanup。
 
-這不是常駐的分散式 capture service。Recorder state、WAL、manifest、checkpoint 與 catalog fact 都維持在本機，且有明確上限。操作這條進階路徑前，請參考儲存庫的 [continuous recorder runbook](https://github.com/r05323028/chronicle/blob/main/docs/continuous-recorder-runbook.md)。
+這不是常駐的分散式 capture service。Recorder state、WAL、manifest、checkpoint 與 catalog fact 都維持在本機，且有明確上限。操作這條進階路徑前，請參考儲存庫的 [recorder runbook](https://github.com/r05323028/chronicle/blob/main/docs/operations/recorder-runbook.md)。目前的本機部署會把 recorder runtime 與 incremental ETL 放在同一程序中；這是拓撲選擇，不是邏輯所有權。ETL 仍是獨立邊界（參閱 [ETL](../etl/)）。一個 `.chronicle-domain.lock` 保護本機檔案系統協調網域，但不是 Recorder 與 ETL 之間的架構性所有權機制。
 
 ## 停止與復原
 

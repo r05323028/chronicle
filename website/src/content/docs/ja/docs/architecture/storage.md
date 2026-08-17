@@ -3,7 +3,7 @@ title: ストレージ
 description: canonical session と payload をローカルファイルシステムへ公開する境界。
 ---
 
-Chronicle は現在、recording と canonical session をローカルファイルシステムに保存します。storage は永続化と atomic publication を担当し、replay は WAL の内部ではなく永続化された canonical artifact を読み取ります。
+Chronicle は現在、recording と canonical session をローカルファイルシステムに保存します。storage は耐久性のある永続化と publication プリミティブを担当し、publication の決定、publication 検証、checkpoint advancement ordering は ETL が所有します。replay は WAL の内部ではなく永続化された canonical artifact を読み取ります。
 
 ## 公開 data directory
 
@@ -24,7 +24,7 @@ Chronicle は現在、recording と canonical session をローカルファイ�
   sessions/<session-uuid>/
 ```
 
-正規化された 1 つの `.chronicle-domain.lock` が、name claim、capture、ETL、publication、catalog update を 1 つの transaction として保護します。
+ローカルファイルシステムのデプロイ内では、正規化された `.chronicle-domain.lock` が name claim、capture、ETL、publication、catalog update を 1 つの transaction として保護します。この lock はローカルデプロイの調整メカニズムであり、Recorder と ETL の間のアーキテクチャ上の所有メカニズムではありません。
 
 ## canonical session の公開
 

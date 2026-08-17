@@ -11,7 +11,7 @@ Replay planner preserves one result per canonical operation. Complete supported 
 - Target mapping is mandatory per connection. Missing mapping fails.
 - Recorded production destination is never a fallback.
 - Mapping back to recorded endpoint is blocked by default.
-- Policy defaults to dry-run with reads, writes, authentication, publication, and unknown operations denied.
+- Explicit-target mode defaults to dry-run; command mode grants only execution/read effects for the owned loopback listener, after target-independent planning. Writes, authentication, publication, and unknown operations are denied by default in both modes.
 - Command mode starts target only after target-independent planning and scope setup, then requires one unique loopback listener owned by supervised cgroup members and their open socket inode.
 - Explicit-target execution requires `http://<loopback-ip>:<port>`, matching repeated `--allow-host`, effect authorization, and `--execute`; configuration cannot supply these gates.
 - HTTP replay removes every captured Host and emits one target Host; removes Connection tokens, hop-by-hop fields, Authorization, Proxy-Authorization, Cookie, Forwarded, X-Forwarded-*, Expect, and Transfer-Encoding; then emits one recomputed Content-Length. It never follows redirects.
@@ -40,7 +40,6 @@ Command mode executes only after target-independent denial checks and owned-list
 
 ## Planned controls
 
-- explicit confirmation/flag for non-dry-run;
 - operation filters and protocol-specific classification;
 - authentication/token/header replacement from external runtime configuration;
 - blocklists for production networks and service identities;

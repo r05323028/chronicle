@@ -35,6 +35,14 @@ canonical validation
 atomic filesystem publication
 ```
 
+## インクリメンタル処理
+
+記録中、ETL は recovery-authoritative な committed WAL prefix に対してインクリメンタルに実行されます。canonical delta batch を公開し、publication の後にのみ durable な incremental checkpoint を進めます。epoch rollover では、境界付きで checksum され lineage 検証済みの continuation evidence を永続化するため、epoch をまたぐ状態も処理可能です。WAL epoch の境界はプロトコル再構成の境界ではありません。finalization は、完了した各 epoch に対して 1 つの決定論的な canonical session の最終的な権威ある publication を行います。
+
+## デプロイの独立性
+
+Recorder と ETL は現在のローカルデプロイでは同一プロセスに配置できますが、ETL は durable evidence contract を通じて recovery-authoritative evidence を消費し、キャプチャ所有権、Recorder プロセス、共有ファイルシステム名前空間を必要としません。ETL が canonical publication、publication 検証、checkpoint advancement ordering を所有します。
+
 ## 再起動可能性
 
 finalization に失敗しても、永続化された WAL と checkpoint／publication state から再開できます。checkpoint は進捗の証拠であり、WAL durability の代替でも任意の出力への identity binding でもありません。矛盾する metadata は fail closed となり、診断のために残ります。

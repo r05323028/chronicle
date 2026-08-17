@@ -21,7 +21,7 @@ chronicle record --name checkout -- ./my-app
 
 Chronicle は先にキャプチャをアタッチしてからアプリケーションを起動します。アプリケーションが終了したとき、`Ctrl+C` を押したとき、または明示的な `--duration` が満了したときに記録を停止します。実行中は別のターミナルから代表的なリクエストを送ってください。
 
-`--duration` を指定しない場合、記録はアプリケーションの終了または停止まで続きます。WAL 全体の物理容量上限は 4 GiB です。
+`--duration` を指定しない場合、記録はアプリケーションの終了または停止まで続きます。WAL の物理容量上限は epoch ごとに 4 GiB で、親 recording に合計上限はありません。
 
 :::caution
 記録中、アプリケーションには loopback 以外のアドレスから到達できなければなりません。command mode replay は loopback 上で監視対象のコピーを起動し、記録された宛先そのものをターゲットにすることを拒否します。
@@ -42,7 +42,7 @@ chronicle inspect checkout
 chronicle replay checkout -- ./my-app
 ```
 
-command mode はターゲットを起動する前に計画を完了し、その scope が所有する loopback listener を 1 つ検出します。ターゲットに依存しない policy check を通過した後にだけリプレイします。デフォルトは dry-run です。該当する policy を明示的に認可しない限り、書き込みなどの操作は拒否されたままです。
+command mode はターゲットを起動する前に計画を完了し、その scope が所有する loopback listener を 1 つ検出します。ターゲットに依存しない policy check を通過した後にだけリプレイします。所有する listener に対する実行と読み取りは自動的に認可されます。書き込みなどの操作と他の効果は、明示的に認可しない限り拒否されたままです。
 
 すでに起動しているアプリケーションには、loopback の IP リテラルと必要なすべての gate を指定した explicit target mode だけを使用してください。
 

@@ -31,7 +31,7 @@ chronicle record --retry checkout
 
 command、PID、cgroup、daemon の各モードは 1 つの continuous coordinator を共有します。1 つの filesystem domain、上限付き epoch rotation、incremental ETL／continuation resume、liveness／health metadata、shutdown cleanup を所有し、先行 epoch の ETL が遅れても capture を継続できます。
 
-これは常時稼働する分散キャプチャサービスではありません。recorder state、WAL、manifest、checkpoint、catalog fact はローカルに保持され、上限もあります。この高度な経路を運用する前に、リポジトリの [continuous recorder runbook](https://github.com/r05323028/chronicle/blob/main/docs/continuous-recorder-runbook.md)を確認してください。
+これは常時稼働する分散キャプチャサービスではありません。recorder state、WAL、manifest、checkpoint、catalog fact はローカルに保持され、上限もあります。この高度な経路を運用する前に、リポジトリの [recorder runbook](https://github.com/r05323028/chronicle/blob/main/docs/operations/recorder-runbook.md)を確認してください。現在のローカルデプロイでは recorder runtime と incremental ETL を同一プロセスに配置しています。これはトポロジーの選択であり、論理的な所有権ではありません。ETL は独立した境界のままです（[ETL](../etl/) を参照）。1 つの `.chronicle-domain.lock` がローカル filesystem の調整ドメインを保護しますが、Recorder と ETL の間のアーキテクチャ上の所有メカニズムではありません。
 
 ## 停止と復旧
 

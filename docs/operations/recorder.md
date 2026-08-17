@@ -1,4 +1,4 @@
-# Continuous recorder
+# Recorder
 
 ## Runtime shape
 
@@ -34,7 +34,7 @@ Recorder owns one filesystem domain. WAL commit markers remain acknowledgement a
 - `wal_dir/continuation-in.json` / `continuation-out.json`: immutable bounded handoff evidence.
 - `store_root/`: immutable delta, recovery, and provenance artifacts.
 
-One mutating recorder per filesystem domain. Standalone ETL, cleanup, or store mutation must not bypass that ownership boundary.
+One mutating recorder per filesystem domain; standalone ETL, cleanup, or store mutation must not bypass that ownership boundary. This is a local deployment coordination mechanism: `.chronicle-domain.lock` protects one filesystem coordination domain in the current co-located deployment, not the architectural ownership mechanism between Recorder and ETL. Recorder and ETL remain separate logical boundaries, and ETL stays independently deployable.
 
 ## Readiness and health
 
@@ -54,4 +54,4 @@ Capture scope must be outside the recorder state/store subtree. Config files con
 
 ## Operations
 
-Use `chronicle internal recorder --config /etc/chronicle/recorder.toml` in foreground. Use `chronicle internal recorder-status --state-root /var/lib/chronicle` for read-only readiness. See [`systemd/chronicle-recorder.service`](systemd/chronicle-recorder.service) and [`continuous-recorder-runbook.md`](./continuous-recorder-runbook.md).
+Use `chronicle internal recorder --config /etc/chronicle/recorder.toml` in foreground. Use `chronicle internal recorder-status --state-root /var/lib/chronicle` for read-only readiness. See [`systemd/chronicle-recorder.service`](systemd/chronicle-recorder.service) and [`recorder-runbook.md`](./recorder-runbook.md).

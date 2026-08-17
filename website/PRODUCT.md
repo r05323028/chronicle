@@ -33,7 +33,7 @@ Users work from a shell and repository. The current public CLI is intent-oriente
 - Recording lifetime is optional at the public surface; omitted `--duration` has no whole-run deadline. Epoch and segment WAL limits remain bounded, and a parent recording may own multiple immutable epoch sessions.
 - WAL v1 is segmented, append-only, group-committed, checksum-validated, and recovery-authoritative through in-WAL commit markers.
 - ETL reconstructs bounded sessions and atomically publishes one canonical session per finalized epoch to local filesystem storage; a WAL epoch boundary is not a protocol reconstruction boundary.
-- Replay is dry-run by default, denies effects until authorized, requires loopback target mapping, and never falls back to the recorded production destination.
+- Replay never falls back to the recorded production destination. Command mode replays into a supervised copy and grants execution/read for the owned listener only; explicit-target mode is dry-run until `--execute` and all target/effect gates are supplied; writes always require explicit authorization.
 - Public data is local filesystem storage today. PostgreSQL, S3-compatible persistence, TLS decryption, HTTP/2+, additional protocols, encryption at rest, comprehensive redaction, Docker packaging, and Kubernetes packaging are not implemented.
 - Canonical English is the source for localized site content. Traditional Chinese (zh-TW) and Japanese (ja) are supported locales; technical terms must remain consistent through a glossary.
 - Documentation has a current/Latest surface and an archived 0.1 surface; versioning must be isolated so future published versions can be added without rewriting the site.
@@ -45,8 +45,8 @@ The product name is Chronicle. Existing repository banner artwork lives at `docs
 ## Evidence on Hand
 
 - `README.md`: current product summary, installation, quick start, capabilities, safety, limitations, CLI table, and architecture overview.
-- `docs/operations.md`: operational bounds, recording, recovery, ETL, inspect, replay, doctor, and migration details.
-- `docs/architecture.md`, `docs/architecture/crate-boundaries.md`, `docs/canonical-model.md`, `docs/replay-safety.md`, and `docs/wal-format.md`: canonical architecture and safety facts.
+- `docs/operations/overview.md`: operational bounds, recording, recovery, ETL, inspect, replay, doctor, and migration details.
+- `docs/architecture/overview.md`, `docs/architecture/crate-boundaries.md`, `docs/canonical-model.md`, `docs/replay-safety.md`, and `docs/wal-format.md`: canonical architecture and safety facts.
 - `crates/chronicle-cli/src/main.rs`: exact public command names and flags.
 - `install.sh` and `.github/workflows/release.yml`: release installation and artifact contracts.
 - `docs/branding/banner.png`: existing project banner.
