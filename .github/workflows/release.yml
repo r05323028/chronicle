@@ -158,6 +158,90 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  privileged-acceptance:
+    name: x86_64 privileged recorder acceptance
+    needs: resolve-context
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out release candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Prepare x86 Multipass guest
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          command -v multipass >/dev/null 2>&1 || \
+            sudo snap install multipass --classic
+          sudo snap restart multipass.multipassd || true
+          timeout 180 bash -c \
+            'until sudo multipass list >/dev/null 2>&1; do sleep 3; done'
+          timeout 300 sudo multipass find
+          timeout 600 sudo multipass launch 24.04 \
+            --name chronicle-x86 --cpus 2 --memory 6G --disk 20G
+          test "$(sudo multipass exec chronicle-x86 -- uname -m)" = x86_64
+
+      - name: Run fresh release-grade acceptance
+        run: |
+          set -euo pipefail
+          set +e
+          sudo -E env HOME=/root PATH="$PATH:/usr/local/bin" \
+            "$GITHUB_WORKSPACE/scripts/acceptance.sh" \
+            --profile all \
+            --executor multipass \
+            --vm chronicle-x86 \
+            --release \
+            --no-reuse \
+            --gate-timeout-seconds 3600 \
+            --evidence-root \
+            "$GITHUB_WORKSPACE/target/validation-evidence/acceptance"
+          acceptance_status=$?
+          set -e
+          sudo chown -R "$(id -u):$(id -g)" \
+            target/validation-evidence/acceptance 2>/dev/null || true
+          report=$(find target/validation-evidence/acceptance \
+            -name acceptance-report.json -print -quit 2>/dev/null || true)
+          if [[ -n "$report" ]]; then
+            python3 - "$report" <<'PY'
+          import json
+          import sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          print(json.dumps({
+              "status": value.get("status"),
+              "release_eligible": value.get("release_eligible"),
+              "failed": value.get("failed_scenarios"),
+              "not_checked": value.get("not_checked_scenarios"),
+              "completed": len(value.get("completed_scenarios", [])),
+              "selected": len(value.get("selected_scenarios", [])),
+          }, sort_keys=True))
+          PY
+          else
+            echo "acceptance report missing" >&2
+          fi
+          if [[ "$acceptance_status" -ne 0 ]]; then
+            exit "$acceptance_status"
+          fi
+          test -n "$report"
+          python3 - "$report" <<'PY'
+          import json
+          import sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert value["status"] == "passed", value
+          assert value["release_eligible"] is True, value
+          assert value["environment"]["architecture"] == "x86_64", value
+          assert not value["failed_scenarios"], value
+          assert not value["not_checked_scenarios"], value
+          PY
+
+      - name: Upload x86 acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-acceptance-x86_64-${{ github.run_id }}
+          path: target/validation-evidence/acceptance/
+          if-no-files-found: warn
+          retention-days: 30
+
   release-notes:
     name: Generate release notes with Pi
     needs: [resolve-context, release]
@@ -184,7 +268,8 @@ jobs:
 
       - name: Generate release notes with Pi
         id: generate
-        uses: shaftoe/pi-coding-agent-action@v2.27.0
+        uses: >-
+          shaftoe/pi-coding-agent-action@0698813906fb1f23425bd742510e3080d624840d
         env:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
         with:
@@ -212,7 +297,7 @@ jobs:
 
   prepare-release:
     name: Prepare release artifacts
-    needs: [resolve-context, release, release-notes]
+    needs: [resolve-context, release, release-notes, privileged-acceptance]
     runs-on: ubuntu-latest
     steps:
       - name: Download release archives

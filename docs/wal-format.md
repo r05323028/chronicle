@@ -1,6 +1,6 @@
 # WAL Format
 
-Chronicle has one mutable pre-0.1 WAL format: v1. Readers reject every other declared format, envelope, and record-schema version. No legacy reader or format dispatch remains.
+Chronicle 0.1 defines one public WAL v1 format. Readers reject every other declared format, envelope, and record-schema version with typed fail-closed behavior; no legacy reader or format dispatch remains. WAL v1 framing and in-WAL commit-marker semantics are compatibility-sensitive within 0.1.x. Valid v1 writers and readers may come from different supported 0.1.x releases, while unsupported versions and malformed/corrupt input are never guessed or migrated implicitly.
 
 All integers are little-endian. Recording WAL lives under `segments/`; segment files are named `{first_sequence:020}.chwal`.
 

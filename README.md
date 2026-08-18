@@ -19,7 +19,7 @@ The design follows four principles:
 - **Protocol- and storage-independent core.** ETL reconstructs evidence into a canonical session representation that does not depend on how it was captured or where it is stored, so recordings remain portable and stable.
 - **Replay decoupled from capture.** Replay consumes canonical sessions through protocol interfaces. It has no dependency on capture, eBPF, WAL, or ETL, and it never automatically targets the original production destination.
 
-Chronicle is early but runnable software. See [Current capabilities](#current-capabilities--status) and [Current limitations](#current-limitations) for exactly what is and is not supported today.
+Chronicle 0.1.0 is the first stable public release. See [Current capabilities](#current-capabilities--status) and [Current limitations](#current-limitations) for exactly what is and is not supported today.
 
 ## Current capabilities / status
 
@@ -36,17 +36,17 @@ Not implemented (planned or out of scope, not silently supported): PostgreSQL/S3
 
 ## Installation
 
-Chronicle has not published its first stable release yet; the currently usable path is to [build from source](#build-from-source). A release installer becomes the recommended path starting with the first public release.
+Install latest stable Chronicle release:
 
-### Release installer (from the first public release)
+### Release installer
 
-On a supported Linux host (`x86_64` or `aarch64`), the installer will resolve the configured stable release and install it with a single command:
+On a supported Linux host (`x86_64` or `aarch64`), the installer resolves the configured stable release and installs it with a single command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh | sh
 ```
 
-The installer detects the platform, downloads the matching `chronicle-<version>-<target>.tar.gz` archive, verifies it against the release's `SHA256SUMS`, and installs the `chronicle` binary into `$HOME/.local/bin` (created if missing). If that directory is not on your `PATH`, the installer prints the `export PATH` line to add. It requires only `sh`, `curl`, `tar`, and a SHA-256 utility; no Rust toolchain.
+The installer detects the platform, downloads the matching `chronicle-<version>-<target>.tar.gz` archive, verifies it against the release's `SHA256SUMS`, and installs the `chronicle` binary into `$HOME/.local/bin` (created if missing). If that directory is not on your `PATH`, the installer prints the `export PATH` line to add. It requires POSIX `sh`, `curl`, `tar`, `uname`, `grep`, `head`, `cut`, `awk`, `mktemp`, and a SHA-256 utility; no Rust toolchain.
 
 Verify the install:
 
@@ -69,7 +69,7 @@ curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh
   | CHRONICLE_INSTALL_DIR=/some/path sh
 ```
 
-Release binaries are built on Linux with live capture included automatically, so it works out of the box on a supported Linux host. Prefer the installer over building from source once releases exist, unless you are developing Chronicle itself.
+Release binaries are built on Linux with live capture included automatically, so they work out of the box on a supported Linux host. Prefer the installer for normal use; build from source when developing Chronicle itself.
 
 ### Manual installation (advanced/fallback)
 
@@ -112,12 +112,7 @@ Contributor demos on Linux can run the CLI directly: `cargo run -p chronicle-cli
 
 ## Requirements
 
-Live capture on Linux requires:
-
-- a supported OS and kernel: Linux 6.1+ with cgroup v2 enabled and BTF available (`/sys/kernel/btf/vmlinux`);
-- a supported architecture: little-endian x86_64 or aarch64;
-- eBPF capabilities for the recording process: `CAP_BPF` and `CAP_NET_ADMIN`;
-- the capture programs embedded in the binary (every Linux build has them; non-Linux builds omit live capture).
+Live capture is Linux-only. Release binaries target little-endian x86_64 and aarch64/arm64. The 0.1 release-verified runtime environment is Ubuntu 24.04 with Linux 6.8, cgroup v2, readable BTF, and aarch64; x86_64 and other Linux 6.1+ environments require matching privileged acceptance and are not proven by artifact availability alone. The recording process also needs `CAP_BPF` and `CAP_NET_ADMIN`, and the binary must contain embedded capture programs.
 
 Run `chronicle doctor` to check all of this before recording. `doctor` is non-destructive: it probes platform, architecture, cgroup v2, BTF, the embedded capture object and programs, attachment, and capabilities, and reports remediation for anything missing. Non-Linux hosts support the portable surface without live capture.
 
@@ -227,7 +222,7 @@ See [docs/replay-safety.md](docs/replay-safety.md) for the complete safety model
 
 ## Current Limitations
 
-- **Live capture is Linux-only** — cgroup v2, kernel 6.1+, BTF, x86_64/aarch64, and eBPF privileges are required. Other platforms get the portable surface only.
+- **Live capture is Linux-only** — release binaries target x86_64/aarch64, while 0.1 production runtime evidence is retained for Ubuntu 24.04/Linux 6.8/aarch64. Other Linux kernels/architectures require matching privileged acceptance; non-Linux platforms get the portable surface only.
 - **Plaintext HTTP/1.1 only** — TLS ciphertext is opaque and cannot be decoded; HTTP/2+ is not supported.
 - **Bounded, epoch-rolled recording** — an optional whole-recording `--duration`; when omitted, recording runs until the source completes, an explicit stop, or a fatal failure. WAL storage is bounded by segments and epochs (4 GiB physical ceiling per epoch by default), and epochs roll over without terminating the parent recording. Not a multi-host distributed capture platform.
 - **Sensitive local artifacts** — no encryption at rest, no comprehensive redaction, no tenant isolation.

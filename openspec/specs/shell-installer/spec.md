@@ -129,12 +129,12 @@ The installer SHALL download and extract inside a temporary directory (for examp
 
 ### Requirement: Installer dependencies
 
-The installer SHALL require only commonly available tools: `sh`, `curl`, `tar`, and a SHA-256 utility (`sha256sum` or `shasum -a 256`). Missing required tools SHALL fail with a clear message. The installer SHALL NOT require package managers, Rust/Cargo, or any heavyweight runtime.
+The installer SHALL require only commonly available tools used by its implementation: POSIX `sh`, `curl`, `tar`, `uname`, `grep`, `head`, `cut`, `awk`, `mktemp`, and one SHA-256 utility (`sha256sum` or `shasum -a 256`), plus standard POSIX file utilities. Missing commands that are explicitly required by preflight SHALL fail with a clear diagnostic. The installer SHALL NOT require package managers, Rust/Cargo, or any heavyweight runtime.
 
 #### Scenario: Missing dependency
 
-- **WHEN** a required tool (for example `curl`) is absent
-- **THEN** installation aborts with a message naming the missing tool
+- **WHEN** a required command such as `curl`, `awk`, `grep`, `head`, `cut`, or the SHA-256 utility is absent
+- **THEN** installation aborts before download with a message naming the missing command
 
 ### Requirement: Installer testability
 

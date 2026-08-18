@@ -4,13 +4,11 @@ description: 安裝 Chronicle 發行版本的二進位檔，或從原始碼建�
 slug: zh-tw/0-1/docs/getting-started/installation
 ---
 
-## 目前的安裝方式
+## 發行版本安裝器
 
-目前尚未發布第一個穩定版本；從原始碼建置是現在可用的安裝路徑。下列發行版本安裝器會在首次公開版本發布後成為建議路徑。
+安裝最新穩定版 Chronicle：
 
-## 發行版本安裝器（自首次公開版本起）
-
-Chronicle 發行版本的二進位檔將支援 Linux `x86_64` 與 `aarch64`／`arm64`。儲存庫提供的安裝器會取得 GitHub Release 的設定穩定版本、選擇相符的封存檔、驗證 `SHA256SUMS`，只有驗證成功後才會安裝。
+Chronicle 發行版本的二進位檔支援 Linux `x86_64` 與 `aarch64`／`arm64`。儲存庫提供的安裝器會取得 GitHub Release 的設定穩定版本、選擇相符的封存檔、驗證 `SHA256SUMS`，只有驗證成功後才會安裝。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh | sh
@@ -75,10 +73,10 @@ Linux 建置會包含已提交到儲存庫的 eBPF 擷取物件。其他平台�
 
 ## live capture 的主機需求
 
-- Linux 6.1 或更新版本。
-- 啟用 cgroup v2。
-- `/sys/kernel/btf/vmlinux` 提供 BTF。
-- 小端序 `x86_64` 或 `aarch64`。
+- 發行版本二進位檔 target 為小端序 `x86_64` 與 `aarch64`／`arm64`。
+- 0.1 保留的 live capture 執行驗證環境是 Ubuntu 24.04、Linux 6.8、aarch64。
+- 其他 Linux 6.1+ 核心與 x86_64 需要相符的 privileged acceptance；二進位檔可建置不代表 runtime 支援。
+- 啟用 cgroup v2，`/sys/kernel/btf/vmlinux` 提供 BTF，並具備必要 eBPF capability。
 - 錄製程序需要 `CAP_BPF` 與 `CAP_NET_ADMIN`。
 - 二進位檔中包含內嵌的擷取程式。
 

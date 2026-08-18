@@ -77,13 +77,28 @@ bootstrap_vm() {
 		set -euo pipefail
 		if ! command -v clang >/dev/null || ! command -v zstd >/dev/null; then
 			sudo apt-get update -qq
-			sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang llvm libelf-dev pkg-config zstd
+			sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+				clang llvm libelf-dev pkg-config zstd
 		fi
+		if ! command -v rustup >/dev/null; then
+			curl --proto '=https' --tlsv1.2 --max-time 120 -sSf \
+				https://sh.rustup.rs | sh -s -- -y --profile minimal \
+				--default-toolchain none
+		fi
+		export PATH="$HOME/.cargo/bin:$PATH"
 		if ! rustup toolchain list | grep -q "^nightly"; then
 			rustup toolchain install nightly --profile minimal --component rust-src
 		fi
 		if ! command -v bpf-linker >/dev/null; then
-			cargo +nightly install bpf-linker --locked
+			case "$(uname -m)" in
+			x86_64) bpf_arch=x86_64 ;;
+			aarch64 | arm64) bpf_arch=aarch64 ;;
+			*) echo "unsupported guest architecture: $(uname -m)" >&2; exit 1 ;;
+			esac
+			curl --max-time 120 -fsSL -o /tmp/bpf-linker.tar.zst \
+				"https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-${bpf_arch}-unknown-linux-musl.tar.zst"
+			tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
+			sudo install -m 0755 /tmp/bpf-linker /usr/local/bin/bpf-linker
 		fi
 	'
 }
@@ -105,7 +120,7 @@ run_remote() {
 	MULTIPASS_TIMEOUT=$MULTIPASS_REMOTE_TIMEOUT multipass exec "$VM" -- bash -lc "
 		set +e
 		cd '$VM_SOURCE_ROOT'
-		sudo -E env HOME=/home/ubuntu PATH=\"\$PATH\" \\
+		sudo -E env HOME=/home/ubuntu PATH=\"\$PATH:/home/ubuntu/.cargo/bin\" \\
 			CHRONICLE_ACCEPTANCE_PROFILE='$profile' \\
 			CHRONICLE_ACCEPTANCE_EXECUTOR=multipass \\
 			CHRONICLE_ACCEPTANCE_RUN_ID='$RUN_ID' \\

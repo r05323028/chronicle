@@ -3,7 +3,7 @@ title: 本機 Linux
 description: 支援 live capture 與 replay 的部署形式。
 ---
 
-Chronicle 支援的 live-capture 部署形式是本機 Linux 主機。發行版本二進位檔的 target 為 `x86_64-unknown-linux-gnu` 與 `aarch64-unknown-linux-gnu`；capture adapter 除了需要二進位檔，也需要核心與 capability 支援。
+Chronicle 發行版本的 live-capture 部署形式是本機 Linux 主機。發行版本二進位檔的 target 為 `x86_64-unknown-linux-gnu` 與 `aarch64-unknown-linux-gnu`；0.1 保留的 runtime 驗證環境是 Ubuntu 24.04/Linux 6.8/aarch64。x86_64 與其他 Linux 6.1+ 環境需要相符的 privileged acceptance；二進位檔可建置不代表 runtime 支援。
 
 ## 就緒檢查清單
 
@@ -13,10 +13,10 @@ chronicle doctor
 
 live capture 需要：
 
-- Linux 6.1 以上；
-- cgroup v2；
-- `/sys/kernel/btf/vmlinux` 提供 BTF；
-- 小端序 x86_64 或 aarch64；
+- 發行版本 target 為 x86_64-unknown-linux-gnu 與 aarch64-unknown-linux-gnu；
+- runtime 驗證環境：Ubuntu 24.04/Linux 6.8/aarch64；
+- 其他 Linux 6.1+ 核心與 x86_64 需要相符的 privileged acceptance；
+- 啟用 cgroup v2、`/sys/kernel/btf/vmlinux` 提供 BTF，並具備必要 capability；
 - 錄製程序需要 `CAP_BPF` 與 `CAP_NET_ADMIN`；
 - 二進位檔包含內嵌 eBPF 程式；
 - 工作負載產生有明確上限的明文 HTTP/1.1。

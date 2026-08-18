@@ -3,13 +3,11 @@ title: Installation
 description: Install the released Chronicle binary or build the workspace from source.
 ---
 
-## Build from source (currently usable)
+## Release installer
 
-A public release does not exist yet, so building from source is the currently usable installation path. The release installer below becomes the recommended path starting with the first public release.
+Install latest stable Chronicle release:
 
-## Release installer (from the first public release)
-
-Chronicle release binaries will be supported on Linux `x86_64` and `aarch64`/`arm64`. The repository installer will resolve the configured stable GitHub Release, select the matching archive, verify `SHA256SUMS`, and install only after verification succeeds.
+Chronicle release binaries are supported on Linux `x86_64` and `aarch64`/`arm64`. The repository installer will resolve the configured stable GitHub Release, select the matching archive, verify `SHA256SUMS`, and install only after verification succeeds.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/r05323028/chronicle/main/install.sh | sh
@@ -74,10 +72,10 @@ Only eBPF pipeline development needs the separate nightly rebuild described in t
 
 ## Host requirements for live capture
 
-- Linux 6.1 or newer.
-- cgroup v2 enabled.
-- BTF available at `/sys/kernel/btf/vmlinux`.
-- Little-endian `x86_64` or `aarch64`.
+- Release binaries target little-endian `x86_64` and `aarch64`/`arm64`.
+- The 0.1 release-verified live-capture environment is Ubuntu 24.04 with Linux 6.8 and aarch64.
+- Other Linux 6.1+ kernels and x86_64 require matching privileged acceptance; binary availability is not runtime proof.
+- cgroup v2 enabled, BTF available at `/sys/kernel/btf/vmlinux`, and required eBPF capabilities.
 - `CAP_BPF` and `CAP_NET_ADMIN` for the recording process.
 - Embedded capture programs present in the binary.
 

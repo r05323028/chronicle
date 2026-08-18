@@ -4,7 +4,7 @@
 
 WAL and published sessions can contain production headers and bodies, including credentials and personal data. Chronicle uses private Unix modes and safe default output, but does **not** provide encryption at rest, secret discovery, comprehensive redaction, or tenant isolation. Inspect and reports omit bodies and arbitrary header values.
 
-Live recording is bounded plaintext TCP capture, not always-on capture. It supports Linux 6.1+, cgroup v2, readable BTF, x86_64/aarch64, and required eBPF hooks/capabilities. macOS and ordinary CI use rootless fixtures, ETL, inspect, replay, and eBPF compile checks. Runtime evidence comes only from the opt-in privileged profile. Verified capture matrix: Ubuntu 24.04, Linux 6.8, aarch64, cgroup v2, readable BTF (production-object privileged acceptance; see `validation/test-architecture/README.md`). Other kernels, architectures, cloud-provider kernels, and offload characteristics are not verified and require their own privileged acceptance run.
+Live recording is bounded plaintext TCP capture, not always-on capture. Release binaries target Linux x86_64/aarch64; the 0.1 release-verified runtime environment is Ubuntu 24.04, Linux 6.8, aarch64, cgroup v2, readable BTF, and required production eBPF hooks/capabilities. x86_64, Linux 6.1+ minimum-boundary environments, other kernels, cloud-provider kernels, and offload characteristics require matching privileged acceptance; an artifact build is not runtime proof. macOS and ordinary CI use rootless fixtures, ETL, inspect, replay, and eBPF compile checks. Runtime evidence comes only from the opt-in privileged profile (see `validation/test-architecture/README.md`).
 
 ## Quick start
 
@@ -136,7 +136,7 @@ CHRONICLE_CURRENT_WAL_DIR=/path/to/current-production-wal \
   ./scripts/tests/test-user-intent-cli-rollback.sh
 ```
 
-The harness proves a controlled older binary reads current WAL/canonical artifacts. Current binaries are not required to read artifacts produced by unreleased older builds (pre-0.1 single-model policy).
+The harness proves a controlled older binary reads current WAL/canonical artifacts. Supported 0.1.x readers and writers must preserve the published v1 contracts; repository-only or unsupported-version artifacts fail closed rather than receiving an implicit migration adapter.
 
 Docker and Kubernetes packaging are future follow-up only; no container orchestrator integration is implemented.
 

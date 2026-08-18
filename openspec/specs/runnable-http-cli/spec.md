@@ -6,7 +6,7 @@ Minimal record, inspect, and replay command contracts plus end-to-end runnable H
 
 ### Requirement: Minimal record command
 
-CLI record SHALL expose the public forms per `user-intent-cli`: `record -- COMMAND...`, `record --pid PID`, `record --cgroup PATH [--allow-shared-cgroup]`, and `record --retry RECORDING`, with optional `--name` and `--duration`, and global `--data-dir` resolution. Shared acknowledgement SHALL be invalid with `--pid` or no explicit `--cgroup`. Conflicting options SHALL be validated; `record` requires exactly one mode. The pre-0.1 `--source`/`--wal-dir`/`--segment-bytes`/`--duration-seconds`/`--max-wal-bytes` forms were removed before 0.1.0 and SHALL NOT be reintroduced. Public selector forms SHALL show effective cgroup path/ID/direct TGID count/descendant cgroup count/selected-subtree scope/acknowledgement before attach, perform preflight, create/finalize metadata, run eBPF plus bounded in-WAL-marker group commit, handle limits/signals, and print safe categorized summary; ETL/finalization runs automatically per `user-intent-cli`. CLI help and diagnostics SHALL use **direct cgroup TGID set** for distinct host-visible TGIDs resolved from numeric PIDs listed directly in selected node's `cgroup.procs`; they SHALL NOT call it a POSIX process group, thread count, container ID, or descendant union.
+CLI record SHALL expose the public forms per `user-intent-cli`: `record -- COMMAND...`, `record --pid PID`, `record --cgroup PATH [--allow-shared-cgroup]`, and `record --retry RECORDING`, with optional `--name` and `--duration`, and global `--data-dir` resolution. Shared acknowledgement SHALL be invalid with `--pid` or no explicit `--cgroup`. Conflicting options SHALL be validated; `record` requires exactly one mode. The removed `--source`/`--wal-dir`/`--segment-bytes`/`--duration-seconds`/`--max-wal-bytes` compatibility forms SHALL NOT be reintroduced. Public selector forms SHALL show effective cgroup path/ID/direct TGID count/descendant cgroup count/selected-subtree scope/acknowledgement before attach, perform preflight, create/finalize metadata, run eBPF plus bounded in-WAL-marker group commit, handle limits/signals, and print safe categorized summary; ETL/finalization runs automatically per `user-intent-cli`. CLI help and diagnostics SHALL use **direct cgroup TGID set** for distinct host-visible TGIDs resolved from numeric PIDs listed directly in selected node's `cgroup.procs`; they SHALL NOT call it a POSIX process group, thread count, container ID, or descendant union.
 
 #### Scenario: Fixture record uses current artifacts
 
@@ -60,7 +60,7 @@ CLI record SHALL expose the public forms per `user-intent-cli`: `record -- COMMA
 
 ### Requirement: Minimal inspect command
 
-CLI inspect SHALL expose `inspect <RECORDING>` and `inspect latest` per `user-intent-cli`, resolving recordings from the data directory per `recording-identity` with global `--data-dir`; the pre-0.1 session-root `inspect SESSION --root ROOT` form was removed before 0.1.0 and SHALL NOT be reintroduced. It SHALL support global `--format human|json`, default human, and delegate to application/storage service.
+CLI inspect SHALL expose `inspect <RECORDING>` and `inspect latest` per `user-intent-cli`, resolving recordings from the data directory per `recording-identity` with global `--data-dir`; the removed session-root `inspect SESSION --root ROOT` compatibility form SHALL NOT be reintroduced. It SHALL support global `--format human|json`, default human, and delegate to application/storage service.
 
 #### Scenario: Inspect happy path
 
@@ -79,7 +79,7 @@ CLI inspect SHALL expose `inspect <RECORDING>` and `inspect latest` per `user-in
 
 ### Requirement: Minimal replay command
 
-CLI replay SHALL expose the public forms per `user-intent-cli` and `safe-local-http-replay`: `replay <RECORDING> -- COMMAND...` (spawned target with inferred local target and authorization) and `replay <RECORDING> --target URL` (explicit target requiring full authorization), mutually exclusive, resolving recordings with global `--data-dir`. Defaults SHALL remain human output, dry-run, no effect authorization, no target default, and no network. The pre-0.1 session-root `replay SESSION --root ROOT` form was removed before 0.1.0 and SHALL NOT be reintroduced. Human/JSON output SHALL include exact replay outcome, fully/partially/not replayable classification, aggregate executable/non-executable counts, and one result per operation.
+CLI replay SHALL expose the public forms per `user-intent-cli` and `safe-local-http-replay`: `replay <RECORDING> -- COMMAND...` (spawned target with inferred local target and authorization) and `replay <RECORDING> --target URL` (explicit target requiring full authorization), mutually exclusive, resolving recordings with global `--data-dir`. Defaults SHALL remain human output, dry-run, no effect authorization, no target default, and no network. The removed session-root `replay SESSION --root ROOT` compatibility form SHALL NOT be reintroduced. Human/JSON output SHALL include exact replay outcome, fully/partially/not replayable classification, aggregate executable/non-executable counts, and one result per operation.
 
 #### Scenario: Replay dry-run
 
@@ -324,22 +324,22 @@ Public `doctor` SHALL use resolved data directory and expose no required WAL/out
 
 ### Requirement: Versioned command JSON contracts
 
-Until compatibility freeze, each public or hidden command report contract SHALL remain version 1 per `mvp-schema-versioning`; this change introduces no v2 or version dispatch. New public record/list/recording-oriented-inspect contracts are documented v1 objects. Existing hidden legacy success JSON remains byte-compatible through 0.1.x as its documented v1 contract. Any future version increase requires explicit compatibility-freeze change.
+Documented public `record`, `list`, `inspect`, `replay`, and `doctor` machine-readable outputs that are declared stable SHALL use one deterministic version-1 schema per command contract and SHALL remain compatible within 0.1.x. Public JSON SHALL contain no human prose or captured sensitive values. Hidden `internal` output, advisory diagnostics, and other non-public reports are not compatibility-sensitive unless an active specification explicitly declares them public. Any public schema version increase, field-meaning change, or incompatible output change SHALL follow `public-compatibility-boundary` and an explicit OpenSpec change; no ad hoc v2 dispatch or fallback is permitted.
 
 #### Scenario: New public reports
 
-- **WHEN** public record, list, or recording-oriented inspect emits JSON
-- **THEN** object declares version 1 and matches its one current documented schema
+- **WHEN** a public command emits JSON under a documented stable contract
+- **THEN** stdout is one valid deterministic version-1 object matching that command's documented schema
 
 #### Scenario: No ad hoc v2
 
-- **WHEN** implementation adds recording identity fields
-- **THEN** it does not introduce v2 or a v1/v2 reader/renderer dispatch
+- **WHEN** implementation adds a public field or changes a public report
+- **THEN** it does not introduce v2 or a v1/v2 reader/renderer dispatch without the explicit public compatibility process
 
 #### Scenario: Automation parses outputs
 
-- **WHEN** command runs with JSON format
-- **THEN** stdout matches one documented deterministic v1 schema and contains no human prose
+- **WHEN** user or automation runs a public command with JSON format
+- **THEN** stdout matches one documented deterministic v1 schema, contains no human prose or sensitive values, and hidden/advisory output is not misrepresented as public
 
 ### Requirement: Foreground recorder command
 

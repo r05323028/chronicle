@@ -97,8 +97,6 @@ pub enum ApplicationError {
         data_dir: PathBuf,
         lock_root: PathBuf,
     },
-    #[error("{0} command is not implemented in current scaffold")]
-    NotImplemented(&'static str),
 }
 
 /// Stable replay-result exit-code classification for outer adapters.

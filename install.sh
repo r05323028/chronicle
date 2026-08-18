@@ -18,8 +18,8 @@
 #   CHRONICLE_UNAME_OS    override uname -s (tests)
 #   CHRONICLE_UNAME_MACHINE  override uname -m (tests)
 #
-# POSIX sh only: no bashisms. Requires: sh, curl, tar, and a SHA-256 utility
-# (sha256sum or shasum -a 256).
+# POSIX sh only: no bashisms. Requires: sh, curl, tar, uname, grep, head,
+# cut, awk, mktemp, and a SHA-256 utility (sha256sum or shasum -a 256).
 
 set -eu
 
@@ -32,10 +32,10 @@ die() {
 
 # --- preflight dependencies ------------------------------------------------
 
-command -v curl >/dev/null 2>&1 || die 'curl is required (not found on PATH)'
-command -v tar >/dev/null 2>&1 || die 'tar is required (not found on PATH)'
-command -v awk >/dev/null 2>&1 || die 'awk is required (not found on PATH)'
-command -v mktemp >/dev/null 2>&1 || die 'mktemp is required (not found on PATH)'
+for dependency in curl tar uname grep head cut awk mktemp; do
+	command -v "$dependency" >/dev/null 2>&1 ||
+		die "$dependency is required (not found on PATH)"
+done
 
 if command -v sha256sum >/dev/null 2>&1; then
 	sha256_of() { sha256sum "$1"; }

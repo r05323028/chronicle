@@ -6,11 +6,13 @@
 - **Planned:** intended for a future milestone.
 - **Future:** explicit extension point, not a current promise.
 
-## Pre-0.1 versioning policy
+## Public compatibility and versioning policy
 
-Before the first public release, every internal artifact domain has one current runtime model, reader, and writer. Capture events, private eBPF ABI records, WAL, canonical sessions, manifests, recording metadata, epoch catalogs, rollover transitions, ETL checkpoints, continuations, fixtures, and machine-readable reports evolve by updating the current model plus repository fixtures, tests, and documentation in same change. Unreleased internal persisted schemas may be replaced rather than supported through permanent runtime compatibility layers; persisted structures may keep explicit schema version numbers (for example epochs.json version 2). No hidden pre-release CLI compatibility surface is retained, and runtime lineage is never inferred from identifier equality.
+Chronicle 0.1.0 establishes one public compatibility line. Compatibility-sensitive contracts are WAL v1 segment/envelope framing and in-WAL commit-marker semantics; Capture Event v1 where it is intentionally persisted or versioned across the capture/WAL/fixture boundary; Canonical Session v1; Session Manifest v1; replay safety and authorization; documented public `record`, `list`, `inspect`, `replay`, and `doctor` behavior; and documented public machine-readable schemas declared as version 1. The hidden `internal` namespace, private eBPF ABI, transient runtime state, advisory catalog/metadata, and other implementation details are not frozen unless their owning contract explicitly makes them public.
 
-Chronicle does not retain V1/V2/V3 dispatch enums, migration adapters, dual writers, or compatibility readers for repository history. Stable wire formats intentionally preserved by the project (WAL v1 framing and commit markers, Capture Event v1, Canonical Session v1, replay safety contracts) remain versioned separately. A freeze requires explicit OpenSpec change declaring compatibility freeze, frozen contract scope, supported reader/writer combinations, migration policy, and deprecation policy.
+Within 0.1.x, writers emit declared v1 contracts and readers accept valid v1 artifacts from supported 0.1.x writers without same-build or same-host coupling. Unknown or unsupported versions, malformed input, and failed integrity checks fail closed with typed diagnostics before payload interpretation, durable mutation, or replay network I/O. No reader guesses fields, silently defaults obsolete data, or infers compatibility from identifiers.
+
+A public contract migration or incompatible change requires an explicit OpenSpec change naming source/destination versions, reader/writer combinations, provenance/integrity handling, bounded migration or an explicit no-migration decision, deprecation window, tests, and documentation. Deprecations do not remove or silently reinterpret frozen behavior inside 0.1.x; safety fixes may block unsafe behavior immediately but must document the compatibility impact. Version increases and future incompatible CLI, schema, or replay behavior use a new compatibility line and never appear as ad hoc dispatch. Domain-specific format detail remains in the owning specifications and [`docs/wal-format.md`](../wal-format.md).
 
 ## Boundaries
 

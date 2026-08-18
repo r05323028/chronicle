@@ -4,7 +4,7 @@ description: ライブキャプチャとリプレイに対応するデプロイ�
 slug: ja/0-1/docs/deployment/local
 ---
 
-Chronicle がライブキャプチャで対応するデプロイ形態はローカル Linux ホストです。リリース版バイナリの target は `x86_64-unknown-linux-gnu` と `aarch64-unknown-linux-gnu` です。キャプチャアダプターには、バイナリに加えて kernel と capability のサポートが必要です。
+Chronicle のリリース版ライブキャプチャのデプロイ形態はローカル Linux ホストです。リリース版バイナリの target は `x86_64-unknown-linux-gnu` と `aarch64-unknown-linux-gnu` です。0.1 でリリース検証済みのランタイム環境は Ubuntu 24.04／Linux 6.8／aarch64 です。x86_64 とその他の Linux 6.1 以降の環境には対応する特権アクセプタンスが必要で、バイナリのビルドはランタイム対応の証明になりません。
 
 ## 準備状態チェックリスト
 
@@ -14,10 +14,10 @@ chronicle doctor
 
 ライブキャプチャには次が必要です。
 
-- Linux 6.1 以上；
-- cgroup v2；
-- `/sys/kernel/btf/vmlinux` に BTF があること；
-- リトルエンディアンの x86_64 または aarch64；
+- リリース版 target は x86_64-unknown-linux-gnu と aarch64-unknown-linux-gnu；
+- リリース検証済みランタイム：Ubuntu 24.04／Linux 6.8／aarch64；
+- その他の Linux 6.1 以降のカーネルと x86_64 には対応する特権アクセプタンスが必要；
+- cgroup v2、`/sys/kernel/btf/vmlinux` の BTF、必要な capability；
 - 記録プロセスの `CAP_BPF` と `CAP_NET_ADMIN`；
 - バイナリに組み込まれた eBPF プログラム；
 - 上限付きの平文 HTTP/1.1 を生成するワークロード。

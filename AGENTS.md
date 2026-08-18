@@ -128,19 +128,15 @@ Extract-Transform-Load; replay default-deny safety; deterministic replay/test be
 test architecture; privileged acceptance semantics; release qualification guarantees. Detail:
 `docs/architecture/crate-boundaries.md`.
 
-Before 0.1.0, prefer one current domain model over compatibility layers for unreleased internal
-formats; preserve only intentional wire/storage compatibility boundaries.
+Public 0.1 compatibility rules:
 
-Durable pre-0.1 rules:
-
-- Do not add migration adapters for unreleased formats.
-- Do not add compatibility aliases before a public contract exists.
+- Keep frozen WAL, intentionally persisted Capture Event, Canonical Session, Session Manifest, replay-safety, public CLI, and declared public JSON contracts stable within 0.1.x.
+- Do not add migration adapters for unsupported or repository-only formats, compatibility aliases, or implicit lineage fallbacks.
+- Introduce any incompatible public change only through an explicit OpenSpec change with version, reader/writer, migration, deprecation, test, and documentation policy.
 - Do not add feasibility-only implementations when production validation paths exist.
 - Historical behavior belongs in Git history and archived OpenSpec changes.
 - Runtime lineage must be explicit; never infer from identifiers.
-- The hidden `internal` namespace is current operational surface; hidden pre-release CLI
-  compatibility entrypoints must not return (the legacy-names guard in
-  `scripts/validation.py` covers removed identifiers, retired paths, and scenario ids).
+- The hidden `internal` namespace is current operational surface; hidden compatibility entrypoints must not return (the legacy-names guard in `scripts/validation.py` covers removed identifiers, retired paths, and scenario ids).
 
 Recording lifetime may be unbounded while epochs and segments remain bounded. A WAL epoch boundary is not a protocol reconstruction boundary; cross-epoch state requires bounded, versioned, checksummed, lineage-verified continuation evidence.
 

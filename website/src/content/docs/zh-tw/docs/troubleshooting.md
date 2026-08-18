@@ -16,12 +16,10 @@ chronicle --format json doctor
 
 請檢查：
 
-- 主機是 Linux 6.1 以上；
-- 已掛載 cgroup v2，且選定的工作負載位於預期的 subtree；
-- `/sys/kernel/btf/vmlinux` 存在；
-- 二進位檔包含 capture object 與程式；
-- 錄製程序具有 `CAP_BPF` 與 `CAP_NET_ADMIN`；
-- 架構是小端序 x86_64 或 aarch64。
+- runtime 驗證環境是 Ubuntu 24.04/Linux 6.8/aarch64；
+- x86_64 與其他 Linux 6.1+ 環境需要相符的 privileged acceptance；
+- cgroup v2 已掛載、`/sys/kernel/btf/vmlinux` 存在，且二進位檔包含 capture programs；
+- 錄製程序具備 `CAP_BPF` 與 `CAP_NET_ADMIN`。
 
 非 Linux 建置仍支援 fixture 錄製、列出、檢查、replay 規劃與驗證，以及 doctor；但不提供 live eBPF capture。
 

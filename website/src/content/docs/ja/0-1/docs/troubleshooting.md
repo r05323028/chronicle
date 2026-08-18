@@ -17,12 +17,10 @@ chronicle --format json doctor
 
 次を確認します。
 
-- ホストが Linux 6.1 以降であること；
-- cgroup v2 がマウントされ、選択したワークロードが意図した subtree にあること；
-- `/sys/kernel/btf/vmlinux` が存在すること；
-- バイナリに capture object とプログラムが含まれること；
-- 記録プロセスに `CAP_BPF` と `CAP_NET_ADMIN` があること；
-- アーキテクチャがリトルエンディアンの x86_64 または aarch64 であること。
+- リリース検証済みランタイムが Ubuntu 24.04／Linux 6.8／aarch64 であること；
+- x86_64 とその他の Linux 6.1 以降の環境には対応する特権アクセプタンスが必要であること；
+- cgroup v2 がマウントされ、`/sys/kernel/btf/vmlinux` に BTF があり、バイナリにキャプチャプログラムが含まれること；
+- 記録プロセスに `CAP_BPF` と `CAP_NET_ADMIN` があること。
 
 非 Linux ビルドでも fixture の記録、一覧表示、検査、リプレイの計画と検証、doctor は利用できます。ライブ eBPF キャプチャは利用できません。
 

@@ -18,4 +18,4 @@
 
 - [x] 4.1 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features` (35/35 binaries), strict OpenSpec validation (28/28), architecture/catalog/select/ownership checks.
 - [x] 4.2 Validation python suites, acceptance runner/readiness tests, and rootless suites pass; `validate.sh fast`, help, and dry runs show the new modes.
-- [ ] 4.3 Privileged Linux acceptance (live-capture/recorder) requires a privileged Linux host/VM per policy; covered by CI/acceptance on supported Linux.
+- [x] 4.3 Privileged Linux acceptance (live-capture/recorder) requires a privileged Linux host/VM per policy; covered by fresh x86_64 Multipass release acceptance run `32175100105`.

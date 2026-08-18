@@ -16,12 +16,10 @@ Read the probe code and remediation before changing the host.
 
 Check:
 
-- the host is Linux 6.1+;
-- cgroup v2 is mounted and the selected workload is in the intended subtree;
-- `/sys/kernel/btf/vmlinux` exists;
-- the binary contains the capture object and programs;
-- the recording process has `CAP_BPF` and `CAP_NET_ADMIN`;
-- the architecture is little-endian x86_64 or aarch64.
+- the release-verified runtime is Ubuntu 24.04/Linux 6.8/aarch64;
+- x86_64 and other Linux 6.1+ environments require matching privileged acceptance;
+- cgroup v2 is mounted, `/sys/kernel/btf/vmlinux` exists, and the binary contains capture programs;
+- the recording process has `CAP_BPF` and `CAP_NET_ADMIN`.
 
 Non-Linux builds still support fixture recording, listing, inspection, replay planning and verification, and doctor. They do not provide live eBPF capture.
 

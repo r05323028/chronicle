@@ -4,7 +4,7 @@ description: The supported deployment shape for live capture and replay.
 slug: 0-1/docs/deployment/local
 ---
 
-Chronicle's supported live-capture deployment is a local Linux host. Release binaries target `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`; the capture adapter requires kernel and capability support in addition to the binary.
+Chronicle's released live-capture deployment is a local Linux host. Release binaries target `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`; the 0.1 release-verified runtime environment is Ubuntu 24.04/Linux 6.8/aarch64. x86_64 and other Linux 6.1+ environments require matching privileged acceptance; an artifact build is not runtime proof.
 
 ## Readiness checklist
 
@@ -14,10 +14,10 @@ chronicle doctor
 
 Live capture needs:
 
-* Linux 6.1+;
-* cgroup v2;
-* BTF at `/sys/kernel/btf/vmlinux`;
-* little-endian x86\_64 or aarch64;
+* release binaries target x86\_64-unknown-linux-gnu and aarch64-unknown-linux-gnu;
+* release-verified runtime: Ubuntu 24.04/Linux 6.8/aarch64;
+* other Linux 6.1+ kernels and x86\_64 require matching privileged acceptance;
+* cgroup v2, BTF at `/sys/kernel/btf/vmlinux`, and required capabilities;
 * `CAP_BPF` and `CAP_NET_ADMIN` for the recording process;
 * embedded eBPF programs in the binary;
 * a workload emitting bounded plaintext HTTP/1.1.

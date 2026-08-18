@@ -41,6 +41,7 @@ RESOLVE_CONTEXT = ROOT / "scripts" / "release" / "resolve-release-context.sh"
 WRITE_MODELS = ROOT / "scripts" / "release" / "write-opencode-go-models-json.py"
 
 PUBLISH_GATE = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+PI_ACTION_SHA = "0698813906fb1f23425bd742510e3080d624840d"
 
 
 def workflow_text() -> str:
@@ -164,13 +165,15 @@ class ReleasePublicationTests(unittest.TestCase):
 
     def test_gh_actions_pin_is_immutable_stable(self):
         pins = re.findall(
-            r"uses: shaftoe/pi-coding-agent-action@(\S+)", workflow_text()
+            r"uses:\s*(?:>-\s*)?shaftoe/pi-coding-agent-action@([0-9a-fA-F]+)",
+            workflow_text(),
         )
         self.assertTrue(pins, "pi-coding-agent-action not referenced")
         for pin in pins:
             self.assertRegex(
-                pin, r"^v\d+\.\d+\.\d+$", f"moving action reference: {pin}"
+                pin, r"^[0-9a-fA-F]{40}$", f"non-immutable action reference: {pin}"
             )
+        self.assertEqual(pins, [PI_ACTION_SHA])
 
     def test_publish_is_thin_and_depends_on_prepare_release(self):
         shape = WorkflowShape(workflow_text())
@@ -180,7 +183,7 @@ class ReleasePublicationTests(unittest.TestCase):
         )
         self.assertEqual(
             shape.jobs["prepare-release"]["scalars"].get("needs"),
-            "[resolve-context, release, release-notes]",
+            "[resolve-context, release, release-notes, privileged-acceptance]",
         )
 
 

@@ -41,4 +41,4 @@
 
 - [x] 7.1 `cargo build --release --locked` works and produces a live-capture binary on Linux (verified via `cargo check -p chronicle-cli --target x86_64-unknown-linux-gnu --locked`; full Linux release build covered by CI/release workflow and privileged acceptance on Linux hosts).
 - [x] 7.2 Formatting, clippy, workspace tests, strict OpenSpec validation, and repository validation pass (fmt check, clippy -D warnings, 35/35 test binaries, OpenSpec 27/27, architecture check, tooling tests, rootless suites).
-- [ ] 7.3 Privileged Linux validation per policy (requires a privileged Linux host/Multipass VM; not runnable on this macOS host — CI and the acceptance entrypoint cover it on supported Linux).
+- [x] 7.3 Privileged Linux validation per policy (requires a privileged Linux host/Multipass VM; covered by fresh x86_64 Multipass release acceptance run `32175100105`).
