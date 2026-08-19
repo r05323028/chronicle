@@ -9,38 +9,35 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-## Commit messages
+## Pull-request workflow
 
-Chronicle uses [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/)
-to keep history readable and usable by release tooling.
+Changes to `main` go through pull requests. Pull requests are squash-merged, so the PR title
+becomes the canonical commit title on `main`; use a meaningful title before opening or updating a
+PR. The `PR title` CI check validates this format, and all required GitHub CI checks must pass
+before merge.
 
 ```text
-<type>[optional scope][!]: <description>
-
-[optional body]
-
-[optional footer(s)]
+<type>(<optional-scope>)<optional-!>: <description>
 ```
 
-- `feat` — new feature; `fix` — bug fix.
-- Common additional types: `build`, `chore`, `ci`, `docs`, `perf`, `refactor`, `style`, and
-  `test`. The specification allows other types.
-- Scope is optional and names the affected area: `fix(wal): reject truncated records`.
-- Body and footers follow the subject after one blank line. Use trailers such as
-  `Refs: #123` when useful.
-- Mark breaking changes with `!` (`feat(api)!: change response shape`) or an uppercase
-  `BREAKING CHANGE: ...` footer. Breaking changes can use any type.
+Allowed types: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`, `chore`, and
+`revert`. Scope and `!` are optional. Choose type and scope from user/developer-visible intent,
+not implementation noise. Intermediate branch commits do not need to follow Conventional Commits;
+`wip`, `fix tests`, and `address review` are acceptable local history. Do not rewrite branch
+history only to make temporary commits conventional.
 
 Examples:
 
 ```text
-feat(replay): add deterministic session filtering
-fix(wal): reject truncated commit markers
-docs: clarify release qualification
+feat(record): support session correlation
+fix(replay): preserve response ordering
+docs: clarify installation requirements
+refactor(etl): separate storage concerns
 ```
 
-Commit types describe intent; they do not replace Chronicle's explicit versioning and release
-qualification policy.
+This keeps `main` linear and meaningful, makes each squash merge one coherent change, and gives
+release-note/changelog tools such as `git-cliff` deterministic repository metadata. This change
+does not add `git-cliff`.
 
 ## Validation timeouts
 
