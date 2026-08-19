@@ -9,6 +9,39 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
+## Commit messages
+
+Chronicle uses [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/)
+to keep history readable and usable by release tooling.
+
+```text
+<type>[optional scope][!]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+- `feat` — new feature; `fix` — bug fix.
+- Common additional types: `build`, `chore`, `ci`, `docs`, `perf`, `refactor`, `style`, and
+  `test`. The specification allows other types.
+- Scope is optional and names the affected area: `fix(wal): reject truncated records`.
+- Body and footers follow the subject after one blank line. Use trailers such as
+  `Refs: #123` when useful.
+- Mark breaking changes with `!` (`feat(api)!: change response shape`) or an uppercase
+  `BREAKING CHANGE: ...` footer. Breaking changes can use any type.
+
+Examples:
+
+```text
+feat(replay): add deterministic session filtering
+fix(wal): reject truncated commit markers
+docs: clarify release qualification
+```
+
+Commit types describe intent; they do not replace Chronicle's explicit versioning and release
+qualification policy.
+
 ## Validation timeouts
 
 Never run potentially blocking commands without a bounded timeout. Use the repository wrapper:

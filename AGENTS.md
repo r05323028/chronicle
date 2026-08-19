@@ -180,6 +180,14 @@ privileged); privileged execution, live-capture, and recorder are gate selectors
 Portable assertions MUST NOT become privileged proof merely because a Multipass profile can run
 them. Normative details: `validation/test-architecture/README.md`.
 
+## Commit convention
+
+Use [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/) for commit subjects:
+`<type>[optional scope][!]: <description>`. Use `feat` for new features and `fix` for bug
+fixes; mark breaking changes with `!` or a `BREAKING CHANGE: ...` footer. Other types are
+allowed. Keep commits focused. See `CONTRIBUTING.md#commit-messages` for body, footer, and
+examples.
+
 ## Task completion rules
 
 - A task is complete only from evidence that task explicitly requires; OpenSpec checkboxes are
