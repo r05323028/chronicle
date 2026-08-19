@@ -139,9 +139,11 @@ class WorkflowContractTests(unittest.TestCase):
     def test_frozen_sha_is_verified_and_propagated(self):
         workflow = workflow_text()
         self.assertIn("ref: ${{ github.sha }}", workflow)
-        self.assertGreaterEqual(
-            workflow.count("ref: ${{ needs.resolve-context.outputs.sha }}"), 3
+        self.assertEqual(
+            workflow.count("ref: ${{ github.sha }}"),
+            workflow.count("uses: actions/checkout@"),
         )
+        self.assertNotIn("ref: ${{ needs.resolve-context.outputs.sha }}", workflow)
         self.assertIn("frozen_sha=$(git rev-parse HEAD)", workflow)
         self.assertIn("sha=$WORKFLOW_SHA", workflow)
         self.assertIn("sha: ${{ steps.resolve.outputs.sha }}", workflow)
@@ -208,7 +210,7 @@ class WorkflowContractTests(unittest.TestCase):
         tag_start = workflow.index("\n  create-tag:\n")
         publish_start = workflow.index("\n  publish:\n")
         tag_job = workflow[tag_start:publish_start]
-        self.assertIn("ref: ${{ needs.resolve-context.outputs.sha }}", tag_job)
+        self.assertIn("ref: ${{ github.sha }}", tag_job)
         self.assertIn("refs/tags/$tag", state)
         self.assertIn('"sha=$sha"', state)
         self.assertIn("--method POST", state)

@@ -105,7 +105,7 @@ jobs:
       - name: Check out frozen release candidate
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ needs.resolve-context.outputs.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Install OpenSpec CLI
@@ -153,7 +153,7 @@ jobs:
       - name: Check out frozen release candidate
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ needs.resolve-context.outputs.sha }}
+          ref: ${{ github.sha }}
 
       - name: Install eBPF build toolchain
         run: |
@@ -243,7 +243,7 @@ jobs:
       - name: Check out frozen release candidate with full history
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ needs.resolve-context.outputs.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Configure OpenCode Go provider
@@ -389,7 +389,7 @@ jobs:
       - name: Check out frozen release candidate
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ needs.resolve-context.outputs.sha }}
+          ref: ${{ github.sha }}
 
       - name: Create or reuse tag at frozen SHA
         env:
