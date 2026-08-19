@@ -245,17 +245,27 @@ The shell installer SHALL be covered by the portable validation layer, not privi
 
 ### Requirement: Release workflow validation
 
-Release-workflow behavior SHALL be covered by portable validation tests in `scripts/tests/validation/test_release_workflow.py` wired into the `tooling:validation-tests` command (fast and targeted validation). The tests SHALL protect, without duplicating the workflow YAML line-by-line: existence of `.github/prompts/release-notes.md`, absence of the release-note prompt inline in the workflow, no `--generate-notes` publication, publication consuming `release-notes.md`, explicit `gh` authentication/repository context, tag/workspace-version mismatch failure, environment-variable-driven OpenCode Go provider configuration, `workflow_dispatch` support, the publication gate (`github.event_name == 'push'` plus `startsWith(github.ref, 'refs/tags/v')`) and the absence of release-mutating `gh` commands outside the gated publish job, dry-run version resolution from the root `Cargo.toml`, `SHA256SUMS` generation and verification before publication, and the `prepared-release` bundle artifact.
+Release-workflow behavior SHALL be covered by portable tests in `scripts/tests/validation/test_release_workflow.py`, wired into fast and release qualification tooling validation. Tests SHALL verify semantic properties rather than snapshotting the complete YAML, including: no pushed `v*` production trigger; dispatch inputs and `main` restriction; strict stable/prerelease version behavior and workspace matching; frozen SHA propagation and explicit checkout refs; canonical `./scripts/validate.sh release` dependency before build/tag; tag target and immutable retry state handling; preparation/checksum ordering; no tag or GitHub Release mutation path for `prepare`; draft creation/reuse, expected-asset verification, `--verify-tag`/equivalent behavior, no generated-notes fallback, prerelease flags, least-privilege permissions, non-cancelling concurrency, and repository-managed release-note prompt behavior.
+
+#### Scenario: Workflow contract is portable
+
+- **WHEN** release workflow or context/state scripts regress
+- **THEN** portable validation fails without requiring a real tag, GitHub Release, or privileged environment
+
+#### Scenario: Dry preparation mutation boundary is protected
+
+- **WHEN** a change makes a `prepare` path able to create a tag, create/upload/edit a GitHub Release, or publish a draft
+- **THEN** portable validation fails
 
 #### Scenario: Workflow regression detected without privileged gates
 
-- **WHEN** the release workflow, prompt file, or version-context script changes
-- **THEN** the release-workflow validation tests run as part of portable tooling validation and fail on any protected regression without requiring a privileged environment
+- **WHEN** the release workflow, prompt file, or version-context/state script changes
+- **THEN** release-workflow validation tests run as part of portable tooling validation and fail on a protected regression without requiring a privileged environment
 
 #### Scenario: Dry-run safety protected
 
-- **WHEN** a regression would allow a manual dispatch to publish or would skip checksum verification before publication
-- **THEN** the release-workflow validation tests fail
+- **WHEN** a regression would allow a manual `prepare` dispatch to publish or would skip checksum verification before tag promotion
+- **THEN** release-workflow validation tests fail
 
 ### Requirement: Release snapshots prove released state
 

@@ -8,7 +8,7 @@ Work from the checked-out repository and its git history. Do not rely on any pre
 
 1. The release being prepared: determine the intended release version yourself.
    - If the checked-out repository points at a release tag (for example `git describe --tags --exact-match` or `git tag --points-at HEAD`), that tag identifies the release.
-   - Otherwise (for example a manual dry run from a branch), there is no release tag: the intended release version is the workspace version in the root `Cargo.toml` and the intended release tag is `v<version>`.
+   - Otherwise (for example before tag promotion or during a manual dry run), there is no release tag: the intended release version is the workspace version in the root `Cargo.toml` and the intended release tag is `v<version>`.
 2. The previous release: find the most recent semantic-version tag of the form `v<major>.<minor>.<patch>` that is not the current release. If no such tag exists, treat this release as the initial public release.
 3. What actually shipped: inspect the repository documentation (README, docs/) and the implementation to understand the behavior delivered since the previous release. You may use git history (for example `git log --oneline <previous-tag>..HEAD`) to identify what changed, but do not dump raw commit history into the notes.
 

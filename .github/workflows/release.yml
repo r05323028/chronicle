@@ -1,20 +1,32 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
-  # Manual trigger = release dry run: exercises the full preparation path
-  # (build, notes, archives, checksums, bundle) but never publishes.
   workflow_dispatch:
+    inputs:
+      mode:
+        description: >-
+          Release mode: prepare is non-mutating; release promotes and publishes
+        required: true
+        type: choice
+        options:
+          - prepare
+          - release
+        default: prepare
+      version:
+        description: Workspace release version, for example 0.2.0 or 0.2.0-rc.1
+        required: true
+        type: string
+
+concurrency:
+  group: chronicle-release
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
   # Release-note generation (Pi + OpenCode Go). Non-secret values live here so
-  # the jobs reference them without duplicating literals. The API key is NOT a
-  # workflow env: it stays in the OPENCODE_GO_API_KEY secret and is injected
+  # jobs reference them without duplicating literals. The API key is injected
   # only into the step that talks to the provider.
   OPENCODE_GO_BASE_URL: https://opencode.ai/zen/go/v1
   RELEASE_NOTES_MODEL: deepseek-v4-flash
@@ -22,44 +34,112 @@ env:
 
 jobs:
   resolve-context:
-    name: Resolve release context
+    name: Freeze and resolve release context
     runs-on: ubuntu-latest
     outputs:
       mode: ${{ steps.resolve.outputs.mode }}
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
       is-release: ${{ steps.resolve.outputs.is-release }}
+      is-prerelease: ${{ steps.resolve.outputs.is-prerelease }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag-exists: ${{ steps.state.outputs.tag-exists }}
+      release-state: ${{ steps.state.outputs.release-state }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - name: Check out repository
+      - name: Check out frozen workflow SHA
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
 
-      - name: Resolve mode, version and intended tag
+      - name: Freeze SHA and resolve requested version
         id: resolve
+        env:
+          RELEASE_MODE: ${{ inputs.mode }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          WORKFLOW_EVENT: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-              MODE=release
-              TAG="$GITHUB_REF_NAME"
-            else
-              MODE=dry-run
-              TAG=""
-            fi
-          else
-            MODE=dry-run
-            TAG=""
-          fi
+          [[ "$WORKFLOW_EVENT" == workflow_dispatch ]] || {
+            echo "release workflow requires workflow_dispatch" >&2
+            exit 1
+          }
+          [[ "$WORKFLOW_REF" == refs/heads/main ]] || {
+            echo "release workflow may run only from refs/heads/main" >&2
+            exit 1
+          }
+          frozen_sha=$(git rev-parse HEAD)
+          [[ "$frozen_sha" == "$WORKFLOW_SHA" ]] || {
+            echo "checkout does not match github.sha:" \
+              "$frozen_sha != $WORKFLOW_SHA" >&2
+            exit 1
+          }
           ./scripts/release/resolve-release-context.sh \
-            "$MODE" Cargo.toml "$TAG" >> "$GITHUB_OUTPUT"
+            "$RELEASE_MODE" Cargo.toml "$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Require committed documentation snapshot
         env:
           RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
         run: node website/scripts/verify-release-docs.mjs "$RELEASE_VERSION"
 
+      - name: Reject conflicting tag or release state
+        id: state
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          scripts/release/manage-release-state.sh inspect "$TAG" "$SHA" \
+            >> "$GITHUB_OUTPUT"
+
+  release-qualification:
+    name: Canonical release qualification
+    needs: resolve-context
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out frozen release candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Install OpenSpec CLI
+        run: npm install -g @fission-ai/openspec@1.9.0
+
+      - name: Prepare Multipass guest for canonical acceptance
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          command -v multipass >/dev/null 2>&1 || \
+            sudo snap install multipass --classic
+          sudo snap restart multipass.multipassd || true
+          timeout 180 bash -c \
+            'until sudo multipass list >/dev/null 2>&1; do sleep 3; done'
+          timeout 300 sudo multipass find
+          timeout 600 sudo multipass launch 24.04 \
+            --name chronicle-release --cpus 2 --memory 6G --disk 20G
+          test "$(sudo multipass exec chronicle-release -- uname -m)" = x86_64
+
+      - name: Run canonical release qualification
+        run: ./scripts/validate.sh release --vm chronicle-release --force
+
+      - name: Upload release qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-qualification-evidence-${{ github.run_id }}
+          path: target/validation-evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
   release:
     name: Build chronicle-${{ matrix.target }}
-    needs: resolve-context
+    needs: [resolve-context, release-qualification]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -70,8 +150,10 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
-      - name: Check out repository
+      - name: Check out frozen release candidate
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install eBPF build toolchain
         run: |
@@ -84,7 +166,8 @@ jobs:
           rustup toolchain install nightly --profile minimal \
             --component rust-src
           curl -fsSL -o /tmp/bpf-linker.tar.zst \
-            "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-${bpf_arch}-unknown-linux-musl.tar.zst"
+            "https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/"\
+            "bpf-linker-${bpf_arch}-unknown-linux-musl.tar.zst"
           tar --zstd -xf /tmp/bpf-linker.tar.zst -C /tmp
           sudo mv /tmp/bpf-linker /usr/local/bin/bpf-linker
           bpf-linker --version
@@ -97,8 +180,7 @@ jobs:
 
       - name: Build chronicle release binary
         # Linux targets include live eBPF capture automatically.
-        run: >-
-          cargo build -p chronicle-cli --release --locked
+        run: cargo build -p chronicle-cli --release --locked
 
       - name: Validate release binary
         run: |
@@ -109,14 +191,12 @@ jobs:
           python3 - <<'PY'
           import json, subprocess, sys
           proc = subprocess.run(
-              ["./target/release/chronicle", "--format", "json",
-               "doctor"],
+              ["./target/release/chronicle", "--format", "json", "doctor"],
               capture_output=True,
               text=True,
           )
-          # doctor's exit code reflects the runner's kernel/privilege
-          # environment (BTF, cgroup v2, CAP_BPF), not artifact health.
-          # The embedded capture object probes below are the artifact gate.
+          # doctor's exit code reflects runner kernel/privilege support, not
+          # artifact health. Embedded capture probes gate the artifact.
           report = json.loads(proc.stdout)
           probes = {p["code"]: p["status"] for p in report["probes"]}
           for code in ("capture.object", "capture.programs"):
@@ -133,12 +213,11 @@ jobs:
           PY
 
       - name: Package archive
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.resolve-context.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION=$(
-            grep -m1 '^version' Cargo.toml |
-            sed -E 's/version *= *"([^"]+)".*/\1/'
-          )
           mkdir -p dist
           cp target/release/chronicle dist/chronicle
           cp LICENSE dist/LICENSE
@@ -147,8 +226,6 @@ jobs:
             "dist/chronicle-${VERSION}-${TARGET}.tar.gz" \
             chronicle LICENSE README.md
           rm dist/chronicle dist/LICENSE dist/README.md
-        env:
-          TARGET: ${{ matrix.target }}
 
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -158,100 +235,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  privileged-acceptance:
-    name: x86_64 privileged recorder acceptance
-    needs: resolve-context
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - name: Check out release candidate
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-
-      - name: Prepare x86 Multipass guest
-        run: |
-          set -euo pipefail
-          test "$(uname -m)" = x86_64
-          command -v multipass >/dev/null 2>&1 || \
-            sudo snap install multipass --classic
-          sudo snap restart multipass.multipassd || true
-          timeout 180 bash -c \
-            'until sudo multipass list >/dev/null 2>&1; do sleep 3; done'
-          timeout 300 sudo multipass find
-          timeout 600 sudo multipass launch 24.04 \
-            --name chronicle-x86 --cpus 2 --memory 6G --disk 20G
-          test "$(sudo multipass exec chronicle-x86 -- uname -m)" = x86_64
-
-      - name: Run fresh release-grade acceptance
-        run: |
-          set -euo pipefail
-          set +e
-          sudo -E env HOME=/root PATH="$PATH:/usr/local/bin" \
-            "$GITHUB_WORKSPACE/scripts/acceptance.sh" \
-            --profile all \
-            --executor multipass \
-            --vm chronicle-x86 \
-            --release \
-            --no-reuse \
-            --gate-timeout-seconds 3600 \
-            --evidence-root \
-            "$GITHUB_WORKSPACE/target/validation-evidence/acceptance"
-          acceptance_status=$?
-          set -e
-          sudo chown -R "$(id -u):$(id -g)" \
-            target/validation-evidence/acceptance 2>/dev/null || true
-          report=$(find target/validation-evidence/acceptance \
-            -name acceptance-report.json -print -quit 2>/dev/null || true)
-          if [[ -n "$report" ]]; then
-            python3 - "$report" <<'PY'
-          import json
-          import sys
-          value = json.load(open(sys.argv[1], encoding="utf-8"))
-          print(json.dumps({
-              "status": value.get("status"),
-              "release_eligible": value.get("release_eligible"),
-              "failed": value.get("failed_scenarios"),
-              "not_checked": value.get("not_checked_scenarios"),
-              "completed": len(value.get("completed_scenarios", [])),
-              "selected": len(value.get("selected_scenarios", [])),
-          }, sort_keys=True))
-          PY
-          else
-            echo "acceptance report missing" >&2
-          fi
-          if [[ "$acceptance_status" -ne 0 ]]; then
-            exit "$acceptance_status"
-          fi
-          test -n "$report"
-          python3 - "$report" <<'PY'
-          import json
-          import sys
-          value = json.load(open(sys.argv[1], encoding="utf-8"))
-          assert value["status"] == "passed", value
-          assert value["release_eligible"] is True, value
-          assert value["environment"]["architecture"] == "x86_64", value
-          assert not value["failed_scenarios"], value
-          assert not value["not_checked_scenarios"], value
-          PY
-
-      - name: Upload x86 acceptance evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: release-acceptance-x86_64-${{ github.run_id }}
-          path: target/validation-evidence/acceptance/
-          if-no-files-found: warn
-          retention-days: 30
-
   release-notes:
     name: Generate release notes with Pi
     needs: [resolve-context, release]
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository with full history
+      - name: Check out frozen release candidate with full history
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          # Full history so the agent can resolve the current and previous
-          # release tags itself from the checked-out repository.
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Configure OpenCode Go provider
@@ -268,8 +260,8 @@ jobs:
 
       - name: Generate release notes with Pi
         id: generate
-        uses: >-
-          shaftoe/pi-coding-agent-action@0698813906fb1f23425bd742510e3080d624840d
+        uses: "shaftoe/pi-coding-agent-action@\
+          0698813906fb1f23425bd742510e3080d624840d"
         env:
           OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
         with:
@@ -281,10 +273,11 @@ jobs:
           prompt: ${{ steps.prompt.outputs.prompt }}
 
       - name: Save generated release notes
+        env:
+          RELEASE_NOTES_RESPONSE: ${{ steps.generate.outputs.response }}
         run: |
-          cat > release-notes.md <<'CHRONICLE_NOTES_EOF'
-          ${{ steps.generate.outputs.response }}
-          CHRONICLE_NOTES_EOF
+          set -euo pipefail
+          printf '%s\n' "$RELEASE_NOTES_RESPONSE" > release-notes.md
           test -s release-notes.md
 
       - name: Upload release notes artifact
@@ -297,7 +290,7 @@ jobs:
 
   prepare-release:
     name: Prepare release artifacts
-    needs: [resolve-context, release, release-notes, privileged-acceptance]
+    needs: [resolve-context, release-qualification, release, release-notes]
     runs-on: ubuntu-latest
     steps:
       - name: Download release archives
@@ -313,9 +306,10 @@ jobs:
           path: prepared-release
 
       - name: Verify expected artifacts
+        env:
+          VERSION: ${{ needs.resolve-context.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.resolve-context.outputs.version }}"
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             archive="prepared-release/chronicle-${VERSION}-${target}.tar.gz"
             [[ -f "$archive" ]] || {
@@ -323,7 +317,7 @@ jobs:
               exit 1
             }
           done
-          [[ -f prepared-release/release-notes.md ]] || {
+          [[ -s prepared-release/release-notes.md ]] || {
             echo "missing release-notes.md" >&2
             exit 1
           }
@@ -336,35 +330,40 @@ jobs:
           (
             cd prepared-release
             sha256sum chronicle-*.tar.gz > SHA256SUMS
+            test -s SHA256SUMS
             sha256sum -c SHA256SUMS
           )
           echo "SHA256SUMS verified"
           cat prepared-release/SHA256SUMS
 
       - name: Write release preparation summary
+        env:
+          MODE: ${{ needs.resolve-context.outputs.mode }}
+          VERSION: ${{ needs.resolve-context.outputs.version }}
+          TAG: ${{ needs.resolve-context.outputs.tag }}
+          SHA: ${{ needs.resolve-context.outputs.sha }}
         run: |
           set -euo pipefail
-          MODE="${{ needs.resolve-context.outputs.mode }}"
-          VERSION="${{ needs.resolve-context.outputs.version }}"
-          TAG="${{ needs.resolve-context.outputs.tag }}"
-          ARCHIVES=$(basename -a prepared-release/chronicle-*.tar.gz \
-            | tr '\n' ' ')
+          ARCHIVES=$(basename -a prepared-release/chronicle-*.tar.gz |\
+            tr '\n' ' ')
           {
             echo "## Release preparation summary"
             echo ""
             echo "- Mode: ${MODE}"
             echo "- Resolved workspace version: ${VERSION}"
             echo "- Intended release tag: ${TAG}"
+            echo "- Frozen release SHA: ${SHA}"
             echo "- Generated archives: ${ARCHIVES}"
             echo "- release-notes.md: present"
             echo "- SHA256SUMS: present and verified"
-            if [[ "$MODE" == "dry-run" ]]; then
-              echo "- Publication: SKIPPED (dry run)"
+            if [[ "$MODE" == prepare ]]; then
+              echo "- Publication: SKIPPED (prepare mode)"
               echo ""
-              echo "Dry run completed successfully."
-              echo "No GitHub Release was created."
+              echo "Preparation completed successfully."
+              echo "No tag or GitHub Release was created."
             else
-              echo "- Publication: deferred to publish job (tag push)"
+              echo "- Tag promotion: deferred until preparation succeeds"
+              echo "- Publication: deferred to create-tag and publish jobs"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -376,12 +375,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    name: Create GitHub Release
-    # Real-release boundary: publication happens only for a pushed v* tag.
-    # A workflow_dispatch run is a dry run: gh release create is unreachable.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [resolve-context, prepare-release]
+  create-tag:
+    name: Promote immutable release tag
+    if: needs.resolve-context.outputs.mode == 'release'
+    needs: [resolve-context, release-qualification, prepare-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -389,30 +386,155 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      - name: Check out frozen release candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Create or reuse tag at frozen SHA
+        env:
+          TAG: ${{ needs.resolve-context.outputs.tag }}
+          SHA: ${{ needs.resolve-context.outputs.sha }}
+        run: scripts/release/manage-release-state.sh ensure-tag "$TAG" "$SHA"
+
+  publish:
+    name: Create, verify, and publish GitHub Release
+    if: needs.resolve-context.outputs.mode == 'release'
+    needs: [resolve-context, create-tag, prepare-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.resolve-context.outputs.tag }}
+      VERSION: ${{ needs.resolve-context.outputs.version }}
+      SHA: ${{ needs.resolve-context.outputs.sha }}
+      IS_PRERELEASE: ${{ needs.resolve-context.outputs.is-prerelease }}
+    steps:
       - name: Download prepared release bundle
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: prepared-release
           path: .
 
-      - name: Publish GitHub Release
-        run: >-
-          gh release create "${{ needs.resolve-context.outputs.tag }}"
-          chronicle-*.tar.gz SHA256SUMS
-          --notes-file release-notes.md
-          --verify-tag
+      - name: Verify immutable tag before release mutation
+        run: |
+          set -euo pipefail
+          tag_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" \
+            --jq '.object.sha')
+          [[ "$tag_sha" == "$SHA" ]] || {
+            echo "tag $TAG points to $tag_sha, expected frozen SHA $SHA" >&2
+            exit 1
+          }
 
-      - name: Assert SHA256SUMS is attached to the release
-        run: >-
-          gh release view "${{ needs.resolve-context.outputs.tag }}"
-          --json assets --jq '.assets[].name'
-          | grep -qx SHA256SUMS
+      - name: Create or reuse draft release
+        run: |
+          set -euo pipefail
+          release_draft() {
+            local error value
+            error=$(mktemp)
+            if value=$(gh api "repos/$GH_REPO/releases/tags/$TAG" \
+              --jq '.draft' 2>"$error"); then
+              rm -f "$error"
+              printf '%s' "$value"
+              return 0
+            fi
+            if grep -Eq 'HTTP[^[:alnum:]]*404' "$error"; then
+              rm -f "$error"
+              return 0
+            fi
+            cat "$error" >&2
+            rm -f "$error"
+            return 1
+          }
+
+          current_draft=$(release_draft)
+          if [[ -z "$current_draft" ]]; then
+            release_flags=(--draft --title "Chronicle ${VERSION}" \
+              --notes-file release-notes.md --verify-tag)
+            if [[ "$IS_PRERELEASE" == true ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "$TAG" "${release_flags[@]}"
+          else
+            [[ "$current_draft" == true ]] || {
+              echo "GitHub Release $TAG is already published;" \
+                "refusing overwrite" >&2
+              exit 1
+            }
+            if [[ "$IS_PRERELEASE" == true ]]; then
+              gh release edit "$TAG" --notes-file release-notes.md --prerelease
+            else
+              gh release edit "$TAG" --notes-file release-notes.md \
+                --prerelease=false
+            fi
+          fi
+
+      - name: Upload or repair expected release assets
+        run: |
+          set -euo pipefail
+          draft=$(gh release view "$TAG" --json isDraft \
+            --jq '.isDraft')
+          [[ "$draft" == true ]] || {
+            echo "release $TAG is no longer a draft;" \
+              "refusing asset mutation" >&2
+            exit 1
+          }
+          gh release upload "$TAG" \
+            "chronicle-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            "chronicle-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+            SHA256SUMS --clobber
+
+      - name: Verify draft assets and prerelease state
+        run: |
+          set -euo pipefail
+          [[ "$(gh release view "$TAG" --json isDraft \
+            --jq '.isDraft')" == true ]] || {
+            echo "release $TAG is not a draft during verification" >&2
+            exit 1
+          }
+          expected_prerelease=false
+          if [[ "$IS_PRERELEASE" == true ]]; then
+            expected_prerelease=true
+          fi
+          actual_prerelease=$(gh release view "$TAG" --json isPrerelease \
+            --jq '.isPrerelease')
+          [[ "$actual_prerelease" == "$expected_prerelease" ]] || {
+            echo "release prerelease state mismatch:" \
+              "$actual_prerelease != $expected_prerelease" >&2
+            exit 1
+          }
+          assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          for expected in \
+            "chronicle-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            "chronicle-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+            SHA256SUMS; do
+            grep -Fx -- "$expected" <<<"$assets" >/dev/null || {
+              echo "release $TAG missing expected asset: $expected" >&2
+              exit 1
+            }
+          done
+
+      - name: Publish verified draft
+        run: |
+          set -euo pipefail
+          release_id=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq '.id')
+          gh api --method PATCH \
+            "repos/$GH_REPO/releases/$release_id" -F draft=false
+          [[ "$(gh release view "$TAG" --json isDraft \
+            --jq '.isDraft')" == false ]] || {
+            echo "release $TAG did not leave draft state" >&2
+            exit 1
+          }
 
       - name: Write publication summary
         run: |
           {
             echo "## Release published"
             echo ""
-            echo "- Tag: ${{ needs.resolve-context.outputs.tag }}"
-            echo "- Version: ${{ needs.resolve-context.outputs.version }}"
+            echo "- Tag: $TAG"
+            echo "- Version: $VERSION"
+            echo "- Frozen SHA: $SHA"
+            echo "- Prerelease: $IS_PRERELEASE"
           } >> "$GITHUB_STEP_SUMMARY"
