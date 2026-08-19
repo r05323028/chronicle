@@ -180,6 +180,18 @@ privileged); privileged execution, live-capture, and recorder are gate selectors
 Portable assertions MUST NOT become privileged proof merely because a Multipass profile can run
 them. Normative details: `validation/test-architecture/README.md`.
 
+## Pull-request workflow
+
+- Prepare work as a pull-request-targeted change; do not assume direct pushes to `main`.
+- Squash merging makes the final PR title the canonical commit title on `main`; choose a
+  Conventional Commit-compatible title before presenting or creating a PR.
+- Intermediate branch commits may be `wip`, `fix tests`, or `address review`; do not rewrite
+  branch history merely to make temporary commits conventional.
+- Keep each PR conceptually coherent so its squash commit describes shipped intent, not
+  implementation noise. Required GitHub CI checks must pass before merge.
+- Release/changelog automation treats the resulting linear `main` history as deterministic input.
+  Detailed workflow guidance lives in `CONTRIBUTING.md#pull-request-workflow`.
+
 ## Task completion rules
 
 - A task is complete only from evidence that task explicitly requires; OpenSpec checkboxes are

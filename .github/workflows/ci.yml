@@ -3,6 +3,11 @@ name: CI
 on:
   push:
   pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
 
 permissions:
   contents: read
@@ -16,6 +21,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  pr-title:
+    name: PR title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Validate PR title (Conventional Commits)
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 scripts/validate_pr_title.py
+
   checks:
     name: Rust checks
     runs-on: ubuntu-latest

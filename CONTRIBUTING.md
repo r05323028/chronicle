@@ -9,6 +9,36 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
+## Pull-request workflow
+
+Changes to `main` go through pull requests. Pull requests are squash-merged, so the PR title
+becomes the canonical commit title on `main`; use a meaningful title before opening or updating a
+PR. The `PR title` CI check validates this format, and all required GitHub CI checks must pass
+before merge.
+
+```text
+<type>(<optional-scope>)<optional-!>: <description>
+```
+
+Allowed types: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`, `chore`, and
+`revert`. Scope and `!` are optional. Choose type and scope from user/developer-visible intent,
+not implementation noise. Intermediate branch commits do not need to follow Conventional Commits;
+`wip`, `fix tests`, and `address review` are acceptable local history. Do not rewrite branch
+history only to make temporary commits conventional.
+
+Examples:
+
+```text
+feat(record): support session correlation
+fix(replay): preserve response ordering
+docs: clarify installation requirements
+refactor(etl): separate storage concerns
+```
+
+This keeps `main` linear and meaningful, makes each squash merge one coherent change, and gives
+release-note/changelog tools such as `git-cliff` deterministic repository metadata. This change
+does not add `git-cliff`.
+
 ## Validation timeouts
 
 Never run potentially blocking commands without a bounded timeout. Use the repository wrapper:
