@@ -24,14 +24,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  # Release-note generation (Pi + OpenCode Go). Non-secret values live here so
-  # jobs reference them without duplicating literals. The API key is injected
-  # only into the step that talks to the provider.
-  OPENCODE_GO_BASE_URL: https://opencode.ai/zen/go/v1
-  RELEASE_NOTES_MODEL: deepseek-v4-flash
-  RELEASE_NOTES_THINKING_LEVEL: off
-
 jobs:
   resolve-context:
     name: Freeze and resolve release context
@@ -236,7 +228,7 @@ jobs:
           retention-days: 7
 
   release-notes:
-    name: Generate release notes with Pi
+    name: Generate deterministic release notes
     needs: [resolve-context, release]
     runs-on: ubuntu-latest
     steps:
@@ -246,39 +238,51 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Configure OpenCode Go provider
-        run: python3 scripts/release/write-opencode-go-models-json.py
-
-      - name: Load release-note prompt
-        id: prompt
-        run: |
-          {
-            echo "prompt<<CHRONICLE_PROMPT_EOF"
-            cat .github/prompts/release-notes.md
-            echo "CHRONICLE_PROMPT_EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Generate release notes with Pi
-        id: generate
-        uses: "shaftoe/pi-coding-agent-action@\
-          0698813906fb1f23425bd742510e3080d624840d"
+      - name: Install git-cliff 2.13.1
         env:
-          OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
-        with:
-          github_token: ${{ github.token }}
-          provider: opencode-go
-          model: ${{ env.RELEASE_NOTES_MODEL }}
-          thinking_level: ${{ env.RELEASE_NOTES_THINKING_LEVEL }}
-          load_builtin_extensions: false
-          prompt: ${{ steps.prompt.outputs.prompt }}
-
-      - name: Save generated release notes
-        env:
-          RELEASE_NOTES_RESPONSE: ${{ steps.generate.outputs.response }}
+          GIT_CLIFF_VERSION: 2.13.1
+          GIT_CLIFF_SHA512: >-
+            e716cce3a07dda41b1e370d6afbd7a59eb3d4739509fb7856aeec8da2be28c0396584e29e106141c1a1c535c1827dbc1f60417524f5cfb1da9e11f700bd00f30
         run: |
           set -euo pipefail
-          printf '%s\n' "$RELEASE_NOTES_RESPONSE" > release-notes.md
+          archive="git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          archive_path="$RUNNER_TEMP/$archive"
+          url="https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/${archive}"
+          curl --fail --silent --show-error --location --proto '=https' \
+            --tlsv1.2 --output "$archive_path" "$url"
+          printf '%s  %s\n' "$GIT_CLIFF_SHA512" "$archive_path" |
+            sha512sum --check --status -
+          mkdir -p "$RUNNER_TEMP/git-cliff" "$RUNNER_TEMP/bin"
+          tar --extract --gzip --file "$archive_path" \
+            --directory "$RUNNER_TEMP/git-cliff" --strip-components=1
+          install -m 0755 "$RUNNER_TEMP/git-cliff/git-cliff" \
+            "$RUNNER_TEMP/bin/git-cliff"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          git-cliff --version | grep -Fx "git-cliff ${GIT_CLIFF_VERSION}"
+
+      - name: Resolve previous release boundary
+        id: range
+        env:
+          VERSION: ${{ needs.resolve-context.outputs.version }}
+          TAG: ${{ needs.resolve-context.outputs.tag }}
+          SHA: ${{ needs.resolve-context.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/resolve-release-range.py \
+            "$VERSION" "$TAG" "$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release-notes.md from frozen history
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve-context.outputs.tag }}
+          RELEASE_RANGE: ${{ steps.range.outputs.range }}
+        run: |
+          set -euo pipefail
+          git-cliff --config cliff.toml --github-repo "$GITHUB_REPO" \
+            --tag "$TAG" --output release-notes.md "$RELEASE_RANGE"
           test -s release-notes.md
+          grep -q "^## What's Changed$" release-notes.md
 
       - name: Upload release notes artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

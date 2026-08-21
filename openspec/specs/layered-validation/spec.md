@@ -259,7 +259,7 @@ Release-workflow behavior SHALL be covered by portable tests in `scripts/tests/v
 
 #### Scenario: Workflow regression detected without privileged gates
 
-- **WHEN** the release workflow, prompt file, or version-context/state script changes
+- **WHEN** the release workflow, git-cliff configuration/range resolver, or version-context/state script changes
 - **THEN** release-workflow validation tests run as part of portable tooling validation and fail on a protected regression without requiring a privileged environment
 
 #### Scenario: Dry-run safety protected

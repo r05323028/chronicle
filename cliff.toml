@@ -1,0 +1,53 @@
+# Chronicle release notes: deterministic, product-focused Conventional Commit rendering.
+
+[remote.github]
+owner = "r05323028"
+repo = "chronicle"
+
+[changelog]
+body = """
+## What's Changed
+{% for group, commits in commits | group_by(attribute="group") -%}
+{% if commits | length > 0 -%}
+{{ "\n" }}### {{ group | striptags | trim }}
+{{ "\n" }}{% for commit in commits -%}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}{% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}{% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}
+{% endfor -%}
+{% endif -%}
+{% endfor -%}
+{% if github -%}
+{% set new_contributors = github.contributors | filter(attribute="is_first_time", value=true) -%}
+{% if new_contributors | length > 0 %}
+## New Contributors
+{{ "\n" }}{% for contributor in new_contributors -%}
+- @{{ contributor.username }} made their first contribution{% if contributor.pr_number %} in #{{ contributor.pr_number }}{% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
+"""
+trim = true
+render_always = false
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+require_conventional = true
+fail_on_unmatched_commit = true
+protect_breaking_commits = true
+split_commits = false
+filter_commits = false
+tag_pattern = '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$'
+use_branch_tags = false
+topo_order = true
+topo_order_commits = true
+sort_commits = "oldest"
+
+commit_parsers = [
+  { message = '^(?:feat|fix|perf|refactor|docs|test|build|ci|chore|revert)(?:\([^)]*\))?!:', group = "<!-- 0 -->Breaking Changes" },
+  { field = "raw_message", pattern = '(?s)^(?:feat|fix|perf|refactor|docs|test|build|ci|chore|revert)(?:\([^)]*\))?:.*BREAKING CHANGE:', group = "<!-- 0 -->Breaking Changes" },
+  { message = '^feat(?:\([^)]*\))?:', group = "<!-- 1 -->Features" },
+  { message = '^fix(?:\([^)]*\))?:', group = "<!-- 2 -->Bug Fixes" },
+  { message = '^perf(?:\([^)]*\))?:', group = "<!-- 3 -->Performance" },
+  { message = '^revert(?:\([^)]*\))?:', group = "<!-- 4 -->Reverts" },
+  { message = '^(?:docs|test|build|ci|chore|refactor)(?:\([^)]*\))?:', skip = true },
+]
