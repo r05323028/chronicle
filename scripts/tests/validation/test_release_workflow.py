@@ -17,15 +17,44 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[3]
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 CLIFF_CONFIG = ROOT / "cliff.toml"
+GIT_CLIFF_INSTALLER = ROOT / "scripts" / "release" / "install-git-cliff.sh"
 RELEASE_RANGE = ROOT / "scripts" / "release" / "resolve-release-range.py"
 RESOLVE_CONTEXT = ROOT / "scripts" / "release" / "resolve-release-context.sh"
 MANAGE_STATE = ROOT / "scripts" / "release" / "manage-release-state.sh"
-GIT_CLIFF = shutil.which("git-cliff")
 
 
 def workflow_text() -> str:
     return RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+
+def ci_workflow_text() -> str:
+    return CI_WORKFLOW.read_text(encoding="utf-8")
+
+
+def installer_value(name: str) -> str:
+    raw = GIT_CLIFF_INSTALLER.read_text(encoding="utf-8")
+    match = re.search(rf"^readonly {re.escape(name)}=(\S+)$", raw, re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"missing {name} in {GIT_CLIFF_INSTALLER}")
+    return match.group(1)
+
+
+def require_git_cliff() -> str:
+    path = shutil.which("git-cliff")
+    expected = f"git-cliff {installer_value('GIT_CLIFF_VERSION')}"
+    if path is None:
+        raise AssertionError(
+            f"{expected} is required; install it with {GIT_CLIFF_INSTALLER} and add it to PATH"
+        )
+    proc = subprocess.run([path, "--version"], capture_output=True, text=True)
+    actual = proc.stdout.strip()
+    if proc.returncode != 0 or actual != expected:
+        raise AssertionError(
+            f"expected {expected}, found {actual or proc.stderr.strip()}"
+        )
+    return path
 
 
 class WorkflowShape:
@@ -254,13 +283,18 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("path: release-notes.md", workflow)
         self.assertIn("fetch-depth: 0", notes_job)
         self.assertIn("ref: ${{ github.sha }}", notes_job)
-        self.assertIn("GIT_CLIFF_VERSION: 2.13.1", notes_job)
-        self.assertIn("GIT_CLIFF_SHA512:", notes_job)
+        self.assertIn("scripts/release/install-git-cliff.sh", notes_job)
+        self.assertNotIn("GIT_CLIFF_VERSION:", notes_job)
+        self.assertNotIn("GIT_CLIFF_SHA512:", notes_job)
+        self.assertIn("GITHUB_PATH", notes_job)
+        self.assertLess(
+            notes_job.index("scripts/release/install-git-cliff.sh"),
+            notes_job.index("scripts/release/resolve-release-range.py"),
+        )
         self.assertIn("GITHUB_TOKEN: ${{ github.token }}", notes_job)
         self.assertIn("GITHUB_REPO: ${{ github.repository }}", notes_job)
         self.assertIn('--config cliff.toml --github-repo "$GITHUB_REPO"', notes_job)
         self.assertIn('grep -q "^## What\'s Changed$" release-notes.md', notes_job)
-        self.assertNotIn("--offline", notes_job)
         self.assertIn("scripts/release/resolve-release-range.py", notes_job)
         self.assertIn(
             "VERSION: ${{ needs.resolve-context.outputs.version }}", notes_job
@@ -486,6 +520,10 @@ class CliffConfigTests(unittest.TestCase):
         self.assertTrue(git["require_conventional"])
         self.assertTrue(git["fail_on_unmatched_commit"])
         self.assertTrue(git["protect_breaking_commits"])
+        self.assertEqual(
+            git["commit_preprocessors"],
+            [{"pattern": r" \(#[0-9]+\)$", "replace": ""}],
+        )
         parsers = git["commit_parsers"]
         groups = {parser["group"] for parser in parsers if "group" in parser}
         self.assertEqual(
@@ -528,6 +566,35 @@ class CliffConfigTests(unittest.TestCase):
             "revert",
         ):
             self.assertIn(commit_type, raw)
+
+
+class GitCliffInstallerTests(unittest.TestCase):
+    def test_shared_installer_is_pinned_and_fail_closed(self):
+        self.assertTrue(GIT_CLIFF_INSTALLER.is_file())
+        self.assertTrue(GIT_CLIFF_INSTALLER.stat().st_mode & stat.S_IXUSR)
+        raw = GIT_CLIFF_INSTALLER.read_text(encoding="utf-8")
+        self.assertEqual(installer_value("GIT_CLIFF_VERSION"), "2.13.1")
+        self.assertRegex(installer_value("GIT_CLIFF_SHA512"), r"^[0-9a-f]{128}$")
+        self.assertIn("x86_64-unknown-linux-gnu", raw)
+        self.assertIn("--proto '=https'", raw)
+        self.assertIn("--tlsv1.2", raw)
+        self.assertIn("sha512sum --check --status -", raw)
+        self.assertIn("install -m 0755", raw)
+        self.assertIn("--version", raw)
+        self.assertNotIn("latest", raw.lower())
+        for workflow in (workflow_text(), ci_workflow_text()):
+            self.assertIn("scripts/release/install-git-cliff.sh", workflow)
+            self.assertNotIn("GIT_CLIFF_VERSION:", workflow)
+            self.assertNotIn("GIT_CLIFF_SHA512:", workflow)
+        ci = ci_workflow_text()
+        self.assertIn('PATH="$bin_dir:$PATH"', ci)
+        self.assertLess(
+            ci.index("scripts/release/install-git-cliff.sh"),
+            ci.index("./scripts/validate.sh fast"),
+        )
+
+    def test_real_fixture_class_is_not_skip_gated(self):
+        self.assertFalse(getattr(GitCliffFixtureTests, "__unittest_skip__", False))
 
 
 class GitRepositoryMixin:
@@ -619,18 +686,27 @@ class ReleaseRangeTests(GitRepositoryMixin, unittest.TestCase):
             self.assertIn("expected frozen SHA", proc.stderr)
 
 
-@unittest.skipUnless(GIT_CLIFF, "git-cliff is not installed; fixture test skipped")
 class GitCliffFixtureTests(GitRepositoryMixin, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.git_cliff = require_git_cliff()
+
     def _render(self, repo: Path, tag: str, release_range: str, output: Path):
-        cliff = GIT_CLIFF or "git-cliff"
+        config = CLIFF_CONFIG.read_text(encoding="utf-8")
+        config = re.sub(
+            r"\[remote\.github\]\nowner = .*\nrepo = .*\n\n",
+            "",
+            config,
+            count=1,
+        )
+        fixture_config = output.with_name("cliff-fixture.toml")
+        fixture_config.write_text(config, encoding="utf-8")
         return subprocess.run(
             [
-                cliff,
-                "--offline",
+                self.git_cliff,
                 "--config",
-                str(CLIFF_CONFIG),
-                "--github-repo",
-                "r05323028/chronicle",
+                str(fixture_config),
                 "--tag",
                 tag,
                 "--output",
@@ -651,10 +727,11 @@ class GitCliffFixtureTests(GitRepositoryMixin, unittest.TestCase):
             self._commit(repo, "chore: initial")
             self._git(repo, "tag", "v0.1.0")
             for message in (
-                "feat(record): support correlation",
+                "feat(record): support correlation (#123)",
                 "test(record): add correlation fixtures",
                 "docs(record): document correlation semantics",
-                "fix(replay): preserve ordering",
+                "fix(replay): preserve ordering (#42)",
+                "feat(parser): support HTTP (experimental)",
                 "ci(release): improve publication gate",
                 "refactor(wal): split checkpoint writer",
                 "refactor(etl)!: reorganize internals",
@@ -695,7 +772,10 @@ class GitCliffFixtureTests(GitRepositoryMixin, unittest.TestCase):
             ]
             self.assertEqual(heading_positions, sorted(heading_positions))
             self.assertIn("- **record:** Support correlation", notes)
+            self.assertNotIn("Support correlation (#123)", notes)
             self.assertIn("- **replay:** Preserve ordering", notes)
+            self.assertNotIn("Preserve ordering (#42)", notes)
+            self.assertIn("- **parser:** Support HTTP (experimental)", notes)
             self.assertIn("- **wal:** Reduce checkpoint writes", notes)
             self.assertIn("- **cli:** Remove legacy replay syntax", notes)
             self.assertIn("- **etl:** Reorganize internals", notes)

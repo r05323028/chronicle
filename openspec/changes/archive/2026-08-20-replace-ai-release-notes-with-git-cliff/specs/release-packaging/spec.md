@@ -2,7 +2,7 @@
 
 ### Requirement: Pi-generated release notes
 
-**Reason**: Release notes are no longer model-generated; the active contract is deterministic local Git history rendered by git-cliff. The archived requirement remains historical record only.
+**Reason**: Release notes are no longer model-generated; the active contract is deterministic Git-history classification rendered by git-cliff with optional GitHub presentation enrichment. The archived requirement remains historical record only.
 
 **Migration**: Use the deterministic git-cliff release-note requirement below. Keep `release-notes.md` as the artifact consumed by preparation and publication.
 
