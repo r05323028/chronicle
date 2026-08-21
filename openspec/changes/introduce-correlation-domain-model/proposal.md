@@ -1,31 +1,42 @@
 ## Why
 
-Chronicle's current pipeline reconstructs protocol-neutral connections and canonical operations from `CaptureEvent` evidence, but it has no Chronicle-owned domain model for correlating independent logical interactions into one replayable application scenario. Chronicle 0.2.0 needs that boundary before adding tracing adapters, runtime lineage capture, correlation algorithms, scenario replay, or test generation; otherwise a tracing framework or infrastructure carrier could accidentally become scenario ownership.
+Chronicle already turns capture evidence into protocol-neutral `CanonicalOperation` values and publishes deterministic `CanonicalSession` artifacts. It does not yet define how those logical interactions relate to the application Chronicle is recording, how one scenario references operations published in different epoch sessions, or who owns resolved, ambiguous, and uncorrelated outcomes. Without those boundaries, packet direction, sockets, tracing providers, or session artifacts could be mistaken for application scenario identity.
 
-Repository inspection on `origin/main` (`75051fc`) found the existing ownership seam: `chronicle-common` owns shared IDs and timestamps; `chronicle-capture` owns socket/process/payload evidence; `chronicle-session` groups transport evidence into connection streams; `chronicle-canonical` owns `CanonicalSession`/`CanonicalOperation`; `chronicle-protocol` and built-ins own protocol request/response correlation; and `chronicle-etl` transforms committed WAL evidence into canonical publication. The current checkout is one unrelated release commit ahead of `origin/main`; no inspected correlation boundary differs. No OpenTelemetry, W3C, B3, Datadog, or AWS X-Ray dependency exists.
+Current architecture assigns observation to `chronicle-capture`, transport reconstruction to `chronicle-session`, protocol-local message pairing to `chronicle-protocol`, canonical operations and validation to `chronicle-canonical`, and complete publication ordering to `chronicle-etl`. A recording may publish one canonical session per finalized epoch, and existing canonical provenance already records contributing epoch ranges and a completion-owner epoch. `CaptureEvent` v1 contains socket/lifecycle/payload evidence; it does not contain an event identity. `Direction` describes byte flow, not application ownership.
 
 ## What Changes
 
-- Define a Chronicle-owned correlation domain model for scenarios, logical interactions, causal relationships, evidence provenance, confidence, and unresolved outcomes.
-- Reuse `CanonicalOperation`/`OperationId` as Chronicle's existing logical interaction concept instead of creating a duplicate operation/interaction identity.
-- Establish stable event and scenario identity ownership, with infrastructure IDs remaining evidence only and session/recording/epoch identities remaining distinct.
-- Define a framework-neutral `CorrelationEvidence` vocabulary covering trace, protocol, execution, process/thread, connection/socket, stream, temporal, and custom evidence without exposing tracing SDK types.
-- Define categorical resolution semantics for exact, strong, inferred, ambiguous, and uncorrelated results; preserve candidates and evidence instead of forcing unsafe ownership.
-- Define the conservative 0.2 scenario boundary: one root ingress, causally correlated synchronous interactions, and the ingress response; post-response background work is excluded.
-- Specify where the model fits the current crate graph and how WAL, reconstruction, protocol canonicalization, ETL, storage, and future adapters interact with it.
-- Add implementation tasks for domain validation, concurrency cases, architecture/dependency checks, and durable documentation updates.
-- **Do not implement production code, correlation algorithms, tracing adapters, replay, exports, or test generation in this change.**
+- Define Chronicle-owned `InteractionRole` semantics with `Ingress` and `Egress` values. The role is attached to, or deterministically derived for, each logical canonical interaction from application-relative ownership evidence; it is not packet direction.
+- Keep `CanonicalOperation` and `OperationId` as the logical interaction and interaction identity. Add no `InteractionId`.
+- Define a scoped `CanonicalOperationRef` containing recording lineage, owning epoch/session scope, and `OperationId`, so correlation can safely reference operations outside their owning `CanonicalSession` and across epoch boundaries.
+- Introduce a recording-scoped `CorrelationGraph` aggregate. It owns `Scenario` children, role assignments, resolutions, and selected causal edges; resolved, ambiguous, and uncorrelated interactions remain represented in one canonical result.
+- Make only an interaction classified as `Ingress` eligible to be a scenario root. Preserve protocol direction, transport carriers, infrastructure identifiers, and external trace identifiers as evidence only.
+- Preserve framework-neutral evidence, optional trace enrichment, concurrency safety, ambiguity, and replayability/completeness independence.
+- Explicitly omit `EventId` from this foundation. Existing `OperationId` plus scoped references and existing provenance are sufficient for correlation. Any future event identity requires a dedicated deterministic-identity or versioned-compatibility change.
+- Keep this change algorithm-neutral: it defines values and validation for supplied resolutions, not a resolver, heuristic, temporal inference, runtime lineage algorithm, or automatic ownership from raw interleaved traffic.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `correlation-domain-model`: Chronicle-owned scenario/interaction identities, framework-neutral correlation evidence, causal relationships, explainable resolution, conservative scenario boundaries, and safety invariants for concurrent application behavior.
+- `correlation-domain-model`: Chronicle-owned interaction roles, scoped canonical operation references, recording-scoped correlation ownership, scenario membership, causal relationships, framework-neutral evidence, and unresolved outcomes.
 
 ### Modified Capabilities
 
-None. Existing protocol specifications continue to own request/response pairing (for example HTTP/1.1 FIFO correlation); this change defines cross-interaction scenario ownership and does not alter that behavior.
+None. Existing protocol specifications continue to own protocol request/response pairing. This change adds cross-interaction scenario semantics without changing HTTP, database, WAL, capture, replay, or CLI behavior.
 
-## Impact
+## Compatibility and Impact
 
-The future implementation is expected to extend `chronicle-common` with only neutral identity primitives needed by the domain and add a correlation module to `chronicle-canonical`, reusing existing `OperationId`/`CanonicalOperation`. `chronicle-capture`, `chronicle-session`, and protocol adapters remain evidence/reconstruction/operation producers; `chronicle-etl` remains the complete transformation and publication owner. No new crate, tracing SDK, external adapter, WAL format, Capture Event v1 format, Canonical Session v1 format, CLI contract, or production dependency is changed by this planning-only task. Architecture documentation and `AGENTS.md` will eventually receive concise durable invariants; detailed rationale remains in this change and the canonical architecture docs.
+This is a planning-only revision. It does not modify production Rust, manifests, tracing dependencies, crate boundaries, Capture Event v1, Canonical Session v1, WAL v1, Session Manifest v1, public JSON, CLI behavior, or replay behavior.
+
+The public 0.1 compatibility boundary remains unchanged. Correlation data must not be added implicitly to frozen v1 artifacts. A later implementation may first publish a separately versioned correlation sidecar/new artifact, or may introduce an explicit 0.2 versioned contract through a dedicated compatibility/migration OpenSpec change. That decision is not authorized by this foundation.
+
+`chronicle-common` may eventually own only neutral `ScenarioId` primitives; correlation semantics and `CanonicalOperationRef` remain in the canonical domain. No standalone correlation crate is introduced. Core/domain APIs expose no OpenTelemetry, W3C, B3, Datadog, AWS X-Ray, or other tracing SDK types.
+
+## Out of Scope and Future Changes
+
+- Correlation resolver or algorithm, scoring, weighted evidence, temporal inference, runtime instrumentation, or automatic scenario selection. Track in `correlate-ingress-and-egress-interactions` or equivalent.
+- Pluggable trace evidence providers and concurrent-ingress correlation implementation.
+- Persisted scenario/correlation artifact design, if not covered by the sidecar decision.
+- Event identity for capture evidence. A future change must choose deterministic derivation from stable immutable provenance or an explicit versioned contract; it must not alter 0.1 schemas silently.
+- Scenario artifact UX, replay v2, dependency matching, exports, assertions, and test generation.

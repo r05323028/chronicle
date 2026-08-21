@@ -1,219 +1,287 @@
 ## Purpose
 
-Define Chronicle's framework-neutral correlation domain for turning independently observed logical interactions into explainable, replayable application scenarios without making tracing SDKs or infrastructure carriers part of domain ownership.
+Define Chronicle's framework-neutral correlation domain for application-relative interaction roles, durable references across canonical sessions and epochs, and explicit ownership of resolved, ambiguous, and uncorrelated outcomes. The capability validates supplied resolutions; it does not implement correlation selection.
 
 ## ADDED Requirements
 
-### Requirement: Chronicle owns scenario and interaction semantics
+### Requirement: Chronicle owns application-relative interaction role
 
-Chronicle SHALL own the meaning of a scenario, logical interaction, causal relationship, and correlation outcome. For this capability, an interaction SHALL mean the existing `CanonicalOperation` concept and SHALL represent one logical request/response exchange or equivalent protocol operation. It SHALL NOT mean a TCP connection, socket, process, thread, packet, protocol stream, or WAL record. Existing protocol canonicalizers SHALL continue to own protocol-local request/response pairing; scenario correlation SHALL be a distinct Chronicle domain concern.
+Chronicle SHALL define a protocol-neutral `InteractionRole` with `Ingress` and `Egress` values. The role SHALL describe the logical interaction's relationship to the recorded application: ingress is accepted from a remote/client side, and egress is initiated toward a remote service or dependency. Each correlation input interaction SHALL have the role attached or deterministically derived from Chronicle-owned application-relative evidence before correlation-domain validation. Role semantics SHALL NOT be inferred from packet direction or byte-flow direction alone.
 
-#### Scenario: Logical interaction is independent of transport carrier
+#### Scenario: Passive HTTP server interaction is ingress
 
-- **WHEN** one HTTP/2 connection carries streams for three independent requests
-- **THEN** each logical request/response exchange can be represented as a separate interaction
-- **AND** no interaction identity is derived from or merged solely because streams share one connection
+- **WHEN** a passive server connection accepted by the recorded application carries a remote client's HTTP request and response exchange
+- **THEN** its `CanonicalOperation` is classified as `InteractionRole::Ingress`
+- **AND** the classification describes remote client to recorded application ownership, not the direction of individual HTTP messages
 
-#### Scenario: Protocol correlation remains protocol-owned
+#### Scenario: Active HTTP client interaction is egress
 
-- **WHEN** an HTTP/1.1 canonicalizer pairs a request and response on a persistent connection
-- **THEN** it produces one logical operation/interaction for that exchange
-- **AND** scenario correlation consumes that interaction and its evidence without rediscovering HTTP framing
+- **WHEN** the recorded application actively connects to a remote HTTP service and performs an HTTP request/response exchange
+- **THEN** its `CanonicalOperation` is classified as `InteractionRole::Egress`
+- **AND** the classification remains egress even though the response bytes travel from server to client on the wire
 
-### Requirement: Scenario boundary is conservative and root-based
+#### Scenario: Active database or cache interaction is egress
 
-A `Scenario` SHALL represent one root ingress interaction and the causally correlated synchronous interactions triggered while handling that ingress, ending at the ingress response boundary. A root ingress SHALL be a logical interaction, not a socket or listener. Background work that starts after the ingress response SHALL NOT automatically become a member of that scenario; a future specification MAY extend the boundary. Evidence for excluded or unresolved work SHALL remain representable rather than being silently discarded.
+- **WHEN** the recorded application actively connects to PostgreSQL, MySQL, Redis, or another database/cache dependency and performs a logical operation
+- **THEN** that `CanonicalOperation` is classified as `InteractionRole::Egress`
+- **AND** the database/cache protocol name does not change the application-relative role
 
-#### Scenario: Root ingress with synchronous children
+#### Scenario: Bidirectional payload does not change role
 
-- **WHEN** an ingress request triggers an outbound HTTP call, a database operation, and a cache operation before its response
-- **THEN** one scenario can contain the ingress interaction as root and those child interactions as causally related members
-- **AND** the ingress response closes the 0.2 scenario boundary
+- **WHEN** one logical HTTP, database, or cache interaction contains payload bytes in both wire directions
+- **THEN** it retains one application-relative `InteractionRole`
+- **AND** individual request/response byte directions do not switch it between ingress and egress
 
-#### Scenario: Post-response background work
+#### Scenario: Direction is not interaction role
 
-- **WHEN** background work begins after the ingress response has completed
-- **THEN** that work is not automatically assigned to the completed scenario
-- **AND** its interaction and correlation evidence remain available as unresolved, uncorrelated, or separately rooted domain data
+- **WHEN** capture evidence labels bytes `ClientToServer` and `ServerToClient`
+- **THEN** those labels remain byte-flow evidence
+- **AND** domain validation does not accept them as a substitute for `InteractionRole`
 
-### Requirement: Stable Chronicle-owned identities remain distinct
+#### Scenario: Transport evidence contributes without owning semantics
 
-Event, interaction, and scenario identities SHALL be stable typed identities owned by Chronicle rather than by a tracing SDK or infrastructure carrier. The implementation SHALL reuse existing `OperationId` as the identity of a canonical interaction and SHALL NOT create a second independent operation/interaction identity. A stable `EventId` SHALL identify one observed event/evidence instance, and a stable `ScenarioId` SHALL identify one scenario aggregate. `RecordingId`, `EpochId`, `SessionId`, `ConnectionId`, process IDs, thread IDs, socket identities, stream identities, WAL sequence numbers, and timestamps SHALL retain their existing meanings and SHALL NOT be repurposed as scenario identity.
+- **WHEN** validated active/passive socket evidence is available for a canonical operation
+- **THEN** it MAY contribute to deterministic role derivation
+- **AND** socket role, connection identity, stream identity, PID, TID, and packet direction SHALL NOT become canonical scenario identity
 
-#### Scenario: Interaction identity survives connection reuse
+#### Scenario: Missing or conflicting role evidence
 
-- **WHEN** three database request/response exchanges reuse one physical connection
-- **THEN** each exchange has its own stable interaction identity
-- **AND** connection reuse does not replace, alias, or merge those identities
+- **WHEN** application-relative ownership cannot be established or role evidence conflicts
+- **THEN** the interaction remains representable with its evidence
+- **AND** it SHALL NOT qualify as a scenario root through a guessed default
 
-#### Scenario: Storage and scenario identities remain separate
+### Requirement: Existing canonical operation remains interaction identity
 
-- **WHEN** a canonical session or recording contains multiple scenarios
-- **THEN** each scenario has its own scenario identity while session, epoch, and recording identities remain separately addressable
-- **AND** identifier equality is not treated as lineage or ownership
+The domain SHALL reuse `CanonicalOperation` as the logical interaction and `OperationId` as its interaction identity. It SHALL NOT introduce `InteractionId`, a parallel operation object, or a transport-derived replacement. `OperationId` SHALL retain its existing semantics and SHALL NOT be assumed globally unique outside its owning canonical session unless a separate durable invariant establishes that fact.
 
-#### Scenario: WAL order is not event identity
+#### Scenario: Connection reuse preserves interaction identity
 
-- **WHEN** an event is recovered from a different WAL segment or is replayed through ETL
-- **THEN** its event identity remains the identity of the observed event
-- **AND** WAL sequence and byte position remain ordering/provenance evidence only
+- **WHEN** multiple logical database exchanges reuse one physical connection
+- **THEN** each exchange is represented by its own `CanonicalOperation` and `OperationId`
+- **AND** connection reuse does not merge or replace those operation identities
 
-### Requirement: Causal relationships are explicit
+#### Scenario: No duplicate interaction identity
 
-The domain SHALL represent parent/child or equivalent directed causal relationships between interactions. A selected causal edge SHALL identify a parent interaction, a child interaction, and the relationship provenance. Selected causal edges SHALL be acyclic within a scenario, SHALL not self-reference, and SHALL give an interaction at most one selected parent in the 0.2 tree; competing parent candidates SHALL remain in resolution data instead of becoming graph edges. A connection, process, thread, task worker, or time window SHALL NOT implicitly create a causal edge. An interaction with unresolved parentage SHALL be allowed to exist without a selected parent.
+- **WHEN** the correlation domain references a logical interaction
+- **THEN** it uses `OperationId` through a scoped canonical reference
+- **AND** no `InteractionId` is required or introduced
 
-#### Scenario: Interleaved concurrent ingresses
+### Requirement: Canonical operation references are explicitly scoped
 
-- **WHEN** concurrent roots A `POST /checkout`, B `GET /profile`, and C `POST /login` produce interleaved PostgreSQL, HTTP, and Redis interactions in the order `A→postgres`, `B→postgres`, `C→redis`, `A→HTTP`, `C→postgres`, `A→postgres`
-- **THEN** the domain can represent Scenario A with its two PostgreSQL interactions and HTTP child, Scenario B with its PostgreSQL interaction, and Scenario C with Redis and PostgreSQL children
-- **AND** interleaving does not create cross-scenario parent edges
+A durable reference to an operation outside its owning `CanonicalSession` SHALL include enough scope to identify its recording lineage, owning epoch/session artifact, and `OperationId`. The foundation SHALL use a shape equivalent to `CanonicalOperationRef { recording_id, owner_epoch_id, session_id, operation_id }`. The owning epoch is the epoch/session publication containing the authoritative canonical operation occurrence; contributing epoch ranges remain operation provenance. A bare `OperationId` SHALL NOT resolve an external reference.
 
-#### Scenario: Multiplexed protocol streams
+#### Scenario: Same operation ID in different sessions is unambiguous
 
-- **WHEN** one HTTP/2 connection carries stream 1 for Scenario A, stream 3 for Scenario B, and stream 5 for Scenario C
-- **THEN** each stream's logical interactions can have independent scenario membership and causal edges
-- **AND** the shared connection is retained only as carrier evidence
+- **WHEN** Session A and Session B contain equal `OperationId` values under different session/epoch scopes
+- **THEN** their `CanonicalOperationRef` values remain distinct
+- **AND** lookup by one full reference cannot resolve the operation in the other session
 
-#### Scenario: Connection-pool reuse
+#### Scenario: Reference lineage is verified
 
-- **WHEN** PostgreSQL connection number 5 serves request A, then B, then C
-- **THEN** each query interaction can be independently linked to its owning scenario
-- **AND** connection number 5 does not become a permanent parent or owner
+- **WHEN** a graph resolves a `CanonicalOperationRef`
+- **THEN** it verifies recording ownership, owner epoch/session lineage, and exactly one operation occurrence within that session
+- **AND** lineage is not inferred from identifier equality, WAL position, or session naming
 
-### Requirement: Correlation evidence is framework-neutral and explainable
+#### Scenario: Fixture without persisted lineage
 
-The domain SHALL represent correlation evidence as Chronicle-owned, typed, provenance-bearing data. Evidence SHALL be able to express trace relationships, protocol request/response ownership, execution or task lineage, process identity, thread identity, socket or connection identity, protocol stream identity, temporal/lifetime relationships, and custom correlation metadata. Each retained evidence item SHALL identify its evidence kind and source/provenance sufficiently for a future user or diagnostic tool to explain how a resolution was reached. An opaque numeric score without evidence provenance SHALL NOT be the sole persisted explanation.
+- **WHEN** a test or non-persisted fixture lacks recording or epoch provenance
+- **THEN** the supplied domain context provides explicit scope for its reference
+- **AND** the model does not silently promote an unscoped fixture identifier into durable recording lineage
 
-#### Scenario: Trace evidence is normalized
+### Requirement: Scenario references can span canonical sessions and epochs
 
-- **WHEN** a future W3C Trace Context, B3, Datadog, AWS X-Ray, or OpenTelemetry adapter provides a trace relationship
-- **THEN** the adapter maps it into Chronicle-owned trace evidence with normalized/opaque identifiers and source provenance
-- **AND** no OpenTelemetry or other tracing SDK type crosses into the domain model
+A recording-scoped correlation graph SHALL be able to reference operations from multiple deterministic canonical sessions published for different finalized epochs. Epoch rollover SHALL be a publication boundary, not a scenario identity boundary. A causal relationship SHALL carry full scoped references for both parent and child, including when they belong to different sessions.
 
-#### Scenario: Protocol ownership evidence explains a database assignment
+#### Scenario: Ingress crosses an epoch boundary
 
-- **WHEN** a protocol adapter proves that a PostgreSQL response belongs to one logical request and that request is linked to Scenario A
-- **THEN** the resolution can retain protocol ownership evidence and its provenance
-- **AND** a diagnostic tool can state that protocol ownership contributed to the Scenario A assignment
+- **WHEN** an ingress operation begins in epoch N and its canonical completion is owned by epoch N+1
+- **THEN** the domain preserves one logical `OperationId` and one authoritative full reference to the terminal canonical operation
+- **AND** operation provenance retains the bounded contributing ranges from both epochs without creating a second interaction identity
 
-#### Scenario: Custom evidence remains namespaced
+#### Scenario: Successor epoch contains child egress
 
-- **WHEN** an application supplies custom correlation metadata
-- **THEN** the domain preserves it under an explicit provider/namespace and bounded value representation
-- **AND** custom metadata cannot silently replace Chronicle-owned identity or resolution semantics
+- **WHEN** an ingress scenario continues across rollover and a child egress operation is published in the successor epoch's canonical session
+- **THEN** the graph can reference the ingress and child with their respective full operation references
+- **AND** the selected edge may cross the two canonical sessions without becoming ambiguous
 
-### Requirement: Trace context is optional enrichment
+#### Scenario: Scenario identity survives rollover
 
-Recording, interaction construction, and scenario representation SHALL work with complete trace context, partial trace context, another tracing system, W3C Trace Context without an SDK, or no trace context. Trace evidence MAY improve resolution confidence, but its absence SHALL NOT prevent capture, canonical interaction construction, scenario creation, or preservation of other evidence. The domain SHALL NOT synthesize missing trace parentage.
+- **WHEN** a recording publishes a successor canonical session after epoch rollover
+- **THEN** an existing scenario retains its `ScenarioId`
+- **AND** neither `SessionId` nor `EpochId` is substituted for scenario identity
 
-#### Scenario: Complete trace context
+#### Scenario: Restarted ETL resolves the same references
 
-- **WHEN** an interaction carries a valid normalized trace relationship
-- **THEN** the interaction preserves that trace evidence as optional enrichment
-- **AND** the scenario model remains Chronicle-owned and usable if that evidence is later removed
+- **WHEN** ETL restarts and reloads a supplied correlation graph
+- **THEN** it resolves each operation by recording, owner epoch, session, and operation ID with lineage verification
+- **AND** it does not generate a new reference, use a bare operation lookup, or infer a relationship from processing order
 
-#### Scenario: No trace context
+### Requirement: CorrelationGraph owns every correlation outcome
 
-- **WHEN** an application emits no trace context at all
-- **THEN** Chronicle can still represent ingress, outbound, database, cache, and response interactions
-- **AND** correlation uses available non-trace evidence or records an unresolved outcome
+Chronicle SHALL define a top-level `CorrelationGraph` or semantically equivalent recording-scoped aggregate that owns `Scenario` children, role assignments, resolutions keyed by scoped operation reference, and selected causal edges. `Scenario` SHALL be a child entity owned by the aggregate; scenario membership SHALL agree with the aggregate's resolved entries. Every operation admitted to the graph SHALL remain represented by one resolution outcome.
 
-#### Scenario: Partial trace context
+#### Scenario: Resolved interaction belongs to one scenario
 
-- **WHEN** only a trace ID or only a parent relationship is observed
-- **THEN** the partial trace evidence is preserved with its completeness/provenance state
-- **AND** Chronicle does not fill missing fields from PID, TID, socket, connection, or time overlap
+- **WHEN** a supplied resolution selects Scenario A for an operation
+- **THEN** the graph records one `Resolved` outcome with Scenario A and the operation appears in Scenario A membership
+- **AND** the operation does not simultaneously belong to Scenario B
 
-### Requirement: Resolution preserves ambiguity and categorical confidence
+#### Scenario: Ambiguous interaction remains outside membership
 
-Correlation resolution SHALL distinguish a resolved assignment from an unresolved candidate set. A resolved result SHALL carry exactly one of the categorical confidence levels `Exact`, `Strong`, or `Inferred` plus the evidence supporting that assignment. An `Ambiguous` result SHALL preserve one or more candidate scenarios and the evidence for each candidate without selecting an owner. An `Uncorrelated` result SHALL preserve the interaction and available evidence while stating that no scenario assignment is justified. Resolution SHALL NOT require every interaction to belong to a scenario, and confidence SHALL NOT be represented only as an unexplained numeric score.
+- **WHEN** an operation has viable candidates Scenario A and Scenario B but no selected owner
+- **THEN** the graph records `Ambiguous` with both candidate scenario identities and candidate-specific evidence
+- **AND** the operation is not inserted into either scenario membership or selected causal edges
 
-#### Scenario: Exact or strong resolution
+#### Scenario: Uncorrelated interaction remains represented
 
-- **WHEN** Chronicle-owned evidence uniquely or strongly identifies an interaction's scenario
-- **THEN** the resolution records the selected `ScenarioId`, the categorical confidence, and supporting evidence
-- **AND** the selected causal relationship remains inspectable
+- **WHEN** no supplied evidence justifies assigning an operation to a scenario
+- **THEN** the graph records `Uncorrelated` with the operation reference and available evidence
+- **AND** it has no synthetic owner, root, or scenario membership
 
-#### Scenario: Inferred resolution
+#### Scenario: Unresolved operation cannot disappear
 
-- **WHEN** evidence supports a likely scenario but does not establish a unique exact relationship
-- **THEN** the resolution MAY record `Inferred` with all evidence used
-- **AND** the model does not present the inference as an exact fact
+- **WHEN** an admitted operation is not a selected scenario member
+- **THEN** it remains discoverable through the graph's resolution index
+- **AND** omission from `Scenario.members` is not treated as deletion
 
-#### Scenario: Ambiguous candidate ownership
+### Requirement: Only ingress interactions can be scenario roots
 
-- **WHEN** evidence is insufficient or conflicting between Scenario A and Scenario B
-- **THEN** the resolution records `Ambiguous` with both candidate scenario identities and candidate-specific evidence
-- **AND** it does not assign the interaction to either scenario merely to make the scenario complete
+A `Scenario.root` SHALL reference an interaction classified as `InteractionRole::Ingress`. An egress interaction SHALL NOT be accepted as a scenario root. The root rule SHALL be checked from the Chronicle-owned role associated with the scoped operation, not from protocol message direction, socket identity, or an external trace identifier.
 
-#### Scenario: Uncorrelated interaction
+#### Scenario: Valid ingress root
 
-- **WHEN** no viable evidence links an interaction to a scenario
-- **THEN** the interaction remains representable with an `Uncorrelated` resolution
-- **AND** no synthetic root, owner, or scenario membership is created
+- **WHEN** a supplied Scenario A root references an interaction classified as ingress
+- **THEN** graph validation accepts the root if all other identity and membership invariants hold
 
-### Requirement: Infrastructure and time are evidence, never ownership
+#### Scenario: Egress cannot be root
 
-PID, TID, task-worker identity, socket identity, connection identity, protocol stream identity, and timestamps SHALL be represented only as evidence/carriers. The model SHALL NOT assume one PID, one TID, one socket, one connection, one stream, or one time window equals one scenario. Temporal overlap alone SHALL NEVER produce a resolved scenario assignment; temporal evidence MAY be retained as weak or fallback evidence only when combined with a Chronicle-owned resolution policy.
+- **WHEN** a supplied scenario uses an active outbound HTTP, database, or cache interaction as its root
+- **THEN** graph validation rejects the scenario root
+- **AND** the interaction may remain represented as egress, ambiguous, uncorrelated, or a selected child of an ingress scenario
 
-#### Scenario: Same-process concurrency
+### Requirement: Selected causal edges are safe and explicit
 
-- **WHEN** multiple simultaneous ingress requests execute in one process ID
-- **THEN** the domain can distinguish their interaction and scenario identities
-- **AND** process identity alone does not correlate them
+The aggregate SHALL represent selected causal edges with full parent and child operation references and selected relationship evidence. An edge SHALL be accepted only when both endpoints resolve to the same scenario. Selected edges SHALL be acyclic, SHALL reject self-edges, and SHALL give each child at most one selected parent in the 0.2 scenario tree. Ambiguous candidates SHALL never become selected edges. Unresolved operations MAY exist without a selected parent.
 
-#### Scenario: Thread-pool reuse
+#### Scenario: Cross-session causal edge
 
-- **WHEN** request A runs on a thread and request B later reuses that thread
-- **THEN** the thread identity remains evidence attached to each observation
-- **AND** it does not permanently own either request's scenario
+- **WHEN** a resolved parent in Session A and resolved child in Session B are both assigned to Scenario X
+- **THEN** the graph can accept one selected parent-to-child edge using their full references
+- **AND** session or epoch difference alone does not invalidate the edge
 
-#### Scenario: Async task migration
+#### Scenario: Cross-scenario edge is rejected
 
-- **WHEN** one request moves between Tokio worker threads, Go goroutines, Java platform/virtual threads, or Node.js event-loop turns
-- **THEN** execution evidence can record lineage changes without changing the interaction or scenario identity
-- **AND** no single OS thread is required for correlation
+- **WHEN** a proposed edge connects an operation resolved to Scenario A with an operation resolved to Scenario B
+- **THEN** graph validation rejects the edge
+- **AND** it does not reinterpret either resolution to make the edge valid
 
-#### Scenario: Overlapping lifetimes are insufficient
+#### Scenario: Invalid edge shapes are rejected
 
-- **WHEN** two ingress lifetimes overlap in the same process, runtime, thread pool, or connection pool
-- **THEN** overlap may be retained as temporal evidence
-- **AND** overlap alone cannot select either scenario as owner
+- **WHEN** a supplied graph contains a self-edge, a directed cycle, or two selected parents for one child
+- **THEN** graph validation rejects the graph
+- **AND** no invalid edge is silently downgraded into scenario membership
 
-### Requirement: Domain and pipeline boundaries remain dependency-safe
+#### Scenario: Ambiguous candidate is not an edge
 
-The canonical correlation domain SHALL live with Chronicle's protocol-independent canonical model, reusing `CanonicalOperation` and `OperationId`; neutral identity primitives SHALL remain in `chronicle-common`. Capture and eBPF layers SHALL provide only observation evidence, session reconstruction SHALL provide connection/stream reconstruction, protocol implementations SHALL provide protocol-local ownership evidence, and ETL SHALL compose future correlation with canonical publication. Core/domain crates SHALL NOT depend on OpenTelemetry, W3C, B3, Datadog, AWS X-Ray, or any tracing SDK. Future adapters SHALL depend inward on Chronicle-owned evidence contracts rather than the reverse.
+- **WHEN** an ambiguous operation lists Scenario A and Scenario B as candidates
+- **THEN** candidate evidence remains in the resolution
+- **AND** no candidate-specific relationship is emitted as a selected causal edge
 
-#### Scenario: Architecture validation rejects tracing leakage
+### Requirement: Evidence remains framework-neutral and optional
 
-- **WHEN** a future change adds a tracing SDK dependency to `chronicle-common` or `chronicle-canonical`
-- **THEN** existing architecture/dependency validation fails
-- **AND** the adapter must map external types at an outer boundary instead
+Correlation evidence SHALL be Chronicle-owned, tagged, provenance-bearing, and capable of representing trace relationships, protocol ownership, execution/task lineage, process/thread generation, socket/connection generation, protocol stream identity, temporal/lifetime relationships, and bounded namespaced custom values. Trace context SHALL be optional enrichment. Core/domain APIs SHALL NOT expose OpenTelemetry, W3C, B3, Datadog, AWS X-Ray, or other tracing SDK types.
 
-#### Scenario: Existing capture pipeline remains layered
+#### Scenario: Trace provider maps to Chronicle evidence
 
-- **WHEN** committed WAL evidence flows through reconstruction, protocol decoding, canonicalization, and ETL
-- **THEN** scenario correlation consumes Chronicle-owned interactions/evidence at the canonical/ETL seam
-- **AND** WAL durability, socket reconstruction, protocol framing, and storage publication retain their existing owners
+- **WHEN** an outer adapter receives W3C Trace Context, B3, Datadog, AWS X-Ray, or OpenTelemetry data
+- **THEN** it maps that data into Chronicle-owned opaque/provider-labelled evidence
+- **AND** no provider SDK type crosses the canonical/domain API boundary
 
-#### Scenario: No new adapter is required by the foundation
+#### Scenario: No trace context remains representable
 
-- **WHEN** this domain model is implemented without a tracing integration
-- **THEN** core Chronicle crates compile and operate without any tracing SDK
-- **AND** later adapters can be added without changing the domain vocabulary
+- **WHEN** an application supplies no trace context
+- **THEN** ingress, egress, database, cache, and other canonical interactions remain representable
+- **AND** missing trace parents are not synthesized from infrastructure identifiers or timestamps
 
-### Requirement: Correlation foundation remains algorithm- and feature-neutral
+#### Scenario: Temporal-only evidence cannot resolve ownership
 
-This capability SHALL define domain values, identity ownership, evidence provenance, causal relationship semantics, resolution outcomes, validation, and architectural boundaries only. It SHALL NOT require a correlation algorithm, weighted candidate scoring, runtime-specific task instrumentation, tracing adapter implementation, scenario replay, deterministic dependency matching, scenario export, replay assertions, test generation, AI/LLM correlation, or a Web UI.
+- **WHEN** a supplied `Resolved` outcome contains only temporal overlap or timestamp evidence
+- **THEN** model validation rejects that outcome as lacking non-temporal resolution provenance
+- **AND** the interaction may remain ambiguous or uncorrelated with temporal evidence retained
 
-#### Scenario: Algorithm can evolve without schema ownership change
+#### Scenario: Infrastructure identity remains evidence
 
-- **WHEN** a future correlation engine uses different deterministic heuristics or evidence providers
-- **THEN** it can emit the same Chronicle-owned evidence and resolution vocabulary
-- **AND** the scenario/interaction identity and ambiguity semantics remain unchanged
+- **WHEN** PID, TID, task worker, socket, connection, stream, or timestamp values are present
+- **THEN** they remain evidence attached to observations or resolutions
+- **AND** none becomes a scenario or interaction identity by equality or reuse
 
-#### Scenario: Unsupported future feature remains out of scope
+### Requirement: Correlation does not change replayability
 
-- **WHEN** implementation planning reaches replay, export, or test generation
-- **THEN** those features are tracked as separate changes
-- **AND** this capability is accepted only when its domain and validation contracts are complete
+Scenario membership and correlation resolution SHALL remain separate from operation completeness and replayability. Assigning an incomplete, lost, malformed, unsupported, or otherwise non-replayable operation to a scenario SHALL NOT make it replayable or authorize replay.
+
+#### Scenario: Resolved incomplete operation
+
+- **WHEN** an incomplete operation is supplied as resolved into Scenario A
+- **THEN** the graph preserves its Scenario A membership and its incomplete status independently
+- **AND** replay validation continues to reject it as non-replayable
+
+### Requirement: Foundation validation is algorithm-neutral
+
+This capability SHALL validate Chronicle-owned roles, scoped references, supplied resolutions, evidence provenance, membership consistency, and selected-edge invariants. It SHALL NOT require a correlation algorithm to derive scenario ownership from raw capture events or interleaved traffic. Scoring heuristics, weighted evidence, temporal inference, runtime lineage algorithms, and trace-based automatic selection SHALL be future capabilities.
+
+#### Scenario: Supplied resolution is faithfully represented
+
+- **WHEN** a domain fixture supplies canonical operations `op1`, `op2`, and `op3` with pre-resolved ownership `op1 -> Scenario A`, `op2 -> Scenario B`, and `op3 -> Scenario C`
+- **THEN** validation preserves exactly those memberships and resolutions
+- **AND** the fixture does not require the foundation to infer A/B/C from raw event order or interleaving
+
+#### Scenario: Supplied ambiguity remains unresolved
+
+- **WHEN** a fixture supplies an ambiguous candidate set and an uncorrelated operation
+- **THEN** validation preserves both outcomes and their evidence
+- **AND** it does not select an owner to satisfy scenario completeness
+
+#### Scenario: Resolver is a future boundary
+
+- **WHEN** implementation planning reaches automatic correlation of concurrent ingress and egress traffic
+- **THEN** that behavior is specified in a separate resolver change such as `correlate-ingress-and-egress-interactions`
+- **AND** this foundation remains usable with resolver outputs from different future algorithms
+
+### Requirement: Frozen 0.1 contracts remain unchanged and EventId is deferred
+
+This planning change SHALL NOT add fields to Capture Event v1 or Canonical Session v1, alter WAL v1, public stable JSON, or introduce a required `EventId`. Existing `OperationId`, scoped canonical references, and existing provenance are sufficient for this correlation foundation. Persisted correlation data SHALL require either a separately versioned sidecar/new artifact or an explicit 0.2 compatibility/migration change; no implicit v1 field addition, reader default, or compatibility fallback is authorized.
+
+#### Scenario: Capture Event v1 remains unchanged
+
+- **WHEN** this foundation is implemented
+- **THEN** Capture Event v1 still contains its existing evidence contract without an EventId field
+- **AND** no random or processing-order event identity is persisted by this change
+
+#### Scenario: Canonical Session v1 remains unchanged
+
+- **WHEN** roles, scoped references, or correlation outcomes are implemented
+- **THEN** they use a non-v1 domain/sidecar integration surface until an explicit compatibility decision exists
+- **AND** Canonical Session v1 readers and writers are not silently changed
+
+#### Scenario: Future event identity requires its own change
+
+- **WHEN** a later feature proves raw event identity necessary
+- **THEN** a dedicated change chooses deterministic derivation from stable immutable provenance or a new versioned contract/sidecar with reader/writer and migration policy
+- **AND** the choice does not rely on timestamps, WAL byte position alone, processing order, or random regeneration across restart
+- **AND** a derived identity remains unchanged when WAL segmentation or ETL processing order changes
+
+### Requirement: Canonical ownership and dependency direction remain intact
+
+Correlation semantics SHALL remain in `chronicle-canonical` with neutral identity primitives in `chronicle-common`. Capture, session, protocol, WAL, storage, ETL, application, and CLI responsibilities SHALL remain as currently assigned. No standalone correlation crate SHALL be added. Core/domain crates SHALL remain free of tracing SDK/provider dependencies, and tracing evidence SHALL enter only through Chronicle-owned contracts.
+
+#### Scenario: Existing pipeline owners remain
+
+- **WHEN** canonical correlation consumes protocol-produced operations
+- **THEN** capture remains observation owner, session remains reconstruction owner, protocol remains protocol-pairing owner, ETL remains publication/checkpoint owner, and storage remains persistence/verification owner
+- **AND** no lower layer assigns scenario ownership
+
+#### Scenario: Architecture guard remains effective
+
+- **WHEN** a future implementation adds an OpenTelemetry or provider-specific tracing dependency to a core/domain crate
+- **THEN** the existing architecture validation policy rejects the dependency
+- **AND** no parallel correlation crate or SDK-specific domain API is introduced

@@ -1,52 +1,70 @@
-## 1. Identity and canonical domain
+# Future implementation plan
 
-- [ ] 1.1 Add neutral Chronicle-owned `EventId` and `ScenarioId` primitives in `chronicle-common`; verify `OperationId` remains the sole interaction identity and no duplicate `InteractionId` is introduced.
-- [ ] 1.2 Add the correlation domain module under `chronicle-canonical` with `Scenario`, scenario-interaction membership, directed causal edges, `CorrelationEvidence`, `CorrelationResolution`, and categorical `CorrelationConfidence` values defined by `specs/correlation-domain-model/spec.md`.
-- [ ] 1.3 Add domain validation for unique event/interaction/scenario references, root-ingress validity, selected-parent cardinality, self-edge rejection, acyclic selected causal edges, and candidate/evidence reference integrity.
-- [ ] 1.4 Keep operation completeness, replayability, session identity, recording/epoch provenance, and scenario ownership as separate fields/decisions; a scenario assignment MUST NOT make incomplete or lost operations replayable.
+This task list describes the implementation of the foundation after this planning revision. It is deliberately algorithm-neutral. No task may derive Scenario A/B/C from raw interleaved traffic; tests use supplied roles and supplied `CorrelationResolution` values. Resolver behavior belongs to a future change.
 
-## 2. Evidence and resolution semantics
+## 1. Identity and reference model
 
-- [ ] 2.1 Implement the Chronicle-owned tagged evidence vocabulary for trace, protocol ownership, execution/task lineage, process, thread, connection/socket generation, protocol stream, temporal/lifetime, and namespaced custom evidence, including bounded source/provenance metadata.
-- [ ] 2.2 Represent trace identifiers as provider-neutral opaque values with completeness/provenance; add no OpenTelemetry, W3C, B3, Datadog, AWS X-Ray, or other tracing SDK type to any core/domain API.
-- [ ] 2.3 Implement resolved (`Exact`, `Strong`, `Inferred`), `Ambiguous` with candidate-specific evidence, and `Uncorrelated` outcomes without numeric-score-only explanations or forced scenario membership.
-- [ ] 2.4 Add model-level checks proving temporal overlap alone cannot produce a resolved assignment and that PID, TID, socket, connection, stream, task-worker, and timestamp values remain evidence only.
+- [ ] 1.1 Preserve `CanonicalOperation` and `OperationId` as the sole logical interaction concept/identity; add no `InteractionId` or parallel interaction type.
+- [ ] 1.2 Define `CanonicalOperationRef { recording_id, owner_epoch_id, session_id, operation_id }`; validate exact session/epoch/recording lineage and reject bare `OperationId` lookup outside its owning session.
+- [ ] 1.3 Define `ScenarioId` as scenario identity owned by a recording-scoped correlation aggregate; keep recording, epoch, session, connection, stream, process, thread, socket, and trace identities distinct.
+- [ ] 1.4 Define cross-epoch ownership rules: terminal canonical operation uses authoritative owner session/epoch, contributing epoch ranges remain provenance, and continuation-only evidence is not a duplicate operation.
+- [ ] 1.5 Explicitly omit `EventId` from this foundation. Do not add it to `chronicle-common`, Capture Event v1, Canonical Session v1, or correlation APIs; track any future deterministic/event-contract decision separately.
 
-## 3. Pipeline and contract integration
+## 2. Interaction semantics
 
-- [ ] 3.1 Define the canonical/ETL seam where future correlation consumes protocol-produced `CanonicalOperation` values and evidence while `chronicle-capture`, `chronicle-session`, `chronicle-protocol`, `chronicle-wal`, `chronicle-storage`, and `chronicle-application` retain their documented ownership.
-- [ ] 3.2 Preserve protocol-local request/response correlation in protocol canonicalizers; do not make capture, socket reconstruction, WAL order, or storage publication responsible for scenario ownership.
-- [ ] 3.3 Define the 0.2 persisted integration point and reader/writer policy before adding event/scenario fields to Capture Event or Canonical Session artifacts; do not mutate 0.1 v1 artifacts or add implicit compatibility fallbacks.
-- [ ] 3.4 Preserve unresolved evidence through ETL/publication and ensure post-response background work is not automatically attached to a completed ingress scenario.
+- [ ] 2.1 Define Chronicle-owned `InteractionRole::{Ingress,Egress}` in the canonical correlation domain and attach it to, or deterministically derive it for, each correlation input.
+- [ ] 2.2 Define application-relative role derivation from validated ownership evidence: passive server interaction is ingress; active client/dependency interaction is egress; protocol and byte-flow direction are not role semantics.
+- [ ] 2.3 Validate that only ingress interactions can be scenario roots; egress interactions remain valid children or unresolved interactions but never roots.
+- [ ] 2.4 Preserve active/passive socket, direction, connection, stream, PID, TID, worker, and timestamp values as evidence only; conflicting role evidence must not default to ingress.
 
-## 4. Domain and pipeline tests
+## 3. Correlation aggregate
 
-- [ ] 4.1 Add canonical unit tests for stable event/interaction/scenario identity, identity separation, causal-edge validation, explainable evidence retention, and operation completeness/replayability independence.
-- [ ] 4.2 Add an integration fixture covering concurrent `POST /checkout`, `GET /profile`, and `POST /login` roots with interleaved PostgreSQL, HTTP, and Redis interactions; assert independent expected Scenario A/B/C memberships and no cross-scenario parent edge.
-- [ ] 4.3 Add tests for overlapping ingress lifetimes in one PID, reused TIDs/thread-pool workers, async execution migration across runtime workers, and absence of any single-thread/request assumption.
-- [ ] 4.4 Add tests for connection-pool reuse and multiplexed streams, including multiple logical interactions on one socket/connection and independent HTTP/2-style stream ownership.
-- [ ] 4.5 Add tests for complete, partial, and absent trace context; prove no-trace scenarios remain representable and missing trace parents are never synthesized.
-- [ ] 4.6 Add tests for exact/strong/inferred resolution, conflicting evidence, ambiguous A/B candidates with candidate-specific evidence, and uncorrelated interactions that remain preserved without synthetic ownership.
-- [ ] 4.7 Keep each test at the lowest conclusive functional layer required by `validation/test-architecture/README.md`; use unit tests for value invariants and integration tests only for cross-crate ETL/domain flow.
+- [ ] 3.1 Define recording-scoped `CorrelationGraph` aggregate with role assignments, `Scenario` child entities, resolution index keyed by `CanonicalOperationRef`, and selected causal edges.
+- [ ] 3.2 Define `Scenario` root/membership invariants and make aggregate resolution state authoritative; every admitted operation retains one resolved, ambiguous, or uncorrelated outcome.
+- [ ] 3.3 Define `Resolved`, `Ambiguous` with candidate-specific evidence, and `Uncorrelated` values; ambiguous candidates stay outside selected scenario membership.
+- [ ] 3.4 Define selected edge validation: full scoped endpoints, same selected scenario, no self-edge, no cycles, at most one selected parent, and no edges from ambiguous/unresolved candidates.
 
-## 5. Existing architecture validation
+## 4. Evidence and compatibility boundary
 
-- [ ] 5.1 Extend `validation/architecture.toml` and the existing `scripts/validation.py architecture` command with the smallest direct external-dependency denylist needed to reject tracing SDK/provider packages from core/domain processing crates (`chronicle-common`, `chronicle-canonical`, `chronicle-capture`, `chronicle-session`, `chronicle-protocol`, and `chronicle-etl`); keep adapter-owned outer crates separate and do not create a parallel checker.
-- [ ] 5.2 Add standard-library temporary-workspace tests beside existing architecture validation tests proving forbidden tracing dependencies fail, allowed existing CLI logging remains outside the domain rule, and all normal/dev/build Chronicle edges still obey the current allowlist.
-- [ ] 5.3 Mechanically verify the final dependency graph has no OpenTelemetry or provider-specific tracing package in the listed core/domain processing crates, no new Chronicle crate, no reverse adapter edge, and no change to the existing `chronicle-canonical -> chronicle-common` boundary.
-- [ ] 5.4 Run the existing architecture check through `./scripts/validate.sh fast` or its changed-path equivalent and retain diagnostics as implementation evidence.
+- [ ] 4.1 Define Chronicle-owned, tagged, provenance-bearing evidence for trace, protocol ownership, execution/task lineage, process/thread generation, connection/socket generation, protocol streams, temporal/lifetime, and bounded namespaced custom data.
+- [ ] 4.2 Keep trace context optional and provider-neutral; preserve external trace values as opaque evidence and keep tracing SDK types outside core/domain APIs.
+- [ ] 4.3 Encode resolution provenance so temporal-only evidence cannot validate a selected resolution; infrastructure identity remains evidence and never scenario identity.
+- [ ] 4.4 Keep completeness/replayability separate from correlation; scenario membership cannot make incomplete, lost, malformed, unsupported, or otherwise non-replayable operations replayable.
+- [ ] 4.5 Before any persisted integration, choose a separately versioned correlation sidecar/new artifact or submit a dedicated 0.2 compatibility/migration change. Do not add fields or reader fallbacks to Capture Event v1 or Canonical Session v1.
 
-## 6. Durable documentation
+## 5. Domain-only validation
 
-- [ ] 6.1 Update `docs/architecture/crate-boundaries.md` with canonical correlation ownership, common identity ownership, capture/session/protocol/ETL responsibilities, and the adapter-inward dependency direction without changing the allowed Chronicle graph unnecessarily.
-- [ ] 6.2 Update `docs/architecture/overview.md` and `docs/canonical-model.md` with the distinction between protocol request/response correlation and scenario correlation, the conservative ingress-response boundary, and unresolved outcomes.
-- [ ] 6.3 Update `AGENTS.md` with only concise durable invariants: Chronicle owns correlation; trace is optional enrichment; temporal overlap is insufficient; infrastructure identities are evidence; ambiguity remains ambiguity.
-- [ ] 6.4 Review user-facing documentation impact. This foundation changes no CLI or website behavior; if later implementation adds user-facing scenario commands or canonical English pages, update corresponding `zh-tw`/`ja` pages and run `cd website && npm run verify:localization`.
+- [ ] 5.1 Test valid ingress root and rejection of egress HTTP/database/cache roots.
+- [ ] 5.2 Test passive HTTP ingress, active HTTP egress, active database/cache egress, bidirectional payload stability, and rejection of byte-flow `Direction` as role.
+- [ ] 5.3 Test a parent ingress that begins in epoch N and completes in N+1, successor-session child egress, stable ScenarioId, and cross-session/cross-epoch causal references.
+- [ ] 5.4 Test identical `OperationId` values under different scoped recording/session/epoch contexts; prove full references cannot collide through unscoped lookup.
+- [ ] 5.5 Test supplied pre-resolved ownership (`op1 -> Scenario A`, `op2 -> Scenario B`, `op3 -> Scenario C`) and verify memberships without deriving ownership from raw interleaved events.
+- [ ] 5.6 Test ambiguous A/B candidates retain candidate-specific evidence and remain outside memberships/edges; test uncorrelated operations remain in the aggregate without synthetic owners.
+- [ ] 5.7 Test self-edge, cycle, multiple selected parents, cross-scenario edge, missing endpoint, duplicate membership, and invalid root rejection.
+- [ ] 5.8 Test infrastructure identities and temporal overlap remain evidence only; temporal-only supplied resolutions fail model validation.
+- [ ] 5.9 Test operation completeness/replayability remains unchanged when a supplied resolution assigns an incomplete operation to a scenario.
+- [ ] 5.10 Keep these tests at the lowest conclusive domain/integration layer. Do not add resolver, scoring, runtime-lineage, or privileged capture tests to this foundation.
 
-## 7. Validation and acceptance
+## 6. Architecture and documentation
 
-- [ ] 7.1 Validate the change artifacts with `openspec validate --all --strict --no-interactive`.
-- [ ] 7.2 Run `cargo fmt --check`, warnings-denied Clippy, targeted workspace tests, OpenSpec validation, and architecture/tooling checks through the repository's bounded validation entrypoint after implementation; no build-only result counts as completion.
-- [ ] 7.3 Check the final implementation diff for accidental OpenTelemetry/tracing SDK requirements, unsafe PID/TID/socket/connection/stream/time ownership assumptions, missing concurrent-ingress coverage, missing ambiguous/uncorrelated outcomes, and unrelated replay/export/test-generation scope.
-- [ ] 7.4 Run `graphify update .` after any production code modification in the implementation change; this planning-only change modifies no production source and therefore must not trigger a graph update.
-- [ ] 7.5 Confirm implementation changes only the approved domain/docs/validation surfaces, preserve WAL/capture/canonical/replay compatibility rules, and report any architecture conflict before completion.
+- [ ] 6.1 Keep correlation ownership in `chronicle-canonical`, neutral primitives in `chronicle-common`, and the existing crate graph unchanged; do not add a standalone correlation crate.
+- [ ] 6.2 Preserve the existing architecture validation guard for tracing SDK/provider dependencies and extend only its existing policy/check if needed; do not add SDK dependencies to test the guard.
+- [ ] 6.3 Update `docs/architecture/crate-boundaries.md`, `docs/architecture/overview.md`, and `docs/canonical-model.md` after implementation with canonical role/correlation ownership, epoch-scoped references, unresolved outcomes, and v1 compatibility boundaries.
+- [ ] 6.4 Update `AGENTS.md` only with concise durable invariants: Chronicle owns correlation; trace is optional enrichment; roles differ from byte direction; infrastructure identity is evidence; ambiguity remains ambiguity; replayability is separate.
+- [ ] 6.5 Review user-facing documentation impact. This foundation adds no CLI or website behavior; later scenario commands or canonical English changes must update `zh-tw`/`ja` pages and run localization verification.
+
+## 7. Validation and future boundaries
+
+- [ ] 7.1 Run `openspec validate --all --strict --no-interactive` for this change and keep the artifacts internally consistent.
+- [ ] 7.2 After production implementation, run repository bounded fast/targeted validation, architecture checks, domain tests, and direct behavioral probes; a build alone is insufficient.
+- [ ] 7.3 Verify implementation diff contains no production changes outside approved canonical/common/domain/docs/validation surfaces, no tracing SDK, no new Chronicle crate, no `InteractionId`, and no v1 contract mutation.
+- [ ] 7.4 Run `graphify update .` after production source changes in the implementation change; this planning-only revision changes no production source.
+- [ ] 7.5 Keep privileged capture gates out of foundation proof; use them only for future kernel/environment-dependent resolver behavior.
+
+## Future changes
+
+- `correlate-ingress-and-egress-interactions`: deterministic resolver, candidate selection, and concurrent-ingress correlation.
+- Pluggable trace evidence providers and runtime lineage capture.
+- Versioned persisted correlation/scenario artifact and user-facing scenario commands.
+- Event identity/compatibility change, only if raw capture-event identity becomes necessary.
+- Replay v2, dependency matching, exports, assertions, and test generation.
