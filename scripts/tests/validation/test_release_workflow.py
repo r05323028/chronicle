@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -13,13 +13,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import tomllib
+
 ROOT = Path(__file__).resolve().parents[3]
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
-PROMPT_FILE = ROOT / ".github" / "prompts" / "release-notes.md"
+CLIFF_CONFIG = ROOT / "cliff.toml"
+RELEASE_RANGE = ROOT / "scripts" / "release" / "resolve-release-range.py"
 RESOLVE_CONTEXT = ROOT / "scripts" / "release" / "resolve-release-context.sh"
 MANAGE_STATE = ROOT / "scripts" / "release" / "manage-release-state.sh"
-WRITE_MODELS = ROOT / "scripts" / "release" / "write-opencode-go-models-json.py"
-PI_ACTION_SHA = "0698813906fb1f23425bd742510e3080d624840d"
+GIT_CLIFF = shutil.which("git-cliff")
 
 
 def workflow_text() -> str:
@@ -89,31 +91,6 @@ class WorkflowShape:
             for name, config in self.jobs.items()
             if re.search(r"\bgh\s|manage-release-state\.sh", config["run_text"])
         ]
-
-
-class ReleasePromptTests(unittest.TestCase):
-    def test_prompt_file_is_repository_managed_and_structured(self):
-        self.assertTrue(PROMPT_FILE.is_file())
-        prompt = PROMPT_FILE.read_text(encoding="utf-8")
-        self.assertTrue(prompt.strip())
-        self.assertNotIn("${", prompt)
-        self.assertNotIn("```", prompt)
-        for heading in (
-            "## Highlights",
-            "## Installation",
-            "## What's included",
-            "## Known limitations",
-        ):
-            self.assertIn(heading, prompt)
-        self.assertIn("before tag promotion", prompt)
-
-    def test_prompt_is_not_inlined(self):
-        prompt = PROMPT_FILE.read_text(encoding="utf-8")
-        workflow = workflow_text()
-        self.assertIn(".github/prompts/release-notes.md", workflow)
-        for marker in ("What to determine", "Output rules", "## Highlights"):
-            self.assertNotIn(marker, workflow)
-        self.assertIn("Cargo.toml", prompt)
 
 
 class WorkflowContractTests(unittest.TestCase):
@@ -268,15 +245,40 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("isPrerelease", publish)
         self.assertIn("IS_PRERELEASE", workflow)
 
-    def test_release_notes_artifact_and_action_pin_are_preserved(self):
+    def test_release_notes_artifact_and_git_cliff_contract(self):
         workflow = workflow_text()
+        start = workflow.index("\n  release-notes:\n")
+        end = workflow.index("\n  prepare-release:\n")
+        notes_job = workflow[start:end]
         self.assertIn("name: release-notes", workflow)
         self.assertIn("path: release-notes.md", workflow)
-        self.assertIn("RELEASE_NOTES_RESPONSE", workflow)
-        self.assertNotIn("CHRONICLE_NOTES_EOF", workflow)
-        normalized = re.sub(r"\\\s*\n\s*", "", workflow)
-        pins = re.findall(r"shaftoe/pi-coding-agent-action@([0-9a-fA-F]+)", normalized)
-        self.assertEqual(pins, [PI_ACTION_SHA])
+        self.assertIn("fetch-depth: 0", notes_job)
+        self.assertIn("ref: ${{ github.sha }}", notes_job)
+        self.assertIn("GIT_CLIFF_VERSION: 2.13.1", notes_job)
+        self.assertIn("GIT_CLIFF_SHA512:", notes_job)
+        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", notes_job)
+        self.assertIn("GITHUB_REPO: ${{ github.repository }}", notes_job)
+        self.assertIn('--config cliff.toml --github-repo "$GITHUB_REPO"', notes_job)
+        self.assertIn('grep -q "^## What\'s Changed$" release-notes.md', notes_job)
+        self.assertNotIn("--offline", notes_job)
+        self.assertIn("scripts/release/resolve-release-range.py", notes_job)
+        self.assertIn(
+            "VERSION: ${{ needs.resolve-context.outputs.version }}", notes_job
+        )
+        self.assertIn("TAG: ${{ needs.resolve-context.outputs.tag }}", notes_job)
+        self.assertIn("SHA: ${{ needs.resolve-context.outputs.sha }}", notes_job)
+        self.assertIn("--output release-notes.md", notes_job)
+        self.assertIn("--notes-file release-notes.md", workflow)
+        self.assertNotIn("--generate-notes", workflow)
+        for obsolete in (
+            "pi-coding-agent-action",
+            "OPENCODE_GO",
+            "OPENCODE_GO_API_KEY",
+            "RELEASE_NOTES_MODEL",
+            "RELEASE_NOTES_THINKING_LEVEL",
+            ".github/prompts/release-notes.md",
+        ):
+            self.assertNotIn(obsolete, workflow)
 
     def test_gh_jobs_have_explicit_context_and_only_mutators_write(self):
         shape = WorkflowShape(workflow_text())
@@ -474,64 +476,322 @@ raise SystemExit(2)
         self.assertIn("sha=abc123", proc.stdout)
 
 
-class OpenCodeGoProviderTests(unittest.TestCase):
-    def _write_models(
-        self, env: dict[str, str], home: Path
+class CliffConfigTests(unittest.TestCase):
+    def test_cliff_config_is_repository_managed_and_strict(self):
+        self.assertTrue(CLIFF_CONFIG.is_file())
+        raw = CLIFF_CONFIG.read_text(encoding="utf-8")
+        config = tomllib.loads(raw)
+        git = config["git"]
+        self.assertTrue(git["conventional_commits"])
+        self.assertTrue(git["require_conventional"])
+        self.assertTrue(git["fail_on_unmatched_commit"])
+        self.assertTrue(git["protect_breaking_commits"])
+        parsers = git["commit_parsers"]
+        groups = {parser["group"] for parser in parsers if "group" in parser}
+        self.assertEqual(
+            groups,
+            {
+                "<!-- 0 -->Breaking Changes",
+                "<!-- 1 -->Features",
+                "<!-- 2 -->Bug Fixes",
+                "<!-- 3 -->Performance",
+                "<!-- 4 -->Reverts",
+            },
+        )
+        self.assertTrue(any(parser.get("field") == "raw_message" for parser in parsers))
+        self.assertTrue(
+            any(
+                parser.get("skip") and "docs" in parser["message"] for parser in parsers
+            )
+        )
+        self.assertIn('owner = "r05323028"', raw)
+        self.assertIn('repo = "chronicle"', raw)
+        self.assertIn("commit.remote.username", raw)
+        self.assertIn("commit.remote.pr_number", raw)
+        self.assertIn("by @{{ commit.remote.username }}", raw)
+        self.assertIn("in #{{ commit.remote.pr_number }}", raw)
+        self.assertIn("github.contributors", raw)
+        self.assertIn("## New Contributors", raw)
+        self.assertIn('filter(attribute="is_first_time", value=true)', raw)
+        self.assertNotIn("commit.remote.pr_title", raw)
+        self.assertNotIn("remote.pr_labels", raw)
+        for commit_type in (
+            "feat",
+            "fix",
+            "perf",
+            "refactor",
+            "docs",
+            "test",
+            "build",
+            "ci",
+            "chore",
+            "revert",
+        ):
+            self.assertIn(commit_type, raw)
+
+
+class GitRepositoryMixin:
+    @staticmethod
+    def _git(repo: Path, *args: str) -> str:
+        proc = subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+        )
+        return proc.stdout.strip()
+
+    def _init_repo(self, repo: Path) -> None:
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "test@example.invalid")
+        self._git(repo, "config", "user.name", "Chronicle Test")
+
+    def _commit(self, repo: Path, message: str) -> str:
+        self._git(repo, "commit", "--allow-empty", "-qm", message)
+        return self._git(repo, "rev-parse", "HEAD")
+
+    def _resolve(
+        self, repo: Path, version: str, tag: str, sha: str
     ) -> subprocess.CompletedProcess[str]:
-        full_env = dict(os.environ)
-        full_env["HOME"] = str(home)
-        full_env.update(env)
         return subprocess.run(
-            [sys.executable, str(WRITE_MODELS)],
+            [sys.executable, str(RELEASE_RANGE), version, tag, sha],
+            cwd=repo,
             capture_output=True,
             text=True,
-            env=full_env,
         )
 
-    def test_models_json_is_env_driven(self):
+    @staticmethod
+    def _values(proc: subprocess.CompletedProcess[str]) -> dict[str, str]:
+        return dict(line.split("=", 1) for line in proc.stdout.splitlines())
+
+
+class ReleaseRangeTests(GitRepositoryMixin, unittest.TestCase):
+    def test_intended_tag_exclusion_keeps_range_identical(self):
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            env = {
-                "OPENCODE_GO_BASE_URL": "https://example.invalid/v1",
-                "RELEASE_NOTES_MODEL": "some-model",
-                "OPENCODE_GO_API_KEY": "super-secret-value-never-inlined",
-            }
-            proc = self._write_models(env, home)
+            repo = Path(tmp)
+            self._init_repo(repo)
+            self._commit(repo, "chore: initial")
+            self._git(repo, "tag", "v0.1.0")
+            self._commit(repo, "feat(record): support correlation")
+            candidate = self._commit(repo, "fix(replay): preserve ordering")
+
+            absent = self._resolve(repo, "0.1.1", "v0.1.1", candidate)
+            self.assertEqual(absent.returncode, 0, absent.stderr)
+            absent_values = self._values(absent)
+            self.assertEqual(absent_values["previous-tag"], "v0.1.0")
+            self.assertEqual(absent_values["range"], f"v0.1.0..{candidate}")
+
+            self._git(repo, "tag", "v0.1.1", candidate)
+            present = self._resolve(repo, "0.1.1", "v0.1.1", candidate)
+            self.assertEqual(present.returncode, 0, present.stderr)
+            self.assertEqual(present.stdout, absent.stdout)
+
+    def test_prerelease_semver_selects_previous_prerelease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            self._commit(repo, "chore: initial")
+            self._git(repo, "tag", "v0.1.0")
+            self._commit(repo, "feat: prepare release candidate")
+            self._git(repo, "tag", "v0.2.0-rc.1")
+            candidate = self._commit(repo, "fix: stabilize release candidate")
+            proc = self._resolve(repo, "0.2.0-rc.2", "v0.2.0-rc.2", candidate)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            config = json.loads(
-                (home / ".pi" / "agent" / "models.json").read_text(encoding="utf-8")
-            )
-            provider = config["providers"]["opencode-go"]
-            self.assertEqual(provider["baseUrl"], "https://example.invalid/v1")
-            self.assertEqual(provider["api"], "openai-completions")
-            self.assertTrue(provider["authHeader"])
-            self.assertEqual(provider["models"], [{"id": "some-model"}])
-            self.assertEqual(provider["apiKey"], "$OPENCODE_GO_API_KEY")
-            self.assertNotIn(
-                "super-secret-value-never-inlined",
-                (home / ".pi" / "agent" / "models.json").read_text(encoding="utf-8"),
-            )
+            self.assertEqual(self._values(proc)["previous-tag"], "v0.2.0-rc.1")
 
-    def test_models_json_fails_without_env(self):
+    def test_initial_release_uses_full_history_range(self):
         with tempfile.TemporaryDirectory() as tmp:
-            proc = self._write_models({}, Path(tmp))
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("OPENCODE_GO_BASE_URL", proc.stderr)
+            repo = Path(tmp)
+            self._init_repo(repo)
+            candidate = self._commit(repo, "feat: initial release")
+            proc = self._resolve(repo, "0.1.0", "v0.1.0", candidate)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            values = self._values(proc)
+            self.assertEqual(values["previous-tag"], "")
+            self.assertEqual(values["range"], candidate)
 
-    def test_workflow_keeps_provider_and_secret_boundaries(self):
-        workflow = workflow_text()
-        self.assertIn("scripts/release/write-opencode-go-models-json.py", workflow)
-        self.assertIn("provider: opencode-go", workflow)
-        self.assertIn("model: ${{ env.RELEASE_NOTES_MODEL }}", workflow)
-        self.assertIn(
-            "thinking_level: ${{ env.RELEASE_NOTES_THINKING_LEVEL }}", workflow
+    def test_different_existing_intended_tag_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            old = self._commit(repo, "chore: initial")
+            self._git(repo, "tag", "v0.1.1", old)
+            candidate = self._commit(repo, "feat: candidate")
+            proc = self._resolve(repo, "0.1.1", "v0.1.1", candidate)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("expected frozen SHA", proc.stderr)
+
+
+@unittest.skipUnless(GIT_CLIFF, "git-cliff is not installed; fixture test skipped")
+class GitCliffFixtureTests(GitRepositoryMixin, unittest.TestCase):
+    def _render(self, repo: Path, tag: str, release_range: str, output: Path):
+        cliff = GIT_CLIFF or "git-cliff"
+        return subprocess.run(
+            [
+                cliff,
+                "--offline",
+                "--config",
+                str(CLIFF_CONFIG),
+                "--github-repo",
+                "r05323028/chronicle",
+                "--tag",
+                tag,
+                "--output",
+                str(output),
+                release_range,
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
         )
-        self.assertIn("load_builtin_extensions: false", workflow)
-        self.assertEqual(workflow.count("OPENCODE_GO_BASE_URL:"), 1)
-        self.assertEqual(workflow.count("RELEASE_NOTES_MODEL:"), 1)
-        self.assertEqual(workflow.count("RELEASE_NOTES_THINKING_LEVEL:"), 1)
-        self.assertEqual(workflow.count("secrets.OPENCODE_GO_API_KEY"), 1)
-        self.assertNotIn('"$OPENCODE_GO_API_KEY"', workflow)
+
+    def test_groups_breaking_and_retry_output_deterministically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            output = Path(tmp) / "release-notes.md"
+            retry_output = Path(tmp) / "release-notes-retry.md"
+            self._init_repo(repo)
+            self._commit(repo, "chore: initial")
+            self._git(repo, "tag", "v0.1.0")
+            for message in (
+                "feat(record): support correlation",
+                "test(record): add correlation fixtures",
+                "docs(record): document correlation semantics",
+                "fix(replay): preserve ordering",
+                "ci(release): improve publication gate",
+                "refactor(wal): split checkpoint writer",
+                "refactor(etl)!: reorganize internals",
+                "perf(wal): reduce checkpoint writes",
+                "build: update packaging",
+                "chore: update metadata",
+                "feat(cli)!: remove legacy replay syntax",
+                "revert: restore replay guard",
+            ):
+                candidate = self._commit(repo, message)
+
+            first_range = self._values(
+                self._resolve(repo, "0.1.1", "v0.1.1", candidate)
+            )["range"]
+            first = self._render(repo, "v0.1.1", first_range, output)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            notes = output.read_text(encoding="utf-8")
+            self.assertIn("## What's Changed", notes)
+            self.assertNotIn("## Highlights", notes)
+            self.assertNotIn("Release v0.1.1.", notes)
+            for heading in (
+                "### Breaking Changes",
+                "### Features",
+                "### Bug Fixes",
+                "### Performance",
+                "### Reverts",
+            ):
+                self.assertIn(heading, notes)
+            heading_positions = [
+                notes.index(heading)
+                for heading in (
+                    "### Breaking Changes",
+                    "### Features",
+                    "### Bug Fixes",
+                    "### Performance",
+                    "### Reverts",
+                )
+            ]
+            self.assertEqual(heading_positions, sorted(heading_positions))
+            self.assertIn("- **record:** Support correlation", notes)
+            self.assertIn("- **replay:** Preserve ordering", notes)
+            self.assertIn("- **wal:** Reduce checkpoint writes", notes)
+            self.assertIn("- **cli:** Remove legacy replay syntax", notes)
+            self.assertIn("- **etl:** Reorganize internals", notes)
+            self.assertIn("- Restore replay guard", notes)
+            for excluded in (
+                "correlation fixtures",
+                "document correlation semantics",
+                "improve publication gate",
+                "split checkpoint writer",
+                "update packaging",
+                "update metadata",
+            ):
+                self.assertNotIn(excluded, notes)
+            self.assertNotIn("[**breaking**]", notes)
+            self.assertNotIn("initial", notes.lower())
+            for prefix in ("feat(", "fix(", "perf(", "revert:"):
+                self.assertNotIn(prefix, notes)
+
+            self._git(repo, "tag", "v0.1.1", candidate)
+            retry_range = self._values(
+                self._resolve(repo, "0.1.1", "v0.1.1", candidate)
+            )["range"]
+            self.assertEqual(retry_range, first_range)
+            retry = self._render(repo, "v0.1.1", retry_range, retry_output)
+            self.assertEqual(retry.returncode, 0, retry.stderr)
+            self.assertEqual(
+                output.read_bytes(),
+                retry_output.read_bytes(),
+                "same frozen history and config must render identical notes",
+            )
+
+    def test_breaking_footer_remains_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            self._commit(repo, "chore: initial")
+            self._git(repo, "tag", "v0.1.0")
+            self._git(
+                repo,
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "feat(cli): remove legacy syntax",
+                "-m",
+                "BREAKING CHANGE: legacy syntax removed",
+            )
+            candidate = self._git(repo, "rev-parse", "HEAD")
+            release_range = self._values(
+                self._resolve(repo, "0.1.1", "v0.1.1", candidate)
+            )["range"]
+            output = Path(tmp) / "breaking-footer-notes.md"
+            proc = self._render(repo, "v0.1.1", release_range, output)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            notes = output.read_text(encoding="utf-8")
+            self.assertIn("### Breaking Changes", notes)
+            self.assertIn("Remove legacy syntax", notes)
+
+    def test_revert_remains_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._init_repo(repo)
+            self._commit(repo, "chore: initial")
+            self._git(repo, "tag", "v0.1.0")
+            candidate = self._commit(repo, "revert: restore ordering")
+            release_range = self._values(
+                self._resolve(repo, "0.1.1", "v0.1.1", candidate)
+            )["range"]
+            output = Path(tmp) / "revert-notes.md"
+            proc = self._render(repo, "v0.1.1", release_range, output)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            notes = output.read_text(encoding="utf-8")
+            self.assertIn("### Reverts", notes)
+            self.assertIn("Restore ordering", notes)
+
+    def test_invalid_commits_fail_in_release_range(self):
+        for invalid in (
+            "Update stuff",
+            "fix tests",
+            "random message",
+            "random: unsupported type",
+        ):
+            with self.subTest(message=invalid), tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                self._init_repo(repo)
+                self._commit(repo, "chore: initial")
+                self._git(repo, "tag", "v0.1.0")
+                candidate = self._commit(repo, invalid)
+                release_range = self._values(
+                    self._resolve(repo, "0.1.1", "v0.1.1", candidate)
+                )["range"]
+                proc = self._render(
+                    repo, "v0.1.1", release_range, Path(tmp) / "notes.md"
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertRegex(proc.stderr, "conventional|matched|Unmatched")
 
 
 if __name__ == "__main__":
