@@ -42,28 +42,39 @@ The public 0.1 compatibility policy freezes the meaning and supported reading of
 
 ### 1. Chronicle-owned interaction role
 
-Define a canonical-domain value:
+Define two separate Chronicle-owned concepts:
 
 ```text
 enum InteractionRole {
     Ingress,
     Egress,
 }
+
+InteractionRoleResolution =
+    Known(Ingress)
+  | Known(Egress)
+  | Ambiguous {
+        candidates: [InteractionRole],
+        evidence: [CorrelationEvidence],
+    }
+  | Unknown {
+        evidence: [CorrelationEvidence],
+    }
 ```
 
-`Ingress` means the logical interaction is accepted by the recorded application from a remote/client side. `Egress` means the recorded application initiates the logical interaction toward a remote service/dependency. The role describes the relationship to the recorded application, not the protocol's message orientation.
+`InteractionRole` contains only actual application-relative roles. `Ingress` means the logical interaction is accepted by the recorded application from a remote/client side. `Egress` means the recorded application initiates the logical interaction toward a remote service/dependency. `InteractionRoleResolution` records whether Chronicle knows that role; uncertainty is classification state, not a third role.
 
-Every operation supplied to correlation has one role attached in the correlation input or has it deterministically derived before validation from Chronicle-owned, application-relative evidence. The role may be represented in a future correlation sidecar/aggregate rather than as a new Canonical Session v1 field. Missing or conflicting role evidence cannot qualify an operation as a root.
+Every operation supplied to correlation has one role-resolution state attached in the correlation input or deterministically derived before graph validation from Chronicle-owned, application-relative evidence. The state may be represented in a future correlation sidecar/aggregate rather than as a new Canonical Session v1 field. `Known(Ingress)` and `Known(Egress)` are successful classifications. Insufficient evidence produces `Unknown`; valid conflicting evidence produces `Ambiguous` with competing candidates and evidence. Chronicle never guesses a default.
 
 Derivation is semantic normalization, not correlation selection:
 
-- a validated passive HTTP server connection from a remote client to the recorded application yields an ingress HTTP interaction;
-- a validated active HTTP client connection initiated by the recorded application yields an egress HTTP interaction;
-- a validated active PostgreSQL, MySQL, Redis, or other dependency connection initiated by the recorded application yields an egress database/cache interaction.
+- validated passive HTTP server evidence with remote-client-to-recorded-application ownership yields `Known(Ingress)`;
+- validated active HTTP client evidence initiated by the recorded application yields `Known(Egress)`;
+- validated active PostgreSQL, MySQL, Redis, or other dependency evidence initiated by the recorded application yields `Known(Egress)`.
 
-The same logical HTTP operation keeps one role while request and response bytes travel in both directions. `Direction` and byte-flow direction remain wire evidence and never substitute for `InteractionRole`. Active/passive socket evidence may contribute to the derivation, but transport concepts do not become canonical scenario identity. If application ownership cannot be established without contradiction, preserve the operation and evidence as unresolved rather than guessing.
+The same logical HTTP operation keeps one known role while request and response bytes travel in both directions. `Direction` and byte-flow direction remain wire evidence and never substitute for `InteractionRole`; if application ownership is otherwise unknown, `ClientToServer`/`ServerToClient` labels leave the state `Unknown`. Active/passive socket evidence may contribute only when application ownership is established. `SocketRole`, connection, stream, PID, TID, and timing remain evidence, not interaction or scenario identity. Conflicting ownership evidence becomes `Ambiguous`, not a timing or ordering tie-break.
 
-Only `Ingress` is eligible for `Scenario.root`. An egress interaction can be a selected child; it cannot become a scenario root. The role is protocol-neutral and belongs to Chronicle's canonical semantics.
+Only `Known(Ingress)` is eligible for `Scenario.root`. `Known(Egress)` may be a selected child when supplied correlation permits it; `Unknown` and `Ambiguous` role states cannot become roots. Role classification and scenario-correlation resolution are independent: `Unknown + Uncorrelated`, `Known(Egress) + Ambiguous`, `Known(Ingress) + Resolved`, and `Ambiguous + Ambiguous` are all representable combinations. The role semantics are protocol-neutral and belong to Chronicle's canonical domain.
 
 ### 2. Identity vocabulary and scoped operation references
 
@@ -132,7 +143,7 @@ Use a Chronicle-owned `CorrelationGraph` as the aggregate root. The conceptual s
 ```text
 CorrelationGraph {
     recording_id: RecordingId,
-    interaction_roles: Map<CanonicalOperationRef, InteractionRole>,
+    role_resolutions: Map<CanonicalOperationRef, InteractionRoleResolution>,
     scenarios: [Scenario],
     resolutions: Map<CanonicalOperationRef, CorrelationResolution>,
     causal_edges: [SelectedCausalEdge],
@@ -145,9 +156,18 @@ Scenario {
 }
 ```
 
-`Scenario` is a child entity owned by `CorrelationGraph`, not an independent owner. The graph is authoritative for all operation resolutions. Scenario membership is a selected view of graph state and must agree with `Resolved` entries; it is not a second way to hide unresolved operations.
+`Scenario` is a child entity owned by `CorrelationGraph`, not an independent owner. The graph is authoritative for role classification and correlation outcomes. Scenario membership is a selected view of graph state and must agree with `Resolved` entries; it is not a second way to hide unresolved operations.
 
-Every operation admitted to the graph has a role and one resolution entry. The three outcomes are:
+Every operation admitted to the graph has exactly one `InteractionRoleResolution` and one correlation-resolution entry. The classification state and correlation outcome are independent dimensions:
+
+```text
+role: Known(Ingress) | Known(Egress) | Unknown | Ambiguous(...)
+correlation: Resolved(...) | Ambiguous(...) | Uncorrelated
+```
+
+An admitted operation with unknown or ambiguous role remains in `role_resolutions`, with evidence inspectable, even when its correlation outcome is ambiguous or uncorrelated. It cannot become a root unless its role state is `Known(Ingress)`. `Known(Egress)` may be a supplied scenario child; unknown/ambiguous role state is not silently converted into a role or deleted. The graph cannot be valid if any admitted operation disappears merely because Chronicle cannot classify its application-relative role or scenario ownership.
+
+The three correlation outcomes are:
 
 ```text
 Resolved {
@@ -163,9 +183,7 @@ Uncorrelated {
 }
 ```
 
-A resolved operation belongs to exactly one scenario. An ambiguous operation remains outside selected scenario membership but retains every candidate and candidate-specific evidence. An uncorrelated operation remains in `resolutions` with no synthetic owner. The graph cannot be valid if an admitted operation disappears merely because it is not a scenario member.
-
-A scenario root must be an ingress reference. Scenario members include the root and only resolved references assigned to that scenario. Candidate scenarios in an ambiguous resolution do not make the ambiguous operation a member.
+A resolved operation belongs to exactly one scenario. An ambiguous operation remains outside selected scenario membership but retains every candidate and candidate-specific evidence. An uncorrelated operation remains in `resolutions` with no synthetic owner. A scenario root must be a reference with `Known(Ingress)` classification. Candidate scenarios in an ambiguous correlation resolution do not make the ambiguous operation a member.
 
 ### 5. Selected causal edges
 
@@ -207,7 +225,7 @@ The future flow remains layered:
 7. storage persists/verifies a future correlation artifact without deciding ownership;
 8. application composes use cases and CLI remains an outer adapter.
 
-Correlation semantics stay in `chronicle-canonical`; neutral IDs stay in `chronicle-common`. No standalone correlation crate is justified. Architecture validation continues to guard the inward dependency direction and tracing SDK/provider denylist. No core/domain crate depends on a tracing SDK.
+Correlation semantics stay in `chronicle-canonical`; neutral IDs stay in `chronicle-common`. No standalone correlation crate is justified. The repository's existing architecture validation mechanism currently checks Chronicle workspace dependency direction, critical forbids, and semantic/API boundaries; it does not currently enforce an external tracing-SDK/package denylist. Future implementation SHALL extend `validation/architecture.toml`, `scripts/validation.py architecture`, and its existing standard-library fixture tests with the smallest maintainable direct-dependency guard for provider SDKs/integrations (using actual Cargo package identity and covering renames/target-specific declarations as appropriate). Do not create a parallel validator. Outer provider adapters may translate SDK data into Chronicle-owned `CorrelationEvidence`; core/domain crates must not depend on those provider packages. Generic logging/tracing facades are not provider SDKs and must be handled according to the inspected dependency policy rather than blindly banned.
 
 ### 9. EventId decision and compatibility boundary
 

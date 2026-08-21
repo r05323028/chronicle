@@ -6,49 +6,85 @@ Define Chronicle's framework-neutral correlation domain for application-relative
 
 ### Requirement: Chronicle owns application-relative interaction role
 
-Chronicle SHALL define a protocol-neutral `InteractionRole` with `Ingress` and `Egress` values. The role SHALL describe the logical interaction's relationship to the recorded application: ingress is accepted from a remote/client side, and egress is initiated toward a remote service or dependency. Each correlation input interaction SHALL have the role attached or deterministically derived from Chronicle-owned application-relative evidence before correlation-domain validation. Role semantics SHALL NOT be inferred from packet direction or byte-flow direction alone.
+Chronicle SHALL define two separate protocol-neutral concepts. `InteractionRole` SHALL contain only the known application-relative roles `Ingress` and `Egress`. `InteractionRoleResolution` SHALL classify each correlation input as `Known(Ingress)`, `Known(Egress)`, `Unknown`, or `Ambiguous` with competing role candidates and evidence. Uncertainty SHALL be classification state, not an `InteractionRole` variant. Role semantics SHALL describe the logical interaction's relationship to the recorded application and SHALL NOT be inferred from packet direction or byte-flow direction alone.
 
-#### Scenario: Passive HTTP server interaction is ingress
+#### Scenario: Known passive HTTP server interaction is ingress
 
-- **WHEN** a passive server connection accepted by the recorded application carries a remote client's HTTP request and response exchange
-- **THEN** its `CanonicalOperation` is classified as `InteractionRole::Ingress`
-- **AND** the classification describes remote client to recorded application ownership, not the direction of individual HTTP messages
+- **WHEN** validated passive application-server evidence shows a remote client HTTP exchange accepted by the recorded application
+- **THEN** the operation's role resolution is `Known(Ingress)`
+- **AND** the classification describes remote client to recorded application ownership, not individual HTTP message direction
 
-#### Scenario: Active HTTP client interaction is egress
+#### Scenario: Known active HTTP client interaction is egress
 
-- **WHEN** the recorded application actively connects to a remote HTTP service and performs an HTTP request/response exchange
-- **THEN** its `CanonicalOperation` is classified as `InteractionRole::Egress`
-- **AND** the classification remains egress even though the response bytes travel from server to client on the wire
+- **WHEN** validated outbound HTTP client evidence shows the recorded application actively connecting to a remote HTTP service
+- **THEN** the operation's role resolution is `Known(Egress)`
+- **AND** the classification remains egress even though response bytes travel from server to client on the wire
 
-#### Scenario: Active database or cache interaction is egress
+#### Scenario: Known dependency interaction is egress
 
-- **WHEN** the recorded application actively connects to PostgreSQL, MySQL, Redis, or another database/cache dependency and performs a logical operation
-- **THEN** that `CanonicalOperation` is classified as `InteractionRole::Egress`
-- **AND** the database/cache protocol name does not change the application-relative role
+- **WHEN** validated active evidence shows the recorded application connecting to PostgreSQL, MySQL, Redis, or another database/cache dependency
+- **THEN** the operation's role resolution is `Known(Egress)`
+- **AND** the dependency protocol name does not change the application-relative role
 
-#### Scenario: Bidirectional payload does not change role
+#### Scenario: Bidirectional payload does not change a known role
 
 - **WHEN** one logical HTTP, database, or cache interaction contains payload bytes in both wire directions
-- **THEN** it retains one application-relative `InteractionRole`
-- **AND** individual request/response byte directions do not switch it between ingress and egress
+- **THEN** a known role remains the same `Known(Ingress)` or `Known(Egress)` value
+- **AND** individual request/response byte directions do not switch it between roles
 
-#### Scenario: Direction is not interaction role
+#### Scenario: Direction does not solve an unknown role
 
-- **WHEN** capture evidence labels bytes `ClientToServer` and `ServerToClient`
-- **THEN** those labels remain byte-flow evidence
-- **AND** domain validation does not accept them as a substitute for `InteractionRole`
+- **WHEN** an operation has no sufficient application-relative ownership evidence and only `ClientToServer`/`ServerToClient` byte-flow labels
+- **THEN** its role resolution remains `Unknown`
+- **AND** wire direction does not promote it to `Known(Ingress)` or `Known(Egress)`
 
-#### Scenario: Transport evidence contributes without owning semantics
+#### Scenario: Socket role contributes without becoming identity
 
-- **WHEN** validated active/passive socket evidence is available for a canonical operation
-- **THEN** it MAY contribute to deterministic role derivation
-- **AND** socket role, connection identity, stream identity, PID, TID, and packet direction SHALL NOT become canonical scenario identity
+- **WHEN** validated `SocketRole::Active` or `SocketRole::Passive` evidence is available
+- **THEN** it MAY contribute to role normalization only when recorded-application ownership is established
+- **AND** socket role, connection identity, stream identity, PID, TID, and packet direction SHALL NOT become interaction or scenario identity
 
-#### Scenario: Missing or conflicting role evidence
+#### Scenario: Missing ownership evidence is unknown
 
-- **WHEN** application-relative ownership cannot be established or role evidence conflicts
-- **THEN** the interaction remains representable with its evidence
-- **AND** it SHALL NOT qualify as a scenario root through a guessed default
+- **WHEN** application-relative ownership is insufficient to distinguish ingress from egress
+- **THEN** role resolution is `Unknown` and the operation/evidence remains represented
+- **AND** the operation cannot qualify as a scenario root without a later known classification
+- **AND** correlation resolution remains an independent state
+
+#### Scenario: Conflicting ownership evidence is ambiguous
+
+- **WHEN** valid evidence supports both ingress and egress interpretations
+- **THEN** role resolution is `Ambiguous` with the competing role candidates and their evidence
+- **AND** the operation remains represented but cannot qualify as a scenario root
+- **AND** timing, PID, connection ownership, or processing order does not select an arbitrary role
+
+### Requirement: Role classification and correlation resolution remain independent
+
+The aggregate SHALL store role classification state separately from `CorrelationResolution`. Role uncertainty SHALL NOT be collapsed into scenario-correlation uncertainty, and a correlation outcome SHALL NOT rewrite an unknown or ambiguous role into a known role. The model SHALL preserve both dimensions for every admitted operation.
+
+#### Scenario: Known ingress with resolved correlation
+
+- **WHEN** an operation has role `Known(Ingress)` and supplied correlation `Resolved(Scenario A)`
+- **THEN** both states remain inspectable
+- **AND** the operation may qualify as Scenario A's root if other invariants hold
+
+#### Scenario: Known egress with ambiguous correlation
+
+- **WHEN** an operation has role `Known(Egress)` and supplied correlation `Ambiguous(Scenario A, Scenario B)`
+- **THEN** both states remain inspectable
+- **AND** egress root validation fails while candidate correlation evidence remains preserved
+
+#### Scenario: Unknown role with uncorrelated outcome
+
+- **WHEN** an operation has role `Unknown` and supplied correlation `Uncorrelated`
+- **THEN** the graph preserves both the unknown role evidence and uncorrelated outcome
+- **AND** it creates no synthetic root or owner
+
+#### Scenario: Ambiguous role with ambiguous correlation
+
+- **WHEN** an operation has an ambiguous ingress/egress role and ambiguous scenario candidates
+- **THEN** both candidate sets and their evidence remain separate and inspectable
+- **AND** neither uncertainty domain silently selects an owner or role
 
 ### Requirement: Existing canonical operation remains interaction identity
 
@@ -118,7 +154,7 @@ A recording-scoped correlation graph SHALL be able to reference operations from 
 
 ### Requirement: CorrelationGraph owns every correlation outcome
 
-Chronicle SHALL define a top-level `CorrelationGraph` or semantically equivalent recording-scoped aggregate that owns `Scenario` children, role assignments, resolutions keyed by scoped operation reference, and selected causal edges. `Scenario` SHALL be a child entity owned by the aggregate; scenario membership SHALL agree with the aggregate's resolved entries. Every operation admitted to the graph SHALL remain represented by one resolution outcome.
+Chronicle SHALL define a top-level `CorrelationGraph` or semantically equivalent recording-scoped aggregate that owns `Scenario` children, role-resolution state keyed by scoped operation reference, correlation resolutions keyed by scoped operation reference, and selected causal edges. `Scenario` SHALL be a child entity owned by the aggregate; scenario membership SHALL agree with the aggregate's resolved entries. Every operation admitted to the graph SHALL retain exactly one role-resolution state and one correlation-resolution outcome.
 
 #### Scenario: Resolved interaction belongs to one scenario
 
@@ -138,26 +174,38 @@ Chronicle SHALL define a top-level `CorrelationGraph` or semantically equivalent
 - **THEN** the graph records `Uncorrelated` with the operation reference and available evidence
 - **AND** it has no synthetic owner, root, or scenario membership
 
+#### Scenario: Unknown role remains represented
+
+- **WHEN** an admitted operation has role resolution `Unknown` or `Ambiguous`
+- **THEN** its role state and evidence remain discoverable in the graph even if its correlation outcome is ambiguous or uncorrelated
+- **AND** no operation is deleted or hidden because application-relative role classification failed
+
 #### Scenario: Unresolved operation cannot disappear
 
 - **WHEN** an admitted operation is not a selected scenario member
-- **THEN** it remains discoverable through the graph's resolution index
+- **THEN** it remains discoverable through the graph's role-resolution and correlation-resolution indexes
 - **AND** omission from `Scenario.members` is not treated as deletion
 
-### Requirement: Only ingress interactions can be scenario roots
+### Requirement: Only known ingress interactions can be scenario roots
 
-A `Scenario.root` SHALL reference an interaction classified as `InteractionRole::Ingress`. An egress interaction SHALL NOT be accepted as a scenario root. The root rule SHALL be checked from the Chronicle-owned role associated with the scoped operation, not from protocol message direction, socket identity, or an external trace identifier.
+A `Scenario.root` SHALL reference an interaction whose role resolution is `Known(Ingress)`. `Known(Egress)`, `Unknown`, and `Ambiguous` role resolutions SHALL NOT be accepted as scenario roots. The root rule SHALL be checked from the Chronicle-owned role-resolution state associated with the scoped operation, not from protocol message direction, socket identity, timing, or an external trace identifier.
 
-#### Scenario: Valid ingress root
+#### Scenario: Valid known ingress root
 
-- **WHEN** a supplied Scenario A root references an interaction classified as ingress
+- **WHEN** a supplied Scenario A root references an interaction with role resolution `Known(Ingress)`
 - **THEN** graph validation accepts the root if all other identity and membership invariants hold
 
-#### Scenario: Egress cannot be root
+#### Scenario: Known egress cannot be root
 
-- **WHEN** a supplied scenario uses an active outbound HTTP, database, or cache interaction as its root
+- **WHEN** a supplied scenario uses an active outbound HTTP, database, or cache interaction with role resolution `Known(Egress)` as its root
 - **THEN** graph validation rejects the scenario root
 - **AND** the interaction may remain represented as egress, ambiguous, uncorrelated, or a selected child of an ingress scenario
+
+#### Scenario: Unknown or ambiguous role cannot be root
+
+- **WHEN** a supplied scenario uses an operation with role resolution `Unknown` or `Ambiguous` as its root
+- **THEN** graph validation rejects the scenario root
+- **AND** the operation and its role/correlation evidence remain represented without a guessed role
 
 ### Requirement: Selected causal edges are safe and explicit
 
@@ -272,7 +320,7 @@ This planning change SHALL NOT add fields to Capture Event v1 or Canonical Sessi
 
 ### Requirement: Canonical ownership and dependency direction remain intact
 
-Correlation semantics SHALL remain in `chronicle-canonical` with neutral identity primitives in `chronicle-common`. Capture, session, protocol, WAL, storage, ETL, application, and CLI responsibilities SHALL remain as currently assigned. No standalone correlation crate SHALL be added. Core/domain crates SHALL remain free of tracing SDK/provider dependencies, and tracing evidence SHALL enter only through Chronicle-owned contracts.
+Correlation semantics SHALL remain in `chronicle-canonical` with neutral identity primitives in `chronicle-common`. Capture, session, protocol, WAL, storage, ETL, application, and CLI responsibilities SHALL remain as currently assigned. No standalone correlation crate SHALL be added. Core/domain crates SHALL remain free of tracing SDK/provider dependencies, and tracing evidence SHALL enter only through Chronicle-owned contracts. The existing architecture validation mechanism currently checks Chronicle workspace dependency direction, critical forbids, and semantic/API boundaries; it does not yet enforce an external tracing-SDK/package denylist. Future implementation SHALL extend `validation/architecture.toml`, `scripts/validation.py architecture`, and its existing standard-library fixture tests with the smallest maintainable direct-dependency guard based on actual Cargo package identity, without creating a parallel validator.
 
 #### Scenario: Existing pipeline owners remain
 
@@ -280,8 +328,9 @@ Correlation semantics SHALL remain in `chronicle-canonical` with neutral identit
 - **THEN** capture remains observation owner, session remains reconstruction owner, protocol remains protocol-pairing owner, ETL remains publication/checkpoint owner, and storage remains persistence/verification owner
 - **AND** no lower layer assigns scenario ownership
 
-#### Scenario: Architecture guard remains effective
+#### Scenario: Extended architecture mechanism rejects provider SDK leakage
 
 - **WHEN** a future implementation adds an OpenTelemetry or provider-specific tracing dependency to a core/domain crate
-- **THEN** the existing architecture validation policy rejects the dependency
-- **AND** no parallel correlation crate or SDK-specific domain API is introduced
+- **THEN** the extended existing architecture validation mechanism rejects the direct package dependency through its external denylist
+- **AND** the policy continues to retain current workspace-edge and semantic-boundary checks
+- **AND** no parallel validator, correlation crate, or SDK-specific domain API is introduced
