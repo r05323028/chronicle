@@ -6,7 +6,7 @@ Define Chronicle's framework-neutral correlation domain for application-relative
 
 ### Requirement: Chronicle owns application-relative interaction role
 
-Chronicle SHALL define two separate protocol-neutral concepts. `InteractionRole` SHALL contain only the known application-relative roles `Ingress` and `Egress`. `InteractionRoleResolution` SHALL classify each correlation input as `Known(Ingress)`, `Known(Egress)`, `Unknown`, or `Ambiguous` with competing role candidates and evidence. Uncertainty SHALL be classification state, not an `InteractionRole` variant. Role semantics SHALL describe the logical interaction's relationship to the recorded application and SHALL NOT be inferred from packet direction or byte-flow direction alone.
+Chronicle SHALL define two separate protocol-neutral concepts. `InteractionRole` SHALL contain only the known application-relative roles `Ingress` and `Egress`. `InteractionRoleResolution` SHALL classify each correlation input as `Known { role: InteractionRole, evidence: [...] }`, `Unknown { evidence: [...] }`, or `Ambiguous { candidates: [{ role: InteractionRole, evidence: [...] }] }`. In prose, `Known(Ingress)` and `Known(Egress)` are shorthand for evidence-bearing known records. Uncertainty SHALL be classification state, not an `InteractionRole` variant. Every ambiguous candidate SHALL retain its own supporting evidence; evidence SHALL NOT exist only as one undifferentiated shared list. An ambiguous candidate set SHALL contain at least two distinct viable roles, with no duplicate roles. With the current two-value role domain, valid ambiguity means both `Ingress` and `Egress`; validation SHALL express the at-least-two/distinct invariant rather than hard-coding exactly two, so future role values remain possible. Role semantics SHALL describe the logical interaction's relationship to the recorded application and SHALL NOT be inferred from packet direction or byte-flow direction alone.
 
 #### Scenario: Known passive HTTP server interaction is ingress
 
@@ -54,13 +54,58 @@ Chronicle SHALL define two separate protocol-neutral concepts. `InteractionRole`
 #### Scenario: Conflicting ownership evidence is ambiguous
 
 - **WHEN** valid evidence supports both ingress and egress interpretations
-- **THEN** role resolution is `Ambiguous` with the competing role candidates and their evidence
+- **THEN** role resolution is `Ambiguous` with at least two distinct candidate records
+- **AND** evidence supporting `Ingress` is attached to the `Ingress` candidate while evidence supporting `Egress` is attached to the `Egress` candidate
 - **AND** the operation remains represented but cannot qualify as a scenario root
 - **AND** timing, PID, connection ownership, or processing order does not select an arbitrary role
 
+#### Scenario: Candidate-specific role evidence is preserved
+
+- **WHEN** supplied ambiguous role classification contains an `Ingress` candidate supported by passive application-server ownership and an `Egress` candidate supported by active outbound ownership
+- **THEN** each candidate retains its own supporting evidence collection
+- **AND** inspection can answer why the interaction could be ingress and independently why it could be egress
+- **AND** neither candidate's evidence is represented only through one shared list
+
+#### Scenario: Candidate evidence is not swapped
+
+- **WHEN** an ambiguous role contains distinct ingress and egress candidate evidence
+- **THEN** ingress evidence remains associated only with the ingress candidate and egress evidence remains associated only with the egress candidate
+- **AND** the existence of both candidates does not make evidence supporting one role support the other role
+
+#### Scenario: Duplicate role candidates are rejected
+
+- **WHEN** an ambiguous role candidate list contains `Ingress` more than once
+- **THEN** domain validation rejects the role resolution
+- **AND** duplicate candidate records are not deduplicated silently
+
+#### Scenario: A single candidate is known, not ambiguous
+
+- **WHEN** supplied evidence supports only one viable role, such as one `Ingress` candidate with sufficient evidence
+- **THEN** domain validation rejects an `Ambiguous` wrapper containing only that candidate
+- **AND** the supplied resolution uses `Known(Ingress)` with its supporting evidence instead
+
+#### Scenario: Empty ambiguous candidate list is rejected
+
+- **WHEN** an ambiguous role resolution contains no candidate records
+- **THEN** domain validation rejects the resolution
+- **AND** it does not create an unknown or synthetic role implicitly
+
+#### Scenario: Ambiguous candidate cardinality remains extensible
+
+- **WHEN** the current role domain validates an ambiguous resolution
+- **THEN** both distinct `Ingress` and `Egress` candidates are viable
+- **AND** future role values, if introduced, may participate in an ambiguous set of at least two distinct viable candidates without changing candidate-specific evidence semantics
+- **AND** validation does not assume exactly two candidates once the role domain grows
+
+#### Scenario: Ambiguity is not resolved by elimination
+
+- **WHEN** one candidate in an ambiguous role is `Ingress`
+- **THEN** no candidate is selected merely to eliminate ambiguity
+- **AND** the role remains ambiguous until supplied domain evidence resolves it to `Known(Ingress)` or `Known(Egress)`
+
 ### Requirement: Role classification and correlation resolution remain independent
 
-The aggregate SHALL store role classification state separately from `CorrelationResolution`. Role uncertainty SHALL NOT be collapsed into scenario-correlation uncertainty, and a correlation outcome SHALL NOT rewrite an unknown or ambiguous role into a known role. The model SHALL preserve both dimensions for every admitted operation.
+The aggregate SHALL store role classification state separately from `CorrelationResolution`. Role uncertainty SHALL NOT be collapsed into scenario-correlation uncertainty, and a correlation outcome or its evidence SHALL NOT rewrite an unknown or ambiguous role into a known role. Scenario evidence SHALL NOT silently resolve role ambiguity, and role evidence SHALL NOT silently select a scenario. The model SHALL preserve both dimensions for every admitted operation.
 
 #### Scenario: Known ingress with resolved correlation
 
@@ -82,9 +127,22 @@ The aggregate SHALL store role classification state separately from `Correlation
 
 #### Scenario: Ambiguous role with ambiguous correlation
 
-- **WHEN** an operation has an ambiguous ingress/egress role and ambiguous scenario candidates
+- **WHEN** an operation has an ambiguous role with candidate-specific ingress/egress evidence and ambiguous scenario candidates with candidate-specific correlation evidence
 - **THEN** both candidate sets and their evidence remain separate and inspectable
 - **AND** neither uncertainty domain silently selects an owner or role
+
+#### Scenario: Role ambiguity survives resolved correlation
+
+- **WHEN** an operation remains `Ambiguous` between ingress and egress with candidate-specific role evidence while supplied correlation is `Resolved(Scenario A)`
+- **THEN** the role resolution remains ambiguous and its candidate evidence remains inspectable
+- **AND** the operation MAY be represented as a Scenario A member if approved correlation-domain invariants permit it
+- **AND** it cannot qualify as Scenario A's root until role resolution is actually `Known(Ingress)`
+
+#### Scenario: Scenario evidence cannot resolve role ambiguity
+
+- **WHEN** supplied correlation evidence assigns an operation to a scenario but does not supply a selected application-relative role
+- **THEN** domain validation preserves the existing ambiguous role candidates and their evidence
+- **AND** it does not rewrite the role to `Known(Ingress)` or `Known(Egress)` merely to satisfy scenario structure
 
 ### Requirement: Existing canonical operation remains interaction identity
 

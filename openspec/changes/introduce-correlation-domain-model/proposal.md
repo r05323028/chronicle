@@ -9,7 +9,7 @@ The existing architecture validation mechanism checks Chronicle workspace depend
 ## What Changes
 
 - Define Chronicle-owned `InteractionRole` semantics with only `Ingress` and `Egress` values.
-- Define a separate `InteractionRoleResolution` classification state: `Known(Ingress)`, `Known(Egress)`, `Unknown`, or `Ambiguous` with competing candidates/evidence. Uncertainty is not a third interaction role.
+- Define a separate `InteractionRoleResolution` classification state: `Known(Ingress)`, `Known(Egress)`, `Unknown`, or `Ambiguous` with distinct candidate records, each retaining its own supporting evidence. Uncertainty is not a third interaction role; candidate evidence is never one shared undifferentiated list.
 - Define application-relative role semantics and deterministic normalization for known passive HTTP ingress, active HTTP egress, and active database/cache egress. Wire direction and socket role remain evidence only.
 - Keep `CanonicalOperation` and `OperationId` as the logical interaction and interaction identity. Add no `InteractionId`.
 - Define a scoped `CanonicalOperationRef` containing recording lineage, owning epoch/session scope, and `OperationId`, so correlation can safely reference operations outside their owning `CanonicalSession` and across epoch boundaries.
@@ -17,6 +17,8 @@ The existing architecture validation mechanism checks Chronicle workspace depend
 - Make only `Known(Ingress)` eligible to be a scenario root. `Known(Egress)` may be a child; `Unknown` and `Ambiguous` role states cannot become roots and must not be guessed.
 - Keep role classification and scenario-correlation resolution as independent dimensions. For example, `Unknown + Uncorrelated` and `Known(Egress) + Ambiguous` are valid states.
 - Preserve framework-neutral evidence, optional trace enrichment, concurrency safety, ambiguity, and replayability/completeness independence.
+
+- Require ambiguous role candidates to be distinct, viable, and independently explainable; empty, single-candidate, and duplicate-candidate role resolutions are invalid. Current roles make valid ambiguity `Ingress` plus `Egress`, while future roles must retain the same at-least-two, candidate-specific evidence invariant.
 - Explicitly omit `EventId` from this foundation. Existing `OperationId` plus scoped references and existing provenance are sufficient for correlation. Any future event identity requires a dedicated deterministic-identity or versioned-compatibility change.
 - Keep this change algorithm-neutral: it defines values and validation for supplied resolutions, not a resolver, heuristic, temporal inference, runtime lineage algorithm, or automatic ownership from raw interleaved traffic.
 

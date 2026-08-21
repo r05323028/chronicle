@@ -51,20 +51,28 @@ enum InteractionRole {
 }
 
 InteractionRoleResolution =
-    Known(Ingress)
-  | Known(Egress)
-  | Ambiguous {
-        candidates: [InteractionRole],
+    Known {
+        role: InteractionRole,
         evidence: [CorrelationEvidence],
+    }
+  | Ambiguous {
+        candidates: [
+            {
+                role: InteractionRole,
+                evidence: [CorrelationEvidence],
+            }
+        ],
     }
   | Unknown {
         evidence: [CorrelationEvidence],
     }
 ```
 
-`InteractionRole` contains only actual application-relative roles. `Ingress` means the logical interaction is accepted by the recorded application from a remote/client side. `Egress` means the recorded application initiates the logical interaction toward a remote service/dependency. `InteractionRoleResolution` records whether Chronicle knows that role; uncertainty is classification state, not a third role.
+`InteractionRole` contains only actual application-relative roles. `Ingress` means the logical interaction is accepted by the recorded application from a remote/client side. `Egress` means the recorded application initiates the logical interaction toward a remote service/dependency. `InteractionRoleResolution` records whether Chronicle knows that role; uncertainty is classification state, not a third role. In prose, `Known(Ingress)` and `Known(Egress)` are shorthand for the corresponding `Known { role, evidence }` records.
 
-Every operation supplied to correlation has one role-resolution state attached in the correlation input or deterministically derived before graph validation from Chronicle-owned, application-relative evidence. The state may be represented in a future correlation sidecar/aggregate rather than as a new Canonical Session v1 field. `Known(Ingress)` and `Known(Egress)` are successful classifications. Insufficient evidence produces `Unknown`; valid conflicting evidence produces `Ambiguous` with competing candidates and evidence. Chronicle never guesses a default.
+Every operation supplied to correlation has one role-resolution state attached in the correlation input or deterministically derived before graph validation from Chronicle-owned, application-relative evidence. The state may be represented in a future correlation sidecar/aggregate rather than as a new Canonical Session v1 field. A known classification retains its supporting evidence. An `Ambiguous` classification contains candidate records, never bare roles plus one shared evidence list: every candidate retains its own evidence collection explaining why that role remains viable. Candidate evidence remains attached to its candidate and is independently inspectable; it is never swapped, flattened, or used to select a role merely to eliminate ambiguity.
+
+An ambiguous candidate set SHALL contain at least two distinct viable roles. Duplicate candidate roles, an empty candidate set, and a single-candidate set are invalid. If supplied evidence supports only one role, the result is `Known` for that role with its evidence. The current `InteractionRole` domain has only `Ingress` and `Egress`, so a valid ambiguous result currently contains both distinct roles. This is a current-domain consequence, not a shape constraint: if future role values are introduced, validation SHALL continue to require at least two distinct viable candidates with candidate-specific evidence rather than assuming exactly two candidates.
 
 Derivation is semantic normalization, not correlation selection:
 
@@ -72,7 +80,7 @@ Derivation is semantic normalization, not correlation selection:
 - validated active HTTP client evidence initiated by the recorded application yields `Known(Egress)`;
 - validated active PostgreSQL, MySQL, Redis, or other dependency evidence initiated by the recorded application yields `Known(Egress)`.
 
-The same logical HTTP operation keeps one known role while request and response bytes travel in both directions. `Direction` and byte-flow direction remain wire evidence and never substitute for `InteractionRole`; if application ownership is otherwise unknown, `ClientToServer`/`ServerToClient` labels leave the state `Unknown`. Active/passive socket evidence may contribute only when application ownership is established. `SocketRole`, connection, stream, PID, TID, and timing remain evidence, not interaction or scenario identity. Conflicting ownership evidence becomes `Ambiguous`, not a timing or ordering tie-break.
+The same logical HTTP operation keeps one known role while request and response bytes travel in both directions. `Direction` and byte-flow direction remain wire evidence and never substitute for `InteractionRole`; if application ownership is otherwise unknown, `ClientToServer`/`ServerToClient` labels leave the state `Unknown`. Active/passive socket evidence may contribute only when application ownership is established. `SocketRole`, connection, stream, PID, TID, and timing remain evidence, not interaction or scenario identity. Conflicting ownership evidence becomes `Ambiguous` with separately retained candidate evidence, not a timing or ordering tie-break.
 
 Only `Known(Ingress)` is eligible for `Scenario.root`. `Known(Egress)` may be a selected child when supplied correlation permits it; `Unknown` and `Ambiguous` role states cannot become roots. Role classification and scenario-correlation resolution are independent: `Unknown + Uncorrelated`, `Known(Egress) + Ambiguous`, `Known(Ingress) + Resolved`, and `Ambiguous + Ambiguous` are all representable combinations. The role semantics are protocol-neutral and belong to Chronicle's canonical domain.
 
