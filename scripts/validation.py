@@ -153,8 +153,8 @@ def select(root: Path, paths: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def workspace_edges(root: Path) -> list[dict[str, Any]]:
-    """Capture Chronicle workspace path dependencies from bounded Cargo metadata."""
+def _cargo_metadata(root: Path) -> dict[str, Any]:
+    """Read bounded Cargo metadata once per architecture data source."""
     try:
         output = subprocess.check_output(
             ["cargo", "metadata", "--format-version", "1", "--no-deps"],
@@ -166,15 +166,22 @@ def workspace_edges(root: Path) -> list[dict[str, Any]]:
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("bounded cargo metadata failed; cannot check architecture")
     try:
-        value = json.loads(output)
+        return json.loads(output)
     except (ValueError, TypeError) as exc:
         raise RuntimeError(
             "cargo metadata returned malformed JSON; cannot check architecture"
         ) from exc
+
+
+def workspace_edges(root: Path) -> list[dict[str, Any]]:
+    """Capture Chronicle workspace path dependencies from bounded Cargo metadata."""
+    value = _cargo_metadata(root)
     workspace_members = set(value.get("workspace_members", []))
     packages = {pkg["id"]: pkg for pkg in value.get("packages", [])}
     ws = {
-        pkg["name"]: pkg for pkg in packages.values() if pkg["id"] in workspace_members
+        pkg["name"]: pkg
+        for pkg in packages.values()
+        if pkg["id"] in workspace_members and pkg["name"].startswith("chronicle-")
     }
     # Resolve package identity by manifest directory so renames and local
     # aliases never change the evaluated target crate.
@@ -200,6 +207,86 @@ def workspace_edges(root: Path) -> list[dict[str, Any]]:
                 }
             )
     return edges
+
+
+def external_dependencies(root: Path) -> list[dict[str, Any]]:
+    """Capture direct non-workspace package dependencies by Cargo package identity."""
+    value = _cargo_metadata(root)
+    workspace_members = set(value.get("workspace_members", []))
+    packages = {pkg["id"]: pkg for pkg in value.get("packages", [])}
+    workspace = {
+        pkg["name"]: pkg
+        for pkg in packages.values()
+        if pkg["id"] in workspace_members and pkg["name"].startswith("chronicle-")
+    }
+    by_manifest_dir = {
+        str(Path(pkg["manifest_path"]).parent): pkg["name"]
+        for pkg in workspace.values()
+    }
+    dependencies: list[dict[str, Any]] = []
+    for source in sorted(workspace):
+        for dep in sorted(
+            workspace[source].get("dependencies", []), key=lambda d: d["name"]
+        ):
+            target = (
+                by_manifest_dir.get(str(Path(dep["path"]))) if dep.get("path") else None
+            )
+            if target in workspace:
+                continue
+            dependencies.append(
+                {
+                    "source": source,
+                    "package": dep["name"],
+                    "rename": dep.get("rename") or dep["name"],
+                    "kind": dep.get("kind") or "normal",
+                    "optional": bool(dep.get("optional")),
+                    "target_condition": dep.get("target"),
+                }
+            )
+    return dependencies
+
+
+def _external_dependency_issues(
+    root: Path, policy: dict[str, Any], members: set[str]
+) -> list[str]:
+    """Reject provider SDK packages only at protected core/domain boundaries."""
+    protected = policy.get("core_domain_crates", [])
+    forbidden = policy.get("forbidden_packages", [])
+    if not isinstance(protected, list) or not isinstance(forbidden, list):
+        return [
+            "external_dependencies must declare list-valued "
+            "core_domain_crates and forbidden_packages"
+        ]
+    issues: list[str] = []
+    for crate in protected:
+        if crate not in members:
+            issues.append(
+                f"external dependency policy names unknown core/domain crate {crate!r}"
+            )
+    if len(set(forbidden)) != len(forbidden):
+        issues.append(
+            "external dependency policy forbidden_packages contain duplicates"
+        )
+    protected_set = set(protected) & members
+    denied = set(forbidden)
+    for dependency in external_dependencies(root):
+        if (
+            dependency["source"] not in protected_set
+            or dependency["package"] not in denied
+        ):
+            continue
+        detail = (
+            f"forbidden external provider dependency: "
+            f"{dependency['source']} -> {dependency['package']} [{dependency['kind']}]"
+        )
+        if dependency["rename"] != dependency["package"]:
+            detail += f" [renamed as {dependency['rename']}]"
+        if dependency["optional"]:
+            detail += " [optional]"
+        if dependency["target_condition"]:
+            detail += f" [{dependency['target_condition']}]"
+        issues.append(detail)
+    return issues
 
 
 def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
@@ -316,6 +403,13 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
     cycles = find_cycles(edges)
     if cycles:
         issues.append(f"dependency cycle: {' -> '.join(cycles[0])}")
+    external_policy = policy.get("external_dependencies", {})
+    external_issues = (
+        _external_dependency_issues(root, external_policy, member_set)
+        if external_policy
+        else []
+    )
+    issues.extend(external_issues)
     semantic = policy.get("semantic", {})
     semantic_issues = semantic_check(root, semantic) if semantic else []
     issues.extend(semantic_issues)
@@ -328,6 +422,7 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
         "build_edges": sum(1 for e in edges if e["kind"] == "build"),
         "cyclic": bool(cycles),
         "semantic": bool(semantic),
+        "external_dependencies": bool(external_policy),
         "issues": issues,
     }
 

@@ -116,6 +116,7 @@ uuid_id!(EpochId);
 uuid_id!(SessionId);
 uuid_id!(ConnectionId);
 uuid_id!(OperationId);
+uuid_id!(ScenarioId);
 uuid_id!(ReplayRunId);
 
 /// Escape control characters for safe human rendering of untrusted references

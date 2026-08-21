@@ -362,6 +362,9 @@ pub struct CanonicalSession {
     pub replay_attributes: Attributes,
 }
 
+mod correlation;
+pub use correlation::*;
+
 impl CanonicalSession {
     pub fn connection_state(&self, id: &ConnectionId) -> Completeness {
         self.connection_completeness

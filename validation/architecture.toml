@@ -171,3 +171,28 @@ forbidden_re_export_sources = [
 # and symbol plus rationale). Empty today; adding an entry requires the
 # rationale and architecture documentation update in the same change.
 allowed_re_exports = []
+
+[external_dependencies]
+# Direct package identities forbidden in neutral/domain crates. This guard is
+# intentionally narrow: outer adapters may translate provider data, while
+# generic logging/tracing facades remain allowed unless they are provider
+# bridges. Cargo metadata supplies package identity, so renames and target-only
+# declarations cannot evade the policy.
+core_domain_crates = ["chronicle-common", "chronicle-canonical"]
+forbidden_packages = [
+  "opentelemetry",
+  "opentelemetry-api",
+  "opentelemetry-sdk",
+  "opentelemetry-otlp",
+  "opentelemetry-aws",
+  "opentelemetry-datadog",
+  "opentelemetry-jaeger",
+  "opentelemetry-zipkin",
+  "tracing-opentelemetry",
+  "datadog-opentelemetry",
+  "datadog-sdk",
+  "aws-sdk-xray",
+  "b3",
+  "b3-opentelemetry",
+  "opentelemetry-b3",
+]

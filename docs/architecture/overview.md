@@ -30,6 +30,14 @@ A bounded 4096-event queue feeds segmented WAL v1. Each group appends data, one 
 
 JSON is current capture-event payload encoding; WAL framing remains encoding-independent. Public recording lifetime has no implicit time deadline when `--duration` is omitted; explicit deadlines are checked independently from bounded epoch and segment WAL limits. A recording may own many finalized epoch sessions, and a WAL epoch boundary is not a protocol reconstruction boundary: cross-epoch state requires bounded, checksummed, lineage-verified continuation evidence.
 
+## Correlation foundation
+
+The canonical domain owns a recording-scoped correlation foundation separate from Canonical Session v1 persistence. `CanonicalOperation` and `OperationId` remain the sole logical interaction identity. `CanonicalOperationRef { recording_id, owner_epoch_id, session_id, operation_id }` is required for references outside an owning session; ETL or future persistence must verify exact lineage rather than infer it from identifiers. `ScenarioId` remains stable across epoch/session publication boundaries.
+
+`InteractionRole` is application-relative: passive server ownership normalizes to `Ingress`, active outbound HTTP/database/cache ownership normalizes to `Egress`, and wire direction or socket role remains evidence only. `InteractionRoleResolution` preserves `Known`, `Unknown`, and candidate-specific `Ambiguous` outcomes. `CorrelationGraph` stores role state separately from `Resolved`, `Ambiguous`, and `Uncorrelated` correlation outcomes; unresolved operations remain discoverable, ambiguous candidates are not selected membership or edges, and only `Known(Ingress)` may be a scenario root. This foundation validates supplied outcomes; it does not infer ownership from raw interleaved traffic.
+
+Correlation data is not added to Capture Event v1 or Canonical Session v1. Persisted correlation requires a separately versioned sidecar/new artifact or an explicit 0.2 compatibility change.
+
 ## Service boundaries
 
 The production pipeline separates five logical components: **Recorder** (eBPF capture, protocol-neutral evidence, local WAL append/commit/recovery, segment and epoch rollover, capture-side loss accounting, future durable evidence shipping), **Local WAL** (capture durability and recovery authority), **Durable Evidence Store** (immutable evidence handoff preserving checksums and parent/epoch lineage, idempotent publication, independent Recorder/ETL lifecycles), **ETL** (reconstruction, protocol decoding, canonicalization, incremental and final publication, publication verification, checkpoint advancement ordering), and **Canonical Store** (persisted canonical sessions and payload artifacts consumed by inspect/replay).
@@ -60,7 +68,7 @@ Capture owns event production. WAL append/flush is local durability boundary. ET
 
 Rust standard library does not provide derive-based wire serialization, UUIDs, wall-clock serialization, CRC32C, typed error derives, TOML parsing, CLI derivation, async test runtime, or structured diagnostics. Chronicle therefore uses `serde`/`serde_json`, `uuid`, `time`, `crc32c`, `thiserror`, `toml`, `clap`, `tokio`, and `tracing`. `tracing-subscriber` is confined to CLI setup. `tokio` is used only where async execution is exercised.
 
-`httparse` provides bounded HTTP head parsing and `sha2` identifies filesystem payloads. `aya` is isolated in `chronicle-capture-ebpf`; kernel ABI types never cross capture boundary. `sqlx` and `object_store` remain absent until PostgreSQL and S3 adapters have real behavior. `bytes`, `blake3`, `anyhow`, plugin loaders, queues, and embedded databases remain unnecessary.
+`httparse` provides bounded HTTP head parsing and `sha2` identifies filesystem payloads. `aya` is isolated in `chronicle-capture-ebpf`; kernel ABI types never cross capture boundary. Core/domain provider SDKs are denied by exact Cargo package identity; generic `tracing`/logging facades remain allowed. `sqlx` and `object_store` remain absent until PostgreSQL and S3 adapters have real behavior. `bytes`, `blake3`, `anyhow`, plugin loaders, queues, and embedded databases remain unnecessary.
 
 ## Deferred implementations
 

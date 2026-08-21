@@ -5,9 +5,11 @@ import importlib.util
 import shutil
 import sys
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
+from typing import Any
+
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[3]
 _spec = importlib.util.spec_from_file_location(
@@ -32,15 +34,15 @@ class ArchitectureBoundaryTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp)
 
-    def write_workspace(self, crates: dict[str, dict]) -> None:
+    def write_workspace(self, crates: dict[str, Any]) -> None:
         """Write a minimal Cargo workspace: name -> dependency table dict.
 
         Each dependency entry is a dict with keys: package (target name),
         rename (local name, optional), kind (normal/dev/build), optional,
-        target (cfg condition string).
+        target (cfg condition string), and external (path package outside workspace).
         """
         (self.temp / "Cargo.toml").write_text(
-            '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n'
+            '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\nexclude = ["external/*"]\n'
         )
         for name, deps in crates.items():
             crate_dir = self.temp / "crates" / name.removeprefix("chronicle-")
@@ -51,21 +53,26 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             target_tables: dict[str, list[str]] = {}
             for dep in deps:
                 target = dep.get("target")
-                body = f"{{ path = \"../{dep['package'].removeprefix('chronicle-')}\""
+                if dep.get("external"):
+                    external_dir = self.temp / "external" / dep["package"]
+                    external_dir.mkdir(parents=True, exist_ok=True)
+                    (external_dir / "Cargo.toml").write_text(
+                        f'[package]\nname = "{dep["package"]}"\n'
+                        'version = "0.1.0"\nedition = "2021"\n'
+                    )
+                    (external_dir / "src").mkdir(exist_ok=True)
+                    (external_dir / "src" / "lib.rs").write_text("pub fn ping() {}\n")
+                    dependency_path = f"../../external/{dep['package']}"
+                else:
+                    dependency_path = f"../{dep['package'].removeprefix('chronicle-')}"
+                body = '{ path = "' + dependency_path + '"'
                 if dep.get("optional"):
                     body += ", optional = true"
-                body += " }"
                 if dep.get("rename"):
-                    body = (
-                        '{ path = "../'
-                        + dep["package"].removeprefix("chronicle-")
-                        + '", package = "'
-                        + dep["package"]
-                        + '" }'
-                    )
-                    line = f"{dep['rename']} = {body}"
+                    body += f', package = "{dep["package"]}"'
+                    line = f"{dep['rename']} = {body} }}"
                 else:
-                    line = f"{dep['package']} = {body}"
+                    line = f"{dep['package']} = {body} }}"
                 kind = dep.get("kind", "normal")
                 if target:
                     target_tables.setdefault(target, []).append(line)
@@ -92,7 +99,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             (crate_dir / "src").mkdir(exist_ok=True)
             (crate_dir / "src" / "lib.rs").write_text("pub fn ping() {}\n")
 
-    def issues_for(self, crates: dict[str, dict]) -> list[str]:
+    def issues_for(self, crates: dict[str, Any]) -> list[str]:
         self.write_workspace(crates)
         return validation.architecture_check(self.temp, self.policy)["issues"]
 
@@ -320,6 +327,53 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         }
         issues = self.issues_for(crates)
         self.assertTrue(any("dependency cycle" in issue for issue in issues))
+
+    def test_external_provider_package_rejected_in_core_domain(self):
+        crates = {
+            "chronicle-common": [
+                {"package": "opentelemetry-sdk", "external": True},
+            ],
+        }
+        issues = self.issues_for(crates)
+        self.assertTrue(
+            any("forbidden external provider dependency" in issue for issue in issues)
+        )
+        self.assertTrue(
+            any("chronicle-common -> opentelemetry-sdk" in issue for issue in issues)
+        )
+
+    def test_external_package_identity_covers_rename_and_target(self):
+        crates = {
+            "chronicle-common": {},
+            "chronicle-canonical": [
+                {
+                    "package": "aws-sdk-xray",
+                    "external": True,
+                    "rename": "provider_bridge",
+                    "optional": True,
+                    "target": 'cfg(target_os = "linux")',
+                },
+            ],
+        }
+        issues = self.issues_for(crates)
+        self.assertTrue(
+            any("chronicle-canonical -> aws-sdk-xray" in issue for issue in issues)
+        )
+        self.assertTrue(any("renamed as provider_bridge" in issue for issue in issues))
+        self.assertTrue(any("[optional]" in issue for issue in issues))
+        self.assertTrue(any('[cfg(target_os = "linux")]' in issue for issue in issues))
+
+    def test_generic_tracing_facade_and_outer_adapter_provider_are_allowed(self):
+        crates = {
+            "chronicle-common": {},
+            "chronicle-canonical": [
+                {"package": "tracing", "external": True},
+            ],
+            "chronicle-application": [
+                {"package": "opentelemetry-sdk", "external": True},
+            ],
+        }
+        self.assertEqual(self.issues_for(crates), [])
 
     def test_missing_policy_allowlist_table(self):
         # A member without a dev allowlist table must be reported. Write a

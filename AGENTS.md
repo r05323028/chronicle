@@ -140,6 +140,8 @@ Public 0.1 compatibility rules:
 
 Recording lifetime may be unbounded while epochs and segments remain bounded. A WAL epoch boundary is not a protocol reconstruction boundary; cross-epoch state requires bounded, versioned, checksummed, lineage-verified continuation evidence.
 
+Correlation invariants: Chronicle owns application-relative role and scenario correlation; trace is optional opaque enrichment; role differs from byte direction; infrastructure identity is evidence, never scenario identity; ambiguity remains ambiguity; replayability/completeness stays separate. Correlation references use explicit recording/owner-epoch/session scope, and no `InteractionId` or `EventId` is added to frozen v1 contracts.
+
 ## Crate Architecture (mandatory)
 
 13-crate workspace; every crate has one primary owner (see `docs/architecture/crate-boundaries.md`).

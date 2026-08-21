@@ -29,18 +29,18 @@ Additional dev declarations: `application -> wal` (test-support; also a normal e
 ### chronicle-common
 
 - **Primary responsibility**: transport-neutral shared primitives: IDs, timestamps, endpoints, directions, protocol IDs, and small value/formatting helpers.
-- **Owned public concepts**: `RecordingId`, `SessionId`, `ConnectionId`, `OperationId`, `ProtocolId`, `Endpoint`, `Timestamp`, directions, and small value objects.
+- **Owned public concepts**: `RecordingId`, `SessionId`, `ConnectionId`, `OperationId`, `ScenarioId`, `ProtocolId`, `Endpoint`, `Timestamp`, directions, and small value objects.
 - **Allowed Chronicle dependencies**: none (dependency leaf).
 - **Forbidden knowledge**: WAL, ETL, storage, replay, protocol implementations, application, CLI.
 - **Must not change**: identity and timestamp semantics shared by every crate.
 
 ### chronicle-canonical
 
-- **Primary responsibility**: protocol-independent canonical recording/replay model, provenance, completeness, and validation.
-- **Owned public concepts**: `CanonicalSession`, `CanonicalConnection`, `CanonicalOperation`, `TimelineEntry`, `Completeness`, `ReplayMetadata`, `CanonicalValidationError`.
+- **Primary responsibility**: protocol-independent canonical recording/replay model, provenance, completeness, correlation foundation, and validation.
+- **Owned public concepts**: `CanonicalSession`, `CanonicalConnection`, `CanonicalOperation`, `CanonicalOperationRef`, `InteractionRole`, `InteractionRoleResolution`, `CorrelationGraph`, `CorrelationEvidence`, `TimelineEntry`, `Completeness`, `ReplayMetadata`, `CanonicalValidationError`.
 - **Allowed Chronicle dependencies**: `chronicle-common`.
-- **Forbidden knowledge**: capture implementation, WAL implementation, storage backend, application, CLI.
-- **Must not change**: canonical schema v1, validation fail-closed guard, serialized field names.
+- **Forbidden knowledge**: capture implementation, WAL implementation, storage backend, application, CLI, and external tracing/provider SDKs.
+- **Must not change**: canonical schema v1, validation fail-closed guard, serialized field names, or v1 persistence boundaries.
 
 ### chronicle-capture
 
@@ -130,6 +130,8 @@ Additional dev declarations: `application -> wal` (test-support; also a normal e
 - **Forbidden knowledge**: protocol decoding, replay policy, WAL scanning/recovery, ETL orchestration, storage publication, eBPF loading, business safety decisions.
 - **Must not change**: CLI commands, arguments, output, exit codes, or behavior.
 
+Correlation foundation remains a canonical-domain concern, not a new crate or a persisted v1 field. `InteractionRole` contains only `Ingress` and `Egress`; `InteractionRoleResolution` keeps known, unknown, and candidate-specific ambiguous states separate from `Direction` and `SocketRole`. `CorrelationGraph` owns recording-scoped `Scenario` children, role/correlation indexes, and selected causal edges. `CanonicalOperationRef` scopes `OperationId` by recording, owner epoch, and session; epoch rollover remains a publication boundary while `ScenarioId` remains recording-scoped. Ambiguous and uncorrelated operations remain discoverable without synthetic ownership, and only `Known(Ingress)` can be a scenario root. Correlation evidence is Chronicle-owned and provider-neutral; optional external trace values are opaque enrichment.
+
 ## Semantic/API boundaries
 
 Dependency edges alone do not define a boundary: `chronicle-cli -> chronicle-application` is technically satisfied even when the CLI consumes replay/protocol vocabulary re-exported by application. The semantic boundary is: **outer adapters operate only on application-owned contracts**. This section is the documentary counterpart of the `[semantic]` table in `validation/architecture.toml`.
@@ -140,6 +142,7 @@ Dependency edges alone do not define a boundary: `chronicle-cli -> chronicle-app
 - **S2 — Application does not re-export lower-layer vocabulary as an escape hatch.** `pub use` of replay/protocol/WAL/ETL/capture/session/storage/canonical/built-ins/eBPF-adapter items from `chronicle-application` is forbidden except (a) neutral primitives from `chronicle-common` and (b) explicitly allowlisted reviewed contracts (`allowed_re_exports` entries with rationale, added in the same change as their documentation).
 - **S3 — Application-owned view models expose application-owned classification.** Fields an outer adapter needs to interpret (outcome, replayability, operation state) are application-owned types with stable serialization; JSON and exit codes remain unchanged.
 - **S4 — Replay policy stays in replay/application composition.** Options, timing, target mapping, and execution authorization are constructed inside application (`ReplayRequest` -> `LoopbackReplayOptions`); the CLI never builds replay policy.
+- **S5 — Core/domain APIs remain provider-neutral.** `chronicle-common` and `chronicle-canonical` do not depend directly on external tracing SDKs or provider bridges; exact Cargo package identity is checked by the external dependency denylist. Generic logging/tracing facades remain distinct from provider SDKs, and outer adapters translate provider data into `CorrelationEvidence`.
 
 ### CLI forbidden vocabulary (enforced)
 
@@ -153,7 +156,7 @@ Dependency edges alone do not define a boundary: `chronicle-cli -> chronicle-app
 
 ### Enforcement
 
-`scripts/validation.py architecture` scans application re-export lines and CLI source against the `[semantic]` table; wired into `validate.sh fast` and release. Violation messages state the invariant, location, rationale, and remediation.
+`scripts/validation.py architecture` scans application re-export lines and CLI source against the `[semantic]` table and checks protected core/domain direct package dependencies against `[external_dependencies]`; wired into `validate.sh fast` and release. Violation messages state the invariant, location, rationale, and remediation.
 
 ## Reliability boundaries that must not change
 
