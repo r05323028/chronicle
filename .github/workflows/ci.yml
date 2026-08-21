@@ -60,8 +60,12 @@ jobs:
       - name: Install OpenSpec CLI
         run: npm install -g @fission-ai/openspec@1.9.0
 
-      - name: Run fast layered validation
-        run: ./scripts/validate.sh fast
+      - name: Install git-cliff and run fast validation
+        run: |
+          set -euo pipefail
+          bin_dir="$RUNNER_TEMP/git-cliff/bin"
+          scripts/release/install-git-cliff.sh "$bin_dir"
+          PATH="$bin_dir:$PATH" ./scripts/validate.sh fast
 
       - name: Build CLI binary
         run: cargo build -p chronicle-cli --locked

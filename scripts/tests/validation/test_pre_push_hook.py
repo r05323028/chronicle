@@ -85,6 +85,7 @@ class PrePushHookTests(unittest.TestCase):
         self.assertIn("act -j", text)
         self.assertIn("CHRONICLE_PRE_PUSH_JOB:-checks", text)
         self.assertIn("ubuntu-latest=$IMAGE", text)  # Rust-capable act image
+        self.assertIn("--container-architecture linux/amd64", text)
         self.assertIn("catthehacker/ubuntu:rust-latest", text)
         # The default job must exist in the workflow that is the source of truth.
         self.assertIn("checks:", WORKFLOW.read_text())

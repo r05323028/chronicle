@@ -31,7 +31,7 @@ The workflow provides the read-only GitHub token and repository, passes the emit
 
 ## Installation
 
-The notes job downloads the official x86_64 Linux git-cliff 2.13.1 tarball from its immutable versioned release URL, verifies the checked-in SHA-512 digest, checks the reported version, and adds the binary to `GITHUB_PATH`. No new GitHub Action or moving `latest` dependency is introduced.
+The repository-owned `scripts/release/install-git-cliff.sh` downloads the official x86_64 Linux git-cliff 2.13.1 tarball from its immutable versioned release URL, verifies the checked-in SHA-512 digest, checks the reported version, and installs the binary into the caller's tool directory. Normal CI and the release workflow call this helper; no new GitHub Action or moving `latest` dependency is introduced.
 
 ## Workflow path
 
@@ -39,4 +39,4 @@ The existing `release-notes` job keeps full-history checkout and artifact name/b
 
 ## Validation
 
-Portable tests assert the workflow contract, product-only config policy, range selection, current-tag exclusion, retry equivalence, malformed-history failure, breaking footers, metadata template conditionals, and actual git-cliff output in a temporary repository when pinned git-cliff is available. Local validation also runs representative product-history output without creating a release tag.
+Portable tests assert the workflow contract, shared installer contract, product-only config policy, range selection, current-tag exclusion, retry equivalence, malformed-history failure, breaking footers, metadata template conditionals, and actual pinned git-cliff output in a temporary repository. Missing or unusable git-cliff fails test setup rather than skipping the rendering contract. Local validation also runs representative product-history output without creating a release tag.

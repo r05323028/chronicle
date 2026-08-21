@@ -8,7 +8,7 @@ Chronicle release notes follow the canonical linear history:
 PR title → squash commit on main → git-cliff → release-notes.md
 ```
 
-`cliff.toml` defines product-only grouping and strict Conventional Commit parsing. Its GitHub remote settings and the workflow's read-only token enrich included entries with PR and contributor metadata; remote metadata never controls classification. The workflow installs pinned git-cliff 2.13.1, verifies its SHA-512 digest, and renders commits after the previous reachable semantic `v<version>` tag through the frozen candidate SHA. It uses the same explicit range before and after an intended same-SHA tag exists. Release version remains authoritative in `Cargo.toml` and the workflow resolver; git-cliff does not bump versions.
+`cliff.toml` defines product-only grouping and strict Conventional Commit parsing. Its GitHub remote settings and the workflow's read-only token enrich included entries with PR and contributor metadata; remote metadata never controls classification. The shared `scripts/release/install-git-cliff.sh` pins git-cliff 2.13.1 and verifies its SHA-512 digest; normal CI and the release workflow call that same helper. Release notes render commits after the previous reachable semantic `v<version>` tag through the frozen candidate SHA, using the same explicit range before and after an intended same-SHA tag exists. Release version remains authoritative in `Cargo.toml` and the workflow resolver; git-cliff does not bump versions.
 
 ## Normal flow
 

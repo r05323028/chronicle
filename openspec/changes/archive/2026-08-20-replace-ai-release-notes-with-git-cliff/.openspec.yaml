@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-21
+goal: Make release-note generation deterministic and retry-stable with GitHub
+  presentation enrichment without changing artifact publication.

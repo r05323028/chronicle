@@ -84,7 +84,8 @@ run_act_job() {
     printf 'Chronicle pre-push: running GitHub Actions job %s (%s) with act (bounded %ss)...\n' \
         "$job" "$workflow" "$TIMEOUT_SECONDS"
     cd "$ROOT"
-    "$ROOT/scripts/run-with-timeout.sh" "$TIMEOUT_SECONDS" act -j "$job" -W "$ROOT/$workflow" -P "ubuntu-latest=$IMAGE"
+    # Shared git-cliff installer targets Linux x86_64; force amd64 for Apple Silicon act.
+    "$ROOT/scripts/run-with-timeout.sh" "$TIMEOUT_SECONDS" act -j "$job" -W "$ROOT/$workflow" -P "ubuntu-latest=$IMAGE" --container-architecture linux/amd64
 }
 
 run_act_job "$JOB" "$WORKFLOW"

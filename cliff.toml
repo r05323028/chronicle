@@ -42,6 +42,11 @@ topo_order = true
 topo_order_commits = true
 sort_commits = "oldest"
 
+commit_preprocessors = [
+  # Remove only GitHub squash-merge PR suffixes; preserve other parentheses.
+  { pattern = ' \(#[0-9]+\)$', replace = "" },
+]
+
 commit_parsers = [
   { message = '^(?:feat|fix|perf|refactor|docs|test|build|ci|chore|revert)(?:\([^)]*\))?!:', group = "<!-- 0 -->Breaking Changes" },
   { field = "raw_message", pattern = '(?s)^(?:feat|fix|perf|refactor|docs|test|build|ci|chore|revert)(?:\([^)]*\))?:.*BREAKING CHANGE:', group = "<!-- 0 -->Breaking Changes" },
