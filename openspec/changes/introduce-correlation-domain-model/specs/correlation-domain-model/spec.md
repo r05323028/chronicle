@@ -376,9 +376,56 @@ This planning change SHALL NOT add fields to Capture Event v1 or Canonical Sessi
 - **AND** the choice does not rely on timestamps, WAL byte position alone, processing order, or random regeneration across restart
 - **AND** a derived identity remains unchanged when WAL segmentation or ETL processing order changes
 
+### Requirement: Trace providers are optional separately distributed adapters
+
+Trace-provider integrations SHALL be optional, separately distributed adapter/plugin packages. The default Chronicle distribution SHALL NOT depend on, bundle, or link any trace-provider implementation package or provider SDK anywhere in its transitive dependency closure, and no provider SDK type SHALL cross the canonical/domain API boundary. Provider data enters Chronicle only through provider-neutral Chronicle-owned evidence contracts such as `CorrelationEvidence`. Trace context remains optional enrichment: correlation SHALL NOT require any trace provider, and the absence of provider adapters SHALL NOT prevent capture, WAL, ETL, canonicalization, storage, replay, or CLI behavior. Provider installation UX and runtime plugin discovery belong to future changes; this capability introduces neither. A small Chronicle-owned parser for a trace-context wire format is provider-neutral code, not a provider plugin, and is not forbidden by this invariant.
+
+#### Scenario: Default distribution rejects a direct provider SDK
+
+- **WHEN** a crate reachable from the default `chronicle` executable root, such as `chronicle-cli -> chronicle-application`, declares `opentelemetry_sdk`
+- **THEN** architecture validation rejects the dependency
+- **AND** the diagnostic names the dependency path from the default distribution root
+
+#### Scenario: Deep transitive provider dependency is rejected
+
+- **WHEN** a forbidden provider package sits below intermediate workspace crates, such as `chronicle-cli -> chronicle-application -> chronicle-etl -> <provider package>`
+- **THEN** validation walks the transitive dependency closure and still rejects it
+- **AND** checking only direct dependencies of the root would be insufficient
+
+#### Scenario: Optional, renamed, and target-specific declarations cannot bypass policy
+
+- **WHEN** a provider package inside the default-distribution closure is declared `optional = true`, listed under `[target.'cfg(target_os = "linux")'.dependencies]`, or bound to a renamed local key whose `package` value is the provider identity
+- **THEN** validation evaluates Cargo package identity regardless of host platform or feature selection
+- **AND** the declaration fails exactly as a plain dependency would
+
+#### Scenario: Separately distributed adapter outside the closure is allowed
+
+- **WHEN** an adapter crate such as `chronicle-trace-otel` depends on `opentelemetry_sdk` but is unreachable from the default distribution root
+- **AND** it communicates with Chronicle only through Chronicle-owned contracts such as `CorrelationEvidence`
+- **THEN** architecture validation accepts it
+- **AND** no provider SDK type enters `chronicle-common` or `chronicle-canonical`
+
+#### Scenario: Generic tracing facades are not provider SDKs
+
+- **WHEN** `tracing` or `tracing-subscriber` appear where the workspace-edge policy already permits them
+- **THEN** validation does not reject them merely for being tracing-related
+- **AND** lightweight trace-context wire-format parsing is not treated as a heavyweight provider integration by this invariant alone
+
+#### Scenario: No provider plugin is required for normal behavior
+
+- **WHEN** no trace-provider adapter is installed
+- **THEN** capture, WAL, ETL, canonicalization, storage, replay, and CLI behavior continue unchanged
+- **AND** role resolution still represents known, unknown, ambiguous, and uncorrelated outcomes without trace evidence
+
+#### Scenario: Provider installation UX stays outside this foundation
+
+- **WHEN** a user later wants OpenTelemetry, Datadog, AWS X-Ray, or B3 integration
+- **THEN** installation, discovery, registries, and loading runtimes are specified by a dedicated future change
+- **AND** this capability adds no plugin command, registry, discovery mechanism, or dynamic-loading runtime
+
 ### Requirement: Canonical ownership and dependency direction remain intact
 
-Correlation semantics SHALL remain in `chronicle-canonical` with neutral identity primitives in `chronicle-common`. Capture, session, protocol, WAL, storage, ETL, application, and CLI responsibilities SHALL remain as currently assigned. No standalone correlation crate SHALL be added. Core/domain crates SHALL remain free of tracing SDK/provider dependencies, and tracing evidence SHALL enter only through Chronicle-owned contracts. The existing architecture validation mechanism currently checks Chronicle workspace dependency direction, critical forbids, and semantic/API boundaries; it does not yet enforce an external tracing-SDK/package denylist. Future implementation SHALL extend `validation/architecture.toml`, `scripts/validation.py architecture`, and its existing standard-library fixture tests with the smallest maintainable direct-dependency guard based on actual Cargo package identity, without creating a parallel validator.
+Correlation semantics SHALL remain in `chronicle-canonical` with neutral identity primitives in `chronicle-common`. Capture, session, protocol, WAL, storage, ETL, application, and CLI responsibilities SHALL remain as currently assigned. No standalone correlation crate SHALL be added. Core/domain crates SHALL remain free of tracing SDK/provider dependencies, and tracing evidence SHALL enter only through Chronicle-owned contracts. The existing architecture validation mechanism checks Chronicle workspace dependency direction, critical forbids, semantic/API boundaries, core/domain declarations against an external tracing-SDK/package denylist, and the transitive normal/build dependency closure of the declared default distribution roots against the same denylist — every check by actual Cargo package identity, so renamed, optional, and target-specific declarations cannot evade it, and all within the existing validator rather than a parallel one.
 
 #### Scenario: Existing pipeline owners remain
 
@@ -388,7 +435,7 @@ Correlation semantics SHALL remain in `chronicle-canonical` with neutral identit
 
 #### Scenario: Extended architecture mechanism rejects provider SDK leakage
 
-- **WHEN** a future implementation adds an OpenTelemetry or provider-specific tracing dependency to a core/domain crate
-- **THEN** the extended existing architecture validation mechanism rejects the direct package dependency through its external denylist
+- **WHEN** an implementation adds an OpenTelemetry or provider-specific tracing dependency to a core/domain crate, or declares one anywhere inside the default `chronicle` executable dependency closure — directly, transitively, optionally, under a rename, or target-specifically
+- **THEN** the existing architecture validation mechanism rejects the declaration through its external denylist and names the dependency path from the protected crate or default distribution root
 - **AND** the policy continues to retain current workspace-edge and semantic-boundary checks
 - **AND** no parallel validator, correlation crate, or SDK-specific domain API is introduced

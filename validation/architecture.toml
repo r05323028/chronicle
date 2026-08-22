@@ -12,6 +12,16 @@
 # normal-layer architecture. Optional and target-specific declarations are
 # checked from Cargo metadata independent of the current host platform.
 # Package renames are evaluated by package identity, not by the rename string.
+#
+# Provider neutrality has two enforced layers ([external_dependencies]):
+# 1. Core/domain leakage: protected crates must not declare provider packages
+#    in any dependency kind.
+# 2. Default-distribution leakage: no crate reachable from a default
+#    distribution root through normal/build workspace edges (the closure the
+#    default `chronicle` executable installs and links) may declare a provider
+#    package in any normal or build declaration regardless of feature,
+#    optional, or target-specific configuration. Dev-only declarations never
+#    link into the executable.
 
 version = 1
 
@@ -173,26 +183,41 @@ forbidden_re_export_sources = [
 allowed_re_exports = []
 
 [external_dependencies]
-# Direct package identities forbidden in neutral/domain crates. This guard is
-# intentionally narrow: outer adapters may translate provider data, while
-# generic logging/tracing facades remain allowed unless they are provider
+# Layer 1: direct package identities forbidden in neutral/domain crates. This
+# guard is intentionally narrow: outer adapters may translate provider data,
+# while generic logging/tracing facades remain allowed unless they are provider
 # bridges. Cargo metadata supplies package identity, so renames and target-only
 # declarations cannot evade the policy.
 core_domain_crates = ["chronicle-common", "chronicle-canonical"]
+
+# Layer 2: default Chronicle distribution roots (the public `chronicle`
+# executable ships from these crates). The validator walks the transitive
+# normal/build workspace-edge closure of every root and rejects forbidden
+# provider packages anywhere inside it, including renamed, optional, and
+# target-specific declarations. Separately distributed adapter/plugin crates
+# outside this closure may depend on provider packages.
+default_distribution_roots = ["chronicle-cli"]
+# Actual crates.io package identities verified by audit; generic facades such
+# as tracing/tracing-subscriber/tracing-core are deliberately NOT listed.
 forbidden_packages = [
+  # OpenTelemetry API/SDK and exporter/transport bridges.
   "opentelemetry",
   "opentelemetry_api",
   "opentelemetry_sdk",
   "opentelemetry-otlp",
-  "opentelemetry-aws",
-  "opentelemetry-datadog",
-  "opentelemetry-jaeger",
-  "opentelemetry-zipkin",
+  "opentelemetry-http",
+  "opentelemetry-stdout",
   "tracing-opentelemetry",
+  "opentelemetry-contrib",
+  # Datadog integrations.
+  "opentelemetry-datadog",
   "datadog-opentelemetry",
-  "datadog-sdk",
+  "ddtrace",
+  # AWS X-Ray integrations.
+  "opentelemetry-aws",
   "aws-sdk-xray",
-  "b3",
-  "b3-opentelemetry",
-  "opentelemetry-b3",
+  # Other provider exporters/propagators (Jaeger, Zipkin).
+  "opentelemetry-jaeger",
+  "opentelemetry-jaeger-propagator",
+  "opentelemetry-zipkin",
 ]

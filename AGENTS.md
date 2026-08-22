@@ -142,6 +142,12 @@ Recording lifetime may be unbounded while epochs and segments remain bounded. A 
 
 Correlation invariants: Chronicle owns application-relative role and scenario correlation; trace is optional opaque enrichment; role differs from byte direction; infrastructure identity is evidence, never scenario identity; ambiguity remains ambiguity; replayability/completeness stays separate. Correlation references use explicit recording/owner-epoch/session scope, and no `InteractionId` or `EventId` is added to frozen v1 contracts.
 
+Trace-provider invariant: trace providers are optional adapters; provider SDKs must never
+enter Chronicle core/domain APIs or the default `chronicle` executable dependency closure.
+Provider integrations are separately distributed and translate external provider data into
+Chronicle-owned evidence at an outer boundary (`validation/architecture.toml` enforces both
+layers).
+
 ## Crate Architecture (mandatory)
 
 13-crate workspace; every crate has one primary owner (see `docs/architecture/crate-boundaries.md`).

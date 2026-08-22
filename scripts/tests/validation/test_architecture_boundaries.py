@@ -363,17 +363,194 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertTrue(any("[optional]" in issue for issue in issues))
         self.assertTrue(any('[cfg(target_os = "linux")]' in issue for issue in issues))
 
-    def test_generic_tracing_facade_and_outer_adapter_provider_are_allowed(self):
+    def test_generic_tracing_facade_remains_allowed(self):
+        # Generic tracing facades are not provider SDKs and stay allowed where
+        # the workspace-edge policy permits them.
         crates = {
             "chronicle-common": {},
             "chronicle-canonical": [
                 {"package": "tracing", "external": True},
             ],
-            "chronicle-application": [
+        }
+        self.assertEqual(self.issues_for(crates), [])
+
+    def _distribution_fixture(self) -> dict[str, Any]:
+        return {
+            "chronicle-common": {},
+            "chronicle-canonical": [{"package": "chronicle-common"}],
+            "chronicle-application": [{"package": "chronicle-canonical"}],
+            "chronicle-cli": [{"package": "chronicle-application"}],
+        }
+
+    def test_provider_sdk_rejected_in_default_distribution_closure(self):
+        # chronicle-application is part of the default executable dependency
+        # graph, so a direct provider SDK there is a distribution violation.
+        crates = self._distribution_fixture()
+        crates["chronicle-application"].append(
+            {"package": "opentelemetry_sdk", "external": True}
+        )
+        issues = self.issues_for(crates)
+        matches = [
+            issue
+            for issue in issues
+            if "forbidden provider dependency in default Chronicle distribution"
+            in issue
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertIn("chronicle-cli\n  -> chronicle-application", matches[0])
+        self.assertIn("-> opentelemetry_sdk", matches[0])
+
+    def test_deep_transitive_provider_dependency_rejected(self):
+        crates = self._distribution_fixture()
+        crates["chronicle-etl"] = [
+            {"package": "chronicle-canonical"},
+            {"package": "aws-sdk-xray", "external": True},
+        ]
+        crates["chronicle-application"].append({"package": "chronicle-etl"})
+        issues = self.issues_for(crates)
+        matches = [
+            issue
+            for issue in issues
+            if "forbidden provider dependency in default Chronicle distribution"
+            in issue
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertIn(
+            "chronicle-cli\n"
+            "  -> chronicle-application\n"
+            "  -> chronicle-etl\n"
+            "  -> aws-sdk-xray",
+            matches[0],
+        )
+
+    def test_rename_optional_and_target_provider_in_closure_detected(self):
+        crates = self._distribution_fixture()
+        crates["chronicle-application"].append(
+            {
+                "package": "opentelemetry_sdk",
+                "external": True,
+                "rename": "provider_bridge",
+                "optional": True,
+                "target": 'cfg(target_os = "linux")',
+            }
+        )
+        issues = self.issues_for(crates)
+        matches = [
+            issue
+            for issue in issues
+            if "forbidden provider dependency in default Chronicle distribution"
+            in issue
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertIn("-> opentelemetry_sdk", matches[0])
+        self.assertIn("[renamed as provider_bridge]", matches[0])
+        self.assertIn("[optional]", matches[0])
+        self.assertIn('[cfg(target_os = "linux")]', matches[0])
+
+    def test_dev_provider_dependency_is_outside_executable_closure(self):
+        # Dev dependencies never link into the shipped executable, so they are
+        # outside the default-distribution invariant.
+        crates = self._distribution_fixture()
+        crates["chronicle-application"].append(
+            {"package": "opentelemetry_sdk", "external": True, "kind": "dev"}
+        )
+        self.assertEqual(self.issues_for(crates), [])
+
+    def test_separately_distributed_adapter_outside_default_closure_allowed(self):
+        # A provider adapter crate unreachable from the distribution root may
+        # depend on the SDK and reach Chronicle through canonical contracts.
+        policy = (
+            "version = 1\n"
+            "\n"
+            "[members]\n"
+            "members = [\n"
+            '  "chronicle-application",\n'
+            '  "chronicle-canonical",\n'
+            '  "chronicle-cli",\n'
+            '  "chronicle-common",\n'
+            '  "chronicle-trace-otel",\n'
+            "]\n"
+            "\n"
+            "[critical_forbids]\n"
+            "dependency_on_cli = true\n"
+            "session_to_wal = true\n"
+            "protocol_to_builtins = true\n"
+            "common_upward = true\n"
+            "cli_non_application = true\n"
+            "\n"
+            "[normal]\n"
+            '"chronicle-common" = []\n'
+            '"chronicle-canonical" = ["chronicle-common"]\n'
+            '"chronicle-application" = ["chronicle-canonical"]\n'
+            '"chronicle-cli" = ["chronicle-application"]\n'
+            '"chronicle-trace-otel" = ["chronicle-canonical"]\n'
+            "\n"
+            "[dev]\n"
+            '"chronicle-common" = []\n'
+            '"chronicle-canonical" = []\n'
+            '"chronicle-application" = []\n'
+            '"chronicle-cli" = []\n'
+            '"chronicle-trace-otel" = []\n'
+            "\n"
+            "[build]\n"
+            '"chronicle-common" = []\n'
+            '"chronicle-canonical" = []\n'
+            '"chronicle-application" = []\n'
+            '"chronicle-cli" = []\n'
+            '"chronicle-trace-otel" = []\n'
+            "\n"
+            "[external_dependencies]\n"
+            'core_domain_crates = ["chronicle-common", "chronicle-canonical"]\n'
+            'default_distribution_roots = ["chronicle-cli"]\n'
+            'forbidden_packages = ["opentelemetry_sdk"]\n'
+        )
+        self.policy.write_text(policy)
+        crates = {
+            "chronicle-common": {},
+            "chronicle-canonical": [{"package": "chronicle-common"}],
+            "chronicle-application": [{"package": "chronicle-canonical"}],
+            "chronicle-cli": [{"package": "chronicle-application"}],
+            "chronicle-trace-otel": [
+                {"package": "chronicle-canonical"},
                 {"package": "opentelemetry_sdk", "external": True},
             ],
         }
-        self.assertEqual(self.issues_for(crates), [])
+        self.write_workspace(crates)
+        issues = validation.architecture_check(self.temp, self.policy)["issues"]
+        self.assertEqual(issues, [])
+
+    def test_missing_default_distribution_roots_reported(self):
+        policy = (
+            "version = 1\n"
+            "\n"
+            "[members]\n"
+            'members = ["chronicle-common"]\n'
+            "\n"
+            "[critical_forbids]\n"
+            "dependency_on_cli = true\n"
+            "session_to_wal = true\n"
+            "protocol_to_builtins = true\n"
+            "common_upward = true\n"
+            "cli_non_application = true\n"
+            "\n"
+            "[normal]\n"
+            '"chronicle-common" = []\n'
+            "\n"
+            "[dev]\n"
+            '"chronicle-common" = []\n'
+            "\n"
+            "[build]\n"
+            '"chronicle-common" = []\n'
+            "\n"
+            "[external_dependencies]\n"
+            "core_domain_crates = []\n"
+            "default_distribution_roots = []\n"
+            "forbidden_packages = []\n"
+        )
+        self.policy.write_text(policy)
+        self.write_workspace({"chronicle-common": {}})
+        issues = validation.architecture_check(self.temp, self.policy)["issues"]
+        self.assertTrue(any("non-empty" in issue for issue in issues))
 
     def test_missing_policy_allowlist_table(self):
         # A member without a dev allowlist table must be reported. Write a

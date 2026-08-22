@@ -142,7 +142,7 @@ Dependency edges alone do not define a boundary: `chronicle-cli -> chronicle-app
 - **S2 — Application does not re-export lower-layer vocabulary as an escape hatch.** `pub use` of replay/protocol/WAL/ETL/capture/session/storage/canonical/built-ins/eBPF-adapter items from `chronicle-application` is forbidden except (a) neutral primitives from `chronicle-common` and (b) explicitly allowlisted reviewed contracts (`allowed_re_exports` entries with rationale, added in the same change as their documentation).
 - **S3 — Application-owned view models expose application-owned classification.** Fields an outer adapter needs to interpret (outcome, replayability, operation state) are application-owned types with stable serialization; JSON and exit codes remain unchanged.
 - **S4 — Replay policy stays in replay/application composition.** Options, timing, target mapping, and execution authorization are constructed inside application (`ReplayRequest` -> `LoopbackReplayOptions`); the CLI never builds replay policy.
-- **S5 — Core/domain APIs remain provider-neutral.** `chronicle-common` and `chronicle-canonical` do not depend directly on external tracing SDKs or provider bridges; exact Cargo package identity is checked by the external dependency denylist. Generic logging/tracing facades remain distinct from provider SDKs, and outer adapters translate provider data into `CorrelationEvidence`.
+- **S6 — Provider integrations are separately distributed optional adapters.** No crate in the transitive normal/build dependency closure of the default distribution roots (`chronicle-cli`, the public `chronicle` executable) may declare a forbidden provider package — renamed, optional, target-specific, or feature-gated declarations included. Provider SDKs live only in adapter/plugin crates outside that closure, which translate provider data into Chronicle-owned evidence contracts. Lightweight trace-context wire-format parsers remain provider-neutral and are not provider SDKs.
 
 ### CLI forbidden vocabulary (enforced)
 
@@ -156,7 +156,7 @@ Dependency edges alone do not define a boundary: `chronicle-cli -> chronicle-app
 
 ### Enforcement
 
-`scripts/validation.py architecture` scans application re-export lines and CLI source against the `[semantic]` table and checks protected core/domain direct package dependencies against `[external_dependencies]`; wired into `validate.sh fast` and release. Violation messages state the invariant, location, rationale, and remediation.
+`scripts/validation.py architecture` scans application re-export lines and CLI source against the `[semantic]` table, checks protected core/domain direct package dependencies against `[external_dependencies]`, and walks the transitive normal/build workspace-edge closure of `default_distribution_roots` to reject forbidden provider packages anywhere in the default distribution graph (diagnostics include the dependency path); wired into `validate.sh fast` and release. Violation messages state the invariant, location, rationale, and remediation.
 
 ## Reliability boundaries that must not change
 

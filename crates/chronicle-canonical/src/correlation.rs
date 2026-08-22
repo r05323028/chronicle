@@ -389,7 +389,19 @@ impl InteractionRoleResolution {
                 }
                 Ok(())
             }
-            Self::Unknown { evidence } => validate_evidence(evidence),
+            Self::Unknown { evidence } => {
+                validate_evidence(evidence)?;
+                if evidence
+                    .iter()
+                    .any(|item| item.application_ownership().is_some())
+                {
+                    return Err(CorrelationValidationError::InvalidRoleCandidates(
+                        "unknown role must not contain decisive application-ownership evidence"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
             Self::Ambiguous { candidates } => {
                 if candidates.len() < 2 {
                     return Err(CorrelationValidationError::InvalidRoleCandidates(
@@ -1601,6 +1613,36 @@ mod tests {
             InteractionRoleResolution::known(InteractionRole::Egress, mixed)
                 .validate()
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_roles_reject_decisive_ownership_evidence() {
+        // Decisive application-ownership evidence would classify the state as
+        // Known or Ambiguous, so a supplied Unknown must not carry it.
+        for decisive in [
+            vec![CorrelationEvidence::passive_http()],
+            vec![CorrelationEvidence::active_http()],
+            vec![
+                CorrelationEvidence::passive_http(),
+                CorrelationEvidence::active_http(),
+            ],
+        ] {
+            assert!(
+                InteractionRoleResolution::unknown(decisive)
+                    .validate()
+                    .is_err()
+            );
+        }
+        // Neutral-only evidence stays valid for Unknown.
+        assert!(
+            InteractionRoleResolution::unknown(vec![
+                CorrelationEvidence::wire_direction(Direction::ClientToServer),
+                CorrelationEvidence::socket_role(SocketRoleEvidence::Passive),
+                CorrelationEvidence::trace("w3c", "t"),
+            ])
+            .validate()
+            .is_ok()
         );
     }
 

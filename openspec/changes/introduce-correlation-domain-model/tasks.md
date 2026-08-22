@@ -70,6 +70,9 @@ This task list describes the implementation of the foundation after this plannin
 - [x] 6.6 Update `docs/architecture/crate-boundaries.md`, `docs/architecture/overview.md`, and `docs/canonical-model.md` after implementation with role classification/correlation ownership, epoch-scoped references, unresolved outcomes, and v1 compatibility boundaries.
 - [x] 6.7 Update `AGENTS.md` only with concise durable invariants: Chronicle owns correlation; trace is optional enrichment; role differs from byte direction; infrastructure identity is evidence; ambiguity remains ambiguity; replayability is separate.
 - [x] 6.8 Review user-facing documentation impact. This foundation adds no CLI or website behavior; later scenario commands or canonical English changes must update `zh-tw`/`ja` pages and run localization verification.
+- [x] 6.9 Audit the denylist against actual crates.io package identities; remove wrong or nonexistent entries (`b3`, `b3-opentelemetry`, `opentelemetry-b3`, `datadog-sdk`) and keep verified OpenTelemetry/Datadog/X-Ray/Jaeger/Zipkin exporter, bridge, and propagator identities; never list generic `tracing` facades.
+- [x] 6.10 Declare `default_distribution_roots = ["chronicle-cli"]` and enforce the second invariant: reject forbidden provider packages anywhere in the transitive normal/build workspace-edge closure of every root, with dependency-path diagnostics, without treating `optional = true`, renames, target-specific tables, or features as bypasses and without rejecting dev-only declarations that never link into the executable.
+- [x] 6.11 Add standard-library fixture tests for both layers: core/domain rejection, direct and deep transitive closure rejection, rename/optional/target detection inside the closure, dev-dependency exclusion, a separately distributed adapter crate outside the closure depending on `opentelemetry_sdk` being accepted, and a missing/empty roots declaration being reported.
 
 ## 7. Validation and future boundaries
 
@@ -84,5 +87,6 @@ This task list describes the implementation of the foundation after this plannin
 - `correlate-ingress-and-egress-interactions`: deterministic resolver, candidate selection, and concurrent-ingress correlation.
 - Pluggable trace evidence providers and runtime lineage capture.
 - Versioned persisted correlation/scenario artifact and user-facing scenario commands.
+- Trace-provider adapter/plugin installation, discovery, registries, and loading runtimes (for example a conceptual `chronicle plugin install trace-otel`) in a dedicated future change; this foundation adds none of them.
 - Event identity/compatibility change, only if raw capture-event identity becomes necessary.
 - Replay v2, dependency matching, exports, assertions, and test generation.

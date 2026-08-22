@@ -68,7 +68,7 @@ Capture owns event production. WAL append/flush is local durability boundary. ET
 
 Rust standard library does not provide derive-based wire serialization, UUIDs, wall-clock serialization, CRC32C, typed error derives, TOML parsing, CLI derivation, async test runtime, or structured diagnostics. Chronicle therefore uses `serde`/`serde_json`, `uuid`, `time`, `crc32c`, `thiserror`, `toml`, `clap`, `tokio`, and `tracing`. `tracing-subscriber` is confined to CLI setup. `tokio` is used only where async execution is exercised.
 
-`httparse` provides bounded HTTP head parsing and `sha2` identifies filesystem payloads. `aya` is isolated in `chronicle-capture-ebpf`; kernel ABI types never cross capture boundary. Core/domain provider SDKs are denied by exact Cargo package identity; generic `tracing`/logging facades remain allowed. `sqlx` and `object_store` remain absent until PostgreSQL and S3 adapters have real behavior. `bytes`, `blake3`, `anyhow`, plugin loaders, queues, and embedded databases remain unnecessary.
+`httparse` provides bounded HTTP head parsing and `sha2` identifies filesystem payloads. `aya` is isolated in `chronicle-capture-ebpf`; kernel ABI types never cross capture boundary. Core/domain provider SDKs are denied by exact Cargo package identity, and no crate in the default `chronicle` executable dependency closure may declare a forbidden provider package; generic `tracing`/logging facades remain allowed. `sqlx` and `object_store` remain absent until PostgreSQL and S3 adapters have real behavior. `bytes`, `blake3`, `anyhow`, plugin loaders, queues, and embedded databases remain unnecessary.
 
 ## Deferred implementations
 

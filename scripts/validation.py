@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import fnmatch
 import hashlib
@@ -246,16 +247,65 @@ def external_dependencies(root: Path) -> list[dict[str, Any]]:
     return dependencies
 
 
+def _distribution_closure_paths(
+    roots: list[str], edges: list[dict[str, Any]]
+) -> dict[str, tuple[list[str], str]]:
+    """Map each workspace member reachable from a distribution root to its path.
+
+    Reachability follows normal and build workspace edges only: those are the
+    dependencies the default executable installs and links. Dev dependencies
+    never link into an executable build graph and are deliberately excluded.
+    Returns member -> (member names from root to member, final hop kind).
+    """
+    children: dict[str, list[tuple[str, str]]] = {}
+    for edge in edges:
+        if edge["kind"] in ("normal", "build"):
+            children.setdefault(edge["source"], []).append(
+                (edge["target"], edge["kind"])
+            )
+    reached: dict[str, tuple[list[str], str]] = {
+        crate: ([crate], "root") for crate in roots
+    }
+    queue = collections.deque(roots)
+    while queue:
+        source = queue.popleft()
+        path, _ = reached[source]
+        for target, kind in sorted(children.get(source, [])):
+            if target in reached:
+                continue
+            reached[target] = (path + [target], kind)
+            queue.append(target)
+    return reached
+
+
+def _provider_dependency_detail(dependency: dict[str, Any]) -> str:
+    """Suffix describing kind, rename, optionality, and target condition."""
+    detail = f"[{dependency['kind']}]"
+    if dependency["rename"] != dependency["package"]:
+        detail += f" [renamed as {dependency['rename']}]"
+    if dependency["optional"]:
+        detail += " [optional]"
+    if dependency["target_condition"]:
+        detail += f" [{dependency['target_condition']}]"
+    return detail
+
+
 def _external_dependency_issues(
-    root: Path, policy: dict[str, Any], members: set[str]
+    root: Path,
+    policy: dict[str, Any],
+    members: set[str],
+    edges: list[dict[str, Any]],
 ) -> list[str]:
-    """Reject provider SDK packages only at protected core/domain boundaries."""
+    """Reject provider SDKs at core/domain boundaries and inside the default
+    Chronicle distribution dependency closure."""
     protected = policy.get("core_domain_crates", [])
+    roots = policy.get("default_distribution_roots", [])
     forbidden = policy.get("forbidden_packages", [])
-    if not isinstance(protected, list) or not isinstance(forbidden, list):
+    values = (protected, roots, forbidden)
+    if not all(isinstance(value, list) for value in values):
         return [
             "external_dependencies must declare list-valued "
-            "core_domain_crates and forbidden_packages"
+            "core_domain_crates, default_distribution_roots, and forbidden_packages"
         ]
     issues: list[str] = []
     for crate in protected:
@@ -263,29 +313,46 @@ def _external_dependency_issues(
             issues.append(
                 f"external dependency policy names unknown core/domain crate {crate!r}"
             )
+    if not roots:
+        issues.append(
+            "external dependency policy must declare a non-empty "
+            "default_distribution_roots list"
+        )
+    for crate in roots:
+        if crate not in members:
+            issues.append(
+                f"external dependency policy names unknown default distribution "
+                f"root {crate!r}"
+            )
     if len(set(forbidden)) != len(forbidden):
         issues.append(
             "external dependency policy forbidden_packages contain duplicates"
         )
     protected_set = set(protected) & members
+    known_roots = [crate for crate in roots if crate in members]
+    closure = _distribution_closure_paths(known_roots, edges)
     denied = set(forbidden)
     for dependency in external_dependencies(root):
-        if (
-            dependency["source"] not in protected_set
-            or dependency["package"] not in denied
-        ):
+        if dependency["package"] not in denied:
             continue
-        detail = (
-            f"forbidden external provider dependency: "
-            f"{dependency['source']} -> {dependency['package']} [{dependency['kind']}]"
-        )
-        if dependency["rename"] != dependency["package"]:
-            detail += f" [renamed as {dependency['rename']}]"
-        if dependency["optional"]:
-            detail += " [optional]"
-        if dependency["target_condition"]:
-            detail += f" [{dependency['target_condition']}]"
-        issues.append(detail)
+        source = dependency["source"]
+        if source in protected_set:
+            issues.append(
+                f"forbidden external provider dependency: "
+                f"{source} -> {dependency['package']} "
+                + _provider_dependency_detail(dependency)
+            )
+            continue
+        if source in closure and dependency["kind"] != "dev":
+            # Dev declarations never link into the shipped executable.
+            path, _ = closure[source]
+            lines = [path[0]] + [f"  -> {name}" for name in path[1:]]
+            lines.append(f"  -> {dependency['package']}")
+            lines[-1] += " " + _provider_dependency_detail(dependency)
+            issues.append(
+                "forbidden provider dependency in default Chronicle distribution:\n"
+                + "\n".join(lines)
+            )
     return issues
 
 
@@ -405,7 +472,7 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
         issues.append(f"dependency cycle: {' -> '.join(cycles[0])}")
     external_policy = policy.get("external_dependencies", {})
     external_issues = (
-        _external_dependency_issues(root, external_policy, member_set)
+        _external_dependency_issues(root, external_policy, member_set, edges)
         if external_policy
         else []
     )
