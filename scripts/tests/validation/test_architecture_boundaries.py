@@ -331,7 +331,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
     def test_external_provider_package_rejected_in_core_domain(self):
         crates = {
             "chronicle-common": [
-                {"package": "opentelemetry-sdk", "external": True},
+                {"package": "opentelemetry_sdk", "external": True},
             ],
         }
         issues = self.issues_for(crates)
@@ -339,7 +339,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             any("forbidden external provider dependency" in issue for issue in issues)
         )
         self.assertTrue(
-            any("chronicle-common -> opentelemetry-sdk" in issue for issue in issues)
+            any("chronicle-common -> opentelemetry_sdk" in issue for issue in issues)
         )
 
     def test_external_package_identity_covers_rename_and_target(self):
@@ -370,7 +370,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 {"package": "tracing", "external": True},
             ],
             "chronicle-application": [
-                {"package": "opentelemetry-sdk", "external": True},
+                {"package": "opentelemetry_sdk", "external": True},
             ],
         }
         self.assertEqual(self.issues_for(crates), [])

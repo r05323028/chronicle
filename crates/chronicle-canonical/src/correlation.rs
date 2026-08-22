@@ -380,8 +380,14 @@ impl InteractionRoleResolution {
 
     pub fn validate(&self) -> Result<(), CorrelationValidationError> {
         match self {
-            Self::Known { evidence, .. } => {
-                require_evidence(evidence, "known role requires supporting evidence")
+            Self::Known { role, evidence } => {
+                require_evidence(evidence, "known role requires supporting evidence")?;
+                if !evidence_supports_role(evidence, *role) {
+                    return Err(CorrelationValidationError::InvalidRoleCandidates(
+                        "known role requires consistent application-ownership evidence".into(),
+                    ));
+                }
+                Ok(())
             }
             Self::Unknown { evidence } => validate_evidence(evidence),
             Self::Ambiguous { candidates } => {
@@ -401,6 +407,11 @@ impl InteractionRoleResolution {
                         &candidate.evidence,
                         "ambiguous role candidates require supporting evidence",
                     )?;
+                    if !evidence_supports_role(&candidate.evidence, candidate.role) {
+                        return Err(CorrelationValidationError::InvalidRoleCandidates(
+                            "ambiguous role candidates require consistent application-ownership evidence".into(),
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -673,6 +684,11 @@ pub enum CorrelationValidationError {
     DuplicateSessionContext { session_id: SessionId },
     #[error("selected causal edge is supported only by temporal evidence")]
     TemporalOnlyEdgeEvidence,
+    #[error("scenario {scenario} root {root:?} must not become a selected edge child")]
+    RootSelectedParent {
+        scenario: ScenarioId,
+        root: CanonicalOperationRef,
+    },
     #[error("reference {reference:?} belongs to {expected}, not graph recording {found}")]
     ReferenceRecordingScopeMismatch {
         reference: CanonicalOperationRef,
@@ -751,6 +767,37 @@ fn validate_selected_edge_evidence(
         return Err(CorrelationValidationError::TemporalOnlyEdgeEvidence);
     }
     Ok(())
+}
+
+/// Domain predicate: does this ownership classification support this role?
+/// Neutral evidence carries no vote; contradictory ownership fails the role.
+fn ownership_supports_role(ownership: ApplicationOwnership, role: InteractionRole) -> bool {
+    matches!(
+        (ownership, role),
+        (
+            ApplicationOwnership::PassiveApplicationServer,
+            InteractionRole::Ingress
+        ) | (
+            ApplicationOwnership::ActiveOutbound,
+            InteractionRole::Egress
+        )
+    )
+}
+
+/// A declared role needs at least one supporting application-ownership item
+/// and no contradictory one. Neutral evidence may accompany but never
+/// independently establish the role.
+fn evidence_supports_role(evidence: &[CorrelationEvidence], role: InteractionRole) -> bool {
+    let mut supported = false;
+    for item in evidence {
+        if let Some(ownership) = item.application_ownership() {
+            if !ownership_supports_role(ownership, role) {
+                return false;
+            }
+            supported = true;
+        }
+    }
+    supported
 }
 
 /// Recording-scoped owner of role state, correlation outcomes, scenarios, and
@@ -1023,6 +1070,7 @@ impl CorrelationGraph {
                     parent: edge.parent,
                 });
             }
+
             let parent_scenario = self.resolutions[&edge.parent].selected_scenario();
             let child_scenario = self.resolutions[&edge.child].selected_scenario();
             if parent_scenario != Some(edge.scenario) || child_scenario != Some(edge.scenario) {
@@ -1042,6 +1090,13 @@ impl CorrelationGraph {
             return Err(CorrelationValidationError::CausalCycle);
         }
         for edge in &self.causal_edges {
+            let scenario_root = scenarios[&edge.scenario].root;
+            if edge.child == scenario_root {
+                return Err(CorrelationValidationError::RootSelectedParent {
+                    scenario: edge.scenario,
+                    root: scenario_root,
+                });
+            }
             validate_selected_edge_evidence(&edge.evidence)?;
         }
         Ok(())
@@ -1097,11 +1152,17 @@ mod tests {
     }
 
     fn ingress() -> InteractionRoleResolution {
-        InteractionRoleResolution::known(InteractionRole::Ingress, vec![evidence()])
+        InteractionRoleResolution::known(
+            InteractionRole::Ingress,
+            vec![CorrelationEvidence::passive_http()],
+        )
     }
 
     fn egress() -> InteractionRoleResolution {
-        InteractionRoleResolution::known(InteractionRole::Egress, vec![evidence()])
+        InteractionRoleResolution::known(
+            InteractionRole::Egress,
+            vec![CorrelationEvidence::active_http()],
+        )
     }
 
     fn resolved(scenario: ScenarioId) -> CorrelationResolution {
@@ -1292,9 +1353,12 @@ mod tests {
             );
         }
         assert!(
-            InteractionRoleResolution::known(InteractionRole::Ingress, vec![evidence()])
-                .validate()
-                .is_ok()
+            InteractionRoleResolution::known(
+                InteractionRole::Ingress,
+                vec![CorrelationEvidence::passive_http()]
+            )
+            .validate()
+            .is_ok()
         );
     }
 
@@ -1467,6 +1531,112 @@ mod tests {
             reference.resolve_in_session(&missing_range),
             Err(CorrelationValidationError::OperationOwnerMissingRange { .. })
         ));
+    }
+
+    #[test]
+    fn known_roles_require_supporting_ownership_evidence() {
+        let neutral = vec![
+            CorrelationEvidence::trace("w3c", "t"),
+            CorrelationEvidence::temporal(RelativeTimeNanos(0), Some(RelativeTimeNanos(1))),
+            CorrelationEvidence::wire_direction(Direction::ClientToServer),
+            CorrelationEvidence::socket_role(SocketRoleEvidence::Passive),
+        ];
+        // Contradictory ownership is rejected.
+        assert!(
+            InteractionRoleResolution::known(
+                InteractionRole::Ingress,
+                vec![CorrelationEvidence::active_http()]
+            )
+            .validate()
+            .is_err()
+        );
+        assert!(
+            InteractionRoleResolution::known(
+                InteractionRole::Egress,
+                vec![CorrelationEvidence::passive_http()]
+            )
+            .validate()
+            .is_err()
+        );
+        // Neutral-only evidence cannot establish a known role.
+        for evidence in [
+            vec![CorrelationEvidence::wire_direction(
+                Direction::ServerToClient,
+            )],
+            vec![CorrelationEvidence::socket_role(SocketRoleEvidence::Active)],
+            neutral.clone(),
+        ] {
+            assert!(
+                InteractionRoleResolution::known(InteractionRole::Ingress, evidence.clone())
+                    .validate()
+                    .is_err()
+            );
+        }
+        // Supporting ownership may be accompanied by neutral enrichment.
+        let mut ingress_supported = vec![CorrelationEvidence::passive_http()];
+        ingress_supported.extend(neutral.clone());
+        assert!(
+            InteractionRoleResolution::known(InteractionRole::Ingress, ingress_supported)
+                .validate()
+                .is_ok()
+        );
+        let mut egress_supported = vec![CorrelationEvidence::active_http()];
+        egress_supported.extend(neutral);
+        assert!(
+            InteractionRoleResolution::known(InteractionRole::Egress, egress_supported)
+                .validate()
+                .is_ok()
+        );
+        // Mixed ownership contradicts both roles.
+        let mixed = vec![
+            CorrelationEvidence::passive_http(),
+            CorrelationEvidence::active_http(),
+        ];
+        assert!(
+            InteractionRoleResolution::known(InteractionRole::Ingress, mixed.clone())
+                .validate()
+                .is_err()
+        );
+        assert!(
+            InteractionRoleResolution::known(InteractionRole::Egress, mixed)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ambiguous_candidates_require_matching_ownership_evidence() {
+        let swapped = vec![
+            InteractionRoleCandidate {
+                role: InteractionRole::Ingress,
+                evidence: vec![CorrelationEvidence::active_http()],
+            },
+            InteractionRoleCandidate {
+                role: InteractionRole::Egress,
+                evidence: vec![CorrelationEvidence::passive_http()],
+            },
+        ];
+        assert!(matches!(
+            InteractionRoleResolution::ambiguous(swapped).validate(),
+            Err(CorrelationValidationError::InvalidRoleCandidates(_))
+        ));
+        let mut correct_ingress = vec![CorrelationEvidence::passive_http()];
+        correct_ingress.push(CorrelationEvidence::trace("b3", "opaque"));
+        let correct = vec![
+            InteractionRoleCandidate {
+                role: InteractionRole::Ingress,
+                evidence: correct_ingress,
+            },
+            InteractionRoleCandidate {
+                role: InteractionRole::Egress,
+                evidence: vec![CorrelationEvidence::active_http()],
+            },
+        ];
+        assert!(
+            InteractionRoleResolution::ambiguous(correct)
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1680,6 +1850,35 @@ mod tests {
         assert!(matches!(
             graph.validate_structure(),
             Err(CorrelationValidationError::TemporalOnlyEdgeEvidence)
+        ));
+    }
+
+    #[test]
+    fn scenario_root_cannot_be_selected_edge_child() {
+        let recording_id = RecordingId::new();
+        let scenario = ScenarioId::new();
+        let root = reference(recording_id, OperationId::new());
+        let member = reference(recording_id, OperationId::new());
+        let mut graph = graph_with(
+            recording_id,
+            &[
+                (root, ingress(), resolved(scenario)),
+                (member, egress(), resolved(scenario)),
+            ],
+        );
+        graph.add_scenario(Scenario::new(scenario, root)).unwrap();
+        graph.scenarios[0].members.push(member);
+        // Single edge B -> root: acyclic and one-parent, yet invalid because
+        // the root becomes a child.
+        graph.add_causal_edge(SelectedCausalEdge::new(
+            scenario,
+            member,
+            root,
+            vec![evidence()],
+        ));
+        assert!(matches!(
+            graph.validate_structure(),
+            Err(CorrelationValidationError::RootSelectedParent { .. })
         ));
     }
 

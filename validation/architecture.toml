@@ -181,8 +181,8 @@ allowed_re_exports = []
 core_domain_crates = ["chronicle-common", "chronicle-canonical"]
 forbidden_packages = [
   "opentelemetry",
-  "opentelemetry-api",
-  "opentelemetry-sdk",
+  "opentelemetry_api",
+  "opentelemetry_sdk",
   "opentelemetry-otlp",
   "opentelemetry-aws",
   "opentelemetry-datadog",
