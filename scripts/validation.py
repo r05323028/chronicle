@@ -388,7 +388,13 @@ def _external_dependency_issues(
     return issues
 
 
-_RELEASE_TREE_LINE = re.compile(r"^((?:\|   |    )*)((?:\|-- |`-- )?)(.*)$")
+# Accepts both ASCII (`--charset ascii`) and default Unicode tree drawing
+# units, so a Cargo build that ignores or overrides the charset request still parses.
+_RELEASE_TREE_LINE = re.compile(
+    r"^((?:\|   |    |\u2502   )*)((?:\|-- |`-- |\u251c\u2500\u2500 |\u2514\u2500\u2500 )?)(.*)$"
+)
+# Cargo may still emit SGR-styled connectors when color control leaks through (for example a pseudo-TTY); strip ANSI escapes before parsing.
+_ANSI_ESCAPE = re.compile("\x1b\\[[0-9;]*[A-Za-z]")
 
 
 def _cargo_release_tree(workspace: Path, package: str, target: str) -> str:
@@ -415,6 +421,8 @@ def _cargo_release_tree(workspace: Path, package: str, target: str) -> str:
                 "normal,build",
                 "--charset",
                 "ascii",
+                "--color",
+                "never",
             ],
             cwd=workspace,
             text=True,
@@ -437,7 +445,7 @@ def _parse_release_tree_edges(text: str) -> list[tuple[str, str]]:
     """
     edges: list[tuple[str, str]] = []
     stack: list[str] = []
-    for line in text.splitlines():
+    for line in _ANSI_ESCAPE.sub("", text).splitlines():
         if not line.strip():
             continue
         match = _RELEASE_TREE_LINE.match(line)
@@ -486,10 +494,10 @@ def _release_distribution_issues(
         # A root declared by policy but absent from this particular workspace
         # (partial validation fixtures) has no release graph to prove.
         for package in (name for name in root_names if name in member_names):
+            raw_tree = _cargo_release_tree(workspace, package, target)
+            edges = _parse_release_tree_edges(raw_tree)
             adjacency: dict[str, list[str]] = {}
-            for parent, child in _parse_release_tree_edges(
-                _cargo_release_tree(workspace, package, target)
-            ):
+            for parent, child in edges:
                 adjacency.setdefault(parent, []).append(child)
             reached: dict[str, str | None] = {package: None}
             queue = collections.deque([package])
