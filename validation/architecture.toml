@@ -196,12 +196,24 @@ core_domain_crates = ["chronicle-common", "chronicle-canonical"]
 # (a) declaration level - the transitive normal/build workspace-edge closure of
 # every root may not DECLARE a forbidden package (renamed, optional,
 # target-specific, or feature-gated included), even when currently unresolved;
-# (b) resolution level - full Cargo metadata resolve.nodes is walked from the
-# roots so provider packages introduced transitively through third-party
-# crates are also rejected. Dev-only dependencies never link into the shipped
-# executable and stay outside both traversals. Separately distributed
-# adapter/plugin crates outside this closure may depend on provider packages.
+# (b) release-graph level - for every root and every target below, one locked
+# package-selected `cargo tree --locked --edges normal,build --target <t>`
+# query proves what the actual release command (`cargo build -p <root>
+# --release --locked`) would compile, so providers entering transitively
+# through third-party crates are rejected while feature activation by
+# unrelated workspace members cannot contaminate the proof. Dev-only
+# dependencies never link into the shipped executable and stay outside both
+# traversals. Separately distributed adapter/plugin crates outside this
+# closure may depend on provider packages.
 default_distribution_roots = ["chronicle-cli"]
+
+# Release targets whose distribution graph is proven provider-free. Mirrors
+# the .github/workflows/release.yml build matrix; update both when the matrix
+# changes.
+default_distribution_targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+]
 # Actual crates.io package identities verified by audit; generic facades such
 # as tracing/tracing-subscriber/tracing-core are deliberately NOT listed.
 forbidden_packages = [

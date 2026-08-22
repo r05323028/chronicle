@@ -177,16 +177,11 @@ def _cargo_workspace_metadata(root: Path) -> dict[str, Any]:
     )
 
 
-def _cargo_resolved_metadata(root: Path) -> dict[str, Any]:
-    """Bounded full-resolution metadata including the resolved external graph.
-
-    Provides resolve.nodes so the default-distribution check can traverse the
-    actual package graph a locked release build would compile, including
-    third-party transitive dependencies.
-    """
-    return _run_bounded_cargo_metadata(
-        root, ["cargo", "metadata", "--format-version", "1"]
-    )
+# Workspace-only metadata drives declaration and workspace-edge checks; it
+# is deliberately NOT the proof of the shipped release graph (feature
+# unification across unrelated workspace members makes it over-broad). The
+# shipped-graph proof uses the package-selected locked cargo tree queries in
+# _release_distribution_issues.
 
 
 def workspace_edges(root: Path) -> list[dict[str, Any]]:
@@ -368,70 +363,159 @@ def _external_dependency_issues(
                 "forbidden provider dependency in default Chronicle distribution:\n"
                 + "\n".join(lines)
             )
-    if known_roots and denied:
+    targets = policy.get("default_distribution_targets", [])
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or not all(isinstance(item, str) and item for item in targets)
+    ):
+        issues.append(
+            "external dependency policy must declare a non-empty "
+            "default_distribution_targets list of release target triples"
+        )
+        targets = []
+    if len(set(targets)) != len(targets):
+        issues.append(
+            "external dependency policy default_distribution_targets contain duplicates"
+        )
+        targets = list(dict.fromkeys(targets))
+    if known_roots and denied and targets:
         issues.extend(
-            _resolved_distribution_issues(
-                _cargo_resolved_metadata(root), known_roots, denied
+            _release_distribution_issues(
+                root, known_roots, denied, targets, workspace_member_names(root)
             )
         )
     return issues
 
 
-def _resolved_distribution_issues(
-    resolved: dict[str, Any], root_names: list[str], forbidden: set[str]
-) -> list[str]:
-    """Reject forbidden packages reachable in the fully resolved graph.
+_RELEASE_TREE_LINE = re.compile(r"^((?:\|   |    )*)((?:\|-- |`-- )?)(.*)$")
 
-    Traversal starts at each configured default distribution root (matched by
-    package name against workspace members) and follows resolve.nodes edges of
-    kind normal or build, including third-party crates. Dev-only edges never
-    link into the shipped executable and are excluded. Graph identity is the
-    Cargo package ID, so multiple versions of one package name are handled.
-    Returns one diagnostic per reachable forbidden package ID.
+
+def _cargo_release_tree(workspace: Path, package: str, target: str) -> str:
+    """Run one bounded locked package-selected dependency graph query.
+
+    Mirrors the release command `cargo build -p <package> --release --locked`
+    for one distribution target: `--locked` refuses to re-resolve Cargo.lock,
+    `-p <package>` selects features by that root alone (no workspace-wide
+    feature unification), `--target <triple>` resolves as that platform, and
+    `--edges normal,build` excludes dev-only edges that never link into the
+    executable. Output uses the stable ASCII tree grammar (4-character units).
     """
-    id_to_name = {
-        package["id"]: package["name"] for package in resolved.get("packages", [])
-    }
-    workspace_ids = set(resolved.get("workspace_members", []))
-    roots = [
-        package_id
-        for package_id in workspace_ids
-        if id_to_name.get(package_id) in set(root_names)
-    ]
-    adjacency: dict[str, list[str]] = {}
-    for node in resolved.get("resolve", {}).get("nodes", []):
-        edges: list[str] = []
-        for dep in node.get("deps", []):
-            if any(
-                kind.get("kind") in (None, "build") for kind in dep.get("dep_kinds", [])
-            ):
-                edges.append(dep["pkg"])
-        adjacency[node["id"]] = list(dict.fromkeys(edges))
-    reached: dict[str, str | None] = {root: None for root in roots}
-    queue = collections.deque(roots)
-    while queue:
-        current = queue.popleft()
-        for nxt in adjacency.get(current, []):
-            if nxt in reached:
-                continue
-            reached[nxt] = current
-            queue.append(nxt)
-    issues: list[str] = []
-    for package_id in sorted(reached):
-        name = id_to_name.get(package_id)
-        if name not in forbidden:
-            continue
-        chain: list[str] = []
-        cursor: str | None = package_id
-        while cursor is not None:
-            chain.append(id_to_name.get(cursor, cursor))
-            cursor = reached[cursor]
-        chain.reverse()
-        lines = [chain[0]] + [f"  -> {name}" for name in chain[1:]]
-        issues.append(
-            "forbidden provider dependency in resolved default Chronicle "
-            "distribution:\n" + "\n".join(lines)
+    try:
+        return subprocess.check_output(
+            [
+                "cargo",
+                "tree",
+                "--locked",
+                "-p",
+                package,
+                "--target",
+                target,
+                "--edges",
+                "normal,build",
+                "--charset",
+                "ascii",
+            ],
+            cwd=workspace,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
         )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"bounded cargo tree failed for {package} ({target}); cannot check architecture"
+        ) from exc
+
+
+def _parse_release_tree_edges(text: str) -> list[tuple[str, str]]:
+    """Parse ASCII cargo tree output into parent->child name edge pairs.
+
+    Each line is zero or more 4-character ancestor units (`|   ` or spaces),
+    an optional connector (`|-- ` or '`-- '), then the package text whose
+    first whitespace-separated token is the real package name (renames never
+    change it; deduplicated repeats end in `(*)`).
+    """
+    edges: list[tuple[str, str]] = []
+    stack: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = _RELEASE_TREE_LINE.match(line)
+        if match is None:
+            continue
+        indent, connector, rest = match.groups()
+        depth = len(indent) // 4 + (1 if connector else 0)
+        name = rest.split(" ")[0]
+        del stack[depth:]
+        if depth > 0:
+            edges.append((stack[depth - 1], name))
+        stack.insert(depth, name)
+        del stack[depth + 1 :]
+    return edges
+
+
+def workspace_member_names(root: Path) -> set[str]:
+    """Actual Chronicle workspace member package names from bounded metadata."""
+    value = _cargo_workspace_metadata(root)
+    id_to_name = {
+        package["id"]: package["name"] for package in value.get("packages", [])
+    }
+    return {
+        id_to_name[member]
+        for member in value.get("workspace_members", [])
+        if member in id_to_name
+    }
+
+
+def _release_distribution_issues(
+    workspace: Path,
+    root_names: list[str],
+    forbidden: set[str],
+    targets: list[str],
+    member_names: set[str],
+) -> list[str]:
+    """Reject forbidden packages reachable in the locked release graph.
+
+    For every configured default-distribution root and supported release
+    target, exactly one bounded cargo tree query proves what the release
+    artifact would compile. Reachability follows parsed normal/build edges;
+    diagnostics show the dependency path from the root plus the target.
+    """
+    issues: list[str] = []
+    for target in targets:
+        # A root declared by policy but absent from this particular workspace
+        # (partial validation fixtures) has no release graph to prove.
+        for package in (name for name in root_names if name in member_names):
+            adjacency: dict[str, list[str]] = {}
+            for parent, child in _parse_release_tree_edges(
+                _cargo_release_tree(workspace, package, target)
+            ):
+                adjacency.setdefault(parent, []).append(child)
+            reached: dict[str, str | None] = {package: None}
+            queue = collections.deque([package])
+            while queue:
+                current = queue.popleft()
+                for nxt in adjacency.get(current, []):
+                    if nxt in reached:
+                        continue
+                    reached[nxt] = current
+                    queue.append(nxt)
+            for node in sorted(reached):
+                if node not in forbidden:
+                    continue
+                chain: list[str] = []
+                cursor: str | None = node
+                while cursor is not None:
+                    chain.append(cursor)
+                    cursor = reached[cursor]
+                chain.reverse()
+                lines = [f"target: {target}", chain[0]] + [
+                    f"  -> {name}" for name in chain[1:]
+                ]
+                issues.append(
+                    "forbidden provider dependency in default Chronicle release "
+                    "graph:\n" + "\n".join(lines)
+                )
     return issues
 
 
