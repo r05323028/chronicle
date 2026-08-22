@@ -154,15 +154,11 @@ def select(root: Path, paths: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _cargo_metadata(root: Path) -> dict[str, Any]:
-    """Read bounded Cargo metadata once per architecture data source."""
+def _run_bounded_cargo_metadata(root: Path, args: list[str]) -> dict[str, Any]:
+    """Run one bounded cargo metadata invocation and parse its JSON output."""
     try:
         output = subprocess.check_output(
-            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-            cwd=root,
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=120,
+            args, cwd=root, text=True, stderr=subprocess.DEVNULL, timeout=120
         )
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("bounded cargo metadata failed; cannot check architecture")
@@ -174,9 +170,28 @@ def _cargo_metadata(root: Path) -> dict[str, Any]:
         ) from exc
 
 
+def _cargo_workspace_metadata(root: Path) -> dict[str, Any]:
+    """Bounded workspace-only metadata for declarations and workspace edges."""
+    return _run_bounded_cargo_metadata(
+        root, ["cargo", "metadata", "--format-version", "1", "--no-deps"]
+    )
+
+
+def _cargo_resolved_metadata(root: Path) -> dict[str, Any]:
+    """Bounded full-resolution metadata including the resolved external graph.
+
+    Provides resolve.nodes so the default-distribution check can traverse the
+    actual package graph a locked release build would compile, including
+    third-party transitive dependencies.
+    """
+    return _run_bounded_cargo_metadata(
+        root, ["cargo", "metadata", "--format-version", "1"]
+    )
+
+
 def workspace_edges(root: Path) -> list[dict[str, Any]]:
     """Capture Chronicle workspace path dependencies from bounded Cargo metadata."""
-    value = _cargo_metadata(root)
+    value = _cargo_workspace_metadata(root)
     workspace_members = set(value.get("workspace_members", []))
     packages = {pkg["id"]: pkg for pkg in value.get("packages", [])}
     ws = {
@@ -212,7 +227,7 @@ def workspace_edges(root: Path) -> list[dict[str, Any]]:
 
 def external_dependencies(root: Path) -> list[dict[str, Any]]:
     """Capture direct non-workspace package dependencies by Cargo package identity."""
-    value = _cargo_metadata(root)
+    value = _cargo_workspace_metadata(root)
     workspace_members = set(value.get("workspace_members", []))
     packages = {pkg["id"]: pkg for pkg in value.get("packages", [])}
     workspace = {
@@ -353,6 +368,70 @@ def _external_dependency_issues(
                 "forbidden provider dependency in default Chronicle distribution:\n"
                 + "\n".join(lines)
             )
+    if known_roots and denied:
+        issues.extend(
+            _resolved_distribution_issues(
+                _cargo_resolved_metadata(root), known_roots, denied
+            )
+        )
+    return issues
+
+
+def _resolved_distribution_issues(
+    resolved: dict[str, Any], root_names: list[str], forbidden: set[str]
+) -> list[str]:
+    """Reject forbidden packages reachable in the fully resolved graph.
+
+    Traversal starts at each configured default distribution root (matched by
+    package name against workspace members) and follows resolve.nodes edges of
+    kind normal or build, including third-party crates. Dev-only edges never
+    link into the shipped executable and are excluded. Graph identity is the
+    Cargo package ID, so multiple versions of one package name are handled.
+    Returns one diagnostic per reachable forbidden package ID.
+    """
+    id_to_name = {
+        package["id"]: package["name"] for package in resolved.get("packages", [])
+    }
+    workspace_ids = set(resolved.get("workspace_members", []))
+    roots = [
+        package_id
+        for package_id in workspace_ids
+        if id_to_name.get(package_id) in set(root_names)
+    ]
+    adjacency: dict[str, list[str]] = {}
+    for node in resolved.get("resolve", {}).get("nodes", []):
+        edges: list[str] = []
+        for dep in node.get("deps", []):
+            if any(
+                kind.get("kind") in (None, "build") for kind in dep.get("dep_kinds", [])
+            ):
+                edges.append(dep["pkg"])
+        adjacency[node["id"]] = list(dict.fromkeys(edges))
+    reached: dict[str, str | None] = {root: None for root in roots}
+    queue = collections.deque(roots)
+    while queue:
+        current = queue.popleft()
+        for nxt in adjacency.get(current, []):
+            if nxt in reached:
+                continue
+            reached[nxt] = current
+            queue.append(nxt)
+    issues: list[str] = []
+    for package_id in sorted(reached):
+        name = id_to_name.get(package_id)
+        if name not in forbidden:
+            continue
+        chain: list[str] = []
+        cursor: str | None = package_id
+        while cursor is not None:
+            chain.append(id_to_name.get(cursor, cursor))
+            cursor = reached[cursor]
+        chain.reverse()
+        lines = [chain[0]] + [f"  -> {name}" for name in chain[1:]]
+        issues.append(
+            "forbidden provider dependency in resolved default Chronicle "
+            "distribution:\n" + "\n".join(lines)
+        )
     return issues
 
 

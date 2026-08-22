@@ -191,11 +191,16 @@ allowed_re_exports = []
 core_domain_crates = ["chronicle-common", "chronicle-canonical"]
 
 # Layer 2: default Chronicle distribution roots (the public `chronicle`
-# executable ships from these crates). The validator walks the transitive
-# normal/build workspace-edge closure of every root and rejects forbidden
-# provider packages anywhere inside it, including renamed, optional, and
-# target-specific declarations. Separately distributed adapter/plugin crates
-# outside this closure may depend on provider packages.
+# executable ships from these crates). Two complementary traversals reject
+# forbidden provider packages anywhere in the default distribution graph:
+# (a) declaration level - the transitive normal/build workspace-edge closure of
+# every root may not DECLARE a forbidden package (renamed, optional,
+# target-specific, or feature-gated included), even when currently unresolved;
+# (b) resolution level - full Cargo metadata resolve.nodes is walked from the
+# roots so provider packages introduced transitively through third-party
+# crates are also rejected. Dev-only dependencies never link into the shipped
+# executable and stay outside both traversals. Separately distributed
+# adapter/plugin crates outside this closure may depend on provider packages.
 default_distribution_roots = ["chronicle-cli"]
 # Actual crates.io package identities verified by audit; generic facades such
 # as tracing/tracing-subscriber/tracing-core are deliberately NOT listed.

@@ -519,6 +519,116 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         issues = validation.architecture_check(self.temp, self.policy)["issues"]
         self.assertEqual(issues, [])
 
+    def _extend_external_crate(self, name: str, dependencies: list[str]) -> None:
+        """Rewrite an external fixture crate so it depends on sibling externals."""
+        crate = self.temp / "external" / name
+        crate.mkdir(parents=True, exist_ok=True)
+        (crate / "src").mkdir(exist_ok=True)
+        manifest = f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n'
+        if dependencies:
+            body = "\n[dependencies]\n" + "\n".join(
+                f'{dep} = {{ path = "../{dep}" }}' for dep in dependencies
+            )
+            manifest += body + "\n"
+        (crate / "Cargo.toml").write_text(manifest)
+        (crate / "src" / "lib.rs").write_text("pub fn ping() {}\n")
+
+    def test_external_transitive_provider_dependency_rejected(self):
+        # The provider enters through a third-party crate, so no Chronicle
+        # member declares it; only the fully resolved graph can see it.
+        crates = self._distribution_fixture()
+        crates["chronicle-application"].append(
+            {"package": "external-wrapper", "external": True}
+        )
+        self.write_workspace(crates)
+        self._extend_external_crate("external-wrapper", ["opentelemetry_sdk"])
+        self._extend_external_crate("opentelemetry_sdk", [])
+        issues = self.issues_for({})
+        matches = [
+            issue
+            for issue in issues
+            if "forbidden provider dependency in resolved default Chronicle"
+            " distribution" in issue
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertIn(
+            "chronicle-cli\n"
+            "  -> chronicle-application\n"
+            "  -> external-wrapper\n"
+            "  -> opentelemetry_sdk",
+            matches[0],
+        )
+
+    def test_benign_external_transitive_dependency_allowed(self):
+        # Ordinary third-party transitive dependencies are not forbidden.
+        crates = self._distribution_fixture()
+        crates["chronicle-application"].append(
+            {"package": "harmless-wrapper", "external": True}
+        )
+        self.write_workspace(crates)
+        self._extend_external_crate("harmless-wrapper", ["harmless-leaf"])
+        self._extend_external_crate("harmless-leaf", [])
+        self.assertEqual(self.issues_for({}), [])
+
+    def test_dev_only_external_provider_chain_allowed(self):
+        # A provider reachable only below a dev dependency never links into
+        # the shipped executable, so the distribution closure stays clean.
+        crates = self._distribution_fixture()
+        crates["chronicle-application"].append(
+            {"package": "test-helper", "external": True, "kind": "dev"}
+        )
+        self.write_workspace(crates)
+        self._extend_external_crate("test-helper", ["opentelemetry_sdk"])
+        self._extend_external_crate("opentelemetry_sdk", [])
+        self.assertEqual(self.issues_for({}), [])
+
+    def test_resolved_traversal_uses_package_ids_and_shipped_kinds(self):
+        # Graph identity is the Cargo package ID (two versions of one package
+        # are both caught), build-dependency edges count as shipped, and
+        # dev-dependency edges do not.
+        def dep(pkg: str, kind: str | None) -> dict[str, Any]:
+            return {"pkg": pkg, "dep_kinds": [{"kind": kind}]}
+
+        resolved: dict[str, Any] = {
+            "packages": [
+                {"id": "root 1.0", "name": "chronicle-cli"},
+                {"id": "mid 1.0", "name": "some-wrapper"},
+                {"id": "providerA 1.0", "name": "opentelemetry_sdk"},
+                {"id": "providerB 2.0", "name": "opentelemetry_sdk"},
+                {"id": "providerDev 0.9", "name": "opentelemetry_sdk"},
+            ],
+            "workspace_members": ["root 1.0"],
+            "resolve": {
+                "nodes": [
+                    {
+                        "id": "root 1.0",
+                        "deps": [dep("mid 1.0", None)],
+                    },
+                    {
+                        "id": "mid 1.0",
+                        "deps": [
+                            dep("providerA 1.0", None),
+                            dep("providerB 2.0", "build"),
+                            dep("providerDev 0.9", "dev"),
+                        ],
+                    },
+                ]
+            },
+        }
+        issues = validation._resolved_distribution_issues(
+            resolved, ["chronicle-cli"], {"opentelemetry_sdk"}
+        )
+        self.assertEqual(len(issues), 2)
+        for issue in issues:
+            self.assertIn(
+                "forbidden provider dependency in resolved default Chronicle"
+                " distribution",
+                issue,
+            )
+            self.assertIn(
+                "chronicle-cli\n  -> some-wrapper\n  -> opentelemetry_sdk", issue
+            )
+
     def test_missing_default_distribution_roots_reported(self):
         policy = (
             "version = 1\n"
