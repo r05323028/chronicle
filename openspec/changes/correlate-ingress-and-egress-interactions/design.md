@@ -1,29 +1,31 @@
 ## Context
 
-The `correlation-domain-model` capability (archived 2026-08-23) shipped Chronicle-owned `InteractionRole`/`InteractionRoleResolution`, scoped `CanonicalOperationRef`, `CorrelationGraph`, `CorrelationResolution::{Resolved,Ambiguous,Uncorrelated}`, tagged `CorrelationEvidence`, selected-edge invariants, and strict validation — but deliberately no algorithm. `CorrelationGraph::from_operations` accepts already-supplied resolutions; nothing computes them.
+The `correlation-domain-model` capability (archived 2026-08-23) shipped Chronicle-owned `InteractionRole`/`InteractionRoleResolution`, scoped `CanonicalOperationRef`, `CorrelationGraph`, `CorrelationResolution::{Resolved,Ambiguous,Uncorrelated}`, tagged `CorrelationEvidence`, selected-edge invariants, and strict validation — but deliberately no algorithm.
 
-Current code facts this design builds on:
+Repository facts this design is built on (verified on current main):
 
-- `crates/chronicle-canonical/src/correlation.rs` owns all correlation values. `CorrelationEvidenceKind` variants: `TraceRelationship`, `ProtocolOwnership`, `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, `ProtocolStream`, `TemporalLifetime`, `WireDirection`, `SocketRole`, `Custom`. `CorrelationResolution::Resolved` carries `CorrelationConfidence { Exact, Strong, Inferred }`. `CanonicalOperationRef` verifies lineage via `resolve_in_session`.
-- `CanonicalOperation` exposes `started_at_offset`/`completed_at_offset` (`RelativeTimeNanos`) on the recording-relative timeline, plus sequence and provenance — sufficient lifetimes for candidate elimination; no new capture fields are needed.
-- `ScenarioId` is a UUID-based neutral primitive in `chronicle-common`; today it has no deterministic derivation rule.
-- `CorrelationGraph` stores maps keyed by full reference in `BTreeMap`s — deterministic representation already exists.
-- Dependency policy (`validation/architecture.toml`): `chronicle-canonical` depends only on `chronicle-common`; `chronicle-etl` already depends on `chronicle-canonical`. Provider packages are denied in core/domain crates and the whole default-distribution closure.
+- **OperationId is randomly generated at canonicalization time.** The production HTTP canonicalizer assigns `id: OperationId::new()` (`crates/chronicle-protocol-builtins/src/lib.rs`, `fn operation`); `uuid_id!` backs all IDs with `Uuid::new_v4()`. Stability therefore comes only from persistence: incremental ETL checkpoints preserve generated IDs, and cross-epoch continuation preserves one logical operation identity across rollover. Re-canonicalizing the same WAL from scratch generates different IDs. OperationId is stable and unique within a recording lineage's persisted artifacts — nothing more.
+- **`RelativeTimeNanos(u64)` carries no documented recording-global timeline guarantee.** Canonicalizer offsets are derived per reconstructed stream; no artifact asserts cross-session comparability semantics. Any temporal elimination rule would rest on unproven comparability.
+- **Evidence kinds are operation-local records.** `ExecutionTaskLineage { task, worker }`, `TraceRelationship { provider, trace_id, span_id, parent_span_id }`, etc., describe one observation; correlation needs relational predicates comparing child-side items against candidate-side items.
+- **`ScenarioId` is a UUID-backed neutral primitive** (`chronicle-common`), with no derivation rule today. `sha2` is already a workspace dependency used by six crates; `chronicle-canonical` does not yet declare it.
+- Dependency policy (`validation/architecture.toml`) forbids provider packages in core/domain crates and the default-distribution closure; an ordinary hashing crate is unaffected. `chronicle-etl -> chronicle-canonical` already exists.
 
 ## Goals and Non-Goals
 
 ### Goals
 
-- Deterministically reconstruct `Ingress → children` scenarios from canonical operations, roles, and evidence, including concurrent ingress, cross-epoch membership, and chained causality.
-- Preserve ambiguity and uncorrelated outcomes instead of guessing.
-- Keep the resolver provider-neutral, SDK-free, and independent of tracing presence.
-- Make results stable across restarts, retries, replay, iteration order, scheduling, and epoch boundaries.
-- Fit entirely inside existing crate ownership and dependency policy.
+- Deterministically reconstruct scenario ownership from positively supported, candidate-specific relationships — including concurrent ingress, cross-epoch membership, and chained causality — while preserving ambiguity and uncorrelated outcomes.
+- Separate scenario ownership from direct causal-parent selection, matching the domain's existing split between `CorrelationResolution` and `SelectedCausalEdge`.
+- Define every consumed evidence kind as an explicit candidate-relative predicate; the implementation invents no semantics.
+- Derive scenario identity from stable logical scope with exactly specified bytes and versioning.
+- Keep the resolver provider-neutral, SDK-free, bounded in complexity, and independent of tracing presence.
+- Fail closed on broken inputs; never error on merely insufficient or conflicting evidence.
 
 ### Non-Goals
 
-- Persistence of correlation results; any v1 artifact change; `EventId`.
-- Provider adapters, plugin installation/discovery, CLI surfaces.
+- Producing native correlation evidence from real recordings (`derive-native-correlation-evidence`).
+- Temporal elimination of any kind in this change (no proven timeline comparability).
+- Persistence of correlation results; any v1 artifact change; `EventId`; provider adapters or plugin infrastructure.
 - Weighted/scoring/probabilistic correlation; distributed multi-host correlation.
 - Changes to capture, WAL, session reconstruction, protocol pairing, replay, or publication behavior.
 
@@ -31,97 +33,204 @@ Current code facts this design builds on:
 
 ### 1. Resolver placement: `chronicle-canonical`
 
-The resolver is correlation semantics; the foundation invariant assigns correlation semantics to `chronicle-canonical`. It extends the existing `correlation` module. No standalone crate: nothing here justifies a new dependency node, and creating one would force new edges for every consumer. ETL composes; it never implements selection rules.
+The resolver is correlation semantics; the foundation invariant assigns those to `chronicle-canonical`. It extends the existing `correlation` module. No standalone crate: nothing justifies a new dependency node. ETL composes; it never implements selection rules.
 
-### 2. Inputs and outputs
+### 2. Inputs, outputs, and CorrelationContext
 
 ```text
 CorrelationInput {
     reference: CanonicalOperationRef,
-    lifetime: OperationLifetimeView,        // from CanonicalOperation offsets/provenance
-    role: InteractionRoleResolution,        // supplied verbatim
-    evidence: Vec<CorrelationEvidence>,     // Chronicle-owned only
+    operation_view: OperationCorrelationView,   // lifetimes + provenance from CanonicalOperation
+    role: InteractionRoleResolution,            // supplied verbatim
+    evidence: Vec<CorrelationEvidence>,         // Chronicle-owned, operation-local items
+}
+
+correlation_context = {
+    role_resolutions: Map<CanonicalOperationRef, InteractionRoleResolution>,
+    evidence:        Map<CanonicalOperationRef, Vec<CorrelationEvidence>>,
 }
 
 resolve_correlation(recording_id, inputs) -> Result<CorrelationGraph, CorrelationResolverError>
 ```
 
-Output is a fully populated `CorrelationGraph` — role resolutions copied verbatim from inputs, correlation resolutions computed, scenarios created for root-eligible operations, selected edges constructed — which must pass existing `CorrelationGraph::validate(_against_sessions)` unchanged. The resolver validates its own inputs (duplicate references, scope mismatch, invalid supplied roles are errors, not silent drops) and otherwise always produces an outcome per admitted operation; there is no third "resolver failed" state for ordinary evidence situations.
+Canonical sessions supply references, lifetime views, and lineage verification. Role resolutions and evidence arrive exclusively through supplied context; sessions alone cannot fabricate them (frozen v1 sessions contain neither). Output is a fully populated `CorrelationGraph` that must pass existing foundation validation unchanged.
 
-### 3. Evidence tiers
+### 3. Scenario identity contract: `scenario-id-v1`
 
-| Tier | Kinds / conditions | Power |
-| --- | --- | --- |
-| Decisive causal link | `TraceRelationship` whose declared parent context resolves exactly to the candidate operation's trace identity | Can establish ownership alone -> `Exact` |
-| Narrowing | `TemporalLifetime` disjointness (comparable timelines only); `ExecutionTaskLineage` exact-match filtering; `ProcessThreadGeneration` / generation disjointness proving co-execution impossibility | May eliminate impossible candidates; never selects among survivors |
-| Supporting/contextual | `ConnectionSocketGeneration`, `ProtocolStream`, `ProtocolOwnership`, corroborating matches of narrowing kinds | Contributes corroboration (e.g. second independent dimension for `Strong`); never eliminates, never selects alone |
-| Never independent | Temporal overlap, bare PID/TID equality, `WireDirection`, `SocketRole`, shared connection identity, processing order | Cannot produce `Resolved` in any combination with only same-tier items; retained as evidence |
+Identity = recording identity + stable logical root-operation identity:
 
-Rules that make the tiers safe:
+```text
+scenario-id-v1 = UUID-128( SHA-256(
+    "chronicle-correlation/scenario-id/v1"   // fixed ASCII domain separator, 37 bytes
+ || recording_uuid_be                        // RecordingId as Uuid::as_bytes(), 16 bytes
+ || root_operation_uuid_be                   // OperationId  as Uuid::as_bytes(), 16 bytes
+))
+```
 
-- Shared connection/stream identity is *not* narrowing (connection reuse is normal); only generation-disjointness that proves impossibility narrows.
-- Task-lineage matching filters parents to those sharing the child's task identity; if several viable parents share it, it does not resolve.
-- Temporal overlap eliminates nothing and selects nothing. Disjointness eliminates only when both lifetimes are on a comparable timeline; cross-session comparisons without comparable offsets are treated as non-eliminating (fail-safe direction).
-- `Custom` evidence is supporting/contextual by default; a future namespaced kind must be promoted by a spec change, not by resolver discretion.
-- Conflicting decisive links to different owners yield `Ambiguous` with per-candidate evidence; processing order is invisible.
+- Field order, encoding, and sizes are fixed: ASCII separator, then big-endian UUID byte arrays (`Uuid::as_bytes()`). Fixed lengths make delimiters unnecessary.
+- Digest: first 16 bytes of the SHA-256 output become the UUID octets; then version field set to 8 (custom, RFC 9562): `octets[6] = (octets[6] & 0x0F) | 0x80`; variant set to RFC 4122: `octets[8] = (octets[8] & 0x3F) | 0x80`.
+- Epoch and session identities are NOT inputs. Regrouping the same identified operations across different session/epoch publications preserves scenario identity.
+- Guarantee boundary (explicit): stability holds within one recording lineage's persisted operation identities — restarts, retries, resumed ETL, replay over the same published artifacts, any input ordering. It does NOT hold across independent re-canonicalization that regenerates random `OperationId`s from raw WAL; that stronger cross-republication identity requires a future identity/versioning change and is not claimed anywhere in this capability.
+- Versioning: the domain separator embeds `v1`. Any change to fields, order, encoding, hash, truncation, or bit-fixups ships a new separator version and new derivation name; existing derivations never change meaning.
 
-### 4. Outcome selection
+### 4. Two-stage resolution pipeline
 
-For each non-root operation, against the current set of viable owners (scenario roots, later also resolved members):
+Stage A and Stage B answer different questions and write different graph state:
 
-1. Apply eliminating evidence -> survivor set.
-2. Exactly one survivor supported by decisive evidence -> `Resolved(Exact)`.
-3. Exactly one survivor with no decisive item but unique survival after non-temporal narrowing plus at least two independent supporting dimensions -> `Resolved(Strong)`.
-4. Multiple survivors -> `Ambiguous { candidates }` (candidate-specific evidence preserved).
-5. Zero survivors -> `Uncorrelated { evidence }`.
+```text
+all admitted inputs
+   |
+[Stage A] scenario ownership per operation
+   |    construct candidate-specific positive relationships against scenario roots/members
+   |    apply named safe contradiction checks to supported candidates only
+   |    -> Resolved(scenario, Exact|Strong) | Ambiguous(candidates+evidence) | Uncorrelated(evidence)
+   |
+[Stage B] direct causal parents for Resolved operations only
+        evaluate direct-parent predicates within the owning scenario
+        -> exactly one sufficient parent: SelectedCausalEdge
+        -> otherwise: no edge; ownership unchanged; evidence stays in the resolution
+```
 
-The resolver never emits `Inferred`; that confidence remains valid for externally supplied graphs. Ambiguity is never broken by ordering, recency, or count of weak signals.
+Ownership never requires pointing at the root: an operation may bind to any member of a scenario and may inherit membership transitively through uniquely supported parent relations to already-resolved members. Chaining rounds for transitive binding are bounded by scenario member count and processed in canonical input order.
 
-### 5. Candidate construction and scenario identity
+### 5. Relational evidence predicates
 
-Inputs are sorted by full reference tuple before any processing. One scenario candidate is created per root-eligible operation (`Known(Ingress)` only). Unknown/ambiguous-role operations never become owners; known-egress operations never become owners.
+Every rule below is normative; the implementation encodes exactly these comparisons. Child side = the operation being resolved; candidate side = a scenario root or already-resolved member. A relation exists only when both sides carry the referenced items; a missing side yields no relation, never a default.
 
-`ScenarioId` is derived deterministically from a fixed namespace plus the root reference bytes (`recording_id || owner_epoch_id || session_id || operation_id`). Same logical scenario therefore keeps its identity across restarts, retries, replay, and epoch-boundary republication; two recordings or two different roots cannot collide. Randomness, timestamps, and processing counters never enter the derivation.
+| Predicate (name) | Kind(s) | Match condition (child × candidate) | Positive support meaning | Contradiction | Supports ownership | Supports direct parent |
+| --- | --- | --- | --- | --- | --- | --- |
+| `SharedTraceIdentity` | `TraceRelationship` | same non-empty `provider` AND same non-empty `trace_id` | child shares one trace identity with that scenario — scenario-level relationship evidence | none | yes (`Exact` when it is the sole basis) | no |
+| `ExplicitParentSpan` | `TraceRelationship` | child `parent_span_id` non-empty AND equals candidate's non-empty `span_id` with same `provider`+`trace_id` | declared direct span parenthood | none | yes (via member chain inheritance) | yes — sufficient alone |
+| `SameTaskLineage` | `ExecutionTaskLineage` | exact string equality of non-empty `task` values | co-execution within one task generation — scenario-level relationship evidence | none (different tasks never contradict: spawned work gets new task identities) | yes (`Exact` when sole basis) | no |
+| `SharedSpanAmbiguity` | `TraceRelationship` | multiple distinct operations share one `provider`+`trace_id`+`span_id` | marks the span as ambiguous for direct-parent matching | — | n/a | blocks `ExplicitParentSpan` sufficiency for that span |
+| Context-only kinds | `ProcessThreadGeneration`, `ConnectionSocketGeneration`, `ProtocolStream`, `ProtocolOwnership`, `WireDirection`, `SocketRole`, `TemporalLifetime`, `Custom` | — | retained as retained/contextual evidence on outcomes | none ever | never | never |
 
-### 6. Concurrent ingress
+Additional predicate rules:
 
-Overlapping lifetimes create no preference. With Ingress A/B/C overlapping and Egress X/Y present, each egress is evaluated independently against all viable owners purely on evidence tiers. Cases:
+- Provider namespaces are part of trace identity: identical opaque IDs under different providers never match. Trace evidence stays opaque and provider-neutral while remaining namespaced.
+- Missing `span_id`/`parent_span_id`/`trace_id` degrade gracefully: the corresponding predicate simply does not fire.
+- Same `trace_id` alone NEVER implies a selected direct edge; `ExplicitParentSpan` is the only trace-derived direct-parent predicate, and `SharedSpanAmbiguity` suppresses it when several operations share the candidate's span.
+- Connection/socket/stream/process/thread equality supports nothing by itself; shared carriers are normal. They remain attached evidence for inspection.
+- `Custom` evidence is contextual by default; promoting any namespaced custom relation requires a specification change naming its predicate.
 
-- Unique evidence for X->A and Y->B: two scenarios resolve correctly regardless of start order, duration, or recency.
-- Evidence viable for both A and B: `Ambiguous { A, B }` preserved even though "most" evidence leans one way.
-- No viable owner: `Uncorrelated`.
+If a future producer cannot express these relations with current kinds, the smallest additive adjustment extends `CorrelationEvidenceKind`; this change adds none.
 
-No heuristic exists to get wrong: there is no oldest/newest/closest/active tie-break anywhere in the implementation.
+### 6. Supported-candidate model (Stage A)
 
-### 7. Cross-epoch and cross-session scenarios
+Three concepts, strictly ordered:
 
-All ownership decisions operate on full `CanonicalOperationRef`s; session/epoch difference is invisible except for lineage verification and timeline comparability (Decision 3). An ingress owned by epoch N's session and an egress owned by N+1's session resolve into one scenario; selected edges carry both full references. Terminal canonical operations are referenced by their completion-owner scope, matching the foundation's continuation rules.
+- **Possible owner** — any eligible scenario root. Existence alone creates nothing.
+- **Supported candidate** — a possible owner for which at least one positive ownership predicate (`SharedTraceIdentity`, `SameTaskLineage`, or inherited membership via `ExplicitParentSpan` chains) binds THIS operation to THAT scenario specifically.
+- **Sufficiently supported owner** — a supported candidate that survives safe contradiction checks.
 
-### 8. Chained causal edges
+Outcome selection over sufficiently supported owners:
 
-After root-level resolution settles, bounded fixed-point rounds let an operation resolve against an already-resolved member (e.g. ingress -> HTTP egress -> database egress). Edges follow the resolution chain (grandchild attaches to the member its evidence indicates), staying within foundation tree invariants: same scenario, acyclic, ≤1 selected parent, root never a child, ambiguous candidates never edges. Rounds are bounded by member count; ordering within a round is the canonical input order.
+- zero → `Uncorrelated { evidence }` (retained items include whatever contextual evidence exists);
+- exactly one → `Resolved { scenario, confidence }`;
+- two or more → `Ambiguous { candidates }`, each candidate carrying the specific evidence that supports it.
 
-### 9. Role independence
+Absence of eliminating evidence manufactures nothing. Non-candidate-specific context (shared process, connection environment, temporal overlap, protocol family) never creates supported candidates. Every entry in `Ambiguous.candidates` must be explainable by its own evidence list.
 
-The resolver copies supplied `InteractionRoleResolution` values verbatim into the output graph. It never promotes roles, resolves role ambiguity, or lets correlation outcomes rewrite classification. Operations with unknown/ambiguous roles participate in correlation as members/candidates like any other non-root operation (they simply can never be roots) — satisfying the foundation's requirement that both dimensions remain inspectable.
+Contradiction checks operate only on supported candidates and, in this revision, contain exactly one instance: **cross-scenario decisive conflict** — if `ExplicitParentSpan` relations bind one operation decisively into two different scenarios' chains, both scenarios stay supported candidates and the outcome is ambiguity; nothing discards either side. No temporal contradiction exists in this change (Decision 7). Future contradiction checks must each arrive as a named, spec-defined predicate with proven timeline/identity guarantees.
 
-### 10. ETL composition boundary
+### 7. Temporal evidence: contextual only, no elimination
 
-A small helper in `chronicle-etl` converts published `CanonicalSession` values of one recording into `CorrelationInput`s and returns the graph. It contains zero selection logic. The default publication/checkpoint path does not invoke the resolver (Chronicle's low-production-overhead philosophy); invocation is explicit, so future consumers (application use case, CLI command, persistence change) opt in. No dependency-policy change is required.
+Repository inspection found no documented recording-global timeline guarantee behind `RelativeTimeNanos` offsets (per-stream derivation, undocumented cross-session semantics). Therefore this resolver performs **no temporal elimination of any kind**:
 
-### 11. Compatibility and failure behavior
+- overlap selects nothing;
+- non-overlap eliminates nothing — an ingress that completed before downstream asynchronous work began remains fully eligible;
+- incomparable timelines need no special case because no comparison influences outcomes;
+- temporal items ride along as retained contextual evidence.
 
-In-memory runtime capability only; nothing persists. Frozen v1 contracts untouched. Invalid resolver inputs fail closed with typed errors; unverifiable references fail closed rather than resolving leniently; output graphs must pass unchanged foundation validation. If a future `persist-correlation-scenario-artifacts` change lands, it selects a separately versioned sidecar/artifact and inherits these determinism rules.
+Normative precedence rule: safe contradiction evidence may reject an asserted causal relationship only when the contradiction is logically incompatible with that relationship under documented, trustworthy, comparable timeline semantics. Ordinary lifetime non-overlap is not such a contradiction. A future safe rule (for example, candidate start strictly after child start on a proven common timeline) must be introduced by a dedicated change that first establishes the timeline guarantee in the canonical model.
+
+### 8. Confidence from semantics, not counts
+
+- `Exact` — ownership rests directly on at least one positive ownership predicate evaluated between the operation and the owning scenario's root/members (`SharedTraceIdentity`, `SameTaskLineage`, or direct `ExplicitParentSpan` binding).
+- `Strong` — ownership rests solely on transitive inheritance: the operation binds through `ExplicitParentSpan` (or equivalent future named chain relations) to already-resolved members without any direct predicate of its own.
+- `Inferred` — reserved for externally supplied graphs; this resolver never emits it.
+
+No numeric scores, vote counts, or dimension tallies exist anywhere in the resolver. Two weak contextual agreements still support nothing.
+
+### 9. Stage B: direct causal-parent selection
+
+For each `Resolved` operation, candidate parents are members of its own scenario (root included). `ExplicitParentSpan` is the currently defined sufficient direct-parent predicate; a fired `ExplicitParentSpan` whose target span is not shared (`SharedSpanAmbiguity` absent) selects exactly one edge. Outcomes:
+
+- unique sufficient parent → emit `SelectedCausalEdge { scenario, parent, child, evidence }`;
+- multiple sufficient parents, insufficient relationships, or contextual-only relations → emit NO edge; ownership stays `Resolved`; the unresolved-parenthood detail lives in the absence itself plus the resolution's retained evidence — the domain has no second ambiguity channel, and this change does not invent one;
+- proposed parents outside the owning scenario → ignored for edge construction; scenario ownership is never rewritten to make an edge valid.
+
+Foundation edge validation runs unchanged: full scoped endpoints, same scenario, acyclic, ≤1 parent per child, root never a child, ambiguous operations never in edges.
+
+### 10. Role preservation
+
+Supplied `InteractionRoleResolution` values copy verbatim into the output graph. Unknown/ambiguous-role operations participate like any non-root operation (never roots); correlation never promotes roles or rewrites classification.
+
+### 11. Boundedness and complexity
+
+- All indexes deterministic: inputs sorted by full reference tuple; relation indexes are `BTreeMap`s keyed by `(provider, trace_id)`, `task`, `(provider, trace_id, span_id)`, and reference.
+- Candidate lookup uses index hits, never full scans: cost ≈ O((N + R) log N + Σ bucket-hits), where N = operations, R = relational items; worst case degrades only when adversarial inputs share single keys (bounded by bucket size), which correctness never trades away.
+- Transitive chaining rounds are bounded by the owning scenario's member count; recursion depth is explicitly bounded — no unbounded recursion.
+- Retained evidence per outcome is capped at a documented constant (64 items), selected deterministically in canonical item order; overflow drops lowest-priority contextual items last-in-first-out and never drops predicate-bearing items that justify the outcome. Resolver state never scales with arbitrary external identifier cardinalities beyond the input set.
+- Scenario creation is bounded by root-eligible operation count.
+
+### 12. ETL composition boundary
+
+A `chronicle-etl` helper joins published `CanonicalSession` values with a caller-supplied `CorrelationContext` and produces resolver inputs:
+
+- resolves and verifies each full operation reference against session lineage (existing `resolve_in_session`);
+- enriches references with lifetime/provenance views;
+- joins context entries by exact full reference.
+
+Join rules (explicit):
+
+- session operation missing a role-resolution context entry → composition error (suppliers must classify every admitted operation; silence is not `Unknown` by default);
+- missing evidence-map entry → treated as empty evidence (valid: little evidence is a normal situation);
+- context entry referencing no session operation → composition error (mismatched scope fails closed);
+- duplicate context keys → impossible (map keyed by reference); duplicate session-operation references → composition error surfaced from verification.
+
+The helper contains zero ownership-selection semantics and is invoked explicitly — the default publication/checkpoint path never calls it (low production overhead). No dependency-policy change is required.
+
+### 13. Failure taxonomy
+
+Typed `CorrelationResolverError` (input/invariant failures, fail closed): duplicate full operation references; reference lineage/recording-scope mismatch; invalid supplied `InteractionRoleResolution`; malformed `CorrelationEvidence` (fails existing evidence validation); context join violations (Decision 12); internal graph invariant impossibility after construction.
+
+Ordinary evidence situations — never errors: missing trace context; no positive ownership evidence → `Uncorrelated`; several supported candidates → `Ambiguous`; uncertain direct parent → `Resolved` without edge; conflicting valid causal evidence between scenarios → `Ambiguous`; incomparable timing → irrelevant (contextual only).
+
+### 14. Compatibility, persistence, and follow-up boundaries
+
+In-memory runtime capability only; nothing persists; frozen v1 contracts untouched. Deferred follow-ups, in roadmap order:
+
+```text
+introduce-correlation-domain-model (done)
+        ↓
+correlate-ingress-and-egress-interactions      ← this change
+        ↓
+derive-native-correlation-evidence             ← populates the evidence this resolver consumes
+        ↓
+persist-correlation-scenario-artifacts
+        ↓
+integrate-pluggable-trace-evidence-providers
+        ↓
+trace-provider-plugin-installation
+        ↓
+scenario inspect / replay / test generation
+```
+
+`derive-native-correlation-evidence` owns deriving provider-neutral evidence from Chronicle-controlled sources (application/process/task lineage, socket/connection generations, protocol stream relationships, capture/session reconstruction facts). Until it lands, ordinary recordings legitimately produce mostly `Uncorrelated` results — the resolver consumes evidence; it does not mine sessions for it. A separate future identity/versioning change must precede or accompany any cross-republication scenario-identity claim, and a timeline-guarantee change must precede any temporal contradiction rule.
 
 ## Risks and Trade-offs
 
-- Conservative tiers mean some genuinely related operations stay `Ambiguous`/`Uncorrelated` until richer evidence kinds exist. That is intended: wrong attribution is worse than missing attribution.
-- Deterministic ID derivation couples `ScenarioId` to root-reference stability; the foundation already fixes terminal-operation scoping, so the coupling is well-defined.
-- Fixed-point chaining adds mild complexity; bounded rounds keep worst-case cost linear in members × rounds.
+- Conservative supported-candidate gating means weak-but-real signals stay uncorrelated until producers emit relational evidence. Intended: wrong attribution is worse than missing attribution.
+- Identity scoped to persisted operation identities: regrouping preserved, regeneration not — honestly bounded rather than falsely promised.
+- No temporal elimination forfeits some cheap pruning; correctness first, and a timeline-guarantee change can add named contradictions later.
+- Fixed evidence caps trade completeness of retained diagnostics for bounded memory; predicate-bearing justification items are never dropped.
 
 ## Future Changes
 
+- `derive-native-correlation-evidence`: Chronicle-native evidence derivation from capture/session/task/socket sources.
 - `persist-correlation-scenario-artifacts`: versioned persistence of resolved graphs.
-- `integrate-pluggable-trace-evidence-providers`: outer adapters translating OTel/Datadog/X-Ray/B3 data into `CorrelationEvidence`.
-- `trace-provider-plugin-installation`: install/discovery/loading UX.
+- `integrate-pluggable-trace-evidence-providers` / `trace-provider-plugin-installation`: outer adapters translating OTel/Datadog/X-Ray/B3 data into `CorrelationEvidence`, then install/discovery/loading UX.
+- Timeline-guarantee change enabling named safe temporal contradictions.
+- Identity/versioning change for cross-republication scenario stability if ever required.
 - Scenario inspect/UX, scenario replay, test-case generation/assertions.
