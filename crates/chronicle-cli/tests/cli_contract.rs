@@ -116,7 +116,15 @@ fn spawn_server(response: &'static [u8]) -> (String, Arc<Mutex<Vec<u8>>>, thread
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .expect("set read timeout");
                     let mut bytes = [0_u8; 4096];
-                    let count = stream.read(&mut bytes).expect("read request");
+                    // A signal can interrupt the read (EINTR) under loaded or
+                    // emulated CI runners; retry instead of failing the request.
+                    let count = loop {
+                        match stream.read(&mut bytes) {
+                            Ok(count) => break count,
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(error) => panic!("read request: {error}"),
+                        }
+                    };
                     observed
                         .lock()
                         .expect("request lock poisoned")
