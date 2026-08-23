@@ -452,6 +452,11 @@ def _parse_release_tree_edges(text: str) -> list[tuple[str, str]]:
         if match is None:
             continue
         indent, connector, rest = match.groups()
+        # Structural section labels such as [build-dependencies] mark the kind
+        # of the following sibling group; they are not packages and must not
+        # become nodes or disturb the ancestor stack.
+        if rest.startswith("[") and rest.endswith("]"):
+            continue
         depth = len(indent) // 4 + (1 if connector else 0)
         name = rest.split(" ")[0]
         del stack[depth:]

@@ -665,14 +665,19 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             manifest[:end] + ', features = ["otel"]' + manifest[end:]
         )
 
-    def _extend_external_crate(self, name: str, dependencies: list[str]) -> None:
+    def _extend_external_crate(
+        self,
+        name: str,
+        dependencies: list[str],
+        section: str = "dependencies",
+    ) -> None:
         """Rewrite an external fixture crate so it depends on sibling externals."""
         crate = self.temp / "external" / name
         crate.mkdir(parents=True, exist_ok=True)
         (crate / "src").mkdir(exist_ok=True)
         manifest = f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n'
         if dependencies:
-            body = "\n[dependencies]\n" + "\n".join(
+            body = "\n[" + section + "]\n" + "\n".join(
                 f'{dep} = {{ path = "../{dep}" }}' for dep in dependencies
             )
             manifest += body + "\n"
@@ -760,6 +765,76 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 ("chronicle-application", "opentelemetry_sdk"),
                 ("chronicle-application", "shared"),
                 ("chronicle-cli", "tracing"),
+            ],
+        )
+
+    def test_release_tree_parser_preserves_parent_across_section_headers(self):
+        # Section annotations such as [build-dependencies] are structural
+        # labels: they never become nodes and never reset the ancestor stack,
+        # so nested and root-level build groups keep their real parents.
+        tree = (
+            "chronicle-cli v0.1.0 (/tmp/ws)\n"
+            "|-- chronicle-application v0.1.0 (/tmp/ws)\n"
+            "|   `-- external-wrapper v0.1.0\n"
+            "|       [build-dependencies]\n"
+            "|       `-- build-helper v0.1.0\n"
+            "|           `-- opentelemetry_sdk v1.0.0\n"
+            "[build-dependencies]\n"
+            "`-- root-build-helper v0.1.0\n"
+        )
+        edges = validation._parse_release_tree_edges(tree)
+        self.assertEqual(
+            edges,
+            [
+                ("chronicle-cli", "chronicle-application"),
+                ("chronicle-application", "external-wrapper"),
+                ("external-wrapper", "build-helper"),
+                ("build-helper", "opentelemetry_sdk"),
+                ("chronicle-cli", "root-build-helper"),
+            ],
+        )
+        for parent, child in edges:
+            self.assertNotEqual(parent, "[build-dependencies]")
+            self.assertNotEqual(child, "[build-dependencies]")
+
+    def test_external_transitive_build_dependency_provider_rejected(self):
+        # The provider enters only through a third-party crate's build
+        # dependency, so neither Chronicle declarations nor dev handling can
+        # see it; the locked package-selected release graph must reject it.
+        crates = self._distribution_fixture()
+        crates["chronicle-application"].append(
+            {"package": "external-wrapper", "external": True}
+        )
+        self.write_workspace(crates)
+        self._extend_external_crate(
+            "external-wrapper",
+            ["build-helper"],
+            section="build-dependencies",
+        )
+        self._extend_external_crate("build-helper", ["opentelemetry_sdk"])
+        self._extend_external_crate("opentelemetry_sdk", [])
+        issues = self.issues_for({})
+        matches = [
+            issue
+            for issue in issues
+            if "forbidden provider dependency in default Chronicle release graph"
+            in issue
+        ]
+        self.assertEqual(len(matches), 2)
+        for issue in matches:
+            self.assertIn(
+                "chronicle-cli\n"
+                "  -> chronicle-application\n"
+                "  -> external-wrapper\n"
+                "  -> build-helper\n"
+                "  -> opentelemetry_sdk",
+                issue,
+            )
+        self.assertEqual(
+            sorted(issue.splitlines()[1] for issue in matches),
+            [
+                "target: aarch64-unknown-linux-gnu",
+                "target: x86_64-unknown-linux-gnu",
             ],
         )
 
