@@ -12,6 +12,16 @@
 # normal-layer architecture. Optional and target-specific declarations are
 # checked from Cargo metadata independent of the current host platform.
 # Package renames are evaluated by package identity, not by the rename string.
+#
+# Provider neutrality has two enforced layers ([external_dependencies]):
+# 1. Core/domain leakage: protected crates must not declare provider packages
+#    in any dependency kind.
+# 2. Default-distribution leakage: no crate reachable from a default
+#    distribution root through normal/build workspace edges (the closure the
+#    default `chronicle` executable installs and links) may declare a provider
+#    package in any normal or build declaration regardless of feature,
+#    optional, or target-specific configuration. Dev-only declarations never
+#    link into the executable.
 
 version = 1
 
@@ -171,3 +181,60 @@ forbidden_re_export_sources = [
 # and symbol plus rationale). Empty today; adding an entry requires the
 # rationale and architecture documentation update in the same change.
 allowed_re_exports = []
+
+[external_dependencies]
+# Layer 1: direct package identities forbidden in neutral/domain crates. This
+# guard is intentionally narrow: outer adapters may translate provider data,
+# while generic logging/tracing facades remain allowed unless they are provider
+# bridges. Cargo metadata supplies package identity, so renames and target-only
+# declarations cannot evade the policy.
+core_domain_crates = ["chronicle-common", "chronicle-canonical"]
+
+# Layer 2: default Chronicle distribution roots (the public `chronicle`
+# executable ships from these crates). Two complementary traversals reject
+# forbidden provider packages anywhere in the default distribution graph:
+# (a) declaration level - the transitive normal/build workspace-edge closure of
+# every root may not DECLARE a forbidden package (renamed, optional,
+# target-specific, or feature-gated included), even when currently unresolved;
+# (b) release-graph level - for every root and every target below, one locked
+# package-selected `cargo tree --locked --edges normal,build --target <t>`
+# query proves what the actual release command (`cargo build -p <root>
+# --release --locked`) would compile, so providers entering transitively
+# through third-party crates are rejected while feature activation by
+# unrelated workspace members cannot contaminate the proof. Dev-only
+# dependencies never link into the shipped executable and stay outside both
+# traversals. Separately distributed adapter/plugin crates outside this
+# closure may depend on provider packages.
+default_distribution_roots = ["chronicle-cli"]
+
+# Release targets whose distribution graph is proven provider-free. Mirrors
+# the .github/workflows/release.yml build matrix; update both when the matrix
+# changes.
+default_distribution_targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+]
+# Actual crates.io package identities verified by audit; generic facades such
+# as tracing/tracing-subscriber/tracing-core are deliberately NOT listed.
+forbidden_packages = [
+  # OpenTelemetry API/SDK and exporter/transport bridges.
+  "opentelemetry",
+  "opentelemetry_api",
+  "opentelemetry_sdk",
+  "opentelemetry-otlp",
+  "opentelemetry-http",
+  "opentelemetry-stdout",
+  "tracing-opentelemetry",
+  "opentelemetry-contrib",
+  # Datadog integrations.
+  "opentelemetry-datadog",
+  "datadog-opentelemetry",
+  "ddtrace",
+  # AWS X-Ray integrations.
+  "opentelemetry-aws",
+  "aws-sdk-xray",
+  # Other provider exporters/propagators (Jaeger, Zipkin).
+  "opentelemetry-jaeger",
+  "opentelemetry-jaeger-propagator",
+  "opentelemetry-zipkin",
+]

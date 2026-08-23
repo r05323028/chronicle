@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -355,6 +356,16 @@ class TestSupportArchitectureTests(unittest.TestCase):
 
     def issues_for(self, crates: dict[str, dict]) -> list[str]:
         self.write_workspace(crates)
+        # The release-graph layer runs cargo tree --locked, which refuses to
+        # create or update a lockfile; fixtures materialize one up front.
+        if not (self.temp / "Cargo.lock").exists():
+            subprocess.check_output(
+                ["cargo", "generate-lockfile"],
+                cwd=self.temp,
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
+            )
         return validation.architecture_check(self.temp, self.policy)["issues"]
 
     def test_cli_dev_dependency_on_lower_crate_rejected(self):

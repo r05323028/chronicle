@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import fnmatch
 import hashlib
@@ -153,28 +154,45 @@ def select(root: Path, paths: list[str], cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def workspace_edges(root: Path) -> list[dict[str, Any]]:
-    """Capture Chronicle workspace path dependencies from bounded Cargo metadata."""
+def _run_bounded_cargo_metadata(root: Path, args: list[str]) -> dict[str, Any]:
+    """Run one bounded cargo metadata invocation and parse its JSON output."""
     try:
         output = subprocess.check_output(
-            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-            cwd=root,
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=120,
+            args, cwd=root, text=True, stderr=subprocess.DEVNULL, timeout=120
         )
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("bounded cargo metadata failed; cannot check architecture")
     try:
-        value = json.loads(output)
+        return json.loads(output)
     except (ValueError, TypeError) as exc:
         raise RuntimeError(
             "cargo metadata returned malformed JSON; cannot check architecture"
         ) from exc
+
+
+def _cargo_workspace_metadata(root: Path) -> dict[str, Any]:
+    """Bounded workspace-only metadata for declarations and workspace edges."""
+    return _run_bounded_cargo_metadata(
+        root, ["cargo", "metadata", "--format-version", "1", "--no-deps"]
+    )
+
+
+# Workspace-only metadata drives declaration and workspace-edge checks; it
+# is deliberately NOT the proof of the shipped release graph (feature
+# unification across unrelated workspace members makes it over-broad). The
+# shipped-graph proof uses the package-selected locked cargo tree queries in
+# _release_distribution_issues.
+
+
+def workspace_edges(root: Path) -> list[dict[str, Any]]:
+    """Capture Chronicle workspace path dependencies from bounded Cargo metadata."""
+    value = _cargo_workspace_metadata(root)
     workspace_members = set(value.get("workspace_members", []))
     packages = {pkg["id"]: pkg for pkg in value.get("packages", [])}
     ws = {
-        pkg["name"]: pkg for pkg in packages.values() if pkg["id"] in workspace_members
+        pkg["name"]: pkg
+        for pkg in packages.values()
+        if pkg["id"] in workspace_members and pkg["name"].startswith("chronicle-")
     }
     # Resolve package identity by manifest directory so renames and local
     # aliases never change the evaluated target crate.
@@ -200,6 +218,318 @@ def workspace_edges(root: Path) -> list[dict[str, Any]]:
                 }
             )
     return edges
+
+
+def external_dependencies(root: Path) -> list[dict[str, Any]]:
+    """Capture direct non-workspace package dependencies by Cargo package identity."""
+    value = _cargo_workspace_metadata(root)
+    workspace_members = set(value.get("workspace_members", []))
+    packages = {pkg["id"]: pkg for pkg in value.get("packages", [])}
+    workspace = {
+        pkg["name"]: pkg
+        for pkg in packages.values()
+        if pkg["id"] in workspace_members and pkg["name"].startswith("chronicle-")
+    }
+    by_manifest_dir = {
+        str(Path(pkg["manifest_path"]).parent): pkg["name"]
+        for pkg in workspace.values()
+    }
+    dependencies: list[dict[str, Any]] = []
+    for source in sorted(workspace):
+        for dep in sorted(
+            workspace[source].get("dependencies", []), key=lambda d: d["name"]
+        ):
+            target = (
+                by_manifest_dir.get(str(Path(dep["path"]))) if dep.get("path") else None
+            )
+            if target in workspace:
+                continue
+            dependencies.append(
+                {
+                    "source": source,
+                    "package": dep["name"],
+                    "rename": dep.get("rename") or dep["name"],
+                    "kind": dep.get("kind") or "normal",
+                    "optional": bool(dep.get("optional")),
+                    "target_condition": dep.get("target"),
+                }
+            )
+    return dependencies
+
+
+def _distribution_closure_paths(
+    roots: list[str], edges: list[dict[str, Any]]
+) -> dict[str, tuple[list[str], str]]:
+    """Map each workspace member reachable from a distribution root to its path.
+
+    Reachability follows normal and build workspace edges only: those are the
+    dependencies the default executable installs and links. Dev dependencies
+    never link into an executable build graph and are deliberately excluded.
+    Returns member -> (member names from root to member, final hop kind).
+    """
+    children: dict[str, list[tuple[str, str]]] = {}
+    for edge in edges:
+        if edge["kind"] in ("normal", "build"):
+            children.setdefault(edge["source"], []).append(
+                (edge["target"], edge["kind"])
+            )
+    reached: dict[str, tuple[list[str], str]] = {
+        crate: ([crate], "root") for crate in roots
+    }
+    queue = collections.deque(roots)
+    while queue:
+        source = queue.popleft()
+        path, _ = reached[source]
+        for target, kind in sorted(children.get(source, [])):
+            if target in reached:
+                continue
+            reached[target] = (path + [target], kind)
+            queue.append(target)
+    return reached
+
+
+def _provider_dependency_detail(dependency: dict[str, Any]) -> str:
+    """Suffix describing kind, rename, optionality, and target condition."""
+    detail = f"[{dependency['kind']}]"
+    if dependency["rename"] != dependency["package"]:
+        detail += f" [renamed as {dependency['rename']}]"
+    if dependency["optional"]:
+        detail += " [optional]"
+    if dependency["target_condition"]:
+        detail += f" [{dependency['target_condition']}]"
+    return detail
+
+
+def _external_dependency_issues(
+    root: Path,
+    policy: dict[str, Any],
+    members: set[str],
+    edges: list[dict[str, Any]],
+) -> list[str]:
+    """Reject provider SDKs at core/domain boundaries and inside the default
+    Chronicle distribution dependency closure."""
+    protected = policy.get("core_domain_crates", [])
+    roots = policy.get("default_distribution_roots", [])
+    forbidden = policy.get("forbidden_packages", [])
+    values = (protected, roots, forbidden)
+    if not all(isinstance(value, list) for value in values):
+        return [
+            "external_dependencies must declare list-valued "
+            "core_domain_crates, default_distribution_roots, and forbidden_packages"
+        ]
+    issues: list[str] = []
+    for crate in protected:
+        if crate not in members:
+            issues.append(
+                f"external dependency policy names unknown core/domain crate {crate!r}"
+            )
+    if not roots:
+        issues.append(
+            "external dependency policy must declare a non-empty "
+            "default_distribution_roots list"
+        )
+    for crate in roots:
+        if crate not in members:
+            issues.append(
+                f"external dependency policy names unknown default distribution "
+                f"root {crate!r}"
+            )
+    if len(set(forbidden)) != len(forbidden):
+        issues.append(
+            "external dependency policy forbidden_packages contain duplicates"
+        )
+    protected_set = set(protected) & members
+    known_roots = [crate for crate in roots if crate in members]
+    closure = _distribution_closure_paths(known_roots, edges)
+    denied = set(forbidden)
+    for dependency in external_dependencies(root):
+        if dependency["package"] not in denied:
+            continue
+        source = dependency["source"]
+        if source in protected_set:
+            issues.append(
+                f"forbidden external provider dependency: "
+                f"{source} -> {dependency['package']} "
+                + _provider_dependency_detail(dependency)
+            )
+            continue
+        if source in closure and dependency["kind"] != "dev":
+            # Dev declarations never link into the shipped executable.
+            path, _ = closure[source]
+            lines = [path[0]] + [f"  -> {name}" for name in path[1:]]
+            lines.append(f"  -> {dependency['package']}")
+            lines[-1] += " " + _provider_dependency_detail(dependency)
+            issues.append(
+                "forbidden provider dependency in default Chronicle distribution:\n"
+                + "\n".join(lines)
+            )
+    targets = policy.get("default_distribution_targets", [])
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or not all(isinstance(item, str) and item for item in targets)
+    ):
+        issues.append(
+            "external dependency policy must declare a non-empty "
+            "default_distribution_targets list of release target triples"
+        )
+        targets = []
+    if len(set(targets)) != len(targets):
+        issues.append(
+            "external dependency policy default_distribution_targets contain duplicates"
+        )
+        targets = list(dict.fromkeys(targets))
+    if known_roots and denied and targets:
+        issues.extend(
+            _release_distribution_issues(
+                root, known_roots, denied, targets, workspace_member_names(root)
+            )
+        )
+    return issues
+
+
+# Accepts both ASCII (`--charset ascii`) and default Unicode tree drawing
+# units, so a Cargo build that ignores or overrides the charset request still parses.
+_RELEASE_TREE_LINE = re.compile(
+    r"^((?:\|   |    |\u2502   )*)((?:\|-- |`-- |\u251c\u2500\u2500 |\u2514\u2500\u2500 )?)(.*)$"
+)
+# Cargo may still emit SGR-styled connectors when color control leaks through (for example a pseudo-TTY); strip ANSI escapes before parsing.
+_ANSI_ESCAPE = re.compile("\x1b\\[[0-9;]*[A-Za-z]")
+
+
+def _cargo_release_tree(workspace: Path, package: str, target: str) -> str:
+    """Run one bounded locked package-selected dependency graph query.
+
+    Mirrors the release command `cargo build -p <package> --release --locked`
+    for one distribution target: `--locked` refuses to re-resolve Cargo.lock,
+    `-p <package>` selects features by that root alone (no workspace-wide
+    feature unification), `--target <triple>` resolves as that platform, and
+    `--edges normal,build` excludes dev-only edges that never link into the
+    executable. Output uses the stable ASCII tree grammar (4-character units).
+    """
+    try:
+        return subprocess.check_output(
+            [
+                "cargo",
+                "tree",
+                "--locked",
+                "-p",
+                package,
+                "--target",
+                target,
+                "--edges",
+                "normal,build",
+                "--charset",
+                "ascii",
+                "--color",
+                "never",
+            ],
+            cwd=workspace,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"bounded cargo tree failed for {package} ({target}); cannot check architecture"
+        ) from exc
+
+
+def _parse_release_tree_edges(text: str) -> list[tuple[str, str]]:
+    """Parse ASCII cargo tree output into parent->child name edge pairs.
+
+    Each line is zero or more 4-character ancestor units (`|   ` or spaces),
+    an optional connector (`|-- ` or '`-- '), then the package text whose
+    first whitespace-separated token is the real package name (renames never
+    change it; deduplicated repeats end in `(*)`).
+    """
+    edges: list[tuple[str, str]] = []
+    stack: list[str] = []
+    for line in _ANSI_ESCAPE.sub("", text).splitlines():
+        if not line.strip():
+            continue
+        match = _RELEASE_TREE_LINE.match(line)
+        if match is None:
+            continue
+        indent, connector, rest = match.groups()
+        # Structural section labels such as [build-dependencies] mark the kind
+        # of the following sibling group; they are not packages and must not
+        # become nodes or disturb the ancestor stack.
+        if rest.startswith("[") and rest.endswith("]"):
+            continue
+        depth = len(indent) // 4 + (1 if connector else 0)
+        name = rest.split(" ")[0]
+        del stack[depth:]
+        if depth > 0:
+            edges.append((stack[depth - 1], name))
+        stack.insert(depth, name)
+        del stack[depth + 1 :]
+    return edges
+
+
+def workspace_member_names(root: Path) -> set[str]:
+    """Actual Chronicle workspace member package names from bounded metadata."""
+    value = _cargo_workspace_metadata(root)
+    id_to_name = {
+        package["id"]: package["name"] for package in value.get("packages", [])
+    }
+    return {
+        id_to_name[member]
+        for member in value.get("workspace_members", [])
+        if member in id_to_name
+    }
+
+
+def _release_distribution_issues(
+    workspace: Path,
+    root_names: list[str],
+    forbidden: set[str],
+    targets: list[str],
+    member_names: set[str],
+) -> list[str]:
+    """Reject forbidden packages reachable in the locked release graph.
+
+    For every configured default-distribution root and supported release
+    target, exactly one bounded cargo tree query proves what the release
+    artifact would compile. Reachability follows parsed normal/build edges;
+    diagnostics show the dependency path from the root plus the target.
+    """
+    issues: list[str] = []
+    for target in targets:
+        # A root declared by policy but absent from this particular workspace
+        # (partial validation fixtures) has no release graph to prove.
+        for package in (name for name in root_names if name in member_names):
+            raw_tree = _cargo_release_tree(workspace, package, target)
+            edges = _parse_release_tree_edges(raw_tree)
+            adjacency: dict[str, list[str]] = {}
+            for parent, child in edges:
+                adjacency.setdefault(parent, []).append(child)
+            reached: dict[str, str | None] = {package: None}
+            queue = collections.deque([package])
+            while queue:
+                current = queue.popleft()
+                for nxt in adjacency.get(current, []):
+                    if nxt in reached:
+                        continue
+                    reached[nxt] = current
+                    queue.append(nxt)
+            for node in sorted(reached):
+                if node not in forbidden:
+                    continue
+                chain: list[str] = []
+                cursor: str | None = node
+                while cursor is not None:
+                    chain.append(cursor)
+                    cursor = reached[cursor]
+                chain.reverse()
+                lines = [f"target: {target}", chain[0]] + [
+                    f"  -> {name}" for name in chain[1:]
+                ]
+                issues.append(
+                    "forbidden provider dependency in default Chronicle release "
+                    "graph:\n" + "\n".join(lines)
+                )
+    return issues
 
 
 def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
@@ -316,6 +646,13 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
     cycles = find_cycles(edges)
     if cycles:
         issues.append(f"dependency cycle: {' -> '.join(cycles[0])}")
+    external_policy = policy.get("external_dependencies", {})
+    external_issues = (
+        _external_dependency_issues(root, external_policy, member_set, edges)
+        if external_policy
+        else []
+    )
+    issues.extend(external_issues)
     semantic = policy.get("semantic", {})
     semantic_issues = semantic_check(root, semantic) if semantic else []
     issues.extend(semantic_issues)
@@ -328,6 +665,7 @@ def architecture_check(root: Path, path: Path | None = None) -> dict[str, Any]:
         "build_edges": sum(1 for e in edges if e["kind"] == "build"),
         "cyclic": bool(cycles),
         "semantic": bool(semantic),
+        "external_dependencies": bool(external_policy),
         "issues": issues,
     }
 

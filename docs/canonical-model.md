@@ -11,11 +11,19 @@ Canonical endpoints come only from capture socket evidence:
 - active socket: local = client, remote = server;
 - passive socket: remote = client, local = server.
 
-Ingress/egress selects byte direction only. ETL returns typed failure for missing or conflicting socket evidence and never stores `unknown:0` endpoints.
+Ingress/egress describes ownership relative to the recorded application; byte direction remains evidence only. ETL returns typed failure for missing or conflicting socket evidence and never stores `unknown:0` endpoints.
 
 Session-level `source_provenance`, `connection_completeness`, `operation_completeness`, and `replay_attributes` are ordinary v1 fields. Completeness maps are authoritative. `timeline` is sole operation order. Cross-epoch operations record their completion-owner epoch and ordered contributing epoch/WAL ranges; continuation-only or incomplete outcomes remain non-replayable. `PayloadRef` supports bounded inline bytes, filesystem artifacts, S3-compatible references with checksum and size, redacted values, and explicit missing values. `BTreeMap` attributes keep serialization deterministic.
 
 Protocol data declares `PROTOCOL_DATA_SCHEMA_VERSION = 1`; canonical validation rejects any other value. Protocol extension bytes remain narrow and typed by media type rather than replacing core canonical fields.
+
+## Correlation foundation (non-v1 integration surface)
+
+Chronicle keeps logical interaction identity in `CanonicalOperation`/`OperationId`; no `InteractionId` or `EventId` is added. A recording-scoped correlation graph uses `ScenarioId` from `chronicle-common` and references operations with `CanonicalOperationRef { recording_id, owner_epoch_id, session_id, operation_id }`. Durable graph validation requires an explicit set of canonical sessions and verifies recording, owner epoch/session, unique operation occurrence, completion-owner provenance, and contributing ranges; bare or unbound references fail closed. The owner epoch/session identifies the authoritative canonical occurrence; existing `OperationProvenance.epoch_ranges` retains contributing epoch ranges, so continuation-only evidence is not a duplicate operation and a scenario survives rollover.
+
+`InteractionRole::{Ingress,Egress}` describes ownership relative to the recorded application, not `ClientToServer`/`ServerToClient` byte direction. `InteractionRoleResolution` preserves evidence-bearing `Known`, `Unknown`, and candidate-specific `Ambiguous` states. `CorrelationGraph` independently stores `Resolved`, `Ambiguous`, and `Uncorrelated` outcomes, scenario membership, and selected acyclic causal edges. Unknown/ambiguous operations remain inspectable; only `Known(Ingress)` may be a scenario root. Correlation membership does not change completeness or replayability.
+
+`CorrelationEvidence` is Chronicle-owned, tagged, provenance-bearing, and framework-neutral. Trace context is optional opaque enrichment. External tracing SDK types and provider integrations stay outside `chronicle-common` and `chronicle-canonical`; `validation/architecture.toml` checks direct package identity for protected core/domain crates. None of this foundation mutates Capture Event v1, Canonical Session v1, WAL v1, or public JSON. Persisted correlation requires a separately versioned sidecar/new artifact or explicit 0.2 compatibility/migration change.
 
 ## Storage
 
