@@ -262,7 +262,7 @@ The foundation implementation accepts already constructed canonical operations, 
 
 ## Compatibility and Migration Plan
 
-This change requires no persisted-schema migration and does not mutate Capture Event v1, Canonical Session v1, WAL v1, or public APIs; no rollback-specific production migration is introduced.
+This change requires no persisted-schema migration and does not modify Capture Event v1, Canonical Session v1, WAL v1, existing public CLI contracts, or existing declared public JSON/wire contracts. It adds new additive non-v1 canonical-domain Rust APIs for correlation; no rollback-specific production migration is introduced.
 
 Future implementation order:
 

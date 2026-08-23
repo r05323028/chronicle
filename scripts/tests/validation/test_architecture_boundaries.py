@@ -677,8 +677,11 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         (crate / "src").mkdir(exist_ok=True)
         manifest = f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n'
         if dependencies:
-            body = "\n[" + section + "]\n" + "\n".join(
-                f'{dep} = {{ path = "../{dep}" }}' for dep in dependencies
+            body = (
+                "\n["
+                + section
+                + "]\n"
+                + "\n".join(f'{dep} = {{ path = "../{dep}" }}' for dep in dependencies)
             )
             manifest += body + "\n"
         (crate / "Cargo.toml").write_text(manifest)
