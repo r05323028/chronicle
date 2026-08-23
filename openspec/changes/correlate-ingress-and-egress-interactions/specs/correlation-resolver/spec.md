@@ -1,24 +1,23 @@
 ## Purpose
 
-Define Chronicle's deterministic, provider-neutral, ambiguity-safe resolver that selects scenario ownership and selected causal-parent structure for canonical operations from Chronicle-owned role resolutions and candidate-relative `CorrelationEvidence`, producing valid `CorrelationGraph` output. The resolver computes what the `correlation-domain-model` capability validates; foundation validation semantics remain authoritative for resolver output.
+Define Chronicle's deterministic, provider-neutral, ambiguity-safe resolver that selects scenario ownership and selected causal-parent structure for canonical operations from Chronicle-owned role resolutions and candidate-relative `CorrelationEvidence`, producing valid `CorrelationGraph` output. The resolver computes what the `correlation-domain-model` capability validates; foundation validation semantics remain authoritative and unchanged.
 
 ## ADDED Requirements
 
 ### Requirement: Resolver is deterministic and provider-neutral
 
-Chronicle SHALL provide a two-stage resolver that consumes recording-scoped canonical operation references, supplied `InteractionRoleResolution` values, and Chronicle-owned `CorrelationEvidence`, and SHALL produce a populated `CorrelationGraph` satisfying all `correlation-domain-model` invariants without modification of that validator. Given identical inputs, results SHALL be identical — including derived `ScenarioId`s, representation ordering, and retained evidence — across process restarts, ETL retries, ETL replay over the same persisted canonical artifacts, worker scheduling, input iteration order, and map/hash iteration order. The resolver SHALL NOT depend on or expose OpenTelemetry, W3C, B3, Datadog, AWS X-Ray, Jaeger, Zipkin, or other tracing SDK types.
+Chronicle SHALL provide a three-phase resolver that consumes recording-scoped canonical operation references, supplied `InteractionRoleResolution` values, and Chronicle-owned `CorrelationEvidence`, and SHALL produce a populated `CorrelationGraph` satisfying all correlation graph structural/domain invariants. Given identical inputs, results SHALL be identical — including derived `ScenarioId`s, representation ordering, retained witnesses, and edges — across process restarts, ETL retries, ETL replay over the same persisted canonical artifacts, worker scheduling, input iteration order, map/hash iteration order, causal-chain depth, and support-discovery order. The resolver SHALL NOT depend on or expose OpenTelemetry, W3C, B3, Datadog, AWS X-Ray, Jaeger, Zipkin, or other tracing SDK types.
 
 #### Scenario: Restart and retry stability
 
 - **WHEN** the resolver runs twice over identical canonical inputs in separate invocations simulating restart, ETL retry, and replay over the same persisted artifacts
-- **THEN** both outputs are identical including every derived `ScenarioId` and retained evidence selection
+- **THEN** both outputs are identical including every derived `ScenarioId` and retained witness selection
 - **AND** no output depends on wall-clock time, randomness, or processing counters
 
 #### Scenario: Input order independence
 
-- **WHEN** the same canonical inputs are presented in different iteration orders, including orders that would differ under hash-map traversal
-- **THEN** semantic correlation outcomes, memberships, edges, identifiers, and retained witnesses are unchanged
-- **AND** any representation reordering is a deterministic canonical sort, not an outcome change
+- **WHEN** the same canonical inputs are presented in different operation orders, session orders, or chain presentation orders, including orders that would differ under hash-map traversal
+- **THEN** final support sets, correlation outcomes, memberships, edges, identifiers, and retained witnesses are identical
 
 #### Scenario: No provider SDK enters resolution
 
@@ -28,7 +27,7 @@ Chronicle SHALL provide a two-stage resolver that consumes recording-scoped cano
 
 ### Requirement: Scenario identity derives from the complete authoritative root reference
 
-The resolver SHALL derive each `ScenarioId` as `scenario-id-v1`: the first 16 bytes of `SHA-256(fixed_domain_separator || recording_uuid_be || owner_epoch_uuid_be || session_uuid_be || operation_uuid_be)` rendered as a UUID with version field 8 (`octets[6] = (octets[6] & 0x0F) | 0x80`) and RFC 4122 variant (`octets[8] = (octets[8] & 0x3F) | 0x80`). The fixed domain separator SHALL be the exact ASCII bytes `chronicle-correlation/scenario-id/v1`; field order SHALL be separator, then the four `Uuid::as_bytes()` big-endian arrays of the root operation's authoritative `CanonicalOperationRef` in declaration order — recording, owner epoch, session, operation. Bare `OperationId` SHALL NOT be used outside its owning scope because the foundation forbids assuming cross-session uniqueness. Scenario identity SHALL be stable across resolver restarts, retries, replay over the same persisted canonical artifacts, worker scheduling, input iteration order, and map/hash iteration order. Scenario identity SHALL NOT currently be guaranteed across canonical-session regrouping that changes the authoritative root reference, publication into a different owning session/epoch, independent re-canonicalization, or regenerated `OperationId`s; such durability requires a dedicated future logical-identity change.
+The resolver SHALL derive each `ScenarioId` as `scenario-id-v1`: the first 16 bytes of `SHA-256(fixed_domain_separator || recording_uuid_be || owner_epoch_uuid_be || session_uuid_be || operation_uuid_be)` rendered as a UUID with version field 8 (`octets[6] = (octets[6] & 0x0F) | 0x80`) and RFC 4122 variant (`octets[8] = (octets[8] & 0x3F) | 0x80`). The fixed domain separator SHALL be the exact ASCII byte sequence of `chronicle-correlation/scenario-id/v1` (36 bytes); field order SHALL be separator, then the four `Uuid::as_bytes()` big-endian arrays of the root operation's authoritative `CanonicalOperationRef` in declaration order — recording, owner epoch, session, operation. Bare `OperationId` SHALL NOT be used outside its owning scope. Known-answer tests SHALL hash the actual separator bytes rather than any hard-coded length. Scenario identity SHALL be stable across resolver restarts, retries, replay over the same persisted canonical artifacts, worker scheduling, input iteration order, and map/hash iteration order. Scenario identity SHALL NOT currently be guaranteed across canonical-session regrouping that changes the authoritative root reference, publication into a different owning session/epoch, independent re-canonicalization, or regenerated `OperationId`s; such durability requires a dedicated future logical-identity change.
 
 #### Scenario: Deterministic derivation under repetition and permutation
 
@@ -39,8 +38,7 @@ The resolver SHALL derive each `ScenarioId` as `scenario-id-v1`: the first 16 by
 #### Scenario: Duplicate OperationId across sessions yields distinct scenarios
 
 - **WHEN** Recording R owns Session A with a root whose `OperationId` equals X and Session B with a distinct root whose `OperationId` also equals X
-- **THEN** the two roots remain distinct `CanonicalOperationRef`s
-- **AND** their scenarios receive distinct derived identities because owner-epoch/session scope participates in the derivation
+- **THEN** the two roots remain distinct `CanonicalOperationRef`s with distinct derived scenario identities because owner-epoch/session scope participates in the derivation
 - **AND** neither scenario absorbs or collides with the other
 
 #### Scenario: Identity guarantee boundary is honest
@@ -49,9 +47,9 @@ The resolver SHALL derive each `ScenarioId` as `scenario-id-v1`: the first 16 by
 - **THEN** scenario identifiers may legitimately differ and this is conforming behavior
 - **AND** no requirement claims stability across changed publication scope, which stays deferred to a dedicated durable logical-identity change
 
-### Requirement: Scenario roots self-resolve through Chronicle-owned ScenarioRoot evidence
+### Requirement: Scenario roots self-resolve through Chronicle-owned ScenarioRoot evidence and stay pinned
 
-For every admitted operation whose role resolution is `Known(Ingress)`, the resolver SHALL derive the scenario identifier from that operation's complete authoritative reference, create `Scenario { id, root, members: [root] }`, and record the root's own correlation resolution as `Resolved { scenario: id, confidence: Exact, evidence: [ScenarioRoot { root }] }`. This change SHALL add one additive Chronicle-owned evidence kind, `CorrelationEvidenceKind::ScenarioRoot { root: CanonicalOperationRef }`, meaning the resolver deterministically establishes this known-ingress operation as the root of the scenario derived from its full reference; it SHALL be non-temporal so foundation validation accepts the root's resolution unchanged. Root-establishment SHALL be correlation-level evidence distinct from role classification: role evidence answers ingress-versus-egress while `ScenarioRoot` answers which scenario the root owns. The resolver SHALL generate this evidence itself; callers SHALL never place synthetic root evidence into correlation context. Role resolutions SHALL remain verbatim.
+For every admitted operation whose role resolution is `Known(Ingress)`, the resolver SHALL derive the scenario identifier from that operation's complete authoritative reference, create `Scenario { id, root, members: [root] }`, and record the root's own correlation resolution as `Resolved { scenario: id, confidence: Exact, evidence: [ScenarioRoot { root }] }`. This change SHALL add one additive Chronicle-owned evidence kind, `CorrelationEvidenceKind::ScenarioRoot { root: CanonicalOperationRef }`, meaning the resolver deterministically establishes this known-ingress operation as the root of the scenario derived from its full reference; it SHALL be non-temporal so existing foundation validation accepts the root's resolution unchanged. Root establishment is correlation-level evidence distinct from role classification. During Phase A1 support propagation, every established root SHALL have its support set pinned to exactly its own `ScenarioId`: generic ownership predicates SHALL NOT add further scenarios to a root, roots SHALL never become ambiguous or migrate into another scenario, and trace/task/context evidence SHALL NOT override root establishment. Pinning applies only to scenario roots; non-root operations propagate ordinarily. Role resolutions SHALL remain verbatim throughout.
 
 #### Scenario: Root resolves to its own scenario exactly once
 
@@ -63,7 +61,7 @@ For every admitted operation whose role resolution is `Known(Ingress)`, the reso
 
 - **WHEN** a recording contains one `Known(Ingress)` operation and no other operations resolve into its scenario
 - **THEN** the resulting graph contains a valid scenario whose membership is exactly its root
-- **AND** existing foundation validation accepts the graph without weakening
+- **AND** `validate_against_sessions(supplied_sessions)` accepts the graph without weakening any lineage check
 
 #### Scenario: Root establishment does not alter role state
 
@@ -71,9 +69,41 @@ For every admitted operation whose role resolution is `Known(Ingress)`, the reso
 - **THEN** A's `InteractionRoleResolution` remains byte-identical to its supplied value
 - **AND** inspecting scenario membership never substitutes for or mutates role evidence
 
+#### Scenario: Roots sharing one trace remain independently owned
+
+- **WHEN** Ingress A and Ingress B both carry trace relationships with equal provider and trace id
+- **THEN** A stays pinned to Scenario A and B stays pinned to Scenario B
+- **AND** neither root joins, supports, or becomes ambiguous across the other's scenario
+
+#### Scenario: Shared span identity between roots does not merge them
+
+- **WHEN** two known-ingress roots expose span items under one shared provider+trace+span identity
+- **THEN** each root remains resolved to its own scenario
+- **AND** shared-span effects apply only to direct-parent selection, never to root pinning
+
+#### Scenario: Contextual overlap cannot pull a root across scenarios
+
+- **WHEN** a root overlaps another scenario temporally or shares process, connection, or task context with it
+- **THEN** the root's support set remains pinned to its own scenario
+
+### Requirement: Caller-controlled input rejects ScenarioRoot everywhere
+
+Before resolution begins, the resolver SHALL validate that no caller-supplied `ScenarioRoot` item appears anywhere in caller-controlled input: correlation-context evidence maps, `InteractionRoleResolution::Known.evidence`, `Unknown.evidence`, and `Ambiguous.candidates[*].evidence`. Each occurrence SHALL fail as a typed input error. `ScenarioRoot` remains a valid graph-domain value exclusively in resolver output; only the resolver may create it, after input validation identifies actual `Known(Ingress)` roots.
+
+#### Scenario: Direct context evidence injection fails closed
+
+- **WHEN** a context evidence entry contains a `ScenarioRoot` item
+- **THEN** resolution fails with a typed input error naming the offending reference
+
+#### Scenario: Role-evidence smuggling fails closed
+
+- **WHEN** `ScenarioRoot` appears inside `Known.evidence`, `Unknown.evidence`, or any `Ambiguous.candidates[*].evidence`
+- **THEN** resolution fails with a typed input error in every case
+- **AND** no path exists to pre-establish scenarios through caller-supplied data
+
 ### Requirement: Candidates come only from known ingress roots
 
-Stage A SHALL construct one scenario per admitted `Known(Ingress)` operation via the root-establishment semantics above. Operations with `Known(Egress)`, `Unknown`, or `Ambiguous` role resolutions SHALL never own or root a scenario. Scenarios SHALL exist even when nothing else resolves into them.
+Phase A1 SHALL initialize support exactly once per admitted `Known(Ingress)` operation via pinned root establishment. Operations with `Known(Egress)`, `Unknown`, or `Ambiguous` role resolutions SHALL never own or root a scenario. Scenarios SHALL exist even when nothing else resolves into them.
 
 #### Scenario: One scenario per known ingress
 
@@ -93,43 +123,44 @@ Stage A SHALL construct one scenario per admitted `Known(Ingress)` operation via
 - **THEN** no scenario is created rooted at that operation
 - **AND** the supplied role resolution is preserved instead of promoted
 
-### Requirement: Evidence acts only through named candidate-relative predicates
+### Requirement: Evidence acts only through named candidate-relative predicates over full validated input
 
-The resolver SHALL interpret evidence exclusively through defined relational predicates comparing child-side items against candidate-side items; it SHALL NOT infer semantics from field names alone. A predicate fires only when both sides carry the referenced items; missing sides yield no relation, never defaults. Positive ownership predicates are:
+The resolver SHALL interpret evidence exclusively through defined relational predicates comparing child-side items against candidate-side items; it SHALL NOT infer semantics from field names alone. A predicate fires only when both sides carry the referenced items; missing sides yield no relation, never defaults. Ownership-relevant predicates are:
 
-- `SharedTraceIdentity` — child `TraceRelationship` and candidate `TraceRelationship` share equal non-empty `provider` AND equal non-empty `trace_id`: positive scenario-level relationship support for that specific scenario; never direct-parent evidence; provider namespaces are part of identity, so identical opaque values under different providers never match.
-- `ExplicitParentSpan` — child non-empty `parent_span_id` equals a candidate's non-empty `span_id` under the same `provider`+`trace_id`: declared direct span parenthood; supports transitive membership inheritance and is sufficient for Stage B direct parenthood unless the target span is shared by multiple operations.
+- `SharedTraceIdentity` — child `TraceRelationship` and candidate `TraceRelationship` share equal non-empty `provider` AND equal non-empty `trace_id`: adds that specific scenario to the child's support set as DIRECT scenario-level support; never direct-parent evidence; provider namespaces are part of identity, so identical opaque values under different providers never match.
+- `ExplicitParentSpan` — child non-empty `parent_span_id` equals a candidate's non-empty `span_id` under the same `provider`+`trace_id`: declared direct span parenthood; the child inherits the candidate's previous-round support entries transitively; sufficient for Phase B direct parenthood unless the target span is shared by multiple operations.
 
-Resolver-generated `ScenarioRoot` evidence resolves each root to its own scenario per the root-establishment requirement. All remaining kinds — `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, `ProtocolStream`, `ProtocolOwnership`, `WireDirection`, `SocketRole`, `TemporalLifetime`, `Custom` — are contextual only: they support no ownership, no parenthood, contradict nothing, and are retained for inspection. Task and process lineage equality is contextual because no repository contract defines those strings as unique causal-execution identity; `derive-native-correlation-evidence` owns defining such contracts and may promote named predicates through specification changes. Shared span identity (`provider`+`trace_id`+`span_id` carried by multiple operations) blocks only direct-parent sufficiency, never scenario ownership. Promoting any additional predicate requires a specification change naming its comparison rule.
+Resolver-generated `ScenarioRoot` evidence initializes and pins each root per the root-establishment requirement. All remaining kinds — `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, `ProtocolStream`, `ProtocolOwnership`, `WireDirection`, `SocketRole`, `TemporalLifetime`, `Custom` — are contextual only: they add nothing to any support set, contradict nothing, and are retained for inspection. Task and process lineage equality is contextual because no repository contract defines those strings as unique causal-execution identity; `derive-native-correlation-evidence` owns defining such contracts and may promote named predicates through specification changes. Shared span identity blocks only direct-parent sufficiency, never support propagation. Promoting any additional predicate requires a specification change naming its comparison rule.
+
+All predicate evaluation, relation indexes, support propagation, ambiguity detection, and parent selection SHALL operate on the complete validated input evidence set; retention truncation SHALL occur only after semantic resolution is complete as output representation, so evidence volume beyond the retention cap can never alter outcomes.
 
 #### Scenario: Same trace supports several members of one scenario without duplication
 
-- **WHEN** DB Z shares one provider+trace identity with Ingress A, HTTP X, and HTTP Y — all members of Scenario A
-- **THEN** Stage A produces exactly one supported candidate keyed by Scenario A
-- **AND** the three member matches aggregate into one candidate witness set rather than duplicate Scenario A candidates
+- **WHEN** DB Z shares one provider+trace identity with Ingress A, HTTP X, and HTTP Y — all of Scenario A
+- **THEN** Z's support set contains Scenario A exactly once
+- **AND** the three matches aggregate into one scenario-keyed support entry whose internal witnesses record all matching paths
 
-#### Scenario: Explicit parent span selects the direct parent
+#### Scenario: Explicit parent span selects the direct parent after closure
 
-- **WHEN** egress Z carries `parent_span_id` equal to HTTP X's unique `span_id` under the same provider and trace id
-- **THEN** Stage B emits the X → Z selected edge within their common scenario
+- **WHEN** egress Z carries `parent_span_id` equal to HTTP X's unique `span_id` under the same provider and trace id, and Z's final ownership is Resolved(X's scenario)
+- **THEN** Phase B emits the X → Z selected edge within that scenario
 
 #### Scenario: Shared span ambiguity blocks only the edge
 
-- **WHEN** two operations in the same scenario expose the same `provider`+`trace_id`+`span_id` and a child's `parent_span_id` targets that span
-- **THEN** scenario ownership may still resolve on other predicates
+- **WHEN** two operations expose the same `provider`+`trace_id`+`span_id` and a child's `parent_span_id` targets that span
+- **THEN** support propagation through those members still works normally
 - **AND** no selected direct-parent edge is produced toward the shared span
 
 #### Scenario: Same task string alone resolves nothing
 
 - **WHEN** two concurrent known-ingress roots and one egress all carry identical `ExecutionTaskLineage.task` labels with no trace relation between them
-- **THEN** no supported candidate exists for the egress
-- **AND** the outcome is `Uncorrelated` until some positive predicate fires
+- **THEN** no support entry exists for the egress
+- **AND** the outcome is `Uncorrelated` until some ownership predicate fires
 
 #### Scenario: Cross-provider identical IDs never match
 
 - **WHEN** a child carries `provider: "otel", trace_id: "T"` and a candidate carries `provider: "xray", trace_id: "T"`
 - **THEN** no predicate fires between them
-- **AND** provider namespaces remain part of trace identity
 
 #### Scenario: Missing sides degrade to no relation
 
@@ -139,71 +170,79 @@ Resolver-generated `ScenarioRoot` evidence resolves each root to its own scenari
 #### Scenario: Context-only agreement manufactures nothing
 
 - **WHEN** an egress shares process/thread generation, connection environment, protocol family, temporal overlap, and task label with several ingresses but holds no trace relational items
-- **THEN** no scenario becomes a supported candidate from those items
+- **THEN** no scenario enters the egress's support set from those items
 - **AND** they remain retained contextual evidence on whatever outcome is emitted
 
-### Requirement: Ownership requires positive supported candidates aggregated by scenario
+### Requirement: Scenario support propagates monotonically to closure before outcomes materialize
 
-Stage A SHALL distinguish possible owners (eligible roots), supported candidates (possible owners bound to THIS operation by at least one fired positive ownership predicate), and sufficiently supported owners (supported candidates surviving contradiction checks). Supported candidates SHALL be keyed by `ScenarioId`: multiple members of one scenario matching the same operation aggregate into ONE candidate carrying the union of matching witnesses, never duplicates. Absence of eliminating evidence SHALL NOT create support. Outcomes over sufficiently supported owners: zero → `Uncorrelated { evidence }`; exactly one → `Resolved { scenario, Exact }`; two or more → `Ambiguous { candidates }` where every candidate retains deterministic witness evidence explaining why that specific scenario remains viable. Non-candidate-specific context SHALL never manufacture candidates.
+The resolver SHALL split ownership determination into Phase A1 and Phase A2. Phase A1 SHALL maintain `support[operation] : Set<ScenarioId>`, initialized with each root pinned to its own scenario and each non-root operation holding scenarios discoverable through direct positive relationships. Each round SHALL evaluate against a snapshot of the previous round's support state and union newly discoverable scenarios from direct `SharedTraceIdentity`, transitive `ExplicitParentSpan` inheritance through candidates whose support was present in the snapshot, and any future spec-authorized predicates. Support sets SHALL grow monotonically within a run — scenarios may enter, never leave — and SHALL be stored sparsely, creating entries only for discovered positive relationships. A productive round strictly grows at least one `(operation, ScenarioId)` membership; rounds terminate when none grows. Phase A2 SHALL run only after termination: empty support → `Uncorrelated`; exactly one scenario → `Resolved`; multiple → `Ambiguous { candidates }` with one candidate per supported scenario, keyed by `ScenarioId`, each retaining deterministic support witnesses. Final `Resolved`/`Ambiguous` values SHALL NOT be assigned during propagation.
+
+#### Scenario: Short path and long path converge to ambiguity
+
+- **WHEN** Scenario A's support reaches operation Z through a shorter chain in an earlier round while Scenario B's support reaches Z through a longer chain discovered in a later round
+- **THEN** at closure Z's support set contains both Scenario A and Scenario B
+- **AND** the materialized outcome is `Ambiguous(A, B)`, never an early `Resolved(A)` frozen before B became discoverable
+
+#### Scenario: Reversed chain depths do not change results
+
+- **WHEN** the same inputs are presented with reversed operation order, reversed session order, or altered chain presentation
+- **THEN** final support sets, resolutions, identifiers, witnesses, and edges are identical
+- **AND** intra-round eligibility never depends on presentation position
 
 #### Scenario: No evidence does not manufacture ambiguity
 
-- **WHEN** Ingress A and Ingress B exist and egress X carries no candidate-specific relational evidence
-- **THEN** X's outcome is `Uncorrelated`
-- **AND** it does not become `Ambiguous(A, B)` merely because neither was eliminated
+- **WHEN** Ingress A and Ingress B exist and egress X closes with empty support
+- **THEN** X materializes as `Uncorrelated`
+- **AND** it does not become ambiguous merely because neither was eliminated
 
 #### Scenario: Candidate-specific ambiguity only
 
-- **WHEN** egress X carries positive relational evidence specifically supporting Scenario A and specifically supporting Scenario B, while unrelated Ingress C holds none
+- **WHEN** egress X's closed support set is exactly {A, B} from positive relational paths, while unrelated Ingress C contributed nothing
 - **THEN** the outcome is `Ambiguous(A, B)`
-- **AND** C never appears merely because it was not eliminated
-- **AND** each emitted candidate retains its own explaining witnesses
+- **AND** C never appears and each emitted candidate retains its own explaining witnesses
 
 #### Scenario: One ingress owns multiple egress interactions
 
-- **WHEN** Ingress A's scenario is positively linked by shared-trace relations to HTTP egress X and PostgreSQL egress Y, with no competing supported candidate for either
-- **THEN** X and Y both resolve to Scenario A
-- **AND** Scenario A contains Ingress A as root with both egress members
+- **WHEN** HTTP egress X and PostgreSQL egress Y close with support {A} through shared-trace relations and nothing else supports them
+- **THEN** both materialize `Resolved(Scenario A)` and Scenario A contains Ingress A as root with both members
 
 #### Scenario: Concurrent ingresses resolve independently
 
-- **WHEN** Ingress A and Ingress B overlap in time while relational predicates uniquely connect egress X to A and egress Y to B
-- **THEN** the resolver produces Scenario A {A, X} and Scenario B {B, Y}
-- **AND** neither scenario absorbs the other's member despite lifetime overlap
+- **WHEN** Ingress A and Ingress B overlap in time while relational paths give egress X support {A} and egress Y support {B}
+- **THEN** the materialized graph holds Scenario A {A, X} and Scenario B {B, Y}
 
 #### Scenario: Strong causal relation overrides timing intuition
 
-- **WHEN** a decisive trace relation binds egress X to Ingress A while Ingress B is temporally closer
-- **THEN** X resolves to Scenario A
-- **AND** temporal proximity contributes nothing anywhere in the decision
+- **WHEN** a decisive trace path gives X support {A} while Ingress B is temporally closer
+- **THEN** X materializes Resolved(Scenario A)
+- **AND** temporal proximity contributes nowhere
 
-#### Scenario: No valid parent remains uncorrelated
+#### Scenario: Stalled chains stop cleanly
 
-- **WHEN** no supported candidate survives for an egress
-- **THEN** the result is `Uncorrelated` with retained evidence
-- **AND** no synthetic owner, root, or membership entry is created
+- **WHEN** a round adds no support membership
+- **THEN** propagation terminates leaving empty-support operations uncorrelated and multi-supported operations ambiguous
 
 ### Requirement: Temporal evidence is contextual only
 
-Because current canonical offset semantics provide no documented recording-global timeline guarantee, the resolver SHALL perform no temporal elimination of any kind in this change. Lifetime overlap SHALL contribute no support; lifetime non-overlap SHALL eliminate no candidate — including a candidate whose lifetime ended before the child's began, since asynchronous downstream work may start after its cause completes. Safe contradiction evidence may reject an asserted relationship only when logically incompatible under documented, trustworthy, comparable timeline semantics; ordinary lifetime non-overlap is not such a contradiction. Temporal relationships SHALL never override positive relational evidence. Any future temporal contradiction rule requires a dedicated change establishing timeline guarantees first.
+Because current canonical offset semantics provide no documented recording-global timeline guarantee, the resolver SHALL perform no temporal elimination of any kind in this change. Lifetime overlap SHALL add no support; lifetime non-overlap SHALL remove nothing and block nothing — including a candidate whose lifetime ended before the child's began, since asynchronous downstream work may start after its cause completes. Safe contradiction evidence may reject an asserted relationship only when logically incompatible under documented, trustworthy, comparable timeline semantics; ordinary lifetime non-overlap is not such a contradiction. Temporal relationships SHALL never override positive relational evidence. Any future temporal contradiction rule requires a dedicated change establishing timeline guarantees first.
 
 #### Scenario: Async child after ingress completion
 
-- **WHEN** Ingress A completed before egress X began, and trace relational evidence binds X to A's scenario
-- **THEN** X resolves to Scenario A
+- **WHEN** Ingress A completed before egress X began, and trace relational evidence puts A's scenario in X's support set
+- **THEN** X may materialize Resolved(Scenario A)
 - **AND** lifetime non-overlap eliminates nothing and downgrades nothing
 
 #### Scenario: Decisive linkage despite disjoint lifetimes
 
-- **WHEN** an explicit parent-span relation binds a child to a candidate whose lifetime is entirely earlier
-- **THEN** the relation retains full force
+- **WHEN** an explicit parent-span path binds a child to a candidate whose lifetime is entirely earlier
+- **THEN** the path retains full force
 - **AND** no rule compares lifetimes for elimination
 
 #### Scenario: Temporal-only evidence stays unresolved
 
 - **WHEN** an egress overlaps one or more ingress lifetimes and holds no relational predicate
-- **THEN** the outcome is not `Resolved`
-- **AND** the egress remains uncorrelated with its temporal evidence retained
+- **THEN** its support set stays empty on that basis
+- **AND** the outcome is uncorrelated with temporal evidence retained
 
 #### Scenario: Reverse causal ordering is not evaluated in this change
 
@@ -211,61 +250,50 @@ Because current canonical offset semantics provide no documented recording-globa
 - **THEN** this revision still performs no elimination because comparable-timeline guarantees do not yet exist
 - **AND** introducing that check requires the dedicated timeline-guarantee change
 
-### Requirement: Confidence reflects relationship semantics, not counts
+### Requirement: Confidence reflects final support proofs, not counts or discovery order
 
-The resolver SHALL map confidence from how ownership was established: `Exact` when ownership rests on a direct positive scenario-level relationship using a named exact predicate — `SharedTraceIdentity` against the owning scenario, or resolver-generated `ScenarioRoot` establishment for roots; `Strong` when ownership is inherited transitively through a uniquely established `ExplicitParentSpan` member chain without any direct scenario-level identity match of its own. The resolver SHALL never emit `Inferred`; externally supplied graphs retain that freedom. Contextual evidence SHALL never yield `Strong`; counts of matching items, evidence dimensions, temporal proximity, connection reuse, and process/thread equality SHALL contribute nothing to confidence.
+After Phase A2, confidence SHALL derive from how each single supported scenario entered the closed support set: `Exact` when the final support entry contains a direct scenario-level relationship for the operation itself (`SharedTraceIdentity`) or the operation is a pinned `ScenarioRoot`; `Strong` when the operation has no direct scenario-level relationship and its unique final scenario support exists solely through one or more transitive `ExplicitParentSpan` support paths. When several proof paths reach the same scenario, direct support yields `Exact` over transitive `Strong`. When support reaches multiple different scenarios the result is `Ambiguous` and confidence is not materialized. The resolver SHALL never emit `Inferred`; externally supplied graphs retain that freedom. Counts of matching items, evidence dimensions, temporal proximity, connection reuse, process/thread equality, and chain-discovery order SHALL contribute nothing to confidence.
 
 #### Scenario: Directly bound ownership is Exact
 
-- **WHEN** an egress resolves because `SharedTraceIdentity` binds it to the owning scenario directly, or a root resolves through `ScenarioRoot` establishment
-- **THEN** the resolution carries `Exact` confidence
+- **WHEN** an egress closes with support {A} via `SharedTraceIdentity`, or a root closes through `ScenarioRoot` pinning
+- **THEN** the materialized resolution carries `Exact` confidence
 
-#### Scenario: Inherited ownership is Strong
+#### Scenario: Purely inherited ownership is Strong
 
-- **WHEN** a grandchild joins a scenario solely through explicit parent-span chains via already-resolved members with no direct identity match of its own
-- **THEN** the resolution carries `Strong` confidence
-- **AND** scenario ownership semantics are unchanged from direct resolution
+- **WHEN** a grandchild's sole support path into its unique scenario runs through transitive explicit parent-span relations with no direct identity match of its own
+- **THEN** the materialized resolution carries `Strong` confidence
 
-#### Scenario: Weak agreements stay weak
+#### Scenario: Discovery order never picks confidence
 
-- **WHEN** multiple contextual-only dimensions agree about a candidate
-- **THEN** no resolution and no confidence upgrade follows from their count
+- **WHEN** the same operation has one direct path and one transitive path into the same scenario, presented in either discovery order
+- **THEN** the resolution is `Exact` in both runs because direct beats transitive by canonical rule
+- **AND** no round index influences classification
 
-### Requirement: Transitive inheritance runs as an iterative monotonic fixpoint
+#### Scenario: Ambiguity skips confidence
 
-Chaining SHALL use iterative rounds only — no recursive traversal. Each round SHALL evaluate operations against a snapshot of the previous round's resolved state, admitting newly resolved operations only in the following round, and SHALL repeat until a round admits nothing new. Resolved membership SHALL never be removed or reassigned during one run. Every productive round SHALL admit at least one previously unresolved operation, bounding productive rounds by the admitted-operation count. After a no-progress round, unsupported operations remain `Uncorrelated`, multi-candidate-supported operations remain `Ambiguous`, and no fallback fires.
+- **WHEN** closed support contains multiple scenarios
+- **THEN** the outcome is `Ambiguous` without any confidence value
 
-#### Scenario: Long chain resolves through iterative rounds
+### Requirement: Direct causal-parent selection runs only after final ownership exists
 
-- **WHEN** a causal chain longer than any arbitrary depth heuristic connects many operations through explicit parent-span relations
-- **THEN** successive snapshot rounds resolve every chain member
-- **AND** no recursion-depth cap truncates the chain
+Phase B SHALL run exclusively on the Phase A2 outcome — never during propagation. For each operation materializing `Resolved(S)`, Phase B SHALL evaluate sufficient direct-parent predicates among the FINAL members of Scenario S only. Exactly one sufficient parent — currently a fired, unshared `ExplicitParentSpan` — SHALL emit one `SelectedCausalEdge` retaining its predicate witness. Multiple equally sufficient parents, insufficient relationships, contextual-only relations, or proposed parents outside Scenario S SHALL emit NO edge; ownership stays unchanged, unresolved parenthood lives in edge absence plus retained witnesses, and no second ambiguity channel is invented. Operations materializing `Ambiguous` or `Uncorrelated` SHALL receive no selected edges. Foundation edge validation runs unchanged: full scoped endpoints, same scenario, acyclic, at most one parent per child, root never a child.
 
-#### Scenario: Reversed input order yields identical output
+#### Scenario: Stage B waits for final ownership
 
-- **WHEN** the same multi-level chain is presented in forward and reversed operation order
-- **THEN** outcomes, memberships, edges, and identifiers are identical
-- **AND** intra-round eligibility never depends on presentation position within a round
-
-#### Scenario: Stalled chains stop cleanly
-
-- **WHEN** a round admits nothing new
-- **THEN** resolution terminates leaving unsupported operations uncorrelated and multi-supported operations ambiguous
-
-### Requirement: Direct causal-parent selection is a separate stage
-
-For operations already `Resolved` into a scenario, Stage B SHALL evaluate sufficient direct-parent predicates among members of that same scenario only. Exactly one sufficient parent — currently a fired, unshared `ExplicitParentSpan` — SHALL emit one `SelectedCausalEdge` retaining its predicate witness. Multiple equally sufficient parents, insufficient relationships, or contextual-only relations SHALL leave the operation resolved with NO selected edge; unresolved parenthood is represented by edge absence plus retained witnesses, never by a second ambiguity channel or duplicate candidates. Proposed parents outside the owning scenario SHALL be ignored without rewriting ownership. Foundation edge validation runs unchanged: full scoped endpoints, same scenario, acyclic, at most one parent per child, root never a child, ambiguous operations never in edges.
+- **WHEN** a child temporarily held support {A} during propagation and later gained B, closing as `Ambiguous(A, B)`
+- **THEN** no selected edge referencing that child exists from the intermediate A-only state
+- **AND** ambiguous children receive no edges at all
 
 #### Scenario: Same scenario, unresolved direct parent
 
-- **WHEN** Database Z positively belongs to Scenario A while HTTP X and HTTP Y carry equally sufficient direct-parent relations toward Z
-- **THEN** Z remains `Resolved(Scenario A)`
-- **AND** no selected edge references Z as child
-- **AND** no duplicated or self-referential ambiguity candidate is invented
+- **WHEN** Database Z materializes Resolved(Scenario A) while HTTP X and HTTP Y carry equally sufficient direct-parent relations toward Z
+- **THEN** Z remains Resolved(Scenario A)
+- **AND** no selected edge references Z as child and no duplicated ambiguity candidate is invented
 
 #### Scenario: Unique direct parent emits the edge
 
-- **WHEN** evidence uniquely establishes X → Z inside Scenario A
+- **WHEN** evidence uniquely establishes X → Z inside final Scenario A membership
 - **THEN** one selected edge connects X to Z with full scoped references and its predicate witness
 
 #### Scenario: Cross-scenario direct-parent evidence is ignored for edges
@@ -273,32 +301,25 @@ For operations already `Resolved` into a scenario, Stage B SHALL evaluate suffic
 - **WHEN** a proposed direct parent belongs to another scenario
 - **THEN** the edge is not emitted and neither operation's scenario ownership changes
 
-#### Scenario: Chained egress forms a grandchild edge without changing ownership
-
-- **WHEN** an ingress causes an HTTP egress and that egress causes a database egress through explicit parent-span relations
-- **THEN** the graph contains ingress → HTTP and HTTP → database edges within one scenario
-- **AND** all three belong to the same single scenario
-
 #### Scenario: Tree invariant violations are impossible by construction
 
 - **WHEN** the resolver completes any input set
 - **THEN** the emitted graph contains no self-edge, cycle, multi-parent child, or child root
-- **AND** existing graph validation accepts the edge set unchanged
+- **AND** structural graph validation accepts the edge set unchanged
 
 #### Scenario: Ambiguous candidates never become edges
 
-- **WHEN** an operation ends ambiguous between Scenarios A and B
+- **WHEN** an operation materializes ambiguous between Scenarios A and B
 - **THEN** no selected edge references that operation in either scenario
-- **AND** its candidate relationships remain only in resolution evidence
 
 ### Requirement: Role resolution is preserved verbatim
 
-The resolver SHALL copy supplied `InteractionRoleResolution` values into the output graph unchanged, including during root establishment. Correlation outcomes, selected edges, and scenario membership SHALL NOT rewrite an `Unknown` or `Ambiguous` role into a known role. Operations with unknown or ambiguous roles MAY become members through ordinary relational resolution but SHALL never become roots.
+The resolver SHALL copy supplied `InteractionRoleResolution` values into the output graph unchanged, including during root establishment and support propagation. Correlation outcomes, selected edges, and scenario membership SHALL NOT rewrite an `Unknown` or `Ambiguous` role into a known role. Operations with unknown or ambiguous roles MAY become members through ordinary relational resolution but SHALL never become roots.
 
 #### Scenario: Unknown-role member keeps unknown role
 
-- **WHEN** an operation with role resolution `Unknown` carries relational evidence binding it to Scenario A
-- **THEN** it may appear as a Scenario A member with a `Resolved` outcome
+- **WHEN** an operation with role resolution `Unknown` carries relational evidence putting Scenario A in its support set
+- **THEN** it may materialize as a Scenario A member with a `Resolved` outcome
 - **AND** its role resolution remains `Unknown` with original evidence intact
 
 #### Scenario: Ambiguous-role member is never promoted
@@ -314,13 +335,12 @@ The resolver SHALL copy supplied `InteractionRoleResolution` values into the out
 
 ### Requirement: Connection reuse preserves operation independence
 
-Multiple logical operations sharing one physical connection SHALL remain independent canonical operations and independent correlation subjects throughout resolution. Connection, socket, stream, process, and thread identities SHALL remain evidence only and SHALL never merge operations, transfer resolutions, or equal any scenario identity.
+Multiple logical operations sharing one physical connection SHALL remain independent canonical operations and independent correlation subjects throughout resolution. Connection, socket, stream, process, and thread identities SHALL remain evidence only and SHALL never merge operations, transfer support, or equal any scenario identity.
 
 #### Scenario: Shared connection does not merge scenarios
 
 - **WHEN** two egress exchanges reuse one database connection while belonging to relation-distinct scenarios
 - **THEN** both remain separate members of their respective scenarios
-- **AND** shared carrier identity neither merges nor reassigns either
 
 #### Scenario: Carrier identity never equals scenario identity
 
@@ -356,7 +376,7 @@ Trace context SHALL act as high-quality relational evidence when present, and th
 
 #### Scenario: Trace-assisted resolution
 
-- **WHEN** provider-neutral trace relational evidence uniquely establishes ownership for concurrent traffic
+- **WHEN** provider-neutral trace relational evidence uniquely populates support sets for concurrent traffic
 - **THEN** the resolver uses it like any relational evidence
 - **AND** no provider SDK type or adapter participates in resolution
 
@@ -374,7 +394,7 @@ Trace context SHALL act as high-quality relational evidence when present, and th
 
 ### Requirement: ETL composes through an explicit CorrelationContext join
 
-`chronicle-etl` MAY compose resolution by joining published `CanonicalSession` values with an explicitly supplied provider-neutral correlation context containing role resolutions and correlation evidence keyed by full operation reference. Canonical sessions alone SHALL NOT constitute complete resolver input, and the helper SHALL NOT synthesize or fabricate roles, evidence, or root establishment — the resolver owns scenario creation and generates `ScenarioRoot` evidence itself. Join rules SHALL be explicit: an admitted session operation with no context role-resolution entry SHALL fail composition as an error; a missing context evidence entry SHALL be treated as empty evidence; a context entry referencing no verified session operation SHALL fail composition as an error. The helper SHALL verify full operation references against session lineage, contain zero ownership-selection semantics, and remain explicitly invoked — the default publication/checkpoint path SHALL NOT call it.
+`chronicle-etl` MAY compose resolution by joining published `CanonicalSession` values with an explicitly supplied provider-neutral correlation context containing role resolutions and correlation evidence keyed by full operation reference. Canonical sessions alone SHALL NOT constitute complete resolver input, and the helper SHALL NOT synthesize roles, evidence, or root establishment — including rejecting caller-supplied `ScenarioRoot` items wherever they appear in supplied context or nested role evidence. Join rules SHALL be explicit: an admitted session operation with no context role-resolution entry SHALL fail composition as an error; a missing context evidence entry SHALL be treated as empty evidence; a context entry referencing no verified session operation SHALL fail composition as an error. The helper SHALL verify full operation references against session lineage, contain zero ownership-selection semantics, and remain explicitly invoked — the default publication/checkpoint path SHALL NOT call it.
 
 #### Scenario: Composition joins sessions with supplied context
 
@@ -386,7 +406,6 @@ Trace context SHALL act as high-quality relational evidence when present, and th
 
 - **WHEN** an admitted session operation lacks a role-resolution context entry
 - **THEN** composition returns a typed error identifying the reference
-- **AND** it neither defaults the role implicitly nor drops the operation
 
 #### Scenario: Missing evidence entries are valid emptiness
 
@@ -398,13 +417,6 @@ Trace context SHALL act as high-quality relational evidence when present, and th
 
 - **WHEN** a context entry references an operation absent from all supplied sessions after lineage verification
 - **THEN** composition returns a typed error naming the mismatched reference
-- **AND** no silent partial admission occurs
-
-#### Scenario: Callers never supply root evidence
-
-- **WHEN** composition builds resolver inputs from context entries containing `ScenarioRoot` items
-- **THEN** such caller-supplied root claims are rejected as invalid context content because root establishment belongs exclusively to the resolver
-- **AND** scenario creation remains deterministic regardless of caller input
 
 #### Scenario: Publication path stays unchanged
 
@@ -417,50 +429,57 @@ Trace context SHALL act as high-quality relational evidence when present, and th
 - **THEN** the crate membership, allowlist edges, semantic boundaries, and external-dependency guards pass without edits beyond declaring the workspace-standard hashing dependency
 - **AND** no standalone correlation crate exists and no provider package enters any protected closure
 
-### Requirement: Retention keeps minimal deterministic witnesses within bounded capacity
+### Requirement: Retention happens after semantics and keeps minimal deterministic witnesses within bounded capacity
 
-The resolver SHALL retain evidence sufficient to explain each semantic outcome, not every matching item. For `Resolved` outcomes it SHALL retain a deterministic minimal witness set proving chosen-scenario ownership and confidence — the fired predicate item(s), or the resolver-generated `ScenarioRoot` item for roots — plus the direct-parent predicate witness for any emitted edge, filling remaining capacity with contextual/input evidence in canonical input order up to the documented constant. For `Ambiguous` outcomes it SHALL retain, for EVERY emitted candidate, at least one deterministic candidate-specific witness proving that scenario's support, then fill canonically; retention capacity SHALL apply per candidate so ordinary valid ambiguity can neither silently drop candidates nor turn into errors. For `Uncorrelated` outcomes it SHALL retain contextual/input evidence deterministically up to the cap, since no ownership witness exists. Selected edges SHALL retain their direct-parent predicate witness. Witness ordering SHALL be justification-first in canonical predicate order, then canonical contextual fill; recency SHALL NOT determine priority.
+Retention SHALL occur only after Phase A2 and Phase B complete, as output representation over the closed support structure. For `Resolved` outcomes the resolver SHALL retain a deterministic minimal witness proving chosen-scenario ownership and confidence — selected from internal support witnesses by canonical priority `ScenarioRoot` > `ExplicitParentSpan` (transitive proof) > `SharedTraceIdentity` (direct) — plus the direct-parent predicate witness for any emitted edge, filling remaining capacity with contextual/input evidence in canonical input order up to the documented constant. For `Ambiguous` outcomes it SHALL retain, for EVERY emitted candidate, at least one deterministic candidate-specific witness chosen from that scenario's internal support witnesses by the same priority, then fill canonically; retention capacity SHALL apply per candidate so ordinary valid ambiguity neither silently drops candidates nor turns into errors. For `Uncorrelated` outcomes it SHALL retain contextual/input evidence deterministically up to the cap, since no ownership witness exists. Selected edges SHALL retain their direct-parent predicate witness. Witness selection SHALL read the closed support structure rather than arrival or discovery order, making byte-stable retained output well-defined; recency SHALL NEVER determine priority.
 
 #### Scenario: Cap pressure preserves correctness and witnesses
 
-- **WHEN** more raw evidence exists than the retention constant
-- **THEN** the semantic outcome remains correct, deterministic, and explained by retained minimal witnesses
-- **AND** overflow affects only optional contextual fill
+- **WHEN** more raw evidence exists than the retention constant while relational support stays fixed
+- **THEN** support sets, materialized outcomes, and selected edges remain identical to an uncapped run
+- **AND** only optional retained contextual fill differs according to the deterministic cap policy
 
 #### Scenario: Wide ambiguity keeps every candidate explainable
 
 - **WHEN** an operation ends ambiguous across many scenarios and combined raw evidence exceeds the global constant
-- **THEN** each candidate still retains at least one candidate-specific witness
-- **AND** no candidate is dropped and no boundedness error is raised for ordinary valid ambiguity
+- **THEN** each candidate retains at least one candidate-specific witness
+- **AND** no candidate drops and no boundedness error arises for ordinary valid ambiguity
 
 #### Scenario: Uncorrelated retention has no fake witness
 
-- **WHEN** an operation resolves as uncorrelated
+- **WHEN** an operation materializes uncorrelated
 - **THEN** retained items are contextual/input evidence only
 - **AND** no ownership witness is manufactured after the fact
 
-### Requirement: Resolver resource use is bounded and indexed
+### Requirement: Resolver resource use is bounded by sparse support growth
 
-The resolver SHALL use deterministic ordered indexes for candidate and relation lookup, SHALL avoid full scans proportional to operations-times-ingresses-times-evidence where index hits suffice, SHALL run transitive inheritance as the bounded iterative monotonic fixpoint defined above, SHALL keep internal state proportional to the input set rather than arbitrary external identifier cardinalities, and SHALL document its retention constant. Correctness SHALL never be traded for these bounds; where adversarial key-sharing degrades lookup, behavior remains correct.
+The resolver SHALL use deterministic ordered indexes for relation lookup, SHALL store scenario-support sets sparsely — creating `(operation, ScenarioId)` entries only for discovered positive relationships and never eagerly allocating an operation-times-scenario matrix — and SHALL terminate Phase A1 when no support membership is added. A productive round SHALL add at least one previously absent support membership, giving a formal upper bound of N operations times S scenarios memberships; actual usage tracks discovered relationships. There SHALL be no recursion. Internal state SHALL stay proportional to the input set plus discovered support rather than arbitrary external identifier cardinalities. Correctness SHALL never be traded for these bounds.
 
 #### Scenario: Indexed lookups replace global scans
 
 - **WHEN** resolution processes many operations and concurrent ingress requests
-- **THEN** candidate evaluation consults ordered indexes keyed by relation fields and reference
+- **THEN** predicate evaluation consults ordered indexes keyed by relation fields and reference
 - **AND** no step iterates every operation against every ingress against every evidence item
 
-#### Scenario: State scales with inputs only
+#### Scenario: Support storage stays sparse
 
-- **WHEN** recordings contain arbitrarily many distinct external identifier values unrelated to admitted operations
-- **THEN** resolver memory grows with admitted inputs and retained witnesses, not identifier cardinality
+- **WHEN** recordings contain many scenarios but most operations hold few or no relationships
+- **THEN** allocated support entries track discovered positives only
+- **AND** no full operation-by-scenario structure is materialized
+
+#### Scenario: Termination is guaranteed by monotonic growth
+
+- **WHEN** Phase A1 runs on any input set
+- **THEN** each productive round adds at least one new `(operation, ScenarioId)` membership within the N-times-S bound
+- **AND** propagation terminates deterministically
 
 ### Requirement: Invalid inputs fail closed while insufficient evidence resolves normally
 
-Typed resolver errors — failing closed — SHALL cover: duplicate full operation references; reference lineage or recording-scope mismatch; invalid supplied `InteractionRoleResolution`; malformed `CorrelationEvidence`; correlation-context join violations including caller-supplied `ScenarioRoot` content; and impossible internal graph invariants after construction. Ordinary evidence situations SHALL always yield an outcome rather than an error: missing trace context; no positive ownership evidence → `Uncorrelated`; several supported candidates → `Ambiguous`; uncertain direct parent → `Resolved` without an edge; conflicting valid causal evidence between scenarios → `Ambiguous`; incomparable timing → irrelevant because temporal evidence is contextual only.
+Typed resolver errors — failing closed — SHALL cover: duplicate full operation references; reference lineage or recording-scope mismatch; invalid supplied `InteractionRoleResolution`; malformed `CorrelationEvidence`; caller-supplied `ScenarioRoot` in ANY caller-controlled container (context evidence, role evidence, ambiguous-candidate evidence); correlation-context join violations; and impossible internal graph invariants after construction. Ordinary evidence situations SHALL always yield an outcome rather than an error: missing trace context; no positive ownership evidence → `Uncorrelated`; several supported scenarios → `Ambiguous`; uncertain direct parent → `Resolved` without an edge; conflicting valid causal evidence between scenarios → `Ambiguous`; incomparable timing → irrelevant because temporal evidence is contextual only.
 
 #### Scenario: Broken inputs are typed errors
 
-- **WHEN** resolver inputs contain duplicate references, mismatched recording scope, invalid roles, malformed evidence, or join violations
+- **WHEN** resolver inputs contain duplicate references, mismatched recording scope, invalid roles, malformed evidence, smuggled root claims, or join violations
 - **THEN** the resolver rejects the input set with a typed error naming the violation
 - **AND** it neither silently drops the offending data nor guesses substitutes
 
@@ -469,6 +488,21 @@ Typed resolver errors — failing closed — SHALL cover: duplicate full operati
 - **WHEN** inputs are valid but carry no relational evidence, several competing relations, or uncertain parenthood
 - **THEN** the resolver returns `Uncorrelated`, `Ambiguous`, or `Resolved` without an edge respectively
 - **AND** no error is raised for any of these situations
+
+### Requirement: Output validation uses explicit session lineage context
+
+Resolver output SHALL satisfy all correlation graph structural/domain invariants and SHALL succeed under `validate_against_sessions(...)` when the required canonical-session lineage context is supplied. This change SHALL NOT require context-free `validate()` success for non-empty graphs, because the existing foundation defines `validate()` as `validate_against_sessions(&[])` and intentionally fails non-empty graphs with missing-session errors; that contract remains unchanged and lineage validation SHALL NOT be weakened. Implementation MAY expose an additive public structural-validation API equivalent to the existing private structural check if needed, without altering `validate()` semantics.
+
+#### Scenario: Full validation succeeds with supplied sessions
+
+- **WHEN** a non-empty resolver-produced graph is validated against the canonical sessions that own its referenced operations
+- **THEN** `validate_against_sessions(valid_sessions)` succeeds
+
+#### Scenario: Context-free validate semantics remain unchanged
+
+- **WHEN** `validate()` is called directly on a non-empty graph under the current foundation API
+- **THEN** it fails with missing-session context exactly as the foundation defines today
+- **AND** this behavior is expected, tested, and not treated as a resolver defect
 
 ### Requirement: Resolver remains runtime-only and compatibility-safe
 
