@@ -9,6 +9,8 @@ Repository facts this design is built on (verified on current main):
 - **The public validator contract is `validate_against_sessions(sessions)`**: `CorrelationGraph::validate()` delegates to `validate_against_sessions(&[])`, so any non-empty graph fails with `MissingSessionContext` under it — existing foundation tests assert exactly this. Resolver requirements demand structural invariants plus successful `validate_against_sessions(...)` with supplied lineage context, never context-free `validate()` success.
 - **Foundation validation requires non-empty, non-temporal-only correlation evidence for every `Resolved` outcome** (`CorrelationResolution::validate`). A scenario root therefore needs Chronicle-owned correlation-level evidence establishing its membership — role evidence cannot double as correlation evidence.
 - **The foundation separates role classification from scenario correlation**, so role evidence nested inside `InteractionRoleResolution` must never become correlation input.
+- **No validator prohibits `span_id == parent_span_id`** inside a single `TraceRelationship`, so a self-parent relation (`A -> A`) is representable in evidence and must be rejected explicitly during Phase B construction rather than left to cycle detection.
+- **`EvidenceProvenance { source: String, observation: Option<String> }`** participates in evidence equality — canonical witness ordering must cover provenance or byte-stable output breaks under permutation.
 - **`RelativeTimeNanos(u64)` carries no documented recording-global timeline guarantee**, so temporal elimination is unsound in this change.
 - **Evidence kinds are operation-local records with no proven causal-execution identity semantics**: `ExecutionTaskLineage.task` is an opaque string whose producer-side meaning is undefined; equality cannot be trusted as causal identity today.
 - **`ScenarioId` is UUID-backed** (`chronicle-common`); `sha2` is already a workspace dependency used by six crates; `chronicle-canonical` does not yet declare it.
@@ -19,10 +21,10 @@ Repository facts this design is built on (verified on current main):
 
 - Deterministically reconstruct scenario ownership from positively supported, candidate-specific relationships — concurrent ingress, cross-epoch membership, chained causality — preserving ambiguity and uncorrelated outcomes regardless of discovery order or chain depth.
 - Separate role-evidence and correlation-evidence input channels; separate scenario ownership from direct causal-parent selection; separate support propagation from outcome materialization.
-- Construct Phase B parent edges globally per scenario with deterministic cycle-safe removal — valid graphs by construction, never validator-rejection triage.
+- Construct Phase B parent edges through a fixed normative sequence per scenario — invalid-relation pre-filter, unique-parent mapping, whole-graph SCC analysis, internal-cycle-edge removal — valid by construction, never by validator-rejection triage.
 - Define every consumed evidence kind as an explicit candidate-relative predicate; the implementation invents nothing.
+- Define a total canonical ordering over equivalent witnesses (semantic fields + provenance + candidate scope) and over transitive proof paths, so retained output is byte-stable under any presentation order.
 - Derive scenario identity from the complete scoped root reference with exactly specified bytes and versioning.
-- Retain witnesses consistent with materialized confidence, keeping ownership witnesses and direct-parent witnesses distinct.
 
 ### Non-Goals
 
@@ -32,6 +34,7 @@ Repository facts this design is built on (verified on current main):
 - Weighted/scoring/probabilistic correlation; distributed multi-host correlation.
 - Changes to capture, WAL, session reconstruction, protocol pairing, replay, or publication behavior.
 - Changing the meaning of `CorrelationGraph::validate()` or weakening lineage validation (an additive structural-validation API may be exposed only if implementation needs it).
+- A new parent-ambiguity domain type; arbitrary cycle tie-breakers; temporal reasoning; native task/process predicates.
 - Durable logical-operation identity that survives republication scope changes (dedicated future change).
 
 ## Decisions
@@ -118,7 +121,7 @@ Two safety rules surround root establishment:
 
 ### 6. Three-phase resolution pipeline
 
-Phase A1 propagates scenario-support sets to a fixed point without finalizing outcomes; Phase A2 materializes outcomes once after closure; Phase B constructs parent edges globally from final ownership:
+Phase A1 propagates scenario-support sets to a fixed point without finalizing outcomes; Phase A2 materializes outcomes once after closure; Phase B constructs parent edges globally from final ownership through the fixed sequence of Decision 10:
 
 ```text
 all admitted inputs
@@ -135,7 +138,7 @@ immutable correlation-channel relation indexes (FULL validated correlation evide
    |    {} -> Uncorrelated ; {A} -> Resolved(A) ; {A,B,...} -> Ambiguous(A,B,...)
 |    construct final scenario memberships
    |
-[B] GLOBAL direct-parent construction per scenario (see Decision 10)
+[B] GLOBAL direct-parent construction per scenario (Decision 10)
    |
 deterministic minimal-witness retention (output only)
    |
@@ -157,7 +160,7 @@ Ownership-relevant predicates:
 | Predicate | Match condition (child × candidate) | Meaning | Powers |
 | --- | --- | --- | --- |
 | `SharedTraceIdentity` | same non-empty `provider` AND same non-empty `trace_id` in correlation-channel `TraceRelationship` items | child shares one trace identity with that scenario — DIRECT scenario-level support | adds scenario to child's support set; never direct parent |
-| `ExplicitParentSpan` | child non-empty `parent_span_id` equals candidate's non-empty `span_id` under same `provider`+`trace_id` | declared direct span parenthood | child inherits candidate's previous-round support entries transitively; sufficient for Phase B direct parenthood unless span shared |
+| `ExplicitParentSpan` | child non-empty `parent_span_id` equals candidate's non-empty `span_id` under same `provider`+`trace_id` | declared direct span parenthood | child inherits candidate's previous-round support entries transitively; candidate for Phase B direct parenthood subject to Decision 10 filters |
 | `ScenarioRoot` (resolver-generated) | established per created scenario's root | pins the root to its own scenario | resolves the root itself |
 
 Contextual-only kinds — add nothing anywhere, contradict nothing, retained for inspection: `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, `ProtocolStream`, `ProtocolOwnership`, `WireDirection`, `SocketRole`, `TemporalLifetime`, `Custom`.
@@ -190,64 +193,94 @@ Confidence from final support proofs (not counts, not discovery order):
 - `Inferred` — reserved for externally supplied graphs; never emitted here;
 - multiple supported scenarios → `Ambiguous`; confidence is not materialized.
 
-When several proof paths reach the same scenario: direct beats transitive; among equals a canonical ordering applies (Decision 11). Chain-discovery order never influences confidence.
+When several proof paths reach the same scenario: direct beats transitive; among equals the canonical path ordering of Decision 11 applies. Chain-discovery order never influences confidence.
 
 ### 9. Temporal evidence: contextual only, no elimination
 
 No documented recording-global timeline guarantee exists behind `RelativeTimeNanos`, so this resolver performs no temporal elimination: overlap selects nothing; non-overlap eliminates nothing (asynchronous downstream work may start after its cause completes); incomparable timelines are irrelevant because no comparison influences outcomes; temporal items ride along as retained contextual evidence. Safe contradiction evidence may reject an asserted relationship only when logically incompatible under documented comparable timeline semantics; ordinary lifetime non-overlap is never such a contradiction. A future safe rule requires a dedicated timeline-guarantee change first.
 
-### 10. Phase B: global, cycle-safe direct-parent construction after closure
+### 10. Phase B: fixed normative construction sequence, global and cycle-safe
 
-Phase B runs exclusively on final Phase A2 ownership — never during propagation. It is deterministic and GLOBAL within each scenario; there is no incremental "add if still acyclic" loop whose result depends on traversal order:
+Phase B runs exclusively on final Phase A2 ownership — never during propagation — and is deterministic and GLOBAL within each resolved scenario. No incremental "add if still acyclic" logic is allowed anywhere; no validator-driven edge dropping is allowed; foundation validation confirms correctness instead of choosing semantics. For each finally resolved Scenario S, in exactly this order:
 
 ```text
-final resolved membership of Scenario S
-   ↓
-compute ALL sufficient direct-parent relations among S's members
-   (ExplicitParentSpan fired; target span unshared; endpoints inside S)
-   ↓
-derive provisional unique-parent mapping
-   (a child with zero sufficient relations gets none;
-    a child with more than one equally sufficient relation gets none)
-   ↓
-build the complete provisional directed graph over S
-   ↓
-globally identify directed cycles (strongly connected components with >1 node)
-   ↓
-remove every provisional edge INSIDE a cyclic component
-   (cycle participants end with NO selected parent;
-    acyclic edges touching a cycle component only from outside survive)
-   ↓
-emit the final selected-edge set — valid by construction
+1. collect every candidate ExplicitParentSpan relation
+   from CORRELATION-channel evidence only
+2. reject relations where:
+   - parent == child                                    (self-parent)
+   - child == S.root                                    (root never becomes a child)
+   - parent is not a final member of S                  (membership/scope)
+   - child is not a final member of S                   (membership/scope)
+   - the target parent span is shared by >1 operation   (shared-span ambiguity)
+   - the relation otherwise fails the defined predicate
+3. group surviving relations by child
+4. per child:
+   zero sufficient parents     -> no provisional edge
+   exactly one                 -> one provisional edge
+   more than one               -> no provisional edge
+5. build the COMPLETE provisional directed graph for S
+6. compute all directed cyclic SCCs globally
+   (strongly connected components containing more than one node;
+    self-loops cannot occur because step 2 rejected them)
+7. remove every provisional edge whose parent AND child
+   are BOTH members of the same cyclic SCC
+8. emit the remaining selected edges in canonical order
+   (sorted by child reference tuple, then parent reference tuple)
 ```
 
-Cycle semantics: when otherwise-sufficient unique relations form a directed cycle, Chronicle preserves all scenario ownership, guesses nothing, breaks nothing by input order/timestamps/lexical/span/operation order, emits NO selected edge for cycle participants whose parent choice cannot stand without violating graph invariants, and retains the relevant direct-parent evidence for inspection. The safe default removes every edge within the cyclic strongly-connected component; operations outside the component keep their edges when the remaining graph stays a forest (acyclic, ≤1 parent, roots never children) — e.g. in `D → A → B ⇄ C`, the `B ⇄ C` edges vanish while `D → A → B` survives. Removed-edge children keep their `Resolved` ownership and their parent evidence becomes inspectable context, never a second ambiguity channel.
+Precise SCC removal semantics: every node inside a cyclic SCC loses exactly the provisional parent edge that made it part of the cycle — the edge internal to the component. Edges are removed ONLY when parent and child are both members of the same cyclic SCC. An outgoing provisional edge from a cycle participant to a child OUTSIDE the component MAY survive when otherwise valid; incoming acyclic structure from outside is untouched; membership never changes. Example that genuinely reaches the SCC phase (all children have unique sufficient parents):
 
-Foundation edge validation runs unchanged; the emitted set is valid by construction rather than by post-hoc dropping on validator failure.
+```text
+D -> A      B -> C      C -> B      C -> E      E -> F
 
-### 11. Full-evidence semantics, confidence-consistent witness retention
+SCC = { B, C }
+removed:  B -> C, C -> B          (internal to the cyclic component)
+retained: D -> A, C -> E, E -> F  (acyclic; C stays parent of outside child E)
+```
+
+Cycle participants keep their `Resolved` ownership; dropped edges' direct-parent evidence becomes inspectable non-selected context — never a second ambiguity channel. Self-parent relations were already rejected at step 2 as ordinary uncertain/invalid-parent situations (no error, no ownership impact). Root-as-child relations likewise never reach mapping, and root establishment evidence (`ScenarioRoot`) is never mutated or discarded to enforce the invariant. Foundation edge validation runs unchanged and confirms what construction already guarantees.
+
+### 11. Full-evidence semantics, total canonical witness ordering, confidence-consistent retention
 
 **Semantics/representation boundary:** all predicate evaluation, indexes, support propagation, ambiguity detection, and parent selection operate on the complete validated CORRELATION-channel evidence set. Retention/truncation happens only after semantic resolution is complete, as output representation. Caps can never alter outcomes.
 
-**Witnesses must explain the materialized confidence** — selection is semantic, not one global priority list:
+**Total canonical evidence key.** Any two semantically equivalent witness items are ordered by a key covering the ENTIRE value, so distinct serialized values never tie:
 
-- Root `Exact` → retain the `ScenarioRoot` item.
-- Non-root `Exact` → retain a canonical DIRECT `SharedTraceIdentity` witness proving Exact ownership; a transitive span proof must never be substituted merely because it sorts earlier.
-- `Strong` → retain a canonical transitive `ExplicitParentSpan` support proof.
-- `Ambiguous` candidate → prefer a direct candidate-specific ownership witness when one exists, else a canonical transitive proof; every candidate's retained witness matches why it is supported.
+```text
+canonical_evidence_key(item, candidate_ref?) =
+    kind_discriminator            // canonical variant name, lexicographic
+ || every semantic field of the kind,
+    in declaration order,
+    strings compared by UTF-8 bytes,
+    Option values ordered None < Some(value)
+ || candidate CanonicalOperationRef tuple when the witness is
+    candidate-relative           // (recording, epoch, session, operation)
+ || provenance.source            // UTF-8 bytes
+ || provenance.observation       // None < Some, UTF-8 bytes
+```
 
-Canonical ordering keys (byte-stable): within the required class, order by provider, then trace id, then span id where applicable, then candidate full-reference tuple (`recording, epoch, session, operation`); ties impossible because references are unique. Discovery order and input iteration order never matter.
+For `TraceRelationship` concretely: discriminator → provider → trace_id → span_id (None<Some) → parent_span_id (None<Some) → candidate ref → provenance.source → provenance.observation. Two witnesses differing in ANY field — including `parent_span_id` or either provenance value — order deterministically; insertion/presentation order is irrelevant.
 
-**Ownership vs parent witnesses stay separate:** `CorrelationResolution.evidence` carries the ownership witness; `SelectedCausalEdge.evidence` carries the direct-parent witness. Any additional parent detail inside a resolution is optional contextual enrichment, never the primary ownership proof. Which-scenario and which-direct-parent remain separable through output provenance as well as algorithm phases.
+**Transitive proof-path ordering.** For a `Strong` (or fallback ambiguous) transitive `ExplicitParentSpan` proof, candidate paths order by:
 
-Global constant documented (64 items per slot, applied per ambiguity candidate). Justification-first fill, then canonical contextual fill; recency/discovery-order never determines priority.
+1. shortest valid proof path (fewest relations);
+2. lexicographic sequence of candidate `CanonicalOperationRef` tuples along the path;
+3. canonical evidence keys of each relation along the path.
+
+References are unique, so the ordering is total.
+
+**Confidence-consistent selection (unchanged semantics):** root `Exact` keeps its `ScenarioRoot`; non-root `Exact` keeps a canonical DIRECT `SharedTraceIdentity` witness — a canonical transitive proof must NEVER replace an available direct witness merely by ordering; `Strong` keeps the canonical transitive path; `Ambiguous` candidates prefer a direct candidate-specific witness when one exists, else the canonical transitive proof. The total ordering operates ONLY within the required semantic class.
+
+**Ownership vs parent witnesses stay separate:** `CorrelationResolution.evidence` carries the ownership witness; `SelectedCausalEdge.evidence` carries the direct-parent witness; extra parent detail inside a resolution is optional contextual enrichment. Which-scenario and which-direct-parent remain separable through output provenance as well as algorithm phases.
+
+Global constant documented (64 items per slot, applied per ambiguity candidate); justification-first fill via the rules above, then canonical contextual fill; recency/discovery-order never determines priority.
 
 ### 12. Boundedness: sparse support sets
 
 - All indexes deterministic and ordered (`BTreeMap`) keyed by `(provider, trace_id)`, `(provider, trace_id, span_id)`, and full reference; inputs sorted by full reference tuple first; built once from full validated correlation evidence.
 - Support stored sparsely: entries created only by discovered positive relationships; no eager operation×scenario matrix.
 - Monotonic unit: a productive round adds ≥1 previously absent `(operation, ScenarioId)` membership; formal bound N×S; typical usage far lower.
-- Rounds terminate when no membership is added; no recursion; correctness never traded. Phase B cycle analysis is linear-time graph work per scenario (SCC computation), bounded by scenario size.
+- Rounds terminate when no membership is added; no recursion; correctness never traded. Phase B work is linear-time graph analysis per scenario (relation filtering, unique-parent mapping, SCC computation), bounded by scenario size.
 
 ### 13. ETL composition boundary
 
@@ -255,18 +288,19 @@ A `chronicle-etl` helper joins published `CanonicalSession` values with a caller
 
 ### 14. Failure taxonomy
 
-Typed `CorrelationResolverError` (fail closed): duplicate full operation references; reference lineage/recording-scope mismatch; invalid supplied roles; malformed evidence; caller-supplied `ScenarioRoot` in ANY caller-controlled container in EITHER channel; correlation-context join violations; impossible internal graph invariants. Ordinary situations — never errors: missing trace context; no positive ownership evidence → `Uncorrelated`; several supported candidates → `Ambiguous`; uncertain direct parent → `Resolved` without edge; conflicting valid causal evidence between scenarios → `Ambiguous`; incomparable timing → irrelevant.
+Typed `CorrelationResolverError` (fail closed): duplicate full operation references; reference lineage/recording-scope mismatch; invalid supplied roles; malformed evidence; caller-supplied `ScenarioRoot` in ANY caller-controlled container in EITHER channel; correlation-context join violations; impossible internal graph invariants. Ordinary situations — never errors: missing trace context; no positive ownership evidence → `Uncorrelated`; several supported candidates → `Ambiguous`; uncertain, insufficient, self-parent, or cyclic direct-parent relations → `Resolved` without an edge; conflicting valid causal evidence between scenarios → `Ambiguous`; incomparable timing → irrelevant.
 
 ### 15. Validator contract and compatibility boundaries
 
 Resolver output SHALL satisfy all correlation graph structural/domain invariants and SHALL succeed under `validate_against_sessions(...)` when the required canonical-session lineage context is supplied. Context-free `validate()` intentionally fails non-empty graphs today (`MissingSessionContext`); this change neither requires nor claims otherwise and does not weaken lineage validation. An additive public structural-validation API MAY be exposed if implementation needs it, without changing `validate()` semantics.
 
-In-memory runtime capability only; frozen v1 contracts untouched; nothing persists. Roadmap:
+In-memory runtime capability only; frozen v1 contracts untouched; nothing persists. The one modified-capability surface is the additive `ScenarioRoot` variant in `correlation-domain-model` (see its delta spec). Roadmap:
 
 ```text
 introduce-correlation-domain-model (done)
         ↓
-correlate-ingress-and-egress-interactions      ← this change
+correlate-ingress-and-egress-interactions      ← this change (adds correlation-resolver;
+                                                 extends correlation-domain-model with ScenarioRoot)
         ↓
 derive-native-correlation-evidence             ← owns native relational-semantics contracts (logical task generation,
                                                  causal execution lineage, process/task inheritance,
@@ -282,12 +316,12 @@ trace-provider-plugin-installation
 scenario inspect / replay / test generation
 ```
 
-Until native evidence lands, this revision defines no Chronicle-native positive ownership predicate beyond resolver-generated `ScenarioRoot`: non-root operations without supported trace relationships normally remain `Uncorrelated`. That is a capability boundary of THIS revision, not a limitation of provider neutrality — the resolver consumes Chronicle-owned evidence, trace providers remain outer adapters, future native producers add named predicates through separate specs, and no SDK dependency exists anywhere in the resolver. Until native evidence lands, ordinary recordings legitimately produce mostly `Uncorrelated` results.
+Until native evidence lands, this revision defines no Chronicle-native positive ownership predicate beyond resolver-generated `ScenarioRoot`: non-root operations without supported trace relationships normally remain `Uncorrelated`. That is a capability boundary of THIS revision, not a limitation of provider neutrality — the resolver consumes Chronicle-owned evidence, trace providers remain outer adapters, future native producers add named predicates through separate specs, and no SDK dependency exists anywhere in the resolver.
 
 ## Risks and Trade-offs
 
 - Conservative gating (contextual task lineage, no temporal elimination, no native predicates yet) leaves weak-but-real signals unresolved until producers emit relational evidence. Intended.
-- Cycle removal forfeits some derivable structure inside cyclic components; guessing a break point would be worse.
+- Cycle removal forfeits derivable structure inside cyclic components while preserving outgoing acyclic edges; guessing a break point would be worse.
 - Full-reference identity means regrouping operations across publications changes scenario identities. Honest: the foundation provides no stronger invariant to build on.
 - Snapshot-round closure may need more rounds than eager admission; bounded by N×S memberships and immune to ordering effects.
 - Per-candidate retention capacity slightly raises worst-case memory for wide ambiguity; explainability of every candidate outweighs it.
