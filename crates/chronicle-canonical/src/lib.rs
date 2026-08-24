@@ -364,6 +364,8 @@ pub struct CanonicalSession {
 
 mod correlation;
 pub use correlation::*;
+mod correlation_resolver;
+pub use correlation_resolver::*;
 
 impl CanonicalSession {
     pub fn connection_state(&self, id: &ConnectionId) -> Completeness {

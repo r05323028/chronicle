@@ -2,6 +2,7 @@
 
 mod checkpoint;
 mod continuation;
+mod correlation;
 mod delta;
 mod incremental;
 mod publication;
@@ -16,6 +17,7 @@ pub use continuation::{
     EPOCH_CONTINUATION_IN_FILE, EPOCH_CONTINUATION_OUT_FILE, EPOCH_CONTINUATION_STATE_FILE,
     EpochContinuationCheckpoint, INCREMENTAL_CHECKPOINT_SCHEMA_VERSION, IncrementalEtlCheckpoint,
 };
+pub use correlation::{CorrelationCompositionError, compose_correlation};
 pub use delta::{CANONICAL_DELTA_SCHEMA_VERSION, CanonicalDeltaBatchV1, DeltaBatchError};
 pub use incremental::{CommittedWalSnapshot, IncrementalProcessor, IncrementalResult};
 pub use publication::{

@@ -3,6 +3,7 @@ use chronicle_common::{
     ConnectionId, Direction, EpochId, OperationId, ProtocolId, RecordingId, ScenarioId, SessionId,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -68,6 +69,14 @@ pub enum CorrelationEvidenceKind {
         trace_id: String,
         span_id: Option<String>,
         parent_span_id: Option<String>,
+    },
+    /// Resolver-generated establishment of a known-ingress operation as the
+    /// root of its derived scenario. Non-temporal correlation-level membership
+    /// evidence; it classifies no interaction role. Callers may never supply
+    /// it as resolver input; within a graph it is valid only in the
+    /// root-establishment placement checked by graph validation.
+    ScenarioRoot {
+        root: CanonicalOperationRef,
     },
     ProtocolOwnership {
         protocol: ProtocolId,
@@ -522,6 +531,35 @@ impl CorrelationResolution {
     }
 }
 
+/// Fixed ASCII domain separator for `scenario-id-v1` derivation (exactly 36 bytes).
+pub const SCENARIO_ID_V1_SEPARATOR: &[u8; 36] = b"chronicle-correlation/scenario-id/v1";
+
+/// Derive the deterministic `scenario-id-v1` identifier for a scenario rooted
+/// at `root`: the first 16 bytes of
+/// `SHA-256(SCENARIO_ID_V1_SEPARATOR || recording_uuid_be || owner_epoch_uuid_be
+///        || session_uuid_be || operation_uuid_be)`
+/// rendered as a UUID with version field 8 and RFC 4122 variant bits.
+/// Identity is stable across restarts, retries, replay over the same persisted
+/// canonical artifacts, scheduling, and iteration order. It is NOT guaranteed
+/// across canonical-session regrouping that changes the authoritative root
+/// reference, publication into a different owning session/epoch, independent
+/// re-canonicalization, or regenerated operation ids.
+pub fn scenario_id_v1(root: &CanonicalOperationRef) -> ScenarioId {
+    let mut hasher = Sha256::new();
+    hasher.update(SCENARIO_ID_V1_SEPARATOR);
+    hasher.update(root.recording_id.as_uuid().as_bytes());
+    hasher.update(root.owner_epoch_id.as_uuid().as_bytes());
+    hasher.update(root.session_id.as_uuid().as_bytes());
+    hasher.update(root.operation_id.as_uuid().as_bytes());
+    let digest = hasher.finalize();
+    let mut octets = [0u8; 16];
+    octets.copy_from_slice(&digest[..16]);
+    // RFC 9562 version 8 and RFC 4122 variant bits.
+    octets[6] = (octets[6] & 0x0F) | 0x80;
+    octets[8] = (octets[8] & 0x3F) | 0x80;
+    ScenarioId::from_uuid(uuid::Uuid::from_bytes(octets))
+}
+
 /// Durable lookup scope for one canonical logical operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CanonicalOperationRef {
@@ -752,6 +790,15 @@ pub enum CorrelationValidationError {
     MultipleSelectedParents { child: CanonicalOperationRef },
     #[error("selected causal edges contain a cycle")]
     CausalCycle,
+    #[error(
+        "scenario root claim {claim:?} inside operation {reference:?} violates root-establishment placement"
+    )]
+    InvalidScenarioRootPlacement {
+        reference: CanonicalOperationRef,
+        claim: Box<CanonicalOperationRef>,
+    },
+    #[error("ScenarioRoot evidence is not permitted in this position")]
+    MisplacedScenarioRootEvidence,
 }
 
 fn validate_evidence(evidence: &[CorrelationEvidence]) -> Result<(), CorrelationValidationError> {
@@ -971,14 +1018,15 @@ impl CorrelationGraph {
             }
         }
 
+        self.validate_scenario_root_placement(&scenarios)?;
+
         let mut selected_memberships: BTreeMap<CanonicalOperationRef, usize> = BTreeMap::new();
-        for (reference, resolution) in &self.resolutions {
+        for resolution in self.resolutions.values() {
             if let CorrelationResolution::Resolved { scenario, .. } = resolution
                 && !scenarios.contains_key(scenario)
             {
                 return Err(CorrelationValidationError::MissingScenario { id: *scenario });
             }
-            let _ = reference;
         }
 
         for scenario in &self.scenarios {
@@ -1043,6 +1091,78 @@ impl CorrelationGraph {
         }
 
         self.validate_edges(&scenarios)
+    }
+
+    /// Consistency rule for the resolver-generated `ScenarioRoot` variant
+    /// (correlation-domain-model delta). A `ScenarioRoot { root: R }` item is
+    /// valid only inside the `Resolved` correlation outcome of operation R when
+    /// that outcome selects a scenario whose root is R and R's preserved role
+    /// resolution is `Known(Ingress)`. Every other position — another
+    /// operation's resolution, a non-root member's claim, a wrong-scenario
+    /// selection, `Uncorrelated` evidence, ambiguous-candidate evidence, or
+    /// selected-edge evidence — is rejected. Existing evidence validation is
+    /// not redesigned beyond this new variant.
+    fn validate_scenario_root_placement(
+        &self,
+        scenarios: &BTreeMap<ScenarioId, &Scenario>,
+    ) -> Result<(), CorrelationValidationError> {
+        for (reference, resolution) in &self.resolutions {
+            match resolution {
+                CorrelationResolution::Resolved {
+                    scenario, evidence, ..
+                } => {
+                    for item in evidence {
+                        if let CorrelationEvidenceKind::ScenarioRoot { root } = &item.kind {
+                            let placed = scenarios.get(scenario).is_some_and(|entry| {
+                                entry.root == *root
+                                    && *root == *reference
+                                    && matches!(
+                                        self.role_resolutions.get(reference),
+                                        Some(InteractionRoleResolution::Known {
+                                            role: InteractionRole::Ingress,
+                                            ..
+                                        })
+                                    )
+                            });
+                            if !placed {
+                                return Err(
+                                    CorrelationValidationError::InvalidScenarioRootPlacement {
+                                        reference: *reference,
+                                        claim: Box::new(*root),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                CorrelationResolution::Ambiguous { candidates } => {
+                    if candidates.iter().any(|candidate| {
+                        candidate.evidence.iter().any(|item| {
+                            matches!(item.kind, CorrelationEvidenceKind::ScenarioRoot { .. })
+                        })
+                    }) {
+                        return Err(CorrelationValidationError::MisplacedScenarioRootEvidence);
+                    }
+                }
+                CorrelationResolution::Uncorrelated { evidence } => {
+                    if evidence.iter().any(|item| {
+                        matches!(item.kind, CorrelationEvidenceKind::ScenarioRoot { .. })
+                    }) {
+                        return Err(CorrelationValidationError::MisplacedScenarioRootEvidence);
+                    }
+                }
+            }
+        }
+        for edge in &self.causal_edges {
+            if edge
+                .evidence
+                .iter()
+                .any(|item| matches!(item.kind, CorrelationEvidenceKind::ScenarioRoot { .. }))
+            {
+                return Err(CorrelationValidationError::MisplacedScenarioRootEvidence);
+            }
+        }
+        Ok(())
     }
 
     fn validate_reference_scope(

@@ -159,7 +159,7 @@ Ownership-relevant predicates:
 
 | Predicate | Match condition (child × candidate) | Meaning | Powers |
 | --- | --- | --- | --- |
-| `SharedTraceIdentity` | same non-empty `provider` AND same non-empty `trace_id` in correlation-channel `TraceRelationship` items | child shares one trace identity with that scenario — DIRECT scenario-level support | adds scenario to child's support set; never direct parent |
+| `SharedTraceIdentity` | same non-empty `provider` AND same non-empty `trace_id` in correlation-channel `TraceRelationship` items, between pairs NOT joined by a declared parenthood (either direction) | child shares one trace identity with that scenario — DIRECT scenario-level support | adds scenario to child's support set; never direct parent |
 | `ExplicitParentSpan` | child non-empty `parent_span_id` equals candidate's non-empty `span_id` under same `provider`+`trace_id` | declared direct span parenthood | child inherits candidate's previous-round support entries transitively; candidate for Phase B direct parenthood subject to Decision 10 filters |
 | `ScenarioRoot` (resolver-generated) | established per created scenario's root | pins the root to its own scenario | resolves the root itself |
 
