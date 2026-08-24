@@ -153,7 +153,7 @@ All predicate evaluation, relation indexes, support propagation, ambiguity detec
 
 - **WHEN** DB Z shares one provider+trace identity with Ingress A, HTTP X, and HTTP Y — all of Scenario A
 - **THEN** Z's support set contains Scenario A exactly once
-- **AND** the three matches aggregate into one scenario-keyed support entry whose internal witnesses record all matching paths
+- **AND** the matches aggregate into one scenario-keyed entry whose canonical retained witness is derived after closure rather than storing every path
 
 #### Scenario: Explicit parent span selects the direct parent after closure
 
@@ -190,7 +190,7 @@ All predicate evaluation, relation indexes, support propagation, ambiguity detec
 
 ### Requirement: Scenario support propagates monotonically to closure before outcomes materialize
 
-The resolver SHALL split ownership determination into Phase A1 and Phase A2. Phase A1 SHALL maintain `support[operation] : Set<ScenarioId>`, initialized with each root pinned to its own scenario and each non-root operation holding scenarios discoverable through direct positive relationships. Each round SHALL evaluate against a snapshot of the previous round's support state and union newly discoverable scenarios from direct `SharedTraceIdentity`, transitive `ExplicitParentSpan` inheritance through candidates whose support was present in the snapshot, and any future spec-authorized predicates. Support sets SHALL grow monotonically within a run — scenarios may enter, never leave — and SHALL be stored sparsely, creating entries only for discovered positive relationships. A productive round strictly grows at least one `(operation, ScenarioId)` membership; rounds terminate when none grows. Phase A2 SHALL run only after termination: empty support → `Uncorrelated`; exactly one scenario → `Resolved`; multiple → `Ambiguous { candidates }` with one candidate per supported scenario, keyed by `ScenarioId`, each retaining deterministic support witnesses. Final `Resolved`/`Ambiguous` values SHALL NOT be assigned during propagation.
+The resolver SHALL split ownership determination into Phase A1 and Phase A2. Phase A1 SHALL maintain `support[operation] : Set<ScenarioId>`, initialized with each root pinned to its own scenario and each non-root operation holding scenarios discoverable through direct positive relationships. Each round SHALL evaluate against a snapshot of the previous round's support state and union newly discoverable scenarios from direct `SharedTraceIdentity`, transitive `ExplicitParentSpan` inheritance through candidates whose support was present in the snapshot, and any future spec-authorized predicates. Support sets SHALL grow monotonically within a run — scenarios may enter, never leave — and SHALL be stored sparsely, creating entries only for discovered positive relationships. A productive round strictly grows at least one `(operation, ScenarioId)` membership; rounds terminate when none grows. Phase A2 SHALL run only after termination: empty support → `Uncorrelated`; exactly one scenario → `Resolved`; multiple → `Ambiguous { candidates }` with one candidate per supported scenario, keyed by `ScenarioId`, each retaining deterministic support witnesses. Final `Resolved`/`Ambiguous` values SHALL NOT be assigned during propagation. Phase A1 SHALL persist only the sparse support memberships plus at most a bounded per-membership semantic flag (such as whether direct support exists) — it SHALL NOT retain distinct transitive witness paths, whose count grows exponentially in diamond-rich relation graphs while operations stay O(N). Propagation termination SHALL depend only on newly added `(operation, ScenarioId)` memberships, never on discovering a better proof path. After termination, canonical ownership witnesses SHALL be derived from the immutable relation indexes plus the final support sets, so a shorter valid path discovered late wins over an earlier longer one.
 
 #### Scenario: Short path and long path converge to ambiguity
 
@@ -289,6 +289,30 @@ After Phase A2, confidence SHALL derive from how each single supported scenario 
 - **WHEN** closed support contains multiple scenarios
 - **THEN** the outcome is `Ambiguous` without any confidence value
 
+#### Scenario: A later shorter path wins canonical proof selection
+
+- **WHEN** a long transitive support path makes Scenario A discoverable in an early round and a shorter valid path to A becomes available only in a later round
+- **THEN** support closure completes with Scenario A still supported exactly once
+- **AND** the derived canonical witness uses the shorter path, because witness derivation reads the closed graph rather than first-discovery state
+
+#### Scenario: Equal-length transitive paths break by reference sequence
+
+- **WHEN** two valid shortest transitive paths lead to the same scenario with equal length
+- **THEN** the path whose candidate `CanonicalOperationRef` sequence is lexicographically smaller is retained
+- **AND** input or evidence presentation order cannot change which one wins
+
+#### Scenario: Diamond-rich graphs do not force path enumeration
+
+- **WHEN** repeated diamond structures create exponentially many distinct transitive routes into one scenario
+- **THEN** the resolver derives only the single canonical best path from the closed graph
+- **AND** it never enumerates, stores, or iterates every possible path
+
+#### Scenario: Cyclic raw relation graphs terminate derivation
+
+- **WHEN** raw parent-span relations contain cycles such as B⇄C beneath an ownership chain
+- **THEN** support closure terminates normally and canonical proof derivation terminates with a finite simple path
+- **AND** no repeated-reference infinite path is ever considered
+
 ### Requirement: Phase B constructs parent edges through a fixed normative sequence with deterministic cycle safety
 
 Phase B SHALL run exclusively on the final Phase A2 outcome — never during propagation — and SHALL be deterministic and GLOBAL within each finally resolved Scenario S, executing exactly this sequence:
@@ -304,12 +328,12 @@ Phase B SHALL run exclusively on the final Phase A2 outcome — never during pro
 
 No incremental add-if-still-valid traversal logic is allowed anywhere; no validator-driven edge dropping is allowed; foundation validation confirms correctness instead of choosing semantics. Within cyclic components: every participant loses exactly the provisional parent edge internal to the component; an outgoing provisional edge from a cycle participant to a child OUTSIDE the component MAY survive when otherwise valid; acyclic structure outside components is untouched; scenario ownership NEVER changes. Self-parent and root-as-child relations are rejected at step 2 as ordinary uncertain/invalid-parent situations — no error, no ownership impact, and root-establishment evidence (`ScenarioRoot`) is never mutated or discarded to enforce the invariant. Dropped-edge children keep their Resolved ownership with their direct-parent evidence inspectable as non-selected context, never a second ambiguity channel. Foundation validation requirements — full scoped endpoints, same scenario, acyclic, at most one parent per child, root never a child — hold unchanged.
 
-#### Scenario: Multi-parent filtering happens before cycle detection
+#### Scenario: Multi-parent filtering removes all incoming choices before cycle detection
 
-- **WHEN** sufficient unique relations include A→B and C→B and B→C, giving B two sufficient parents
-- **THEN** B receives no provisional parent during mapping
-- **AND** no artificial B⇄C strongly-connected component is ever created
-- **AND** the surviving provisional edges (A→B, B→C) form an acyclic chain and are emitted intact
+- **WHEN** sufficient relations include A→B and C→B and B→C, giving B two sufficient parents {A, C}
+- **THEN** B receives no provisional parent, so BOTH incoming candidate edges A→B and C→B are absent from the provisional graph
+- **AND** C retains its single sufficient parent, so B→C survives as the ONLY provisional edge
+- **AND** no artificial B⇄C strongly-connected component is ever created and ownership is unchanged
 
 #### Scenario: Pure two-node cycle loses only its unsafe edges
 
@@ -393,7 +417,7 @@ Retention SHALL occur only after Phase A2 and Phase B complete, as output repres
 
 Equivalent witnesses SHALL be ordered by a TOTAL canonical key covering the entire value, so distinct serialized items can never tie: the kind discriminator, every semantic field of the kind in declaration order with strings compared as UTF-8 bytes and Option values ordered None before Some, the candidate full-reference tuple when the witness is candidate-relative, then `provenance.source`, then `provenance.observation` (None before Some). For `TraceRelationship` this covers discriminator, provider, trace_id, span_id, parent_span_id, candidate scope, source, and observation — two witnesses differing in ANY field, including `parent_span_id` or provenance values, order deterministically. For transitive proofs, candidate paths SHALL order by shortest valid proof path first, then lexicographic sequence of candidate full-reference tuples along the path, then canonical evidence keys of each relation along the path; references are unique, making the ordering total. Selection reads the closed support structure rather than arrival or discovery order, making byte-stable retained output well-defined; insertion/presentation order and recency SHALL NEVER determine priority.
 
-Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witnesses live on `SelectedCausalEdge.evidence`; any extra parent detail inside a resolution is optional contextual enrichment, never the primary ownership proof. Remaining capacity fills with contextual/input evidence in canonical input order up to the documented constant (64 items), applied per ambiguity candidate so ordinary valid ambiguity neither drops candidates nor turns into errors. `Uncorrelated` outcomes retain contextual/input evidence canonically with no manufactured ownership witness.
+Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witnesses live on `SelectedCausalEdge.evidence`; any extra parent detail inside a resolution is optional contextual enrichment, never the primary ownership proof. Remaining capacity fills with unused contextual/input correlation-channel items SORTED by the total canonical evidence key — non-candidate-relative items taking an empty/None candidate scope — truncated to the documented constant (64 items), applied per ambiguity candidate; caller correlation-evidence presentation order therefore cannot change retained output. Supplied role evidence remains byte-for-byte exactly as provided, including item order — role-resolution preservation is a separate foundation invariant, and the canonical-sort requirement applies only to correlation-channel retention. Ordinary valid ambiguity neither drops candidates nor turns into errors. `Uncorrelated` outcomes retain contextual/input evidence canonically with no manufactured ownership witness.
 
 #### Scenario: Exact resolution keeps an Exact witness
 
@@ -430,6 +454,12 @@ Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witn
 - **WHEN** an operation ends ambiguous across many scenarios and combined raw evidence exceeds the global constant
 - **THEN** each candidate retains at least one confidence-consistent candidate-specific witness
 - **AND** no candidate drops and no boundedness error arises for ordinary valid ambiguity
+
+#### Scenario: Contextual fill is independent of caller evidence order
+
+- **WHEN** the same correlation-evidence multiset exceeding the retention constant is presented in several different orders
+- **THEN** retained correlation evidence — semantic witnesses plus canonically sorted contextual fill — is identical in every run
+- **AND** supplied role evidence remains byte-for-byte unchanged regardless of any sorting rule
 
 #### Scenario: Uncorrelated retention has no fake witness
 
@@ -562,13 +592,19 @@ The resolver architecture SHALL remain provider-neutral: it consumes Chronicle-o
 
 ### Requirement: Resolver resource use is bounded by sparse support growth
 
-The resolver SHALL use deterministic ordered indexes built once from full validated correlation evidence, SHALL store scenario-support sets sparsely — creating `(operation, ScenarioId)` entries only for discovered positive relationships and never eagerly allocating an operation-times-scenario matrix — and SHALL terminate Phase A1 when no support membership is added. A productive round SHALL add at least one previously absent support membership, giving a formal upper bound of N operations times S scenarios memberships. Phase B work SHALL be bounded linear graph analysis per scenario — invalid-relation filtering, unique-parent grouping, whole-graph SCC computation over the provisional graph, and removal of edges internal to cyclic components. There SHALL be no recursion. Internal state SHALL stay proportional to the input set plus discovered support rather than arbitrary external identifier cardinalities. Correctness SHALL never be traded for these bounds.
+The resolver SHALL use deterministic ordered indexes built once from full validated correlation evidence, SHALL store scenario-support sets sparsely — creating `(operation, ScenarioId)` entries only for discovered positive relationships and never eagerly allocating an operation-times-scenario matrix — and SHALL terminate Phase A1 when no support membership is added. A productive round SHALL add at least one previously absent support membership, giving a formal upper bound of N operations times S scenarios memberships. That bound covers sparse memberships and bounded per-membership flags; it does NOT extend to transitive witness-path enumeration, which the resolver SHALL NOT perform — post-closure proof derivation uses temporary search state proportional to the visited frontier over simple paths. Phase B work SHALL be bounded linear graph analysis per scenario — invalid-relation filtering, unique-parent grouping, whole-graph SCC computation over the provisional graph, and removal of edges internal to cyclic components. There SHALL be no recursion. Internal state SHALL stay proportional to the input set plus discovered support rather than arbitrary external identifier cardinalities. Correctness SHALL never be traded for these bounds.
 
 #### Scenario: Indexed lookups replace global scans
 
 - **WHEN** resolution processes many operations and concurrent ingress requests
 - **THEN** predicate evaluation consults ordered indexes keyed by relation fields and reference
 - **AND** no step iterates every operation against every ingress against every evidence item
+
+#### Scenario: High path-count graphs stay within bounded state
+
+- **WHEN** diamond-rich relation graphs create exponentially many distinct transitive routes while operations and scenarios stay O(N)/O(N×S)
+- **THEN** internal state covers indexes, sparse memberships, bounded per-membership flags, Phase B provisional graph, and frontier-proportional proof-search temporaries only
+- **AND** no structure grows with the number of distinct possible paths
 
 #### Scenario: Support storage stays sparse
 

@@ -132,9 +132,9 @@ immutable correlation-channel relation indexes (FULL validated correlation evide
    |
 [A1] scenario support propagation to fixed point
    |    support[operation] : Set<ScenarioId> — grows monotonically, never shrinks
-   |    snapshot rounds; internal support witnesses retained per (operation, scenario)
-   |
-[A2] materialize CorrelationResolution values once
+   |    sparse memberships + bounded per-membership flag; NO witness-path storage
+[A2] canonical witness derivation from closed graph + immutable indexes,
+   |    then materialize CorrelationResolution values once
    |    {} -> Uncorrelated ; {A} -> Resolved(A) ; {A,B,...} -> Ambiguous(A,B,...)
 |    construct final scenario memberships
    |
@@ -149,7 +149,7 @@ Monotonicity is stated over support: *support sets may only gain scenarios durin
 
 A productive round strictly grows at least one `(operation, ScenarioId)` support membership. Termination is guaranteed: support sets only grow and the scenario count is finite.
 
-Support witnesses: for each `(operation, ScenarioId)` entry, A1 retains enough internal witness information to explain why that scenario entered the set — a direct predicate item, or a transitive path (child-to-member `ExplicitParentSpan` plus member support). Multiple members of one scenario aggregate into ONE scenario-keyed support entry carrying all witness paths.
+Witness state stays bounded: Phase A1 persists ONLY the sparse `(operation, ScenarioId)` memberships plus, per membership, at most a bounded semantic flag such as whether direct (`SharedTraceIdentity`) support exists. It NEVER stores the witness paths themselves — raw relation graphs can contain exponentially many distinct transitive paths (repeated diamonds yield 2^k routes into one scenario) while operations and memberships stay O(N)/O(N×S). Termination depends ONLY on newly added support memberships, never on discovering a "better" path. After closure, the canonical ownership witness for each materialized outcome is DERIVED on demand from the immutable relation indexes plus the final support sets, so a later-discovered shorter proof automatically wins and no stale first-discovery witness can persist.
 
 ### 7. Relational evidence predicates (correlation channel only)
 
@@ -192,6 +192,8 @@ Confidence from final support proofs (not counts, not discovery order):
 - `Strong` — the operation has no direct scenario-level relationship and its unique final scenario support exists solely through one or more transitive `ExplicitParentSpan` support paths;
 - `Inferred` — reserved for externally supplied graphs; never emitted here;
 - multiple supported scenarios → `Ambiguous`; confidence is not materialized.
+
+Ownership witnesses are not stored during propagation; they are derived AFTER closure from the immutable relation graph and final support sets using the deterministic best-path rules of Decision 11 — shortest valid simple path first, lexicographic candidate-reference sequence next, canonical evidence keys per relation last. A shorter valid path discovered late therefore wins over an earlier longer one, equal-length paths break by the lexicographic reference sequence, and chain-discovery order never influences either confidence or the retained witness.
 
 When several proof paths reach the same scenario: direct beats transitive; among equals the canonical path ordering of Decision 11 applies. Chain-discovery order never influences confidence.
 
@@ -261,19 +263,19 @@ canonical_evidence_key(item, candidate_ref?) =
 
 For `TraceRelationship` concretely: discriminator → provider → trace_id → span_id (None<Some) → parent_span_id (None<Some) → candidate ref → provenance.source → provenance.observation. Two witnesses differing in ANY field — including `parent_span_id` or either provenance value — order deterministically; insertion/presentation order is irrelevant.
 
-**Transitive proof-path ordering.** For a `Strong` (or fallback ambiguous) transitive `ExplicitParentSpan` proof, candidate paths order by:
+**Transitive proof-path ordering and derivation.** For a `Strong` (or fallback ambiguous) transitive `ExplicitParentSpan` proof, candidate paths order by:
 
 1. shortest valid proof path (fewest relations);
 2. lexicographic sequence of candidate `CanonicalOperationRef` tuples along the path;
 3. canonical evidence keys of each relation along the path.
 
-References are unique, so the ordering is total.
+References are unique, so the ordering is total. The implementation MUST DERIVE the canonical best path — via deterministic shortest-path/dynamic-programming search over the closed support/relation graph — rather than enumerate or store every possible path: raw relation graphs may be cyclic and exponentially path-rich, so search state stays proportional to the visited frontier (visited-set-pruned simple paths), never to the number of distinct paths. A proof path is a FINITE SIMPLE path with no repeated operation reference; cycles in raw relations cannot produce unbounded derivation because revisiting any reference is pruned before extension.
 
 **Confidence-consistent selection (unchanged semantics):** root `Exact` keeps its `ScenarioRoot`; non-root `Exact` keeps a canonical DIRECT `SharedTraceIdentity` witness — a canonical transitive proof must NEVER replace an available direct witness merely by ordering; `Strong` keeps the canonical transitive path; `Ambiguous` candidates prefer a direct candidate-specific witness when one exists, else the canonical transitive proof. The total ordering operates ONLY within the required semantic class.
 
 **Ownership vs parent witnesses stay separate:** `CorrelationResolution.evidence` carries the ownership witness; `SelectedCausalEdge.evidence` carries the direct-parent witness; extra parent detail inside a resolution is optional contextual enrichment. Which-scenario and which-direct-parent remain separable through output provenance as well as algorithm phases.
 
-Global constant documented (64 items per slot, applied per ambiguity candidate); justification-first fill via the rules above, then canonical contextual fill; recency/discovery-order never determines priority.
+Contextual fill is CANONICAL, not caller-ordered: remaining capacity fills from the operation's unused correlation-channel items sorted by the total canonical evidence key (non-candidate-relative items take an empty/None candidate scope in the key), truncated to the documented constant (64 items per slot, applied per ambiguity candidate). Caller evidence presentation order therefore cannot change retained output; the resolver does not preserve correlation-evidence `Vec` order. Role evidence is the deliberate exception — preserved byte-for-byte exactly as supplied, including item order, because role-resolution preservation is a separate foundation invariant. Recency/discovery-order never determines priority anywhere.
 
 ### 12. Boundedness: sparse support sets
 
@@ -281,6 +283,7 @@ Global constant documented (64 items per slot, applied per ambiguity candidate);
 - Support stored sparsely: entries created only by discovered positive relationships; no eager operation×scenario matrix.
 - Monotonic unit: a productive round adds ≥1 previously absent `(operation, ScenarioId)` membership; formal bound N×S; typical usage far lower.
 - Rounds terminate when no membership is added; no recursion; correctness never traded. Phase B work is linear-time graph analysis per scenario (relation filtering, unique-parent mapping, SCC computation), bounded by scenario size.
+- Internal state is bounded by: validated input evidence/indexes; sparse discovered `(operation, ScenarioId)` support memberships; at most a bounded per-membership semantic flag (e.g. direct-support boolean); Phase B provisional graph state; and temporary proof-search state proportional to the visited frontier. The resolver SHALL NOT retain all distinct transitive proof paths — the N×S membership bound does NOT extend to arbitrary path enumeration, which can be exponential in diamond-rich relation graphs.
 
 ### 13. ETL composition boundary
 
