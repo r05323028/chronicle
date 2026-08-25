@@ -159,9 +159,11 @@ Ownership-relevant predicates:
 
 | Predicate | Match condition (child × candidate) | Meaning | Powers |
 | --- | --- | --- | --- |
-| `SharedTraceIdentity` | same non-empty `provider` AND same non-empty `trace_id` in correlation-channel `TraceRelationship` items, between pairs NOT joined by a declared parenthood (either direction) | child shares one trace identity with that scenario — DIRECT scenario-level support | adds scenario to child's support set; never direct parent |
+| `SharedTraceIdentity` | same non-empty `provider` AND same non-empty `trace_id` in correlation-channel `TraceRelationship` items, where the child does not declare that candidate as its explicit parent | child shares one trace identity with that scenario — DIRECT scenario-level support | adds scenario to child's support set; never direct parent |
 | `ExplicitParentSpan` | child non-empty `parent_span_id` equals candidate's non-empty `span_id` under same `provider`+`trace_id` | declared direct span parenthood | child inherits candidate's previous-round support entries transitively; candidate for Phase B direct parenthood subject to Decision 10 filters |
 | `ScenarioRoot` (resolver-generated) | established per created scenario's root | pins the root to its own scenario | resolves the root itself |
+
+`ExplicitParentSpan(child, candidate)` is directional: it exists only when the operation being resolved is the child, its non-empty `parent_span_id` equals the candidate's non-empty `span_id`, and provider plus trace identity match. The reverse declaration (`candidate.parent_span_id == child.span_id`) does not establish the relationship for the child. SharedTraceIdentity is suppressed only when that child declares that candidate as its explicit parent; a candidate declaring the child leaves SharedTraceIdentity available while the candidate is evaluated.
 
 Contextual-only kinds — add nothing anywhere, contradict nothing, retained for inspection: `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, `ProtocolStream`, `ProtocolOwnership`, `WireDirection`, `SocketRole`, `TemporalLifetime`, `Custom`.
 
@@ -275,7 +277,7 @@ References are unique, so the ordering is total. The implementation MUST DERIVE 
 
 **Ownership vs parent witnesses stay separate:** `CorrelationResolution.evidence` carries the ownership witness; `SelectedCausalEdge.evidence` carries the direct-parent witness; extra parent detail inside a resolution is optional contextual enrichment. Which-scenario and which-direct-parent remain separable through output provenance as well as algorithm phases.
 
-Contextual fill is CANONICAL, not caller-ordered: remaining capacity fills from the operation's unused correlation-channel items sorted by the total canonical evidence key (non-candidate-relative items take an empty/None candidate scope in the key), truncated to the documented constant (64 items per slot, applied per ambiguity candidate). Caller evidence presentation order therefore cannot change retained output; the resolver does not preserve correlation-evidence `Vec` order. Role evidence is the deliberate exception — preserved byte-for-byte exactly as supplied, including item order, because role-resolution preservation is a separate foundation invariant. Recency/discovery-order never determines priority anywhere.
+Contextual fill is CANONICAL, not caller-ordered: after required ownership witnesses are retained in full, optional unused correlation-channel items fill up to `CORRELATION_CONTEXTUAL_RETENTION_CAP` (64 items per slot, applied per ambiguity candidate), sorted by the total canonical evidence key. A semantic proof may therefore make total retained evidence exceed 64; only optional contextual fill is capped. Caller evidence presentation order cannot change retained output; the resolver does not preserve correlation-evidence `Vec` order. Role evidence is the deliberate exception — preserved byte-for-byte exactly as supplied, including item order, because role-resolution preservation is a separate foundation invariant. Recency/discovery-order never determines priority anywhere.
 
 ### 12. Boundedness: sparse support sets
 
@@ -327,7 +329,7 @@ Until native evidence lands, this revision defines no Chronicle-native positive 
 - Cycle removal forfeits derivable structure inside cyclic components while preserving outgoing acyclic edges; guessing a break point would be worse.
 - Full-reference identity means regrouping operations across publications changes scenario identities. Honest: the foundation provides no stronger invariant to build on.
 - Snapshot-round closure may need more rounds than eager admission; bounded by N×S memberships and immune to ordering effects.
-- Per-candidate retention capacity slightly raises worst-case memory for wide ambiguity; explainability of every candidate outweighs it.
+- The contextual-fill cap bounds optional evidence while required ownership proofs remain complete; wide ambiguity still retains each candidate's full semantic witness.
 
 ## Future Changes
 

@@ -48,7 +48,7 @@ Ordered by dependency. Approved surfaces: `crates/chronicle-canonical/src/correl
 - [x] 7.1 After closure, derive each materialized outcome's canonical ownership witness from the immutable relation indexes plus final support sets — NOT from first-discovery state: later shorter paths win.
 - [x] 7.2 Derive the canonical transitive proof via deterministic shortest-path/dynamic-programming search over simple paths (visited-set pruned; no repeated references), ordering candidate paths shortest-first, then lexicographic candidate full-reference-tuple sequences, then canonical per-relation evidence keys. No enumeration of all paths; temporary search state proportional to the visited frontier; terminates on cyclic raw relation graphs.
 - [x] 7.3 Materialize outcomes only after derivation inputs are available: empty support -> `Uncorrelated`; one scenario -> `Resolved`; multiple -> `Ambiguous` keyed by ScenarioId with per-candidate witnesses. No final values assigned during propagation.
-- [x] 7.4 Tests: later-shorter-path wins canonical witness; equal-length paths break by lexicographic reference sequence regardless of presentation order; cyclic raw relation graphs terminate derivation with finite proofs; aggregation yields ONE scenario-keyed entry whose derived witness is canonical.
+- [x] 7.4 Tests: helper-level shortest/lexical path rules and a full `resolve_correlation` late-shorter-path regression prove final post-closure witness selection; equal-length paths break by lexicographic reference sequence regardless of presentation order; cyclic raw relation graphs terminate derivation with finite proofs; aggregation yields ONE scenario-keyed entry whose derived witness is canonical.
 
 ## 8. Confidence-consistent ownership-witness selection (unchanged semantics)
 
@@ -59,9 +59,9 @@ Ordered by dependency. Approved surfaces: `crates/chronicle-canonical/src/correl
 ## 9. Total canonical evidence key and deterministic contextual retention
 
 - [x] 9.1 Implement the TOTAL canonical evidence key covering the entire value: kind discriminator -> every semantic field of the kind in declaration order (UTF-8 byte string comparison; Option ordered None < Some) -> candidate full-reference tuple when candidate-relative (empty/None scope for non-relative items) -> `provenance.source` -> `provenance.observation`. For `TraceRelationship`: discriminator, provider, trace_id, span_id, parent_span_id, candidate scope, source, observation. No two distinct serialized items may tie.
-- [x] 9.2 Contextual fill: after semantic witnesses, sort unused correlation-channel items by the canonical key and truncate to the documented constant (64 items, applied per ambiguity candidate); caller correlation-evidence `Vec` order is NOT preserved for retention.
+- [x] 9.2 Contextual fill: after complete semantic witnesses, sort unused correlation-channel items by the canonical key and retain at most `CORRELATION_CONTEXTUAL_RETENTION_CAP` (64 items, applied per ambiguity candidate); required semantic witnesses are never truncated, so total evidence may exceed 64 for long proofs.
 - [x] 9.3 Role-evidence exception test: nested role evidence remains byte-for-byte exactly as supplied (including order) regardless of correlation-retention sorting.
-- [x] 9.4 Permutation-stability tests: same correlation-evidence multiset in several orders -> identical retained correlation evidence after cap application; witnesses differing only in parent_span_id / provenance.source / provenance.observation resolve identically under permutation.
+- [x] 9.4 Permutation-stability tests: same correlation-evidence multiset in several orders -> identical retained correlation evidence after contextual-fill cap application; prefix strings (`"a"`/`"aa"`, `"otel"`/`"otel2"`) order lexicographically; witnesses differing only in parent_span_id / provenance.source / provenance.observation resolve identically under permutation.
 
 ## 10. Stage B: fixed normative construction sequence with deterministic cycle safety
 
@@ -77,7 +77,8 @@ Ordered by dependency. Approved surfaces: `crates/chronicle-canonical/src/correl
 ## 11. Separate ownership-witness and edge-witness retention
 
 - [x] 11.1 Ownership witness lives in `CorrelationResolution.evidence`; direct-parent witness lives on `SelectedCausalEdge.evidence`; extra parent detail inside resolutions is optional contextual enrichment only.
-- [x] 11.2 Retention runs strictly after A2+B over closed support structure; documented constant 64 applied per outcome slot and PER AMBIGUITY CANDIDATE; justification-first fill via section 9 rules then canonically sorted contextual fill; Uncorrelated keeps contextual/input items canonically with no manufactured witness.
+- [x] 11.2 Retention runs strictly after A2+B over closed support structure; required ownership and ambiguity-candidate witnesses are retained in full; `CORRELATION_CONTEXTUAL_RETENTION_CAP` bounds only optional contextual fill per outcome slot and ambiguity candidate; Uncorrelated keeps contextual/input items canonically with no manufactured witness.
+- [x] 11.3 Long-proof regression: a 70-hop Strong transitive witness remains complete and deterministic under input permutation while optional contextual fill remains bounded.
 
 ## 12. Concurrent-ingress, async, temporal, cross-epoch cases (unchanged contracts)
 

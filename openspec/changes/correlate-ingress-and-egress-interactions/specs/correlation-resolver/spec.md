@@ -142,12 +142,18 @@ Phase A1 SHALL initialize support exactly once per admitted `Known(Ingress)` ope
 
 The resolver SHALL interpret evidence exclusively through defined relational predicates comparing child-side items against candidate-side items within the CORRELATION evidence channel; it SHALL NOT infer semantics from field names alone. A predicate fires only when both sides carry the referenced items; missing sides yield no relation, never defaults. Ownership-relevant predicates are:
 
-- `SharedTraceIdentity` — child `TraceRelationship` and candidate `TraceRelationship` share equal non-empty `provider` AND equal non-empty `trace_id`: adds that specific scenario to the child's support set; never direct-parent evidence; provider namespaces are part of identity, so identical opaque values under different providers never match. A pair joined by a declared `ExplicitParentSpan` relation (EITHER side declaring the other as its span parent) routes inherited support through the transitive channel; `SharedTraceIdentity` contributes DIRECT scenario-level support only between pairs without such a declaration.
-- `ExplicitParentSpan` — child non-empty `parent_span_id` equals a candidate's non-empty `span_id` under the same `provider`+`trace_id`: declared direct span parenthood; the child inherits the candidate's previous-round support entries transitively; a candidate for Phase B direct parenthood subject to that phase's invalid-relation filters.
+- `SharedTraceIdentity` — child `TraceRelationship` and candidate `TraceRelationship` share equal non-empty `provider` AND equal non-empty `trace_id`: adds that specific scenario to the child's support set; never direct-parent evidence; provider namespaces are part of identity, so identical opaque values under different providers never match. `SharedTraceIdentity` is suppressed only when THAT CHILD declares THAT CANDIDATE as its explicit parent; a reverse declaration by the candidate does not suppress it for the child being evaluated.
+- `ExplicitParentSpan` — child non-empty `parent_span_id` equals a candidate's non-empty `span_id` under the same non-empty `provider`+`trace_id`: directional declared direct span parenthood; the child inherits the candidate's previous-round support entries transitively; a candidate for Phase B direct parenthood subject to that phase's invalid-relation filters. The reverse condition (`candidate.parent_span_id == child.span_id`) does not establish `ExplicitParentSpan(child, candidate)`.
+
+#### Scenario: Reverse parent declaration leaves SharedTraceIdentity available
+
+- **WHEN** child and candidate share non-empty provider and trace identity, and only the candidate declares the child as its parent
+- **THEN** evaluating the child does not treat the pair as `ExplicitParentSpan(child, candidate)`
+- **AND** `SharedTraceIdentity` remains available as direct support for the child
 
 Resolver-generated `ScenarioRoot` evidence initializes and pins each root per the root-establishment requirement. All remaining kinds — `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, `ProtocolStream`, `ProtocolOwnership`, `WireDirection`, `SocketRole`, `TemporalLifetime`, `Custom` — are contextual only: they add nothing to any support set, contradict nothing, and are retained for inspection. Task and process lineage equality is contextual because no repository contract defines those strings as unique causal-execution identity; `derive-native-correlation-evidence` owns defining such contracts and may promote named predicates through specification changes. Shared span identity blocks only direct-parent sufficiency, never support propagation. Promoting any additional predicate requires a specification change naming its comparison rule.
 
-All predicate evaluation, relation indexes, support propagation, ambiguity detection, and parent selection SHALL operate on the complete validated CORRELATION-channel evidence set; retention truncation SHALL occur only after semantic resolution is complete as output representation, so evidence volume beyond the retention cap can never alter outcomes.
+All predicate evaluation, relation indexes, support propagation, ambiguity detection, and parent selection SHALL operate on the complete validated CORRELATION-channel evidence set. Required semantic ownership witnesses SHALL be retained in full after resolution; `CORRELATION_CONTEXTUAL_RETENTION_CAP` limits only optional contextual fill, so total retained evidence MAY exceed 64 when a required proof is longer. Retention occurs only after semantic resolution is complete as output representation, so evidence volume beyond the contextual-fill cap can never alter outcomes.
 
 #### Scenario: Same trace supports several members of one scenario without duplication
 
@@ -417,7 +423,7 @@ Retention SHALL occur only after Phase A2 and Phase B complete, as output repres
 
 Equivalent witnesses SHALL be ordered by a TOTAL canonical key covering the entire value, so distinct serialized items can never tie: the kind discriminator, every semantic field of the kind in declaration order with strings compared as UTF-8 bytes and Option values ordered None before Some, the candidate full-reference tuple when the witness is candidate-relative, then `provenance.source`, then `provenance.observation` (None before Some). For `TraceRelationship` this covers discriminator, provider, trace_id, span_id, parent_span_id, candidate scope, source, and observation — two witnesses differing in ANY field, including `parent_span_id` or provenance values, order deterministically. For transitive proofs, candidate paths SHALL order by shortest valid proof path first, then lexicographic sequence of candidate full-reference tuples along the path, then canonical evidence keys of each relation along the path; references are unique, making the ordering total. Selection reads the closed support structure rather than arrival or discovery order, making byte-stable retained output well-defined; insertion/presentation order and recency SHALL NEVER determine priority.
 
-Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witnesses live on `SelectedCausalEdge.evidence`; any extra parent detail inside a resolution is optional contextual enrichment, never the primary ownership proof. Remaining capacity fills with unused contextual/input correlation-channel items SORTED by the total canonical evidence key — non-candidate-relative items taking an empty/None candidate scope — truncated to the documented constant (64 items), applied per ambiguity candidate; caller correlation-evidence presentation order therefore cannot change retained output. Supplied role evidence remains byte-for-byte exactly as provided, including item order — role-resolution preservation is a separate foundation invariant, and the canonical-sort requirement applies only to correlation-channel retention. Ordinary valid ambiguity neither drops candidates nor turns into errors. `Uncorrelated` outcomes retain contextual/input evidence canonically with no manufactured ownership witness.
+Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witnesses live on `SelectedCausalEdge.evidence`; any extra parent detail inside a resolution is optional contextual enrichment, never the primary ownership proof. After required semantic witnesses are retained in full, optional unused contextual/input correlation-channel items fill up to `CORRELATION_CONTEXTUAL_RETENTION_CAP` (64 items), SORTED by the total canonical evidence key — non-candidate-relative items taking an empty/None candidate scope — applied per ambiguity candidate. Total resolution evidence MAY exceed 64 only when required semantic proof exceeds the cap; optional contextual fill remains bounded. Caller correlation-evidence presentation order therefore cannot change retained output. Supplied role evidence remains byte-for-byte exactly as provided, including item order — role-resolution preservation is a separate foundation invariant, and the canonical-sort requirement applies only to correlation-channel retention. Ordinary valid ambiguity neither drops candidates nor turns into errors. `Uncorrelated` outcomes retain contextual/input evidence canonically with no manufactured ownership witness.
 
 #### Scenario: Exact resolution keeps an Exact witness
 
@@ -430,6 +436,12 @@ Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witn
 - **WHEN** an operation's sole support into its unique scenario runs through transitive parent-span paths, materializing `Strong`
 - **THEN** the retained ownership witness demonstrates the transitive support path
 - **AND** no direct-style witness is fabricated
+
+#### Scenario: Long Strong proof remains explainable
+
+- **WHEN** a Strong ownership proof contains more than 64 valid ExplicitParentSpan hops
+- **THEN** the complete selected semantic proof remains in the resolution evidence
+- **AND** optional contextual fill is omitted or bounded by `CORRELATION_CONTEXTUAL_RETENTION_CAP` rather than truncating the proof
 
 #### Scenario: Witness tie beyond span ID resolves deterministically
 
@@ -445,7 +457,7 @@ Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witn
 
 #### Scenario: Cap pressure preserves correctness and witnesses
 
-- **WHEN** more raw evidence exists than the retention constant while relational support stays fixed
+- **WHEN** more optional raw evidence exists than `CORRELATION_CONTEXTUAL_RETENTION_CAP` while relational support stays fixed
 - **THEN** support sets, materialized outcomes, and selected edges remain identical to an uncapped run
 - **AND** only optional retained contextual fill differs according to the deterministic cap policy
 
@@ -457,7 +469,7 @@ Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witn
 
 #### Scenario: Contextual fill is independent of caller evidence order
 
-- **WHEN** the same correlation-evidence multiset exceeding the retention constant is presented in several different orders
+- **WHEN** the same correlation-evidence multiset exceeding the contextual-fill cap is presented in several different orders
 - **THEN** retained correlation evidence — semantic witnesses plus canonically sorted contextual fill — is identical in every run
 - **AND** supplied role evidence remains byte-for-byte unchanged regardless of any sorting rule
 

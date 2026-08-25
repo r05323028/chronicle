@@ -17,9 +17,9 @@ use chronicle_common::ScenarioId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-/// Documented retention constant applied per resolution slot and per ambiguity
-/// candidate, strictly after semantic resolution completed.
-pub const CORRELATION_RETENTION_CAP: usize = 64;
+/// Maximum optional contextual correlation evidence retained per resolution
+/// slot or ambiguity candidate after required semantic witnesses are kept.
+pub const CORRELATION_CONTEXTUAL_RETENTION_CAP: usize = 64;
 
 /// Lifetime view of one canonical operation supplied alongside its role and
 /// correlation evidence. Temporal values stay contextual in this revision:
@@ -257,6 +257,23 @@ fn trace_facts(evidence: &[CorrelationEvidence]) -> Vec<TraceFact> {
     facts
 }
 
+/// Typed total canonical evidence key. Each field is a typed ordered part,
+/// so string boundaries are structural and Rust's lexicographic `String` order
+/// preserves proper-prefix ordering (`"a" < "aa"`).
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum CanonicalEvidenceKeyPart {
+    Text(String),
+    OptionalText(Option<String>),
+    U64(u64),
+    OptionalU64(Option<u64>),
+    OptionalConnectionUuid(Option<[u8; 16]>),
+    Reference(CanonicalOperationRef),
+    CandidateScope(Option<CanonicalOperationRef>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct CanonicalEvidenceKey(Vec<CanonicalEvidenceKeyPart>);
+
 /// Total canonical evidence key covering the ENTIRE value so distinct
 /// serialized evidence items can never tie: kind discriminator, every semantic
 /// field of the kind in declaration order (strings by UTF-8 bytes, options as
@@ -266,49 +283,28 @@ fn trace_facts(evidence: &[CorrelationEvidence]) -> Vec<TraceFact> {
 fn canonical_evidence_key(
     item: &CorrelationEvidence,
     candidate_scope: Option<&CanonicalOperationRef>,
-) -> Vec<u8> {
-    fn push_str(key: &mut Vec<u8>, value: &str) {
-        // Raw UTF-8 bytes plus a 0xFF sentinel: 0xFF never occurs inside valid
-        // UTF-8, so the terminator delimits fields without disturbing the
-        // byte-for-byte string order the capability requires.
-        key.extend_from_slice(value.as_bytes());
-        key.push(0xFF);
+) -> CanonicalEvidenceKey {
+    fn push_str(key: &mut CanonicalEvidenceKey, value: &str) {
+        key.0.push(CanonicalEvidenceKeyPart::Text(value.to_owned()));
     }
-    fn push_opt_str(key: &mut Vec<u8>, value: Option<&String>) {
-        match value {
-            None => key.push(0),
-            Some(value) => {
-                key.push(1);
-                push_str(key, value);
-            }
-        }
+    fn push_opt_str(key: &mut CanonicalEvidenceKey, value: Option<&String>) {
+        key.0
+            .push(CanonicalEvidenceKeyPart::OptionalText(value.cloned()));
     }
-    fn push_opt_u64(key: &mut Vec<u8>, value: Option<&u64>) {
-        match value {
-            None => key.push(0),
-            Some(value) => {
-                key.push(1);
-                key.extend_from_slice(&value.to_be_bytes());
-            }
-        }
+    fn push_opt_u64(key: &mut CanonicalEvidenceKey, value: Option<&u64>) {
+        key.0
+            .push(CanonicalEvidenceKeyPart::OptionalU64(value.copied()));
     }
-    fn push_opt_uuid(key: &mut Vec<u8>, value: Option<&crate::ConnectionId>) {
-        match value {
-            None => key.push(0),
-            Some(value) => {
-                key.push(1);
-                key.extend_from_slice(value.as_uuid().as_bytes());
-            }
-        }
+    fn push_opt_uuid(key: &mut CanonicalEvidenceKey, value: Option<&crate::ConnectionId>) {
+        key.0.push(CanonicalEvidenceKeyPart::OptionalConnectionUuid(
+            value.map(|value| *value.as_uuid().as_bytes()),
+        ));
     }
-    fn push_ref(key: &mut Vec<u8>, reference: &CanonicalOperationRef) {
-        key.extend_from_slice(reference.recording_id.as_uuid().as_bytes());
-        key.extend_from_slice(reference.owner_epoch_id.as_uuid().as_bytes());
-        key.extend_from_slice(reference.session_id.as_uuid().as_bytes());
-        key.extend_from_slice(reference.operation_id.as_uuid().as_bytes());
+    fn push_ref(key: &mut CanonicalEvidenceKey, reference: &CanonicalOperationRef) {
+        key.0.push(CanonicalEvidenceKeyPart::Reference(*reference));
     }
 
-    let mut key = Vec::new();
+    let mut key = CanonicalEvidenceKey(Vec::new());
     match &item.kind {
         CorrelationEvidenceKind::TraceRelationship {
             provider,
@@ -379,7 +375,7 @@ fn canonical_evidence_key(
         }
         CorrelationEvidenceKind::TemporalLifetime { start, end } => {
             push_str(&mut key, "temporal_lifetime");
-            key.extend_from_slice(&start.0.to_be_bytes());
+            key.0.push(CanonicalEvidenceKeyPart::U64(start.0));
             push_opt_u64(&mut key, end.map(|end| end.0).as_ref());
         }
         CorrelationEvidenceKind::WireDirection { direction } => {
@@ -413,13 +409,9 @@ fn canonical_evidence_key(
             push_str(&mut key, value);
         }
     }
-    match candidate_scope {
-        None => key.push(0),
-        Some(scope) => {
-            key.push(1);
-            push_ref(&mut key, scope);
-        }
-    }
+    key.0.push(CanonicalEvidenceKeyPart::CandidateScope(
+        candidate_scope.copied(),
+    ));
     push_str(&mut key, item.provenance.source.as_str());
     push_opt_str(&mut key, item.provenance.observation.as_ref());
     key
@@ -783,6 +775,7 @@ struct Witness {
     foreign: Vec<CorrelationEvidence>,
 }
 
+#[allow(clippy::too_many_lines)] // Flat witness selection keeps class rules visible.
 fn derive_ownership_witness(
     reference: CanonicalOperationRef,
     scenario_id: ScenarioId,
@@ -794,7 +787,7 @@ fn derive_ownership_witness(
 ) -> Witness {
     // Direct class: canonical minimal child-side TraceRelationship item sharing
     // trace identity with some candidate whose closed support contains S.
-    let mut best_direct: Option<(Vec<u8>, usize)> = None;
+    let mut best_direct: Option<(CanonicalEvidenceKey, usize)> = None;
     for (index, item) in evidence.iter().enumerate() {
         if let CorrelationEvidenceKind::TraceRelationship {
             provider, trace_id, ..
@@ -854,7 +847,12 @@ fn derive_ownership_witness(
     let mut witness = Witness::default();
     let mut from = reference;
     for to in path {
-        let mut best_hop: Option<(Vec<u8>, usize, bool, Option<CorrelationEvidence>)> = None;
+        let mut best_hop: Option<(
+            CanonicalEvidenceKey,
+            usize,
+            bool,
+            Option<CorrelationEvidence>,
+        )> = None;
         if let Some(input) = ordered.get(&from) {
             for (index, item) in input.evidence.iter().enumerate() {
                 if let CorrelationEvidenceKind::TraceRelationship {
@@ -900,10 +898,9 @@ fn derive_ownership_witness(
     witness
 }
 
-/// Retention happens only after semantics: semantic witnesses keep their slots,
-/// remaining capacity fills with the operation's unused correlation-channel
-/// items sorted by the total canonical evidence key (non-candidate-relative
-/// items take an empty candidate scope), truncated to the documented constant.
+/// Retention happens only after semantics: required semantic witnesses are kept
+/// in full; the cap limits only optional contextual correlation-channel fill
+/// sorted by the total canonical evidence key.
 fn apply_retention(
     witness: Witness,
     all_evidence: &[CorrelationEvidence],
@@ -915,34 +912,31 @@ fn apply_retention(
     }
     retained.extend(witness.foreign);
     let consumed: BTreeSet<usize> = witness.own_indices.into_iter().collect();
-    let mut fill: Vec<(Vec<u8>, &CorrelationEvidence)> = all_evidence
+    let mut fill: Vec<(CanonicalEvidenceKey, &CorrelationEvidence)> = all_evidence
         .iter()
         .enumerate()
         .filter(|(index, _)| !consumed.contains(index))
         .map(|(_, item)| (canonical_evidence_key(item, None), item))
         .collect();
     fill.sort_by(|left, right| left.0.cmp(&right.0));
-    for (_, item) in fill {
-        if retained.len() >= CORRELATION_RETENTION_CAP {
-            break;
-        }
+    let fill_capacity = CORRELATION_CONTEXTUAL_RETENTION_CAP.saturating_sub(retained.len());
+    for (_, item) in fill.into_iter().take(fill_capacity) {
         retained.push(item.clone());
     }
-    retained.truncate(CORRELATION_RETENTION_CAP);
     retained
 }
 
 /// Uncorrelated retention: canonically sorted contextual/input evidence with no
 /// manufactured ownership witness.
 fn uncorrelated_retained(evidence: &[CorrelationEvidence]) -> Vec<CorrelationEvidence> {
-    let mut sorted: Vec<(Vec<u8>, &CorrelationEvidence)> = evidence
+    let mut sorted: Vec<(CanonicalEvidenceKey, &CorrelationEvidence)> = evidence
         .iter()
         .map(|item| (canonical_evidence_key(item, None), item))
         .collect();
     sorted.sort_by(|left, right| left.0.cmp(&right.0));
     sorted
         .into_iter()
-        .take(CORRELATION_RETENTION_CAP)
+        .take(CORRELATION_CONTEXTUAL_RETENTION_CAP)
         .map(|(_, item)| item.clone())
         .collect()
 }
@@ -1027,7 +1021,7 @@ fn construct_selected_edges(
             BTreeMap::new();
         let mut by_child_items: BTreeMap<
             (CanonicalOperationRef, CanonicalOperationRef),
-            (Vec<u8>, CorrelationEvidence),
+            (CanonicalEvidenceKey, CorrelationEvidence),
         > = BTreeMap::new();
         for (child, input) in ordered {
             if !members.contains(child) || *child == root {
@@ -2342,6 +2336,111 @@ mod tests {
     }
 
     #[test]
+    fn late_shorter_path_wins_after_support_closure() {
+        let build = |reverse: bool| {
+            let root = ref_at(10);
+            let p2 = ref_at(11);
+            let p1 = ref_at(12);
+            let x1 = ref_at(13);
+            let x2 = ref_at(14);
+            let x3 = ref_at(15);
+            let z = ref_at(16);
+            let target = ref_at(30);
+            let mut inputs = vec![
+                // Bidirectional long route keeps its intermediate ownership
+                // purely transitive under directional parent semantics:
+                // target -> p1 -> p2 -> root.
+                input(
+                    root,
+                    ingress_role(),
+                    vec![
+                        trace("otel", "L1", Some("r1"), Some("p2_1")),
+                        trace("otel", "L4", Some("r4"), None),
+                    ],
+                ),
+                input(
+                    p2,
+                    egress_role(),
+                    vec![
+                        trace("otel", "L1", Some("p2_1"), Some("r1")),
+                        trace("otel", "L2", Some("p2_2"), Some("p1_2")),
+                    ],
+                ),
+                input(
+                    p1,
+                    egress_role(),
+                    vec![
+                        trace("otel", "L2", Some("p1_2"), Some("p2_2")),
+                        trace("otel", "L3", Some("p1_3"), Some("target_3")),
+                    ],
+                ),
+                input(
+                    target,
+                    egress_role(),
+                    vec![
+                        trace("otel", "L3", Some("target_3"), Some("p1_3")),
+                        trace("otel", "L8", None, Some("z8")),
+                    ],
+                ),
+                // x1 -> x2 -> x3 becomes supported later; z then gains
+                // DIRECT support through its shared L7 identity.
+                input(
+                    x1,
+                    egress_role(),
+                    vec![
+                        trace("otel", "L4", Some("x1_4"), Some("r4")),
+                        trace("otel", "L5", Some("x1_5"), None),
+                    ],
+                ),
+                input(
+                    x2,
+                    egress_role(),
+                    vec![
+                        trace("otel", "L5", Some("x2_5"), Some("x1_5")),
+                        trace("otel", "L6", Some("x2_6"), None),
+                    ],
+                ),
+                input(
+                    x3,
+                    egress_role(),
+                    vec![
+                        trace("otel", "L6", Some("x3_6"), Some("x2_6")),
+                        trace("otel", "L7", Some("x3_7"), None),
+                    ],
+                ),
+                input(
+                    z,
+                    egress_role(),
+                    vec![
+                        trace("otel", "L7", Some("z7"), None),
+                        trace("otel", "L8", Some("z8"), None),
+                    ],
+                ),
+            ];
+            if reverse {
+                inputs.reverse();
+            }
+            resolve(inputs)
+        };
+        let forward = build(false);
+        let backward = build(true);
+        assert_eq!(forward, backward);
+
+        let (scenario, confidence, evidence) = resolved_of(&forward, ref_at(30));
+        assert_eq!(*scenario, scenario_id_v1(&ref_at(10)));
+        assert_eq!(confidence, CorrelationConfidence::Strong);
+        // z becomes direct only after the late x-chain closes. Final A2 proof
+        // selection therefore chooses target -> z, not the earlier long route.
+        assert!(matches!(
+            evidence.first().map(|item| &item.kind),
+            Some(CorrelationEvidenceKind::TraceRelationship {
+                parent_span_id: Some(parent_span_id),
+                ..
+            }) if parent_span_id == "z8"
+        ));
+    }
+
+    #[test]
     fn equal_length_paths_break_by_lexicographic_reference_sequence() {
         // Midpoints bridge two trace identities: they declare parenthood into
         // the root on TR and expose spans on TB for the target. The target
@@ -2871,6 +2970,52 @@ mod tests {
     }
 
     #[test]
+    fn canonical_evidence_key_orders_prefixes_and_contextual_fill_permutations() {
+        let a = trace("a", "trace", Some("span"), None);
+        let aa = trace("aa", "trace", Some("span"), None);
+        assert!(canonical_evidence_key(&a, None) < canonical_evidence_key(&aa, None));
+
+        let otel = trace("otel", "trace", Some("span"), None);
+        let otel2 = trace("otel2", "trace", Some("span"), None);
+        assert!(canonical_evidence_key(&otel, None) < canonical_evidence_key(&otel2, None));
+
+        let build = |reverse: bool| {
+            let root = ref_at(10);
+            let target = ref_at(30);
+            let prefix_a = CorrelationEvidence::custom("ctx", "a", "value");
+            let prefix_aa = CorrelationEvidence::custom("ctx", "aa", "value");
+            let mut evidence = vec![
+                trace("otel", "T", Some("target"), None),
+                prefix_aa,
+                prefix_a,
+            ];
+            if reverse {
+                evidence.reverse();
+            }
+            resolve(vec![
+                input(
+                    root,
+                    ingress_role(),
+                    vec![trace("otel", "T", Some("root"), None)],
+                ),
+                input(target, egress_role(), evidence),
+            ])
+        };
+        let forward = build(false);
+        let backward = build(true);
+        assert_eq!(forward, backward);
+        let (_, _, evidence) = resolved_of(&forward, ref_at(30));
+        assert!(matches!(
+            &evidence[1].kind,
+            CorrelationEvidenceKind::Custom { key, .. } if key == "a"
+        ));
+        assert!(matches!(
+            &evidence[2].kind,
+            CorrelationEvidenceKind::Custom { key, .. } if key == "aa"
+        ));
+    }
+
+    #[test]
     fn cap_pressure_changes_no_semantics_and_fill_is_permutation_stable() {
         let build = |reverse: bool| {
             let root = ref_at(10);
@@ -2905,12 +3050,66 @@ mod tests {
             evidence_a, evidence_b,
             "retained output must be permutation-stable"
         );
-        assert!(evidence_a.len() <= CORRELATION_RETENTION_CAP);
+        assert!(evidence_a.len() <= CORRELATION_CONTEXTUAL_RETENTION_CAP);
         // The semantic witness survived the cap.
         assert!(evidence_a.iter().any(|item| matches!(
             &item.kind,
             CorrelationEvidenceKind::TraceRelationship { span_id, .. } if span_id.as_deref() == Some("z")
         )));
+    }
+
+    #[test]
+    fn semantic_transitive_witness_over_64_hops_is_not_truncated() {
+        const HOPS: usize = 70;
+        let build = |reverse: bool| {
+            let root = ref_at(10);
+            let mut inputs = vec![input(
+                root,
+                ingress_role(),
+                vec![trace("otel", "chain-0", Some("span-0"), Some("span-1"))],
+            )];
+            for index in 1..=HOPS {
+                let mut evidence = Vec::new();
+                let link = index - 1;
+                let trace_id = format!("chain-{link}");
+                let span = format!("span-{index}");
+                let parent_span = format!("span-{link}");
+                evidence.push(trace("otel", &trace_id, Some(&span), Some(&parent_span)));
+                if index < HOPS {
+                    let next_trace_id = format!("chain-{index}");
+                    let next_parent = format!("span-{}", index + 1);
+                    evidence.push(trace(
+                        "otel",
+                        &next_trace_id,
+                        Some(&span),
+                        Some(&next_parent),
+                    ));
+                } else {
+                    evidence.push(task("optional-context"));
+                }
+                inputs.push(input(ref_at(10 + index as u128), egress_role(), evidence));
+            }
+            if reverse {
+                inputs.reverse();
+            }
+            resolve(inputs)
+        };
+        let forward = build(false);
+        let backward = build(true);
+        assert_eq!(forward, backward);
+
+        let target = ref_at(10 + HOPS as u128);
+        let (scenario, confidence, evidence) = resolved_of(&forward, target);
+        assert_eq!(*scenario, scenario_id_v1(&ref_at(10)));
+        assert_eq!(confidence, CorrelationConfidence::Strong);
+        assert_eq!(evidence.len(), HOPS);
+        assert!(evidence.len() > CORRELATION_CONTEXTUAL_RETENTION_CAP);
+        assert!(evidence.iter().all(|item| {
+            !matches!(
+                item.kind,
+                CorrelationEvidenceKind::ExecutionTaskLineage { .. }
+            )
+        }));
     }
 
     #[test]
@@ -2973,7 +3172,7 @@ mod tests {
                 // remaining capacity with the unused input item.
                 assert_eq!(evidence[0].provenance.source, "alpha");
                 assert_eq!(evidence[0].provenance.observation.as_deref(), Some("later"));
-                assert!(evidence.len() <= CORRELATION_RETENTION_CAP);
+                assert!(evidence.len() <= CORRELATION_CONTEXTUAL_RETENTION_CAP);
             }
             other => panic!("expected resolved, got {other:?}"),
         }
