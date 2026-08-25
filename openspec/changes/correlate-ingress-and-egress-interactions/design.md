@@ -137,10 +137,10 @@ immutable correlation-channel relation indexes (FULL validated correlation evide
    |    then materialize CorrelationResolution values once
    |    {} -> Uncorrelated ; {A} -> Resolved(A) ; {A,B,...} -> Ambiguous(A,B,...)
 |    construct final scenario memberships
+   |    ownership-evidence retention from complete inputs (output only)
    |
 [B] GLOBAL direct-parent construction per scenario (Decision 10)
-   |
-deterministic minimal-witness retention (output only)
+   |    complete validated inputs -> selected-edge evidence
    |
 CorrelationGraph
 ```
@@ -277,7 +277,7 @@ References are unique, so the ordering is total. The implementation MUST DERIVE 
 
 **Ownership vs parent witnesses stay separate:** `CorrelationResolution.evidence` carries the ownership witness; `SelectedCausalEdge.evidence` carries the direct-parent witness; extra parent detail inside a resolution is optional contextual enrichment. Which-scenario and which-direct-parent remain separable through output provenance as well as algorithm phases.
 
-Contextual fill is CANONICAL, not caller-ordered: after required ownership witnesses are retained in full, optional unused correlation-channel items fill up to `CORRELATION_CONTEXTUAL_RETENTION_CAP` (64 items per slot, applied per ambiguity candidate), sorted by the total canonical evidence key. A semantic proof may therefore make total retained evidence exceed 64; only optional contextual fill is capped. Caller evidence presentation order cannot change retained output; the resolver does not preserve correlation-evidence `Vec` order. Role evidence is the deliberate exception — preserved byte-for-byte exactly as supplied, including item order, because role-resolution preservation is a separate foundation invariant. Recency/discovery-order never determines priority anywhere.
+Retention targets at most `CORRELATION_RETENTION_TARGET` (64) total retained correlation-evidence items per resolution slot or ambiguity candidate in ordinary cases. Required semantic ownership witnesses are retained in full; optional unused correlation-channel evidence fills only remaining target capacity in canonical order. A required semantic proof longer than 64 is retained in full and receives no optional contextual fill. Retention never feeds Stage B; Stage B reads complete validated correlation inputs and immutable relation indexes. Caller evidence presentation order cannot change retained output; the resolver does not preserve correlation-evidence `Vec` order. Role evidence is the deliberate exception — preserved byte-for-byte exactly as supplied, including item order, because role-resolution preservation is a separate foundation invariant. Recency/discovery-order never determines priority anywhere.
 
 ### 12. Boundedness: sparse support sets
 

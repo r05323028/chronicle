@@ -59,9 +59,10 @@ Ordered by dependency. Approved surfaces: `crates/chronicle-canonical/src/correl
 ## 9. Total canonical evidence key and deterministic contextual retention
 
 - [x] 9.1 Implement the TOTAL canonical evidence key covering the entire value: kind discriminator -> every semantic field of the kind in declaration order (UTF-8 byte string comparison; Option ordered None < Some) -> candidate full-reference tuple when candidate-relative (empty/None scope for non-relative items) -> `provenance.source` -> `provenance.observation`. For `TraceRelationship`: discriminator, provider, trace_id, span_id, parent_span_id, candidate scope, source, observation. No two distinct serialized items may tie.
-- [x] 9.2 Contextual fill: after complete semantic witnesses, sort unused correlation-channel items by the canonical key and retain at most `CORRELATION_CONTEXTUAL_RETENTION_CAP` (64 items, applied per ambiguity candidate); required semantic witnesses are never truncated, so total evidence may exceed 64 for long proofs.
+- [x] 9.2 Retention target: after complete semantic witnesses, target at most `CORRELATION_RETENTION_TARGET` (64 total items per outcome slot or ambiguity candidate) by sorting optional unused correlation-channel items canonically into remaining capacity; required semantic witnesses are never truncated, so long proofs may exceed 64.
 - [x] 9.3 Role-evidence exception test: nested role evidence remains byte-for-byte exactly as supplied (including order) regardless of correlation-retention sorting.
-- [x] 9.4 Permutation-stability tests: same correlation-evidence multiset in several orders -> identical retained correlation evidence after contextual-fill cap application; prefix strings (`"a"`/`"aa"`, `"otel"`/`"otel2"`) order lexicographically; witnesses differing only in parent_span_id / provenance.source / provenance.observation resolve identically under permutation.
+- [x] 9.4 Permutation-stability tests: same correlation-evidence multiset in several orders -> identical retained correlation evidence after total-target budgeting; prefix strings (`"a"`/`"aa"`, `"otel"`/`"otel2"`) order lexicographically; witnesses differing only in parent_span_id / provenance.source / provenance.observation resolve identically under permutation.
+- [x] 9.5 Root retention tests: `ScenarioRoot` remains primary while root correlation-channel TraceRelationship, TemporalLifetime, and Custom context are retained canonically; empty root evidence remains root-only; role evidence stays verbatim.
 
 ## 10. Stage B: fixed normative construction sequence with deterministic cycle safety
 
@@ -77,8 +78,9 @@ Ordered by dependency. Approved surfaces: `crates/chronicle-canonical/src/correl
 ## 11. Separate ownership-witness and edge-witness retention
 
 - [x] 11.1 Ownership witness lives in `CorrelationResolution.evidence`; direct-parent witness lives on `SelectedCausalEdge.evidence`; extra parent detail inside resolutions is optional contextual enrichment only.
-- [x] 11.2 Retention runs strictly after A2+B over closed support structure; required ownership and ambiguity-candidate witnesses are retained in full; `CORRELATION_CONTEXTUAL_RETENTION_CAP` bounds only optional contextual fill per outcome slot and ambiguity candidate; Uncorrelated keeps contextual/input items canonically with no manufactured witness.
+- [x] 11.2 Retention runs after ownership closure and canonical ownership-witness derivation; required ownership and ambiguity-candidate witnesses are retained in full; `CORRELATION_RETENTION_TARGET` targets total retained evidence per outcome slot and ambiguity candidate; Stage B still reads complete validated inputs and immutable indexes; Uncorrelated keeps contextual/input items canonically with no manufactured witness.
 - [x] 11.3 Long-proof regression: a 70-hop Strong transitive witness remains complete and deterministic under input permutation while optional contextual fill remains bounded.
+- [x] 11.4 Stage B full-input regression: a parent-span relation omitted from retained optional output still produces the correct selected edge.
 
 ## 12. Concurrent-ingress, async, temporal, cross-epoch cases (unchanged contracts)
 

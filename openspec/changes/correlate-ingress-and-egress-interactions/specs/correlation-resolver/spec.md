@@ -103,7 +103,7 @@ For every admitted operation whose role resolution is `Known(Ingress)`, the reso
 
 ### Requirement: Caller-controlled input rejects ScenarioRoot everywhere in both channels
 
-Before resolution begins, the resolver SHALL validate that no caller-supplied `ScenarioRoot` item appears anywhere in caller-controlled input: correlation-context evidence maps, `InteractionRoleResolution::Known.evidence`, `Unknown.evidence`, and `Ambiguous.candidates[*].evidence`. Each occurrence SHALL fail as a typed input error. `ScenarioRoot` remains a valid graph-domain value exclusively in resolver output; only the resolver may create it, after input validation identifies actual `Known(Ingress)` roots.
+Before resolution begins, the resolver SHALL validate that no caller-supplied `ScenarioRoot` item appears anywhere in caller-controlled input: correlation-context evidence maps, `InteractionRoleResolution::Known.evidence`, `Unknown.evidence`, and `Ambiguous.candidates[*].evidence`. Each occurrence SHALL fail as a typed input error. Within `CorrelationGraph` values, `ScenarioRoot` is valid only in the root-establishment placement defined by this capability; only the resolver creates it during normal resolution after input validation identifies actual `Known(Ingress)` roots.
 
 #### Scenario: Direct context evidence injection fails closed
 
@@ -153,7 +153,7 @@ The resolver SHALL interpret evidence exclusively through defined relational pre
 
 Resolver-generated `ScenarioRoot` evidence initializes and pins each root per the root-establishment requirement. All remaining kinds — `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, `ProtocolStream`, `ProtocolOwnership`, `WireDirection`, `SocketRole`, `TemporalLifetime`, `Custom` — are contextual only: they add nothing to any support set, contradict nothing, and are retained for inspection. Task and process lineage equality is contextual because no repository contract defines those strings as unique causal-execution identity; `derive-native-correlation-evidence` owns defining such contracts and may promote named predicates through specification changes. Shared span identity blocks only direct-parent sufficiency, never support propagation. Promoting any additional predicate requires a specification change naming its comparison rule.
 
-All predicate evaluation, relation indexes, support propagation, ambiguity detection, and parent selection SHALL operate on the complete validated CORRELATION-channel evidence set. Required semantic ownership witnesses SHALL be retained in full after resolution; `CORRELATION_CONTEXTUAL_RETENTION_CAP` limits only optional contextual fill, so total retained evidence MAY exceed 64 when a required proof is longer. Retention occurs only after semantic resolution is complete as output representation, so evidence volume beyond the contextual-fill cap can never alter outcomes.
+All predicate evaluation, relation indexes, support propagation, ambiguity detection, and parent selection SHALL operate on the complete validated CORRELATION-channel evidence set. Required semantic ownership witnesses SHALL be retained in full after ownership closure and canonical witness derivation; `CORRELATION_RETENTION_TARGET` is a total retained-evidence target, so optional fill uses only remaining capacity and total retained evidence MAY exceed 64 when a required proof is longer. Resolution retention never feeds Stage B: Stage B always evaluates complete validated correlation evidence and immutable relation indexes. Retention occurs only after ownership semantics are complete as output representation, so evidence volume beyond the target can never alter outcomes.
 
 #### Scenario: Same trace supports several members of one scenario without duplication
 
@@ -414,7 +414,7 @@ No incremental add-if-still-valid traversal logic is allowed anywhere; no valida
 
 ### Requirement: Retention happens after semantics, keeps minimal deterministic witnesses consistent with materialized confidence, and separates ownership from parent witnesses
 
-Retention SHALL occur only after Phase A2 and Phase B complete, as output representation over the closed support structure. Retained ownership witnesses SHALL be CONSISTENT with the materialized confidence, chosen semantically rather than by one global priority list:
+Resolution evidence retention SHALL occur after ownership support closure and canonical ownership-witness derivation, as output representation over complete validated correlation inputs. It need not wait for the Stage B function call because retention never feeds Stage B semantics; Stage B evaluates complete validated correlation evidence and immutable relation indexes, then retains selected-edge evidence when emitting edges. Retained ownership witnesses SHALL be CONSISTENT with the materialized confidence, chosen semantically rather than by one global priority list:
 
 - Root `Exact` → the `ScenarioRoot` item;
 - Non-root `Exact` → a canonical DIRECT `SharedTraceIdentity` witness proving Exact ownership — a transitive span proof SHALL never substitute merely because it sorts earlier;
@@ -423,7 +423,20 @@ Retention SHALL occur only after Phase A2 and Phase B complete, as output repres
 
 Equivalent witnesses SHALL be ordered by a TOTAL canonical key covering the entire value, so distinct serialized items can never tie: the kind discriminator, every semantic field of the kind in declaration order with strings compared as UTF-8 bytes and Option values ordered None before Some, the candidate full-reference tuple when the witness is candidate-relative, then `provenance.source`, then `provenance.observation` (None before Some). For `TraceRelationship` this covers discriminator, provider, trace_id, span_id, parent_span_id, candidate scope, source, and observation — two witnesses differing in ANY field, including `parent_span_id` or provenance values, order deterministically. For transitive proofs, candidate paths SHALL order by shortest valid proof path first, then lexicographic sequence of candidate full-reference tuples along the path, then canonical evidence keys of each relation along the path; references are unique, making the ordering total. Selection reads the closed support structure rather than arrival or discovery order, making byte-stable retained output well-defined; insertion/presentation order and recency SHALL NEVER determine priority.
 
-Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witnesses live on `SelectedCausalEdge.evidence`; any extra parent detail inside a resolution is optional contextual enrichment, never the primary ownership proof. After required semantic witnesses are retained in full, optional unused contextual/input correlation-channel items fill up to `CORRELATION_CONTEXTUAL_RETENTION_CAP` (64 items), SORTED by the total canonical evidence key — non-candidate-relative items taking an empty/None candidate scope — applied per ambiguity candidate. Total resolution evidence MAY exceed 64 only when required semantic proof exceeds the cap; optional contextual fill remains bounded. Caller correlation-evidence presentation order therefore cannot change retained output. Supplied role evidence remains byte-for-byte exactly as provided, including item order — role-resolution preservation is a separate foundation invariant, and the canonical-sort requirement applies only to correlation-channel retention. Ordinary valid ambiguity neither drops candidates nor turns into errors. `Uncorrelated` outcomes retain contextual/input evidence canonically with no manufactured ownership witness.
+Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witnesses live on `SelectedCausalEdge.evidence`; any extra parent detail inside a resolution is optional contextual enrichment, never the primary ownership proof. Required semantic witnesses are retained in full. Optional unused contextual/input correlation-channel items fill only remaining capacity up to `CORRELATION_RETENTION_TARGET` (64 total items), SORTED by the total canonical evidence key — non-candidate-relative items taking an empty/None candidate scope — applied per ambiguity candidate. Total resolution evidence MAY exceed 64 only when required semantic proof exceeds the target; optional contextual fill remains bounded. Caller correlation-evidence presentation order therefore cannot change retained output. Supplied role evidence remains byte-for-byte exactly as provided, including item order — role-resolution preservation is a separate foundation invariant, and the canonical-sort requirement applies only to correlation-channel retention. Ordinary valid ambiguity neither drops candidates nor turns into errors. `Uncorrelated` outcomes retain contextual/input evidence canonically with no manufactured ownership witness.
+
+#### Scenario: Root keeps ScenarioRoot and correlation context
+
+- **WHEN** a Known(Ingress) root carries TraceRelationship, TemporalLifetime, and Custom items in its correlation channel
+- **THEN** its `Resolved` `Exact` evidence starts with resolver-generated `ScenarioRoot`
+- **AND** canonical optional root correlation context remains inspectable after that semantic witness
+- **AND** input order does not change the retained output or the preserved role evidence
+
+#### Scenario: Retention never feeds Stage B
+
+- **WHEN** a parent-span relation falls outside a child resolution's retained optional evidence target
+- **THEN** Stage B still evaluates the complete validated correlation input and emits the valid selected edge
+- **AND** ownership and edge selection are unchanged by output retention
 
 #### Scenario: Exact resolution keeps an Exact witness
 
@@ -441,7 +454,7 @@ Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witn
 
 - **WHEN** a Strong ownership proof contains more than 64 valid ExplicitParentSpan hops
 - **THEN** the complete selected semantic proof remains in the resolution evidence
-- **AND** optional contextual fill is omitted or bounded by `CORRELATION_CONTEXTUAL_RETENTION_CAP` rather than truncating the proof
+- **AND** optional contextual fill is omitted or bounded by `CORRELATION_RETENTION_TARGET` rather than truncating the proof
 
 #### Scenario: Witness tie beyond span ID resolves deterministically
 
@@ -457,7 +470,7 @@ Ownership witnesses live in `CorrelationResolution.evidence`; direct-parent witn
 
 #### Scenario: Cap pressure preserves correctness and witnesses
 
-- **WHEN** more optional raw evidence exists than `CORRELATION_CONTEXTUAL_RETENTION_CAP` while relational support stays fixed
+- **WHEN** more optional raw evidence exists than `CORRELATION_RETENTION_TARGET` while relational support stays fixed
 - **THEN** support sets, materialized outcomes, and selected edges remain identical to an uncapped run
 - **AND** only optional retained contextual fill differs according to the deterministic cap policy
 

@@ -62,7 +62,8 @@ The addition affects only the non-frozen runtime correlation-domain surface and 
 
 - **WHEN** caller-controlled input contains `ScenarioRoot` items in either evidence channel
 - **THEN** the resolver rejects them per the `correlation-resolver` capability's input-reservation rules
-- **AND** this domain variant remains valid exclusively in resolver output
+- **AND** caller input cannot supply this variant to the resolver
+- **AND** within `CorrelationGraph` values, this variant is valid only in the root-establishment placement defined above
 
 #### Scenario: Frozen contracts remain untouched
 

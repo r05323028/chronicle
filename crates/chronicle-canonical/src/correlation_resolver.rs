@@ -17,9 +17,10 @@ use chronicle_common::ScenarioId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-/// Maximum optional contextual correlation evidence retained per resolution
-/// slot or ambiguity candidate after required semantic witnesses are kept.
-pub const CORRELATION_CONTEXTUAL_RETENTION_CAP: usize = 64;
+/// Target total retained correlation evidence per resolution slot or ambiguity
+/// candidate. Required semantic witnesses are never truncated; optional fill
+/// uses remaining capacity, so long semantic proofs may exceed this target.
+pub const CORRELATION_RETENTION_TARGET: usize = 64;
 
 /// Lifetime view of one canonical operation supplied alongside its role and
 /// correlation evidence. Temporal values stay contextual in this revision:
@@ -659,14 +660,19 @@ pub fn resolve_correlation(
 
     for (reference, input) in &ordered {
         if roots.contains_key(reference) {
+            let witness = Witness {
+                own_indices: Vec::new(),
+                foreign: vec![CorrelationEvidence::new(
+                    CorrelationEvidenceKind::ScenarioRoot { root: *reference },
+                )],
+            };
+            let evidence = apply_retention(witness, &input.evidence);
             resolutions.insert(
                 *reference,
                 CorrelationResolution::Resolved {
                     scenario: roots[reference].scenario.id,
                     confidence: CorrelationConfidence::Exact,
-                    evidence: vec![CorrelationEvidence::new(
-                        CorrelationEvidenceKind::ScenarioRoot { root: *reference },
-                    )],
+                    evidence,
                 },
             );
             continue;
@@ -771,7 +777,8 @@ pub fn resolve_correlation(
 struct Witness {
     /// Indices into the operation's own correlation-evidence collection.
     own_indices: Vec<usize>,
-    /// Items owned by other operations along a transitive proof path.
+    /// Required semantic items not indexed into current operation evidence,
+    /// including foreign transitive-proof items and resolver-owned root items.
     foreign: Vec<CorrelationEvidence>,
 }
 
@@ -898,9 +905,9 @@ fn derive_ownership_witness(
     witness
 }
 
-/// Retention happens only after semantics: required semantic witnesses are kept
-/// in full; the cap limits only optional contextual correlation-channel fill
-/// sorted by the total canonical evidence key.
+/// Retention happens after ownership semantics: required semantic witnesses are
+/// kept in full; `CORRELATION_RETENTION_TARGET` is the ordinary total target,
+/// and optional contextual fill uses only its remaining capacity.
 fn apply_retention(
     witness: Witness,
     all_evidence: &[CorrelationEvidence],
@@ -919,7 +926,7 @@ fn apply_retention(
         .map(|(_, item)| (canonical_evidence_key(item, None), item))
         .collect();
     fill.sort_by(|left, right| left.0.cmp(&right.0));
-    let fill_capacity = CORRELATION_CONTEXTUAL_RETENTION_CAP.saturating_sub(retained.len());
+    let fill_capacity = CORRELATION_RETENTION_TARGET.saturating_sub(retained.len());
     for (_, item) in fill.into_iter().take(fill_capacity) {
         retained.push(item.clone());
     }
@@ -936,7 +943,7 @@ fn uncorrelated_retained(evidence: &[CorrelationEvidence]) -> Vec<CorrelationEvi
     sorted.sort_by(|left, right| left.0.cmp(&right.0));
     sorted
         .into_iter()
-        .take(CORRELATION_CONTEXTUAL_RETENTION_CAP)
+        .take(CORRELATION_RETENTION_TARGET)
         .map(|(_, item)| item.clone())
         .collect()
 }
@@ -1897,11 +1904,17 @@ mod tests {
         assert_eq!(graph.scenarios.len(), 2);
         let (left_scenario, confidence, evidence) = resolved_of(&graph, left);
         assert_eq!(confidence, CorrelationConfidence::Exact);
-        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence.len(), 2);
         assert!(matches!(
             evidence[0].kind,
             CorrelationEvidenceKind::ScenarioRoot { .. }
         ));
+        assert!(
+            evidence
+                .iter()
+                .skip(1)
+                .any(|item| matches!(item.kind, CorrelationEvidenceKind::TraceRelationship { .. }))
+        );
         let (right_scenario, _, _) = resolved_of(&graph, right);
         assert_ne!(left_scenario, right_scenario);
         for scenario in &graph.scenarios {
@@ -1941,6 +1954,13 @@ mod tests {
         let graph = resolve(vec![input(root, ingress_role(), vec![])]);
         assert_eq!(graph.scenarios.len(), 1);
         assert_eq!(graph.scenarios[0].members, vec![root]);
+        let (_, confidence, evidence) = resolved_of(&graph, root);
+        assert_eq!(confidence, CorrelationConfidence::Exact);
+        assert_eq!(evidence.len(), 1);
+        assert!(matches!(
+            evidence[0].kind,
+            CorrelationEvidenceKind::ScenarioRoot { root: evidence_root } if evidence_root == root
+        ));
         let session = session_for(root, &[]);
         assert!(
             graph
@@ -1951,6 +1971,64 @@ mod tests {
             graph.validate(),
             Err(CorrelationValidationError::MissingSessionContext { .. })
         ));
+    }
+
+    #[test]
+    fn root_retains_correlation_context_after_scenario_root() {
+        let root = ref_at(10);
+        let role = InteractionRoleResolution::known(
+            InteractionRole::Ingress,
+            vec![
+                CorrelationEvidence::passive_http(),
+                CorrelationEvidence::custom("role", "evidence", "preserved"),
+            ],
+        );
+        let build = |reverse: bool| {
+            let mut evidence = vec![
+                trace("otel", "T", Some("root-span"), None),
+                lifetime(1, 2),
+                CorrelationEvidence::custom("ctx", "root", "value"),
+            ];
+            if reverse {
+                evidence.reverse();
+            }
+            resolve_correlation(
+                RecordingId::from_uuid(uuid_at(1)),
+                vec![input(root, role.clone(), evidence)],
+            )
+            .expect("root resolution succeeds")
+        };
+        let forward = build(false);
+        let backward = build(true);
+        assert_eq!(forward, backward);
+        assert_eq!(forward.role_resolution(&root), Some(&role));
+        let (scenario, confidence, evidence) = resolved_of(&forward, root);
+        assert_eq!(*scenario, scenario_id_v1(&root));
+        assert_eq!(confidence, CorrelationConfidence::Exact);
+        assert!(matches!(
+            evidence.first().map(|item| &item.kind),
+            Some(CorrelationEvidenceKind::ScenarioRoot { root: evidence_root })
+                if evidence_root == &root
+        ));
+        assert_eq!(evidence.len(), 4);
+        assert!(
+            evidence
+                .iter()
+                .skip(1)
+                .any(|item| matches!(item.kind, CorrelationEvidenceKind::TraceRelationship { .. }))
+        );
+        assert!(
+            evidence
+                .iter()
+                .skip(1)
+                .any(|item| matches!(item.kind, CorrelationEvidenceKind::TemporalLifetime { .. }))
+        );
+        assert!(
+            evidence
+                .iter()
+                .skip(1)
+                .any(|item| matches!(item.kind, CorrelationEvidenceKind::Custom { .. }))
+        );
     }
 
     // ---------- Task 8: Phase A1 closure ----------
@@ -3016,6 +3094,41 @@ mod tests {
     }
 
     #[test]
+    fn strong_short_proof_uses_only_remaining_retention_capacity() {
+        let root = ref_at(10);
+        let target = ref_at(30);
+        let mut evidence = vec![trace("otel", "T", Some("target"), Some("root"))];
+        evidence.extend(
+            (0..80).map(|index| CorrelationEvidence::custom("ctx", format!("k{index:03}"), "v")),
+        );
+        let graph = resolve(vec![
+            input(
+                root,
+                ingress_role(),
+                vec![trace("otel", "T", Some("root"), None)],
+            ),
+            input(target, egress_role(), evidence),
+        ]);
+        let (_, confidence, evidence) = resolved_of(&graph, target);
+        assert_eq!(confidence, CorrelationConfidence::Strong);
+        assert_eq!(evidence.len(), CORRELATION_RETENTION_TARGET);
+        assert_eq!(
+            evidence
+                .iter()
+                .filter(|item| matches!(item.kind, CorrelationEvidenceKind::Custom { .. }))
+                .count(),
+            CORRELATION_RETENTION_TARGET - 1
+        );
+        assert!(matches!(
+            evidence.first().map(|item| &item.kind),
+            Some(CorrelationEvidenceKind::TraceRelationship {
+                parent_span_id: Some(parent_span_id),
+                ..
+            }) if parent_span_id == "root"
+        ));
+    }
+
+    #[test]
     fn cap_pressure_changes_no_semantics_and_fill_is_permutation_stable() {
         let build = |reverse: bool| {
             let root = ref_at(10);
@@ -3050,11 +3163,72 @@ mod tests {
             evidence_a, evidence_b,
             "retained output must be permutation-stable"
         );
-        assert!(evidence_a.len() <= CORRELATION_CONTEXTUAL_RETENTION_CAP);
+        assert_eq!(evidence_a.len(), CORRELATION_RETENTION_TARGET);
+        assert_eq!(
+            evidence_a
+                .iter()
+                .filter(|item| matches!(item.kind, CorrelationEvidenceKind::Custom { .. }))
+                .count(),
+            CORRELATION_RETENTION_TARGET - 1
+        );
         // The semantic witness survived the cap.
         assert!(evidence_a.iter().any(|item| matches!(
             &item.kind,
             CorrelationEvidenceKind::TraceRelationship { span_id, .. } if span_id.as_deref() == Some("z")
+        )));
+    }
+
+    #[test]
+    fn stage_b_reads_full_input_beyond_retained_output_target() {
+        let root = ref_at(10);
+        let parent = ref_at(11);
+        let child = ref_at(30);
+        let mut child_evidence = vec![trace("otel", "direct", Some("child-direct"), None)];
+        child_evidence.extend(
+            (0..80).map(|index| CorrelationEvidence::custom("ctx", format!("k{index:03}"), "v")),
+        );
+        // This relation sorts after the contextual custom items and is omitted
+        // from child's retained output, but Stage B must still consume it.
+        child_evidence.push(trace(
+            "otel",
+            "edge",
+            Some("child-edge"),
+            Some("parent-edge"),
+        ));
+        let graph = resolve(vec![
+            input(
+                root,
+                ingress_role(),
+                vec![
+                    trace("otel", "direct", Some("root-direct"), None),
+                    trace("otel", "parent", Some("root-parent"), None),
+                ],
+            ),
+            input(
+                parent,
+                egress_role(),
+                vec![
+                    trace("otel", "parent", Some("parent-root"), Some("root-parent")),
+                    trace("otel", "edge", Some("parent-edge"), None),
+                ],
+            ),
+            input(child, egress_role(), child_evidence),
+        ]);
+        assert!(
+            graph
+                .causal_edges
+                .iter()
+                .any(|edge| edge.parent == parent && edge.child == child)
+        );
+        let (_, confidence, evidence) = resolved_of(&graph, child);
+        assert_eq!(confidence, CorrelationConfidence::Exact);
+        assert_eq!(evidence.len(), CORRELATION_RETENTION_TARGET);
+        assert!(!evidence.iter().any(|item| matches!(
+            &item.kind,
+            CorrelationEvidenceKind::TraceRelationship {
+                parent_span_id: Some(parent_span_id),
+                ..
+            } if parent_span_id == "parent-edge"
         )));
     }
 
@@ -3103,7 +3277,7 @@ mod tests {
         assert_eq!(*scenario, scenario_id_v1(&ref_at(10)));
         assert_eq!(confidence, CorrelationConfidence::Strong);
         assert_eq!(evidence.len(), HOPS);
-        assert!(evidence.len() > CORRELATION_CONTEXTUAL_RETENTION_CAP);
+        assert!(evidence.len() > CORRELATION_RETENTION_TARGET);
         assert!(evidence.iter().all(|item| {
             !matches!(
                 item.kind,
@@ -3172,7 +3346,7 @@ mod tests {
                 // remaining capacity with the unused input item.
                 assert_eq!(evidence[0].provenance.source, "alpha");
                 assert_eq!(evidence[0].provenance.observation.as_deref(), Some("later"));
-                assert!(evidence.len() <= CORRELATION_CONTEXTUAL_RETENTION_CAP);
+                assert!(evidence.len() <= CORRELATION_RETENTION_TARGET);
             }
             other => panic!("expected resolved, got {other:?}"),
         }
