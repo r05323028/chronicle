@@ -163,8 +163,10 @@ dependencies = [
  "chronicle-common",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "time",
+ "uuid",
 ]
 
 [[package]]
