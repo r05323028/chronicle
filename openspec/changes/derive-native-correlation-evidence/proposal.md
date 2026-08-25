@@ -1,34 +1,37 @@
 ## Why
 
-PR #6 made correlation selection deterministic and conservative, but current recordings provide no Chronicle-native candidate-specific causal relationship for most non-root operations. The resolver therefore correctly leaves database, outbound HTTP, and asynchronous work `Uncorrelated` when no external trace evidence is supplied. Existing capture, reconstruction, and protocol facts identify socket generations, process snapshots, stream order, and timing, but none proves which ingress caused a downstream operation; promoting any of them by equality or proximity would reintroduce unsafe attribution.
+PR #6 made correlation selection deterministic and conservative, but the existing native-evidence proposal skipped a required production boundary: runtime code cannot name a future `CanonicalOperationRef`. Current Chronicle code creates those references only after reconstruction, protocol canonicalization, ETL operation-ID normalization, session publication, and completion-owner assignment. A direct runtime-to-reference handoff would therefore be fixture-only or would smuggle guessed identity into causal selection.
 
-This change closes that gap with one narrow, provider-neutral vertical slice: an explicit Chronicle-owned execution-handoff fact that names a fully scoped parent and child operation. It does not mine task, process, socket, connection, stream, or temporal identifiers. Those facts remain contextual until a later change proves stronger semantics.
+This change remains named `derive-native-correlation-evidence` because it now includes the real observation-to-canonical binding pipeline. The first production source is explicitly opt-in: a Chronicle cooperative execution-context carrier plus a Chronicle transport/application boundary receipt. Passive recording remains conservative when that cooperation is absent.
 
 ## What Changes
 
-- Inventory current capture, WAL, session, protocol, canonical, and ETL facts and record which facts have causal semantics versus contextual-only meaning.
-- Add one additive Chronicle-owned correlation evidence variant for an explicitly proven execution continuation, with the child-side evidence carrying the complete parent `CanonicalOperationRef`.
-- Define a bounded, serializable `NativeExecutionHandoffFact` input produced by a Chronicle-owned runtime handoff source. The source records an explicit context handoff, not task/process/socket equality and not a tracing-provider context.
-- Derive native evidence at the ETL/canonical composition boundary after exact operation-reference verification. The producer emits relations only; the existing resolver remains responsible for support closure, ambiguity, confidence, witness retention, and causal-parent selection.
-- Authorize the existing resolver to treat explicit native execution continuation as a named transitive parent predicate. Native and trace evidence enter the same Chronicle-owned correlation channel; neither source receives priority or negative-vote semantics.
-- Preserve `Uncorrelated` and `Ambiguous` when handoff facts are absent, genuinely conflicting, unmappable, or insufficient. Async continuation remains eligible even when it begins after ingress completion.
-- Make operation scope and generation handling explicit: full recording/owner-epoch/session/operation references are authoritative; socket cookies, file descriptors, PIDs/TIDs, task labels, connection IDs, stream IDs, WAL sequence, and timestamps never become ownership predicates.
-- Keep derivation bounded and deterministic under input permutation, worker scheduling, retry, restart, and repeated resolution. No transitive ancestry history, scenario artifact, `EventId`, or frozen v1 field is added.
-- Prove concurrent native correlation with a portable Chronicle-owned handoff source for overlapping A/B/C ingress scenarios, including database, HTTP, and post-response continuation children, without any trace-provider package.
+- Define the complete pipeline: runtime execution → pre-canonical native handoff observation → generation-safe `NativeOperationAnchor` → exact anchor-to-canonical binding → bound handoff fact → `NativeExecutionLineage` → existing correlation resolver.
+- Introduce separate semantic contracts for pre-canonical observation, operation anchor, binding result/diagnostic, bound handoff fact, and canonical correlation evidence. Runtime producers never construct future canonical references.
+- Select a concrete first source: an opt-in Chronicle-native execution-context carrier in an application/runtime integration, paired with a transport boundary adapter that supplies exact protocol-local operation position and source/reconstruction lineage.
+- Require the smallest new non-frozen boundary fact current code lacks: a generation-safe operation-boundary receipt connecting the cooperative context handoff to `SourceConnectionGeneration`, protocol-local operation position, recording/epoch placement, and exact source provenance. Current `SourceConnectionGeneration`, `DecodedFrame` provenance, protocol sequence, `CanonicalOperation.provenance`, and `CanonicalOperationRef` scopes remain authoritative where already available.
+- Bind anchors against canonical sessions only by exact composite identity. Zero matches and multiple matches produce typed binding diagnostics and no positive relation. Binding ambiguity is never materialized as resolver causal ambiguity.
+- Keep explicit `ExecutionContinuation` as the only first-slice native predicate. No PID/TID/task/socket/connection/stream equality, timing, proximity, protocol kind, role, processing order, WAL order, active-ingress fallback, or absence-of-contradiction rule is authorized.
+- Feed bound native facts into existing ETL composition and the existing resolver only. Preserve Phase A1 sparse closure, Phase A2 outcome/witness derivation, and Phase B pre-filter → unique-parent → complete provisional graph → SCC → internal-edge removal.
+- Keep native and trace evidence as additive positive support with no weights, priority, or negative voting. Genuine causal conflict remains `Ambiguous`; unresolved binding emits no evidence.
+- Specify passive-only and cooperative-native capability boundaries, restart/loss behavior, bounded state properties, composition proof, and real native production E2E proof separately.
+- Remove arbitrary normative fact-count constants. Require bounded state/work, typed overflow or bounded-loss diagnostics, no silent positive truncation, and no unbounded ancestry history; measured defaults remain implementation work.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `native-correlation-evidence`: derives bounded, provider-neutral Chronicle-native relational evidence from explicit execution-handoff facts and defines the capability boundary for all other current recording identifiers.
+- `native-correlation-evidence`: captures explicit pre-canonical Chronicle-native handoffs, binds generation-safe anchors exactly to canonical operations, and derives bounded native evidence.
 
 ### Modified Capabilities
 
-- `correlation-domain-model`: adds the additive, non-frozen `NativeExecutionLineage` evidence variant with explicit parent reference and validation rules.
-- `correlation-resolver`: adds the named native execution-continuation predicate while preserving the existing three-phase resolver authority and evidence-channel separation.
+- `correlation-domain-model`: defines valid `NativeExecutionLineage` evidence and separates binding failures from graph-level causal ambiguity.
+- `correlation-resolver`: admits bound native execution continuation into existing support, witness, parent, and SCC phases without a second selector.
 
 ## Impact
 
-Implementation is expected to touch the existing `chronicle-canonical` domain/resolver and `chronicle-etl` composition boundary, with optional `chronicle-application` wiring for the Chronicle-owned runtime handoff source. `chronicle-session`, `chronicle-protocol`, and `chronicle-protocol-builtins` remain fact producers only; no current protocol implementation is claimed to prove cross-operation causality. Capture, eBPF, WAL, storage, replay, and CLI behavior remain unchanged in this slice.
+Expected implementation ownership remains within existing dependency direction: `chronicle-application` owns opt-in cooperative source wiring; `chronicle-etl` owns the non-frozen observation/anchor contract, exact binding, bound-fact normalization, and evidence derivation; `chronicle-canonical` owns evidence semantics and resolver predicates; `chronicle-session` and `chronicle-protocol` expose existing reconstruction/protocol-local facts but do not choose ownership; CLI remains unaware. No new crate or dependency edge is proposed.
 
-No new crate or dependency edge is proposed. No OpenTelemetry, Datadog, X-Ray, B3, or other provider SDK enters any Chronicle crate or the default executable closure. Capture Event v1, WAL v1, Canonical Session v1, Session Manifest, persisted checkpoints, public CLI JSON, and replay-safety contracts remain unchanged. Native handoff facts are runtime/composed input in this change; durable capture of that side channel is explicitly deferred rather than smuggled into a frozen format. Re-running canonical artifacts without that input deterministically produces no native support.
+The current passive recorder and eBPF adapter do not prove application execution causality and are unchanged. `chronicle record -- app` without cooperative observations and without trace evidence remains conservative, with non-root work generally `Uncorrelated`. Cooperative mode requires application/runtime integration and a Chronicle transport boundary receipt; it does not require OpenTelemetry or any provider SDK.
+
+Capture Event v1, WAL v1, Canonical Session v1, Session Manifest, persisted checkpoints, public CLI JSON, replay-safety contracts, and the default `chronicle` dependency closure remain unchanged. Native observations are a separate non-frozen runtime/composition input in this change. Durable side-channel persistence and versioning are deferred; loss or restart without recoverable observations fails closed rather than fabricating relations. No `EventId`, scenario graph persistence, or provider type is introduced.

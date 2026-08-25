@@ -1,75 +1,117 @@
 ## ADDED Requirements
 
-### Requirement: Resolver promotes explicit native execution lineage as a named causal predicate
+### Requirement: Resolver admits only exact bound native execution continuation
 
-The existing correlation resolver SHALL recognize `NativeExecutionLineage { parent: P, relation: ExecutionContinuation }` only when it is attached to child C's explicit correlation-evidence channel, P is an admitted full reference in the same recording, and the native evidence passed domain validation. The predicate is directional `C -> P`: C inherits the complete previous-round support set of P as transitive candidate-specific support. It SHALL NOT match by task, process, socket, connection, stream, timestamp, protocol name, or any other contextual field.
+The existing correlation resolver SHALL recognize `NativeExecutionLineage { parent: P, relation: ExecutionContinuation }` only when it appears on child C's explicit correlation-evidence channel, passed domain validation, and names an admitted full parent reference in the same recording. The predicate SHALL be directional `C → P` and SHALL NOT match task, process, socket, connection, stream, timestamp, protocol kind, role, WAL order, processing order, or any other contextual value.
 
-For final parent construction, the same validated native relation MAY be a direct parent candidate for C and SHALL pass through the existing fixed pre-filter, unique-parent mapping, whole-graph SCC analysis, and internal-cycle-edge removal. Native relation support does not create a scenario root, change role classification, or add a second selection algorithm.
+#### Scenario: Bound native parent supplies support
 
-#### Scenario: Native parent propagates support
+- **WHEN** root A is pinned to Scenario A and child A1 has valid native lineage naming A
+- **THEN** the resolver receives candidate-specific positive support from A to A1
+- **AND** the producer does not assign Scenario A
 
-- **WHEN** root A is pinned to Scenario A and child A1 has valid native execution lineage naming A
-- **THEN** A1 receives Scenario A support through the resolver's transitive closure
-- **AND** the producer does not assign Scenario A itself
+#### Scenario: Invalid native evidence is ignored or rejected
 
-#### Scenario: Native-only ownership keeps existing confidence semantics
+- **WHEN** native-shaped evidence has an orphan, cross-recording, unverified, self, or binding-ambiguous parent
+- **THEN** composition/domain validation prevents it from becoming a resolver relation
+- **AND** no contextual fallback creates support
 
-- **WHEN** a non-root operation is supported only through one or more native execution-continuation relations
-- **THEN** it materializes with the resolver's existing transitive confidence semantics (`Strong`)
-- **AND** the resolver does not invent a direct trace or `Exact` witness
+#### Scenario: Direction remains child to parent
 
-#### Scenario: Native relation can produce one selected edge
+- **WHEN** A1 names A as its native parent
+- **THEN** support propagates from A to A1 through the existing parent predicate
+- **AND** the resolver does not infer that A owns every operation that names A's generation, task, socket, or stream
 
-- **WHEN** one final child has exactly one valid native parent in its resolved scenario
-- **THEN** Phase B may emit one selected edge with the native relation as parent evidence
-- **AND** edge construction remains resolver-owned
+### Requirement: Native support uses existing three-phase resolver semantics
 
-#### Scenario: Multiple native parents remain ambiguous
+Native relations SHALL feed the existing resolver without a second selection algorithm:
 
-- **WHEN** valid native relations name parents in two different supported scenarios
-- **THEN** support closure retains both scenarios and materializes `Ambiguous`
-- **AND** no selected edge uses the ambiguous child
+1. Phase A1 SHALL use sparse monotonic support closure over previous-round snapshots.
+2. Phase A2 SHALL derive outcomes, existing confidence semantics, and bounded witnesses without fabricating direct trace evidence.
+3. Phase B SHALL run the fixed parent pre-filter, unique-parent mapping, complete provisional graph, global SCC analysis, and internal cyclic-edge removal sequence.
 
-#### Scenario: Native cycle handling is unchanged
+Native-only transitive ownership SHALL use existing `Strong` semantics unless an existing resolver rule independently proves another outcome. Chronicle-native origin SHALL NOT manufacture `Exact` confidence.
 
-- **WHEN** native relations form a direct-parent cycle
-- **THEN** the existing global SCC sequence removes only internal cycle edges
-- **AND** ownership remains unchanged
+#### Scenario: Native-only transitive ownership is Strong
 
-### Requirement: Resolver combines native and trace support without source priority
+- **WHEN** one operation is supported only through valid native execution-continuation propagation
+- **THEN** the resolver materializes the existing transitive `Strong` outcome
+- **AND** it does not invent an `Exact` witness or direct trace relationship
 
-The resolver SHALL union valid positive support from native execution lineage and Chronicle-owned trace relationships. Same-scenario evidence MAY corroborate one outcome, but source counts and source type SHALL NOT affect confidence or selection. Different-scenario support SHALL remain `Ambiguous`; competing direct-parent candidates SHALL follow existing unique-parent and cycle rules. Role evidence remains excluded from both relation indexes.
+#### Scenario: Support closure is snapshot-based
 
-#### Scenario: Same scenario has two evidence sources
+- **WHEN** a native chain A3 → A2 → A1 → A is processed in any order
+- **THEN** each phase uses the same previous-round support snapshots as existing closure
+- **AND** output does not depend on discovery order, worker scheduling, or map iteration order
 
-- **WHEN** native lineage and a trace relationship both support child A1 under Scenario A
-- **THEN** the result remains Scenario A with existing confidence/witness rules
-- **AND** both source provenances remain inspectable where retention permits
+#### Scenario: Parent edges use existing SCC sequence
 
-#### Scenario: Sources support different scenarios
+- **WHEN** valid native relations produce direct parent candidates
+- **THEN** candidates pass through pre-filter, unique-parent, complete provisional graph, SCC, and internal-edge removal in that order
+- **AND** native evidence does not add a separate parent selector
 
-- **WHEN** native lineage supports Scenario A and trace evidence supports Scenario B
-- **THEN** the result is `Ambiguous(A, B)`
-- **AND** neither source overrides the other
+### Requirement: Native and trace evidence are additive positive sources
 
-#### Scenario: Role-channel native item is ignored
+The resolver SHALL union valid native execution-continuation support with valid Chronicle-owned trace support. Source type, count, provenance label, and arrival order SHALL NOT create weights, priority, negative votes, or tie-breaking authority. Role evidence SHALL remain excluded from correlation indexes.
 
-- **WHEN** a native-shaped item appears only inside role-resolution evidence
-- **THEN** it cannot add resolver support
-- **AND** caller input reservation and role-channel preservation remain unchanged
+#### Scenario: Native and trace agree
 
-### Requirement: Contextual native facts remain outside resolver predicates
+- **WHEN** native and trace evidence both support child A1 under Scenario A
+- **THEN** the resolver keeps Scenario A under existing outcome and witness rules
+- **AND** neither source is promoted to a special priority class
 
-The resolver SHALL continue to treat `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, `ProtocolStream`, `ProtocolOwnership`, `WireDirection`, `SocketRole`, `TemporalLifetime`, and `Custom` as contextual-only for native correlation. Adding `NativeExecutionLineage` SHALL NOT authorize a fallback predicate or an absence-of-contradiction rule for any of those variants.
+#### Scenario: Native and trace disagree
 
-#### Scenario: Context-only evidence stays uncorrelated
+- **WHEN** native evidence supports Scenario A and trace evidence supports Scenario B
+- **THEN** the resolver materializes existing `Ambiguous` semantics for both candidates
+- **AND** neither source overrides or votes down the other
 
-- **WHEN** a child has only equal task, PID/TID, socket, connection, stream, protocol, or timing evidence with a root
-- **THEN** the child remains `Uncorrelated`
-- **AND** no native parent or scenario edge is emitted
+#### Scenario: Role-channel evidence remains excluded
 
-#### Scenario: Explicit relation is required
+- **WHEN** native-shaped or trace-shaped evidence appears only in role-resolution evidence
+- **THEN** it does not enter native or trace relation indexes
+- **AND** supplied role evidence remains preserved
 
-- **WHEN** contextual facts coexist with no valid `NativeExecutionLineage` or trace relationship
-- **THEN** contextual facts remain retained evidence only
-- **AND** the resolver does not use them as a fallback
+### Requirement: Binding ambiguity and causal ambiguity remain distinct
+
+The resolver SHALL receive only exact-bound native relations. A zero-match or multi-match pre-canonical anchor SHALL be represented only by a binding diagnostic and SHALL emit no relation. Resolver-level `Ambiguous` SHALL be reserved for multiple independently exact-bound positive candidates or existing resolver ambiguity, not for an unresolved identity binding.
+
+#### Scenario: Binding ambiguity emits no resolver candidate
+
+- **WHEN** one observation anchor maps to multiple canonical operations
+- **THEN** ETL emits an ambiguous-binding diagnostic and no native evidence
+- **AND** the resolver does not return causal `Ambiguous` for that missing relation
+
+#### Scenario: True causal ambiguity remains Ambiguous
+
+- **WHEN** two independently observed and exactly bound parent handoffs support different scenarios for one child
+- **THEN** the resolver retains both positive candidates and returns existing `Ambiguous` semantics
+- **AND** no source-priority rule resolves the conflict
+
+#### Scenario: Missing observation remains Uncorrelated
+
+- **WHEN** one active ingress exists but no exact native or trace relation reaches an egress
+- **THEN** the resolver returns existing `Uncorrelated` semantics
+- **AND** active-ingress uniqueness does not supply a fallback parent
+
+### Requirement: Native resolver integration preserves roots, roles, and compatibility
+
+Native evidence SHALL not create or accept caller-supplied `ScenarioRoot`, change root pinning, classify interaction roles, change completeness/replayability, persist scenario graphs, add `EventId`, alter frozen contracts, or introduce provider SDK types. Existing resolver input reservation and graph validation remain authoritative.
+
+#### Scenario: Root generation remains resolver-owned
+
+- **WHEN** native evidence supports a known ingress root
+- **THEN** the existing resolver creates any valid `ScenarioRoot` output under existing placement rules
+- **AND** caller-supplied root evidence remains rejected
+
+#### Scenario: Roles remain independent
+
+- **WHEN** native support assigns scenario ownership to an operation with supplied role evidence
+- **THEN** the operation's role resolution remains unchanged
+- **AND** scenario membership is not substituted for role classification
+
+#### Scenario: Compatibility boundary remains intact
+
+- **WHEN** native resolver support is enabled
+- **THEN** Capture Event v1, WAL v1, Canonical Session v1, Session Manifest, checkpoints, public CLI JSON, replay-safety, and default dependency closure remain unchanged
+- **AND** no provider SDK type crosses Chronicle core/domain APIs

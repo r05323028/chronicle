@@ -1,216 +1,230 @@
 ## Context
 
-See `proposal.md` for motivation. This design is grounded in current `main` at PR #6 (`c9e940d`), not an assumed future recorder.
-
-Current path:
+See `proposal.md` for motivation. Current code proves canonical identity only late in the pipeline:
 
 ```text
-CaptureEvent v1 -> WAL v1 -> chronicle-session reconstruction
-  -> per-connection protocol stream -> protocol canonicalization
-  -> CanonicalSession v1 -> explicit CorrelationContext join
-  -> chronicle-canonical resolver -> CorrelationGraph
+CaptureEvent / WAL
+  → ReconstructionConnectionIdentity
+  → ProtocolNeutralConnection / ProtocolStream
+  → DecodedFrame
+  → protocol canonicalizer returns CanonicalizedOperation
+  → ETL session construction and deterministic OperationId normalization
+  → CanonicalSession
+  → CanonicalOperationRef
 ```
 
-Current facts and their verified semantics:
+Relevant current facts:
 
-| Layer | Current fact | Safe meaning | Not safe as ownership support |
-| --- | --- | --- | --- |
-| `chronicle-capture` | `SocketIdentity { socket_cookie, first_seen, network_namespace }` | Reuse-resistant identity of one observed kernel socket generation within its boot/namespace scope | Parent request, task lineage, or ingress ownership |
-| `chronicle-capture` | `SocketEvidence` endpoints, active/passive role, `ProcessMetadata` PID/TID/executable, cgroup | Observation and endpoint/role provenance | Operation identity, process/task causal lineage, or scenario identity |
-| `chronicle-capture` | payload timestamp, direction, TCP/continuation sequence, truncation | Per-observation transport evidence | Global timeline, nearest-ingress selection, or causal order |
-| `chronicle-session` | `ReconstructionConnectionIdentity::Socket`, ordered directional fragments, loss windows | Bounded reconstruction of one socket generation | Cross-connection execution relationship |
-| `chronicle-protocol` | `SourceConnectionGeneration` on decoded frames and `ProtocolStream` per reconstructed connection | Connection-generation and protocol-stream provenance | Cross-stream parenthood; stream/message sequence is not application causality |
-| HTTP builtin | request/response pairing, request sequence, pipeline depth, protocol bytes | One protocol exchange's canonical operation and completeness | Relationship between an ingress operation and another connection's egress |
-| `chronicle-canonical` | `CanonicalOperation` connection/WAL/epoch provenance and relative offsets | Scoped operation and publication provenance | Native relational evidence; no task or handoff field exists |
-| `chronicle-etl` | independently reconstructs connections and invokes protocol canonicalizers; explicit correlation composition is on demand | Complete ETL and exact session/reference join | Native evidence generation from absent facts |
+- `chronicle-session` groups capture into `ReconstructionConnectionIdentity::Fixture` or generation-safe socket identity.
+- `chronicle-protocol::reconstructed_frames` maps that identity to `SourceConnectionGeneration` and carries frame `sequence`, `connection_generation`, and `WalByteRange` provenance in `DecodedFrame`.
+- `ProtocolStream` exposes protocol chunks and local sequence values. Existing HTTP canonicalization uses request/response frame positions, but the current pipeline has no native execution-handoff field.
+- `CanonicalOperation` retains `sequence`, `OperationProvenance.connection_generation`, `wal_ranges`, `epoch_ranges`, and `completion_owner_epoch`. `CanonicalOperationRef` adds recording, owner epoch, session, and final operation scope.
+- `chronicle-etl` assigns deterministic final operation IDs only after canonicalization by hashing the canonical operation with its ID cleared. `OperationId` therefore cannot be a runtime anchor.
+- `CanonicalOperationRef::resolve_in_session` and `chronicle-etl::compose_correlation` already perform full recording/epoch/session/operation verification. The existing resolver receives only fully scoped `CorrelationInput` values.
+- `RecorderOrchestrator` currently owns capture polling, bounded ingest, and WAL admission. CodeGraph/Graphify inspection found no existing execution-context or handoff hook.
 
-Current code therefore exposes no proven task creation, execution continuation, inherited execution context, process parent/child operation binding, or cross-protocol-stream causal relation. `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, and `ProtocolStream` already exist as Chronicle-owned evidence shapes, but their current producers do not define causal semantics. The conservative PR #6 boundary is correct: without trace relationships or a future explicit native relation, non-root operations normally remain `Uncorrelated`.
-
-The resolver already owns support closure, `Resolved`/`Ambiguous`/`Uncorrelated` materialization, confidence, witnesses, and fixed parent-edge construction. It consumes only the explicit correlation-evidence channel; role evidence remains classification provenance. This change must add facts at that boundary without moving selection into a producer.
+`SourceConnectionGeneration` is generation-safe connection context, not operation identity. WAL sequence is ordering/provenance, not causal identity. Protocol position is useful only when paired with source generation and exact recording/epoch/reconstruction lineage. The current code therefore lacks one minimal non-frozen fact: a Chronicle-native operation-boundary receipt emitted by an opted-in runtime/transport integration and tied to the same source facts later retained by canonical operations.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Add one real, narrow native relationship family: explicit Chronicle-owned execution handoff from one fully scoped canonical operation to another.
-- Make the relationship candidate-specific, provider-neutral, generation-safe, bounded, serializable as a runtime value, and deterministic.
-- Derive evidence at ETL/canonical composition after exact operation verification, then reuse the existing resolver unchanged as selection authority except for the named predicate it must understand.
-- Prove concurrent A/B/C ingress isolation, database and HTTP children, post-response async continuation, ambiguity, identifier reuse, retry determinism, and trace coexistence without provider packages.
-- State honestly what current passive capture cannot prove and leave absent native input as a safe no-support result.
+- Make every stage from runtime handoff to canonical evidence explicit.
+- Select one realistic first source: cooperative Chronicle-native execution context plus a Chronicle transport/application boundary adapter.
+- Bind pre-canonical anchors exactly to canonical operations or fail closed.
+- Preserve positive candidate-specific evidence, role-channel isolation, existing resolver authority, ambiguity, provider neutrality, and frozen contracts.
+- Prove both already-bound composition and real observation-to-resolver production flow.
 
 **Non-Goals:**
 
-- Mining task/PID/TID/process/socket/connection/stream/timestamp equality into support.
-- Adding task creation, process inheritance, socket-generation history, protocol-specific cross-stream logic, or provider integrations in this first slice.
-- Changing Capture Event v1, WAL v1, Canonical Session v1, Session Manifest, persisted checkpoints, public CLI JSON, replay safety, or adding `EventId`.
-- Persisting scenario graphs or scenario artifacts.
-- Making runtime handoff facts durable across a restart. A future evidence-durability change must define that separately; this change is deterministic when the same fact set is supplied and is deterministically empty when it is absent.
+- Passive eBPF inference of application causality.
+- Generic process/task/socket/connection/stream lineage.
+- Timing, proximity, active-ingress, protocol-kind, role, WAL-order, or processing-order heuristics.
+- OpenTelemetry or any provider SDK integration.
+- Persisting observations, bound facts, scenario graphs, or adding `EventId`.
+- Changing Capture Event v1, WAL v1, Canonical Session v1, Session Manifest, checkpoints, CLI JSON, replay safety, or resolver phase ordering.
 
 ## Decisions
 
-### 1. First native predicate is explicit execution handoff, not identifier equality
+### 1. First production source: cooperative Chronicle-native context carrier
 
-Introduce one candidate-relative domain value:
+The first source is an opt-in application/runtime integration, not passive recorder inference:
 
 ```text
-CorrelationEvidenceKind::NativeExecutionLineage {
-    parent: CanonicalOperationRef,
+application/runtime
+    │ explicit Chronicle context transfer
+    ▼
+cooperative native source + transport boundary adapter
+    │ NativeExecutionHandoffObservation
+    ▼
+bounded non-frozen side channel
+    │ exact pre-canonical anchors
+    ▼
+chronicle-etl anchor binding against canonical sessions
+    ▼
+BoundNativeExecutionHandoffFact
+    ▼
+NativeExecutionLineage in child correlation evidence
+    ▼
+existing chronicle-canonical resolver
+```
+
+The source owns an opaque Chronicle execution context with a generation that prevents stale context reuse. At an explicit application/runtime handoff, the parent context is passed through a Chronicle-owned API or helper into the child operation. The transport boundary adapter used by the integration supplies the child operation-boundary receipt; a generic task, process, socket, or trace identifier cannot substitute for it.
+
+Source lifecycle:
+
+1. The application/runtime integration creates a Chronicle execution context at an operation boundary that it explicitly owns.
+2. A child operation receives that context through the Chronicle-native carrier and calls the explicit continuation handoff API before or at child invocation.
+3. The Chronicle transport boundary adapter records the exact pre-canonical source receipt for each parent and child operation. If the receipt is not complete until capture/WAL placement, the side channel retains a pending observation only until that receipt is completed.
+4. The source delivers observations to ETL composition through an application-owned bounded handoff channel. ETL consumes them only after the relevant canonical sessions are available.
+5. The observation remains pre-canonical until ETL binding. The source never sees or invents `CanonicalOperationRef`, `ScenarioId`, confidence, selected edges, or resolver outcomes.
+6. On side-channel loss, process restart, missing receipt, or incompatible source lineage, ETL emits typed unresolved/bounded-loss diagnostics and no positive native relation. Durable observation persistence is a later versioned sidecar change.
+
+Application/runtime requirements are explicit: opt-in Chronicle integration, explicit continuation calls, access to the Chronicle transport boundary adapter, and agreement to deliver the non-frozen side-channel records until binding. Applications without that integration remain fully supported in passive-only mode.
+
+### 2. Pre-canonical concepts are separate
+
+The implementation SHALL keep these semantic stages separate:
+
+```text
+NativeExecutionHandoffObservation
+  ├─ parent: NativeOperationAnchor
+  ├─ child:  NativeOperationAnchor
+  ├─ relation: ExecutionContinuation
+  └─ provenance: Chronicle-owned native source provenance
+
+NativeOperationAnchor
+  └─ complete generation-safe source/boundary identity; no canonical reference
+
+AnchorBindingResult
+  ├─ Bound(CanonicalOperationRef)
+  ├─ Unresolved(diagnostic)
+  └─ Ambiguous(diagnostic)
+
+BoundNativeExecutionHandoffFact
+  ├─ parent: CanonicalOperationRef
+  ├─ child: CanonicalOperationRef
+  ├─ relation: ExecutionContinuation
+  └─ source provenance / binding diagnostics
+
+CorrelationEvidence::NativeExecutionLineage
+  └─ child-side candidate-specific evidence consumed by existing resolver
+```
+
+Conceptual non-frozen shapes:
+
+```rust
+NativeOperationBoundaryReceipt {
+    recording_id: RecordingId,
+    source_epoch_id: EpochId,
+    source_generation: SourceConnectionGeneration,
+    protocol_id: ProtocolId,
+    direction: Direction,
+    protocol_operation_position: u64,
+    source_range: WalByteRange,
+}
+
+NativeOperationAnchor {
+    boundary: NativeOperationBoundaryReceipt,
+    // Chronicle execution-context generation is provenance and reuse protection;
+    // it is never an ownership predicate by itself.
+    context_generation: NativeExecutionContextGeneration,
+}
+
+NativeExecutionHandoffObservation {
+    parent: NativeOperationAnchor,
+    child: NativeOperationAnchor,
     relation: ExecutionContinuation,
+    provenance: NativeObservationProvenance,
 }
 ```
 
-The item is attached to the child operation's explicit correlation-evidence collection. Its meaning is narrow: a Chronicle-owned runtime handoff source observed an explicit execution-context transfer from `parent` operation to this child. `parent` is the candidate/reference scope; it is never inferred from a task, process, socket, connection, stream, time, or role value. The item is non-temporal and does not contain a scenario, confidence, selected edge, or role.
+Names are semantic contract names, not required final Rust spelling. `NativeOperationBoundaryReceipt` is the minimal new non-frozen fact current code lacks. Its fields are deliberately composed from real current facts: recording/epoch placement from recorder/ETL lineage, `SourceConnectionGeneration`, protocol-local operation position, and exact `WalByteRange` source provenance. A receipt with only PID, TID, task ID, worker name, file descriptor, socket cookie, connection ID, stream ID, WAL sequence, timestamp, or position without its generation-safe scope is invalid.
 
-The raw composition fact has the same explicit scope:
+The receipt is bounded: one operation-start boundary and one source-range identity, not a transitive ancestry list. An implementation may use an equivalent exact protocol-local boundary representation only when it proves the same reuse and uniqueness properties for each supported protocol adapter. Current adapters that cannot provide this receipt are unsupported by cooperative native binding and produce no relation.
 
-```text
-NativeExecutionHandoffFact {
-    parent: CanonicalOperationRef,
-    child: CanonicalOperationRef,
-    relation: ExecutionContinuation,
-    provenance: EvidenceProvenance,
-}
-```
+### 3. Exact anchor-to-canonical binding
 
-A Chronicle-owned runtime source may implement the handoff as a capability/token transfer, but token equality alone is not evidence. The source must record the parent-to-child handoff event. No external trace SDK, provider context, or vendor wire format is part of this contract.
+ETL builds a deterministic candidate index from supplied canonical sessions. Each anchor is matched against canonical operation plus owning connection using all of these checks:
 
-The first implementation accepts facts after canonical operation references are bound. A pre-canonical source that only has a raw anchor is not allowed to guess a reference: a later change may define an anchor containing a reuse-safe `SourceConnectionGeneration` plus a protocol-local operation position. Bare sequence, socket cookie, PID/TID, task ID, file descriptor, connection ID, or stream ID is never an anchor.
+1. `recording_id` equals the session recording scope.
+2. `source_epoch_id` and `source_range` match one exact source placement in the operation's retained epoch/WAL provenance. This is source epoch, not necessarily `completion_owner_epoch`; an operation may complete in a later epoch.
+3. `source_generation` equals the operation's retained `OperationProvenance.connection_generation`.
+4. `protocol_id` and direction match the owning canonical connection and operation boundary.
+5. `protocol_operation_position` matches the protocol canonicalizer's exact operation boundary and the same retained source range. Protocol kind alone never matches.
+6. The candidate occurrence is unique under the canonical session's full scope. `CanonicalOperationRef::resolve_in_session` performs the final recording, owner-epoch, session, and operation uniqueness checks.
 
-### 2. Current passive capture remains honest
-
-No current `CaptureEvent` or reconstructed session fact is promoted merely because it exists. In particular:
-
-- `SocketIdentity` proves same socket generation only. It is useful to reject stale bindings and distinguish reuse, not to assign an egress to an ingress.
-- `ProcessMetadata` is a point-in-time owner observation. There is no process-generation or operation-execution binding.
-- Relative offsets and monotonic clock identity support observation context only. They do not establish a recording-global causal timeline.
-- TCP/WAL/protocol sequences establish bounded provenance/order in their owning scope only.
-- `ProtocolStream` is per connection. HTTP currently pairs request and response inside one operation and emits no cross-connection causal fact.
-- Passive/active socket role and `ProtocolOwnership` can support application-relative role classification; role evidence cannot double as correlation evidence.
-
-This means a current passive recording with no handoff fact and no trace evidence remains mostly uncorrelated. That is an explicit capability boundary, not a license to use a heuristic. The production-shaped first slice is a Chronicle-owned runtime handoff source supplying facts at composition time; wiring a durable passive capture source for those facts is deferred because it cannot be represented in frozen v1 artifacts safely.
-
-### 3. Derive at ETL/canonical composition, not capture, session, or protocol builtins
-
-Responsibilities stay aligned with existing ownership:
-
-1. `chronicle-capture` and `chronicle-capture-ebpf` remain observation-only and unchanged. They do not emit application-operation or handoff claims in Capture Event v1.
-2. `chronicle-session` remains transport reconstruction-only. It supplies connection-generation and loss context but does not assign lineage.
-3. `chronicle-protocol` remains the generic SPI. `chronicle-protocol-builtins` remains protocol implementation; current HTTP has no proven cross-operation causal relation and is not changed in this slice.
-4. `chronicle-etl` owns a native-fact derivation/composition step after canonical operations and exact session lineage are available. It verifies both full references, normalizes facts, and attaches `NativeExecutionLineage` to the child.
-5. `chronicle-canonical` owns the evidence variant, graph/domain placement validation, and the resolver's named native predicate. It never imports capture, session, WAL, protocol implementation, or provider vocabulary.
-6. `chronicle-application` may own optional runtime-source wiring and pass facts into ETL. CLI remains unaware of correlation and protocol semantics.
-
-The derived result is a `CorrelationContext` input to the existing resolver. The producer emits evidence and bounded diagnostics only. It does not construct `Scenario`, `CorrelationResolution`, `SelectedCausalEdge`, or confidence values.
-
-### 4. Native relation participates in existing resolver phases
-
-The resolver adds one named relation index over validated `NativeExecutionLineage` items. For child C and named parent P:
-
-- **Admission:** require C and P to be admitted full references in the same recording, reject malformed/orphan/cross-scope input, and retain role evidence separately.
-- **Phase A1:** `C -> P` inherits P's previous-round support set as transitive candidate-specific support. Support remains sparse and monotonic; no scenario is chosen by the native producer.
-- **Phase A2:** no native-only direct trace support is fabricated. A unique native-only chain uses existing `Strong` transitive confidence and a native lineage witness. Multiple supported scenarios materialize `Ambiguous`; no confidence is assigned.
-- **Phase B:** the same relation is an eligible direct-parent candidate. It goes through the existing invalid-relation pre-filter, unique-parent mapping, complete provisional graph, global SCC computation, and internal-cycle-edge removal. Multiple parent candidates produce no provisional edge; cycles lose only internal edges.
-- **Retention:** native evidence is retained in the correlation channel under the existing deterministic evidence key/cap rules. Role evidence remains byte-for-byte verbatim. A native relation never replaces a direct trace witness merely because it sorts first.
-
-This preserves resolver authority and avoids a second native selector. Existing temporal rules, root pinning, ScenarioRoot reservation, support closure, ambiguity, and confidence semantics remain intact.
-
-### 5. Scope and identifier reuse are explicit
-
-Every derived item carries the complete parent reference. The child scope comes from the evidence map key and is also checked against the fact. Reference verification must prove recording, owner epoch, session lineage, and exactly one operation occurrence. Cross-epoch parent/child facts are valid when both sessions are supplied and verified; an epoch boundary does not break a causal relation.
-
-The following never create a relation by equality:
-
-- `OperationId` without its recording/epoch/session scope;
-- PID, TGID, TID, process generation, task/worker string;
-- file descriptor, socket cookie, five-tuple, `ConnectionId`, or `SourceConnectionGeneration` alone;
-- protocol stream ID, request sequence, WAL sequence, byte direction, or timestamp.
-
-If a future source binds facts before canonicalization, it must use an explicit generation-safe anchor and exact operation position. A stale/reused anchor maps to zero or multiple operations and is rejected/omitted with bounded diagnostics. The first slice avoids this uncertainty by accepting already bound canonical references.
-
-### 6. Ambiguity and source coexistence are additive, never voting
-
-A raw fact that cannot map to exactly one parent/child reference produces no positive relation and a bounded diagnostic. It is not resolved by nearest time, first/last observation, or one remaining candidate. Conversely, two independently proven facts naming parents in different scenarios both enter the resolver and naturally produce `Ambiguous`; the producer does not collapse them.
-
-Trace and native evidence share the same correlation channel. They only add candidate-specific positive support:
-
-- same scenario: both provenance sources remain inspectable; existing confidence and witness class rules apply;
-- different scenarios: support remains `Ambiguous`; no provider wins;
-- different direct parents: existing unique-parent rule suppresses the selected edge;
-- no source contradicts another through a negative vote. An invalid or missing source only removes its own support.
-
-### 7. Bounds and retention
-
-Use explicit implementation limits:
-
-- at most `32` native handoff facts attached to one child per derivation batch;
-- at most `4096` native handoff facts in one bounded derivation batch;
-- at most `4096` active runtime handoff contexts in the source.
-
-Limits are admission/resource limits, not semantic truncation. On overflow, report typed bounded loss or fail closed for affected facts; do not keep an arbitrary prefix and claim complete evidence. The producer retains one-hop facts only. It does not retain transitive ancestry, all paths, an operation×scenario matrix, or lifetime-wide socket/task-generation history. The resolver's existing sparse N×S support bound and proof derivation rules handle transitivity.
-
-Facts can be streamed in bounded batches. Across a long recording, per-operation direct facts and full scoped references are the compact retained relationship; recording length does not create a transitive explanation graph. Runtime handoff state is released after explicit handoff or bounded terminal cleanup. A restart that cannot restore runtime facts emits no native relation rather than guessing.
-
-### 8. Deterministic normalization
-
-Derivation is a pure normalization step over verified sessions and facts:
-
-1. reject or classify scope/shape errors without fallback;
-2. key facts by `(child_ref, parent_ref, relation_kind, provenance.source, provenance.observation)`;
-3. deduplicate exact keys idempotently;
-4. emit child evidence in canonical order by child reference, parent reference, relation discriminator, then complete provenance;
-5. pass the resulting context to the existing resolver.
-
-No hash-map iteration order, worker scheduling, retry count, recorder restart, random ID, or processing-order identifier affects output. Native relation evidence is serializable as a Chronicle-owned runtime value. Given identical canonical sessions and identical fact input, output and bounded diagnostics are byte-identical. Given canonical artifacts without the optional fact input, output is deterministically native-empty; durable rehydration of the fact stream is a separate change.
-
-### 9. Explicit answers to repository-inspection questions
-
-1. **Raw facts available today:** socket generation and endpoint/role/process snapshots; payload timestamps/directions/transport sequence; reconstructed per-socket streams, loss, and termination; protocol frames and per-connection stream; canonical operation connection/WAL/epoch provenance, relative offsets, request/response protocol data, completeness; ETL session lineage and deterministic operation references.
-2. **Actual causal semantics today:** socket generation identifies one observed physical socket generation; canonical full references identify one operation occurrence after lineage verification; HTTP request/response pairing identifies the two halves of one operation. None proves ingress-to-egress execution causality.
-3. **Contextual-only facts:** PID/TID/task/process labels, connection/socket/FD/five-tuple equality, stream/message/WAL sequence, wire direction, socket role, relative time/lifetime, protocol name, and custom values.
-4. **New evidence required:** one additive `NativeExecutionLineage { parent, relation: ExecutionContinuation }` variant plus a serializable `NativeExecutionHandoffFact` composition input. No existing contextual variant is overloaded.
-5. **Existing variants reused:** `EvidenceProvenance`, `CanonicalOperationRef`, existing correlation channel, resolver retention, and `CorrelationContext`. `ExecutionTaskLineage`, `ProcessThreadGeneration`, `ConnectionSocketGeneration`, and `ProtocolStream` remain contextual.
-6. **Derivation location:** ETL/canonical composition after canonical operations and session lineage are available; not capture, WAL, session, or protocol builtins.
-7. **Crate ownership:** canonical owns domain/predicate/resolver; ETL owns exact join/derivation; application may wire runtime facts; capture/session/protocol remain fact/context producers; CLI remains outer adapter.
-8. **Provider neutrality:** only Chronicle types cross the boundary; provider adapters, if any, translate at the outer boundary and are separately distributed.
-9. **Reuse/generations:** full references are authoritative; any pre-canonical anchor must include reuse-safe source generation plus exact local position; bare identifiers never bind.
-10. **Boundedness:** 32 facts/child, 4096 facts/batch, 4096 active handoffs; one-hop facts only; overflow fails closed; resolver keeps existing sparse support bound.
-11. **Determinism:** canonical total ordering and exact deduplication over full references, relation kind, and provenance; no derived IDs or arrival order.
-12. **Ambiguous native facts:** unmappable raw fact yields no relation plus bounded diagnostic; independently proven competing relations reach resolver and remain `Ambiguous`.
-13. **Native plus trace:** both contribute positive support through one channel; neither contradicts or overrides the other; disagreement remains ambiguity.
-14. **Safe resolver predicates:** only explicit child-side `NativeExecutionLineage` naming an admitted parent; it supports transitive ownership and eligible direct-parent construction under existing phases.
-15. **Forbidden predicates:** timing/proximity/overlap, same or nearest ingress, task/PID/TID/process equality, process inheritance alone, socket/FD/connection/stream equality, byte direction, protocol name, WAL/sequence order, absence of contradiction, weighted voting, or provider priority.
-
-### 10. First vertical slice input and proof
-
-The first end-to-end proof uses canonical fixture sessions plus a production-shaped Chronicle-owned handoff source, not a fake resolver shortcut. It creates overlapping known-ingress roots A/B/C and explicit one-hop facts:
+Exactly one candidate produces:
 
 ```text
-A -> database A1
-A -> HTTP A2
-A -> async continuation A3
-B -> database B1
-B -> HTTP B2
-C -> database C1
+CanonicalOperationRef::new(
+    recording_id,
+    operation.provenance.completion_owner_epoch,
+    session.id,
+    operation.id,
+)
 ```
 
-The source supplies complete operation references. The ETL composition step derives child evidence, then invokes the existing resolver. Tests permute operations/facts, overlap lifetimes, place A3 after A's completion, reuse contextual task/socket/connection identifiers, and omit all trace evidence. Expected graph ownership follows only handoff facts. The scenario remains uncorrelated if the handoff fact is removed, and ambiguous if valid facts name competing parents.
+The owner epoch in the resulting reference is the canonical operation's verified completion owner. It is not guessed from the anchor's source epoch. Parent and child bind independently, so cross-epoch continuation is allowed when both references bind exactly.
+
+Zero candidates produce `AnchorBindingUnresolved`. Multiple candidates produce `AnchorBindingAmbiguous`. Both are binding diagnostics, not `CorrelationResolution::Ambiguous`; ETL emits no bound fact and no positive evidence in either case. The binder MUST NOT choose by nearest timestamp, first/last operation, active ingress, processing order, WAL order, PID/TID equality, socket/connection equality, protocol kind, role, absence of other candidates, or any other fallback.
+
+If either endpoint fails binding, the observation is discarded from positive derivation. If both endpoints bind, ETL verifies same recording, complete reference scope, parent/child existence, and relation direction before creating the bound fact. Exact duplicate observations are idempotent under a canonical tuple of both anchors, relation, and source provenance; conflicting observations remain separate facts and are resolved by the existing resolver.
+
+### 4. Ownership by crate and dependency direction
+
+- `chronicle-application` owns the opt-in cooperative source wiring, context carrier lifecycle, transport/application boundary adapter, and delivery into ETL. It does not select scenarios.
+- `chronicle-etl` owns the non-frozen observation/anchor/bound-fact contracts at the composition boundary, exact binding against canonical sessions, deterministic normalization, bounded-loss diagnostics, and conversion to correlation-channel evidence.
+- `chronicle-canonical` owns `NativeExecutionLineage` domain validation, role/correlation channel rules, native relation predicates, support closure, witnesses, confidence, direct-parent candidates, and final graph validation.
+- `chronicle-session` and `chronicle-protocol` expose reconstruction identity, source generation, protocol-local position, and provenance. They do not infer or select causal ownership.
+- `chronicle-protocol-builtins` supplies protocol-local boundary receipts only through the existing protocol-owned contracts; it does not depend on `chronicle-application` or choose scenarios.
+- `chronicle-cli` remains unaware of native evidence and correlation semantics.
+
+This split follows existing direction: application already composes ETL; ETL already depends on canonical/session/protocol; canonical owns the domain/resolver. No new crate or dependency edge is required. `validation/architecture.toml`, `docs/architecture/crate-boundaries.md`, and `AGENTS.md` need no dependency-policy changes unless implementation discovers otherwise.
+
+### 5. Evidence and resolver integration remain additive
+
+ETL emits only child-side `NativeExecutionLineage` for bound facts. It does not create scenarios, confidence, selected edges, role classifications, or transitive paths. The existing resolver indexes the native relation alongside existing positive trace relations:
+
+- Phase A1 uses previous-round support snapshots for directional `child → parent` sparse closure.
+- Phase A2 derives outcomes, existing `Strong` transitive confidence, and bounded witnesses without fabricating `Exact` trace evidence.
+- Phase B adds validated native parent candidates to the existing pre-filter → unique-parent → complete provisional graph → SCC → internal-edge removal sequence.
+- Native and trace support are unioned with no weights, priority, or negative votes. Different supported scenarios remain `Ambiguous`.
+- Role evidence remains a separate channel and is preserved byte-for-byte.
+
+### 6. Bounds, loss, restart, and determinism
+
+The contract requires properties, not arbitrary numeric constants:
+
+- active native source state, per-child pending state, side-channel batches, binding work, and retained one-hop facts MUST be bounded;
+- observations MUST NOT retain transitive ancestry or operation-by-scenario matrices;
+- overflow MUST fail closed or emit typed bounded-loss diagnostics;
+- positive relations MUST NOT be silently truncated while claiming complete native evidence;
+- exact duplicate retries MUST be idempotent;
+- canonical ordering of anchors, diagnostics, facts, and evidence MUST be independent of input order, worker scheduling, hash order, retry, and restart over the same supplied inputs;
+- missing/restarted side-channel input produces no native relation and never changes replayability, WAL authority, checkpoint ordering, or completeness;
+- implementation defaults may be named/configured after resource measurement, but no default count is a normative OpenSpec semantic in this change.
+
+### 7. Proof layers
+
+The implementation must report two separate proofs:
+
+**Composition/integration proof:** start with an already-bound `BoundNativeExecutionHandoffFact`; compose canonical sessions through ETL; derive `NativeExecutionLineage`; run the existing resolver; validate `CorrelationGraph`. This proves the canonical composition and resolver vertical slice only.
+
+**Native production E2E proof:** start with an opt-in cooperative runtime handoff in an overlapping A/B/C application scenario; observe parent/child anchors through the real side channel; bind them against canonical sessions; derive the bound fact and evidence; run the resolver; validate the scenario graph. The test must not manually construct final `CanonicalOperationRef` handoff facts as its starting input. It must include exact, zero-match, multi-match, identifier-reuse, async continuation, missing-observation, binding-ambiguity, causal-ambiguity, native+trace agreement/disagreement, passive-only, and no-provider cases.
+
+A fixture that begins at `CanonicalOperationRef` is labeled composition/integration, never production E2E.
 
 ## Risks / Trade-offs
 
-- **[Current passive recorder has no handoff producer] →** do not claim that current recordings magically gain native correlation. Add the explicit runtime/composed source contract in this slice; leave no-fact recordings safely uncorrelated. Define durable capture in a later compatibility/evidence-durability change.
-- **[Runtime facts can be lost across restart] →** facts are optional, serializable, and deterministic when replayed with the same input; missing facts fail closed. No guessed reconstruction is allowed.
-- **[A single explicit handoff source is narrower than broad task/socket lineage] →** narrow semantics are reviewable and safe. Defer other families until concrete producers prove candidate-specific meaning.
-- **[Conflicting parents reduce selected edges] →** ambiguity and no-edge outcomes are preferable to silently choosing a parent; existing resolver cycle and multi-parent rules remain authoritative.
-- **[Input caps can reduce completeness] →** overflow is typed/bounded loss, never silent semantic truncation. Capture/reliability reporting remains separate from correlation outcomes.
-- **[Evidence retention can hide optional context] →** resolver semantics operate on complete validated input; existing required-witness retention and deterministic cap rules remain unchanged.
+- **[No passive causal proof]** → Passive-only mode remains conservative and documentation names cooperative integration as required for native causality.
+- **[Boundary receipt unavailable or protocol adapter cannot prove exact position]** → Emit unresolved binding diagnostics and no relation; add support only after adapter-specific proof.
+- **[Side-channel loss or restart]** → Typed bounded-loss evidence, no guessed relation, no frozen-artifact changes; durable sidecar is separate work.
+- **[Identifier reuse]** → Require complete source generation, recording/epoch lineage, protocol position, and exact source range; reject zero/multiple matches.
+- **[Cross-epoch completion]** → Match source epoch through retained epoch/WAL provenance, then use verified completion owner epoch for `CanonicalOperationRef`.
+- **[Protocol canonicalizer drift]** → Add contract tests that receipt position and retained canonical provenance identify exactly one operation for each supported adapter.
+- **[Unbounded producer growth]** → Bound active state and one-hop facts, make overflow typed, and never claim completeness after positive truncation.
 
 ## Migration Plan
 
-1. Implement domain additions and resolver predicate behind existing runtime APIs; do not alter v1 serializers or default CLI flow.
-2. Implement ETL native-fact verification/normalization and optional application composition wiring. Existing callers pass no facts and retain current behavior.
-3. Add unit, integration, deterministic, boundedness, identifier-reuse, and end-to-end vertical-slice tests before enabling any production call path.
-4. Run architecture and dependency validation; no dependency edge or crate addition is expected.
-5. Review documentation/AGENTS impact. Update durable guidance only if implementation makes the explicit handoff predicate a repository-wide invariant; do not update user-facing correlation UX because none is introduced.
-6. Roll back by omitting the optional fact input or disabling the composition call. Existing capture, WAL, canonical publication, storage, replay, and CLI artifacts remain readable because no frozen contract changes.
-
-No production code is part of this task; these steps are implementation tasks for a later apply phase.
+This is additive and opt-in. Existing passive capture, WAL recovery, canonical session construction, ETL publication/checkpoints, CLI output, replay, and trace adapters continue unchanged. Implementation first adds the non-frozen source/boundary contract and composition path, then enables a cooperative integration. Disabling or removing that integration returns behavior to passive-only conservative correlation. Durable observation persistence/versioning requires a later explicit compatibility change.
