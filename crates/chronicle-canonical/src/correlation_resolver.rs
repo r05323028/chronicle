@@ -199,11 +199,13 @@ impl RelationIndexes {
     }
 }
 
-/// Symmetric declared-parenthood check: the pair (operation, candidate) is
-/// joined by a declared `ExplicitParentSpan` relation when EITHER side
-/// declares the other as its span parent. Such pairs route inherited support
-/// through the transitive channel regardless of which side holds it.
-fn pair_declared(
+/// Directional declared-parenthood check: does THIS operation declare
+/// `candidate` as its span parent (`reference.parent_span_id ==
+/// candidate.span_id` under one provider+trace identity)? `ExplicitParentSpan`
+/// is directional — a reverse declaration by the candidate never creates a
+/// relationship, never suppresses `SharedTraceIdentity`, and never routes
+/// inherited support through the transitive channel.
+fn declares_parent(
     reference: &CanonicalOperationRef,
     candidate: &CanonicalOperationRef,
     declared_parents: &BTreeMap<CanonicalOperationRef, BTreeSet<CanonicalOperationRef>>,
@@ -211,9 +213,6 @@ fn pair_declared(
     declared_parents
         .get(reference)
         .is_some_and(|parents| parents.contains(candidate))
-        || declared_parents
-            .get(candidate)
-            .is_some_and(|parents| parents.contains(reference))
 }
 
 /// Sparse per-operation support state. Memberships exist only for discovered
@@ -461,6 +460,10 @@ pub fn resolve_correlation(
                 found: reference.recording_id,
             });
         }
+        // Input reservation runs FIRST so a smuggled ScenarioRoot surfaces as
+        // the typed reservation error even when the surrounding role state
+        // would independently fail validation.
+        reject_reserved_scenario_root(reference, &input.role, &input.evidence)?;
         input
             .role
             .validate()
@@ -476,7 +479,6 @@ pub fn resolve_correlation(
                 }
             })?;
         }
-        reject_reserved_scenario_root(reference, &input.role, &input.evidence)?;
         ordered.insert(reference, input);
     }
 
@@ -555,7 +557,7 @@ pub fn resolve_correlation(
                         }
                         // Declared parenthood between the pair routes the
                         // inheritance through the transitive channel below.
-                        if pair_declared(reference, candidate, &declared_parents) {
+                        if declares_parent(reference, candidate, &declared_parents) {
                             continue;
                         }
                         if let Some(candidate_support) = snapshot.get(candidate) {
@@ -628,7 +630,7 @@ pub fn resolve_correlation(
             {
                 for candidate in candidates {
                     if candidate == reference
-                        || pair_declared(reference, candidate, &declared_parents)
+                        || declares_parent(reference, candidate, &declared_parents)
                     {
                         continue;
                     }
@@ -807,7 +809,7 @@ fn derive_ownership_witness(
                 // Declared parenthood between the pair routes that relation
                 // through the transitive channel; it never counts here.
                 if *candidate != reference
-                    && !pair_declared(&reference, candidate, parent_edges)
+                    && !declares_parent(&reference, candidate, parent_edges)
                     && support.get(candidate).is_some_and(|candidate_support| {
                         candidate_support.scenarios.contains(&scenario_id)
                     })
@@ -1187,6 +1189,7 @@ mod tests {
         SourceMetadata, SourceProvenance, TimelineEntry,
     };
     use chronicle_common::{Endpoint, EpochId, OperationId, RecordingId, SessionId};
+    use std::collections::{BTreeMap, BTreeSet};
     use time::OffsetDateTime;
     use uuid::Uuid;
 
@@ -1546,6 +1549,20 @@ mod tests {
     }
 
     #[test]
+    fn wrong_scenario_root_reference_fails_minimal_validation() {
+        let (mut graph, root, member) = placement_fixture();
+        *graph.resolutions.get_mut(&member).unwrap() = CorrelationResolution::Resolved {
+            scenario: scenario_id_v1(&root),
+            confidence: CorrelationConfidence::Exact,
+            evidence: vec![scenario_root_item(ref_at(99))],
+        };
+        assert!(matches!(
+            graph.validate(),
+            Err(CorrelationValidationError::InvalidScenarioRootPlacement { .. })
+        ));
+    }
+
+    #[test]
     fn wrong_operation_placement_fails_validation() {
         let (mut graph, _root, member) = placement_fixture();
         let stranger = ref_at(99);
@@ -1778,10 +1795,8 @@ mod tests {
         ));
 
         // 2. Known role evidence
-        let known_with_smuggled = InteractionRoleResolution::known(
-            InteractionRole::Ingress,
-            vec![CorrelationEvidence::passive_http(), smuggled],
-        );
+        let known_with_smuggled =
+            InteractionRoleResolution::known(InteractionRole::Ingress, vec![smuggled]);
         let result = resolve_correlation(
             RecordingId::from_uuid(uuid_at(1)),
             vec![input(operation, known_with_smuggled, vec![])],
@@ -1796,7 +1811,7 @@ mod tests {
 
         // 3. Unknown role evidence
         let unknown_with_smuggled =
-            InteractionRoleResolution::unknown(vec![task("w"), scenario_root_item(operation)]);
+            InteractionRoleResolution::unknown(vec![scenario_root_item(operation)]);
         let result = resolve_correlation(
             RecordingId::from_uuid(uuid_at(1)),
             vec![input(operation, unknown_with_smuggled, vec![])],
@@ -1813,10 +1828,7 @@ mod tests {
         let ambiguous_with_smuggled = InteractionRoleResolution::ambiguous(vec![
             crate::InteractionRoleCandidate {
                 role: InteractionRole::Ingress,
-                evidence: vec![
-                    CorrelationEvidence::passive_http(),
-                    scenario_root_item(operation),
-                ],
+                evidence: vec![scenario_root_item(operation)],
             },
             crate::InteractionRoleCandidate {
                 role: InteractionRole::Egress,
@@ -1950,6 +1962,107 @@ mod tests {
     // ---------- Task 8: Phase A1 closure ----------
 
     #[test]
+    fn directional_parent_child_inherits_parent_support_transitively() {
+        let parent = ref_at(10);
+        let child = ref_at(11);
+        let graph = resolve(vec![
+            input(
+                parent,
+                ingress_role(),
+                vec![trace("otel", "T", Some("parent-span"), None)],
+            ),
+            input(
+                child,
+                egress_role(),
+                vec![trace("otel", "T", Some("child-span"), Some("parent-span"))],
+            ),
+        ]);
+        let (scenario, confidence, evidence) = resolved_of(&graph, child);
+        assert_eq!(*scenario, scenario_id_v1(&parent));
+        assert_eq!(confidence, CorrelationConfidence::Strong);
+        assert!(matches!(
+            evidence.first().map(|item| &item.kind),
+            Some(CorrelationEvidenceKind::TraceRelationship {
+                parent_span_id: Some(parent_span_id),
+                ..
+            }) if parent_span_id == "parent-span"
+        ));
+        assert!(
+            graph
+                .causal_edges
+                .iter()
+                .any(|edge| edge.parent == parent && edge.child == child)
+        );
+    }
+
+    #[test]
+    fn reverse_parent_declaration_keeps_shared_trace_direct_and_edge_directional() {
+        let root = ref_at(20);
+        let declaring_child = ref_at(21);
+        let declared_parent = ref_at(22);
+        let graph = resolve(vec![
+            input(
+                root,
+                ingress_role(),
+                vec![trace("otel", "R", Some("root-span"), None)],
+            ),
+            input(
+                declaring_child,
+                egress_role(),
+                vec![
+                    trace("otel", "T", Some("child-span"), Some("parent-span")),
+                    trace("otel", "R", Some("root-bridge"), None),
+                ],
+            ),
+            input(
+                declared_parent,
+                egress_role(),
+                vec![trace("otel", "T", Some("parent-span"), None)],
+            ),
+        ]);
+
+        // The only declaration is child -> parent. It is not a relationship
+        // in the reverse parent -> child direction.
+        let mut declared_parents: BTreeMap<CanonicalOperationRef, BTreeSet<CanonicalOperationRef>> =
+            BTreeMap::new();
+        declared_parents.insert(declaring_child, BTreeSet::from([declared_parent]));
+        assert!(declares_parent(
+            &declaring_child,
+            &declared_parent,
+            &declared_parents
+        ));
+        assert!(!declares_parent(
+            &declared_parent,
+            &declaring_child,
+            &declared_parents
+        ));
+
+        // Reverse evaluation keeps SharedTraceIdentity available, so the
+        // parent receives Exact rather than transitive-only Strong support.
+        let (_, parent_confidence, parent_evidence) = resolved_of(&graph, declared_parent);
+        assert_eq!(parent_confidence, CorrelationConfidence::Exact);
+        assert!(matches!(
+            parent_evidence.first().map(|item| &item.kind),
+            Some(CorrelationEvidenceKind::TraceRelationship {
+                parent_span_id: None,
+                ..
+            })
+        ));
+        assert!(
+            graph
+                .causal_edges
+                .iter()
+                .any(|edge| edge.parent == declared_parent && edge.child == declaring_child)
+        );
+        assert!(
+            !graph
+                .causal_edges
+                .iter()
+                .any(|edge| edge.parent == declaring_child && edge.child == declared_parent)
+        );
+    }
+
+    #[test]
     fn transitive_chain_resolves_strong_with_parent_span_edges() {
         let root = ref_at(10);
         let middle = ref_at(11);
@@ -1973,12 +2086,12 @@ mod tests {
         ]);
         let (scenario, confidence, _) = resolved_of(&graph, middle);
         assert_eq!(*scenario, scenario_id_v1(&root));
-        // Middle's every same-trace neighbor is joined by a declared
-        // parenthood (it declares into the root; the leaf declares into it),
-        // so its support stays purely transitive -> Strong.
-        assert_eq!(confidence, CorrelationConfidence::Strong);
-        // The leaf bare-shares the root's trace identity without any declared
-        // parenthood between them — a direct scenario-level relation -> Exact.
+        // The middle declares the root as parent, but the leaf's reverse
+        // declaration must not suppress SharedTraceIdentity for middle.
+        // Closed support therefore retains direct support -> Exact.
+        assert_eq!(confidence, CorrelationConfidence::Exact);
+        // The leaf declares the middle as parent, while the root is an
+        // undeclared same-trace supporter -> Exact through SharedTraceIdentity.
         let (_, leaf_confidence, _) = resolved_of(&graph, leaf);
         assert_eq!(leaf_confidence, CorrelationConfidence::Exact);
         // Stage B edges: R->M, M->L.
@@ -2179,102 +2292,53 @@ mod tests {
     // ---------- Task 9: post-closure proof derivation ----------
 
     #[test]
-    fn later_shorter_path_wins_witness_derivation() {
-        // Per-edge unique trace identities keep every declared pair isolated,
-        // so no accidental bare share creates a direct channel.
-        //
-        // Early route (support completes round 3, proof length 3):
-        //   target -> p1 -> p2 -> root        (edges E3, E2, E1)
-        // Late route (z gains DIRECT support only at round 4 through its bare
-        // share with x3; the target's proof via z becomes derivable later but
-        // is SHORTER — a single hop to a direct-origin supporter):
-        //   target -> z                        (edge E8)
-        // Post-closure derivation must retain the z-route witness.
-        let root = ref_at(10);
-        let p2 = ref_at(11);
-        let p1 = ref_at(12);
-        let x1 = ref_at(13);
-        let x2 = ref_at(14);
-        let x3 = ref_at(15);
-        let z = ref_at(16);
+    fn canonical_transitive_path_prefers_shortest_then_lexical_sequence() {
+        let start = ref_at(10);
+        let x = ref_at(11);
+        let y = ref_at(12);
         let target = ref_at(30);
-        let graph = resolve(vec![
-            // Root exposes one span per incident edge trace.
-            input(
-                root,
-                ingress_role(),
-                vec![
-                    trace("otel", "E1", Some("rE1"), None),
-                    trace("otel", "E4", Some("rE4"), None),
-                ],
-            ),
-            // Early chain: root <- p2 <- p1 <- target.
-            input(
-                p2,
-                egress_role(),
-                vec![
-                    trace("otel", "E1", Some("pE1"), Some("rE1")),
-                    trace("otel", "E2", Some("pE2"), None),
-                ],
-            ),
-            input(
-                p1,
-                egress_role(),
-                vec![
-                    trace("otel", "E2", None, Some("pE2")),
-                    trace("otel", "E3", Some("pE3"), None),
-                ],
-            ),
-            input(
-                target,
-                egress_role(),
-                vec![
-                    trace("otel", "E3", None, Some("pE3")),
-                    trace("otel", "E8", None, Some("zE8")),
-                ],
-            ),
-            // Late-direct branch: x-chain purely transitive, then z bare-shares.
-            input(
-                x1,
-                egress_role(),
-                vec![
-                    trace("otel", "E4", Some("xE4"), Some("rE4")),
-                    trace("otel", "E5", Some("xE5"), None),
-                ],
-            ),
-            input(
-                x2,
-                egress_role(),
-                vec![
-                    trace("otel", "E5", None, Some("xE5")),
-                    trace("otel", "E6", Some("xE6"), None),
-                ],
-            ),
-            input(
-                x3,
-                egress_role(),
-                vec![
-                    trace("otel", "E6", None, Some("xE6")),
-                    trace("otel", "E7", Some("xE7"), None),
-                ],
-            ),
-            input(
-                z,
-                egress_role(),
-                vec![
-                    trace("otel", "E7", Some("zE7"), None),
-                    trace("otel", "E8", Some("zE8"), None),
-                ],
-            ),
-        ]);
-        let (_, confidence, evidence) = resolved_of(&graph, target);
-        assert_eq!(confidence, CorrelationConfidence::Strong);
-        match &evidence[0].kind {
-            CorrelationEvidenceKind::TraceRelationship { parent_span_id, .. } => {
-                assert_eq!(parent_span_id.as_deref(), Some("zE8"));
-            }
-            other => panic!("expected transitive witness, got {other:?}"),
-        }
+        let targets = BTreeSet::from([target]);
+
+        // Insert the longer route first. The two valid paths are:
+        // start -> x -> target
+        // start -> y -> x -> target
+        let mut longer_first: BTreeMap<CanonicalOperationRef, BTreeSet<CanonicalOperationRef>> =
+            BTreeMap::new();
+        longer_first.entry(start).or_default().insert(y);
+        longer_first.entry(y).or_default().insert(x);
+        longer_first.entry(x).or_default().insert(target);
+        longer_first.entry(start).or_default().insert(x);
+        assert_eq!(
+            canonical_transitive_path(start, &targets, &longer_first),
+            Some(vec![x, target])
+        );
+
+        // Reverse construction order must produce the same shortest proof.
+        let mut shorter_first: BTreeMap<CanonicalOperationRef, BTreeSet<CanonicalOperationRef>> =
+            BTreeMap::new();
+        shorter_first.entry(start).or_default().insert(x);
+        shorter_first.entry(x).or_default().insert(target);
+        shorter_first.entry(start).or_default().insert(y);
+        shorter_first.entry(y).or_default().insert(x);
+        assert_eq!(
+            canonical_transitive_path(start, &targets, &shorter_first),
+            Some(vec![x, target])
+        );
+
+        let low = ref_at(40);
+        let high = ref_at(41);
+        let mut lexical: BTreeMap<CanonicalOperationRef, BTreeSet<CanonicalOperationRef>> =
+            BTreeMap::new();
+        // Both routes have two hops; low is the lexicographically smaller
+        // CanonicalOperationRef sequence despite being inserted second.
+        lexical.entry(start).or_default().insert(high);
+        lexical.entry(high).or_default().insert(target);
+        lexical.entry(start).or_default().insert(low);
+        lexical.entry(low).or_default().insert(target);
+        assert_eq!(
+            canonical_transitive_path(start, &targets, &lexical),
+            Some(vec![low, target])
+        );
     }
 
     #[test]
