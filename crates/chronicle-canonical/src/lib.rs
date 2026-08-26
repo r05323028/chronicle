@@ -174,7 +174,7 @@ pub trait Redactor: Send + Sync {
     ) -> (PayloadRef, Vec<RedactionRecord>);
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SourceConnectionGeneration {
     Fixture,

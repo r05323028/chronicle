@@ -120,7 +120,8 @@ NativeOperationBoundaryReceipt {
     source_generation: SourceConnectionGeneration,
     protocol_id: ProtocolId,
     direction: Direction,
-    protocol_operation_position: u64,
+    // Opaque or protocol-owned exact segmentation identity; never an application counter.
+    protocol_operation_boundary: ProtocolOwnedOperationBoundary,
     source_range: WalByteRange,
 }
 
@@ -139,11 +140,37 @@ NativeExecutionHandoffObservation {
 }
 ```
 
+`protocol_operation_boundary` is produced by, or derived from, the same protocol boundary and canonicalization authority that deterministically defines operation segmentation. It is not application-owned. An application or runtime integration MUST NOT synthesize a request number, message index, local counter, or protocol ordinal and present it as canonical binding authority. If the protocol needs a non-integer identity, the protocol SPI MAY expose an opaque protocol-owned exact boundary identity. Protocol adapter disagreement, missing authority, or inability to prove that the receipt and canonicalizer describe the same boundary fails closed.
+
+The receipt is therefore an observation of the canonicalizer's boundary, not a second segmentation algorithm. Repeated or pipelined operations on one connection remain distinguishable only through authoritative protocol boundary identity plus generation-safe source and exact provenance; runtime-local ordering cannot repair ambiguity.
+
 Names are semantic contract names, not required final Rust spelling. `NativeOperationBoundaryReceipt` is the minimal new non-frozen fact current code lacks. Its fields are deliberately composed from real current facts: recording/epoch placement from recorder/ETL lineage, `SourceConnectionGeneration`, protocol-local operation position, and exact `WalByteRange` source provenance. A receipt with only PID, TID, task ID, worker name, file descriptor, socket cookie, connection ID, stream ID, WAL sequence, timestamp, or position without its generation-safe scope is invalid.
 
 The receipt is bounded: one operation-start boundary and one source-range identity, not a transitive ancestry list. An implementation may use an equivalent exact protocol-local boundary representation only when it proves the same reuse and uniqueness properties for each supported protocol adapter. Current adapters that cannot provide this receipt are unsupported by cooperative native binding and produce no relation.
 
-### 3. Exact anchor-to-canonical binding
+### 2a. Pending receipt completion and race handling
+
+A handoff observation MUST remain pending until both parent and child operation-boundary receipts are complete. The normative lifecycle is:
+
+```text
+ingress parent A starts
+      ↓
+Chronicle context generation exists
+      ↓
+child continuation starts
+      ↓
+parent boundary receipt pending
+      ↓
+NativeExecutionHandoffObservation pending
+      ↓
+parent and child receipts complete
+      ↓
+complete observation enters bounded ETL side channel
+```
+
+The child may complete before the parent, the parent may complete before the child, or both may complete independently. No partial anchor, guessed position, active-operation reference, timestamp match, processing-order match, task identity, connection identity, or other fallback may reach ETL binding. A parent with multiple pending children owns independent bounded pending entries; one incomplete entry MUST NOT block unrelated observations.
+
+Completion notifications MUST be deterministic and idempotent. Duplicate receipt or handoff delivery produces one complete observation. If either endpoint never completes, pending state is evicted by the bounded source lifecycle and emits a typed unresolved or bounded-loss diagnostic with no positive native relation. Restart or side-channel loss discards pending state fail closed with the same diagnostic class. Pending state and diagnostics are bounded; overflow never silently retains an arbitrary positive subset.
 
 ETL builds a deterministic candidate index from supplied canonical sessions. Each anchor is matched against canonical operation plus owning connection using all of these checks:
 

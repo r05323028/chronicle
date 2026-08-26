@@ -55,9 +55,9 @@ The first production source SHALL be an opt-in Chronicle cooperative execution-c
 
 ### Requirement: NativeOperationAnchor is complete, generation-safe, and pre-canonical
 
-A `NativeOperationAnchor` SHALL contain a complete Chronicle-owned boundary receipt with recording scope, source epoch placement, `SourceConnectionGeneration`, protocol identity, direction, exact protocol-local operation position, and exact source/reconstruction provenance sufficient to identify one later canonical operation or fail closed. The anchor MAY contain an opaque Chronicle execution-context generation as provenance, but that value SHALL NOT be an ownership predicate by itself. An anchor SHALL be bounded and SHALL NOT contain transitive ancestry.
+A `NativeOperationAnchor` SHALL contain a complete Chronicle-owned boundary receipt with recording scope, source epoch placement, `SourceConnectionGeneration`, protocol identity, direction, an authoritative protocol-owned exact operation-boundary identity, and exact source/reconstruction provenance sufficient to identify one later canonical operation or fail closed. The boundary identity MAY be opaque; it MUST be produced by, or derived from, the same protocol boundary/canonicalization authority that deterministically defines operation segmentation. The anchor MAY contain an opaque Chronicle execution-context generation as provenance, but that value SHALL NOT be an ownership predicate by itself. An anchor SHALL be bounded and SHALL NOT contain transitive ancestry.
 
-The first supported receipt SHALL use current facts where available: `SourceConnectionGeneration`, protocol-local operation position from the protocol boundary, recording/epoch/reconstruction lineage, and exact `WalByteRange` or equivalent source placement. A new non-frozen boundary receipt is required because current passive code exposes connection generation and provenance but no execution-handoff-to-operation binding fact. An implementation SHALL NOT substitute an unsupported field or bare identifier.
+The first supported receipt SHALL use current facts where available: `SourceConnectionGeneration`, the authoritative protocol-owned operation-boundary identity from the protocol segmentation path, recording/epoch/reconstruction lineage, and exact `WalByteRange` or equivalent source placement. An application/runtime integration MUST NOT synthesize a request number, message index, counter, or ordinal and use it as binding authority. A new non-frozen boundary receipt is required because current passive code exposes connection generation and provenance but no execution-handoff-to-operation binding fact. An implementation SHALL NOT substitute an unsupported field or bare identifier.
 
 #### Scenario: Valid anchor has complete source scope
 
@@ -85,9 +85,73 @@ The first supported receipt SHALL use current facts where available: `SourceConn
 
 #### Scenario: Unsupported protocol boundary fails closed
 
-- **WHEN** a protocol adapter cannot provide exact operation position and source provenance for an anchor
+- **WHEN** a protocol adapter cannot provide an authoritative exact operation-boundary identity and source provenance for an anchor
 - **THEN** the observation is unresolved
-- **AND** protocol kind or timing does not replace the missing boundary fact
+- **AND** protocol kind, timing, processing order, or runtime-local position does not replace the missing boundary fact
+
+#### Scenario: Runtime-local operation counters are rejected
+
+- **WHEN** an application/runtime integration supplies its own request number, message index, counter, or ordinal instead of the protocol-owned segmentation identity
+- **THEN** the anchor is rejected as lacking authoritative boundary provenance
+- **AND** no canonical binding or positive native relation is emitted
+
+#### Scenario: Protocol authority disagreement fails closed
+
+- **WHEN** runtime/transport and protocol canonicalization disagree about which operation boundary a receipt describes
+- **THEN** the receipt is unresolved
+- **AND** neither source may choose a boundary or repair the disagreement with order, timing, or connection identity
+
+### Requirement: Pending handoff observations wait for complete receipts
+
+A `NativeExecutionHandoffObservation` SHALL be assembled only after both parent and child `NativeOperationAnchor` receipts are complete. The source SHALL retain incomplete parent/child receipt state in bounded pending storage and SHALL emit no partial anchor to ETL. Parent and child completion MAY occur in either order. Each pending child SHALL remain independent, duplicate completion SHALL be idempotent, and one incomplete observation SHALL NOT block unrelated observations. If an endpoint never completes, pending state is lost on bounded expiry, overflow, or restart, or side-channel delivery loses the pending entry, the source SHALL emit a typed unresolved or bounded-loss diagnostic and no positive native relation. Timestamp, proximity, processing order, active-operation, PID/TID/task, socket/connection, stream, or other contextual fallback is forbidden.
+
+#### Scenario: Child continuation precedes parent receipt
+
+- **WHEN** child continuation is observed before parent boundary receipt completion
+- **THEN** the handoff remains pending with no partial parent anchor
+- **AND** later completion of both receipts produces one complete observation that may bind exactly
+
+#### Scenario: Parent receipt completes later
+
+- **WHEN** child receipt completes first and parent receipt completes later within the bounded source lifecycle
+- **THEN** the completed observation binds using both authoritative receipts
+- **AND** no child-first ordering heuristic is used
+
+#### Scenario: Parent receipt completes first
+
+- **WHEN** parent receipt completes before child receipt
+- **THEN** the parent is retained as pending context for the child
+- **AND** child completion produces one complete observation without using an active-operation fallback
+
+#### Scenario: Parent never completes
+
+- **WHEN** child continuation is observed but parent receipt never becomes complete
+- **THEN** bounded expiry/loss emits a typed unresolved or bounded-loss diagnostic
+- **AND** no native relation is emitted
+
+#### Scenario: Child never completes
+
+- **WHEN** parent receipt completes but child receipt never becomes complete
+- **THEN** bounded expiry/loss emits a typed unresolved or bounded-loss diagnostic
+- **AND** no native relation is emitted
+
+#### Scenario: Restart loses pending state
+
+- **WHEN** source restart loses an incomplete parent, child, or handoff entry
+- **THEN** recovery emits no guessed relation
+- **AND** native evidence remains absent while existing WAL, completeness, and replay semantics remain unchanged
+
+#### Scenario: Duplicate completion is idempotent
+
+- **WHEN** receipt or handoff completion notifications are delivered repeatedly
+- **THEN** one deterministic complete observation is emitted
+- **AND** duplicate relations and duplicate positive evidence are not created
+
+#### Scenario: Multiple children remain independent and bounded
+
+- **WHEN** two children are pending against one incomplete parent
+- **THEN** each child retains an independent bounded pending entry
+- **AND** completion or loss of one child does not block, complete, or mutate the other
 
 ### Requirement: Anchor binding is exact and fail-closed
 

@@ -77,7 +77,7 @@ Additional dev declarations: `application -> wal` (test-support; also a normal e
 ### chronicle-protocol
 
 - **Primary responsibility**: detector/decoder/canonicalizer/replay-adapter/verifier SPI and registry.
-- **Owned public concepts**: `ProtocolRegistry`, detector/decoder/canonicalizer/replay/verifier interfaces, protocol streams.
+- **Owned public concepts**: `ProtocolRegistry`, detector/decoder/canonicalizer/replay/verifier interfaces, protocol streams, `ProtocolOperationBoundaryIdentity`, and `ProtocolBoundaryAuthority`. Canonicalizers may expose exact protocol-owned segmentation identity; runtime integrations cannot authorize local counters.
 - **Allowed Chronicle dependencies**: `chronicle-canonical`, `chronicle-common`, `chronicle-session`.
 - **Forbidden knowledge**: concrete built-in protocol implementations (`chronicle-protocol-builtins`).
 - **Must not change**: protocol SPI contracts used by built-ins and ETL.
@@ -93,7 +93,7 @@ Additional dev declarations: `application -> wal` (test-support; also a normal e
 ### chronicle-etl
 
 - **Primary responsibility**: complete Extract-Transform-Load from recovery-authoritative evidence through canonical publication.
-- **Owned public concepts**: validated WAL extraction, session reconstruction, protocol interpretation, canonicalization, incremental artifact publication, one-shot final session publication, publication verification, and checkpoint advancement ordering.
+- **Owned public concepts**: validated WAL extraction, session reconstruction, protocol interpretation, canonicalization, incremental artifact publication, one-shot final session publication, publication verification, checkpoint advancement ordering, pre-canonical native observations/anchors, exact binding diagnostics, bounded handoff facts, and native evidence composition.
 - **Allowed Chronicle dependencies**: `chronicle-canonical`, `chronicle-capture`, `chronicle-common`, `chronicle-protocol`, `chronicle-session`, `chronicle-storage`, `chronicle-wal`; dev `chronicle-protocol-builtins`.
 - **Forbidden knowledge**: CLI, application, eBPF implementation.
 - **Must not change**: ETL remains complete Extract-Transform-Load; storage dependency and publication-before-checkpoint authority stay in ETL; persisted ETL/checkpoint formats unchanged.
@@ -117,7 +117,7 @@ Additional dev declarations: `application -> wal` (test-support; also a normal e
 ### chronicle-application
 
 - **Primary responsibility**: user-facing use-case orchestration and composition (record, recorder, ETL, replay, inspect, doctor).
-- **Owned public concepts**: request/result/error APIs for outer adapters; domain lock, quota policy, supervised scope, composition.
+- **Owned public concepts**: request/result/error APIs for outer adapters; domain lock, quota policy, supervised scope, composition, and opt-in `CooperativeNativeSource` context/handoff wiring. It never assigns canonical operation or scenario identity.
 - **Allowed Chronicle dependencies**: every non-CLI Chronicle crate needed for composition, including optional target-gated `chronicle-capture-ebpf`.
 - **Forbidden knowledge**: none beyond not depending on CLI; must not duplicate ETL publication semantics, replay planning, or WAL durability logic.
 - **Must not change**: exact domain-lock acquisition, quota accounting, and reliability authority; no new crates.
@@ -130,7 +130,7 @@ Additional dev declarations: `application -> wal` (test-support; also a normal e
 - **Forbidden knowledge**: protocol decoding, replay policy, WAL scanning/recovery, ETL orchestration, storage publication, eBPF loading, business safety decisions.
 - **Must not change**: CLI commands, arguments, output, exit codes, or behavior.
 
-Correlation foundation remains a canonical-domain concern, not a new crate or a persisted v1 field. `InteractionRole` contains only `Ingress` and `Egress`; `InteractionRoleResolution` keeps known, unknown, and candidate-specific ambiguous states separate from `Direction` and `SocketRole`. `CorrelationGraph` owns recording-scoped `Scenario` children, role/correlation indexes, and selected causal edges. `CanonicalOperationRef` scopes `OperationId` by recording, owner epoch, and session; epoch rollover remains a publication boundary while `ScenarioId` remains recording-scoped. Ambiguous and uncorrelated operations remain discoverable without synthetic ownership, and only `Known(Ingress)` can be a scenario root. Correlation evidence is Chronicle-owned and provider-neutral; optional external trace values are opaque enrichment.
+Correlation foundation remains a canonical-domain concern, not a new crate or a persisted v1 field. `InteractionRole` contains only `Ingress` and `Egress`; `InteractionRoleResolution` keeps known, unknown, and candidate-specific ambiguous states separate from `Direction` and `SocketRole`. ETL supplies only exact-bound native lineage as an additive positive relation; the resolver remains sole selection authority. `CorrelationGraph` owns recording-scoped `Scenario` children, role/correlation indexes, and selected causal edges. `CanonicalOperationRef` scopes `OperationId` by recording, owner epoch, and session; epoch rollover remains a publication boundary while `ScenarioId` remains recording-scoped. Ambiguous and uncorrelated operations remain discoverable without synthetic ownership, and only `Known(Ingress)` can be a scenario root. Correlation evidence is Chronicle-owned and provider-neutral; optional external trace values are opaque enrichment.
 
 The correlation RESOLVER is canonical-domain semantics inside `chronicle-canonical` (three-phase support closure, outcome materialization, parent-edge construction); no standalone correlation crate exists. `ScenarioId` derivation uses the workspace-standard `sha2` hashing crate declared by `chronicle-canonical` — an ordinary external dependency, not a provider package. `chronicle-etl` composes resolution through an explicit `CorrelationContext` join (reference verification plus ordering only, zero selection semantics), invoked on demand; the default publication/checkpoint path never calls it.
 

@@ -22,6 +22,10 @@ canonical session 是 Chronicle 在擷取與重播之間交接的資料。它以
 
 Timeline 是唯一的 operation order。Completeness map 具有權威性。若 endpoint evidence 遺失或互相衝突，ETL 會失敗；它絕不會儲存捏造的 `unknown:0` endpoint。
 
+## Native correlation evidence
+
+`NativeExecutionLineage` 是 additive、non-temporal 的 evidence，並且只保留在 child 的 correlation channel。只有在 ETL 對兩個 pre-canonical Chronicle-native boundary receipt 完成 exact bind 後，才會建立它。Operation boundary identity 由 protocol canonicalizer 擁有；application-local request counter 絕不能成為 binding authority。Observation 遺失、ambiguous 或遺失時，不會改變 completeness 或 replayability。
+
 ## 唯一可變動的 v1 契約
 
 目前的 canonical schema 是 `CANONICAL_SCHEMA_VERSION = 1`。Reader 會拒絕其他版本。在明確的 compatibility freeze 之前，Chronicle 不會維護歷史 migration reader；未來變更版本時，必須在獨立的 design change 中定義相容性與 migration policy。

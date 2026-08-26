@@ -12,6 +12,7 @@ use chronicle_canonical::{
 };
 use chronicle_common::{Direction, Endpoint, ProtocolId, Timestamp};
 use chronicle_session::{ReconstructionDirection, ReconstructionEvidence};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -237,6 +238,46 @@ pub trait DecoderFactory: Send + Sync {
     fn create(&self) -> Box<dyn ProtocolDecoder>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolBoundaryAuthority {
+    Canonicalizer,
+    RuntimeSupplied,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProtocolOperationBoundaryIdentity {
+    pub protocol: ProtocolId,
+    pub value: String,
+    pub authority: ProtocolBoundaryAuthority,
+}
+
+impl ProtocolOperationBoundaryIdentity {
+    /// Runtime integrations may carry opaque values, but ETL rejects them as
+    /// binding authority unless a protocol canonicalizer vouches for them.
+    pub fn new(protocol: ProtocolId, value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self {
+            protocol,
+            value,
+            authority: ProtocolBoundaryAuthority::RuntimeSupplied,
+        })
+    }
+
+    pub fn from_canonicalizer(protocol: ProtocolId, value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self {
+            protocol,
+            value,
+            authority: ProtocolBoundaryAuthority::Canonicalizer,
+        })
+    }
+
+    pub const fn is_authoritative(&self) -> bool {
+        matches!(self.authority, ProtocolBoundaryAuthority::Canonicalizer)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalizedOperation {
     pub operation: CanonicalOperation,
@@ -253,6 +294,16 @@ impl std::ops::Deref for CanonicalizedOperation {
 
 pub trait ProtocolCanonicalizer: Send + Sync {
     fn protocol(&self) -> &ProtocolId;
+
+    /// Return the exact protocol-owned segmentation identity for one canonical
+    /// operation. Runtime integrations must never synthesize this value.
+    fn operation_boundary_identity(
+        &self,
+        _operation: &CanonicalOperation,
+    ) -> Option<ProtocolOperationBoundaryIdentity> {
+        None
+    }
+
     fn canonicalize(
         &self,
         stream: &ProtocolStream<'_>,

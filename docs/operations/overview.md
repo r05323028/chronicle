@@ -27,6 +27,20 @@ selected cgroup subtree -> eBPF capture -> 4096-event queue -> segmented WAL
   -> atomic filesystem publication -> inspect or authorized loopback replay
 ```
 
+Native correlation is opt-in and separate from passive capture:
+
+```text
+cooperative runtime context
+  -> explicit parent/child handoff
+  -> protocol-owned boundary receipts
+  -> bounded application/ETL side channel
+  -> exact binding or typed unresolved/ambiguous diagnostic
+  -> NativeExecutionLineage
+  -> existing correlation resolver
+```
+
+Passive-only recording remains conservative: no cooperative observation and no trace evidence means no native causal claim. Cooperative mode requires exact protocol boundary authority; it never falls back to timing, processing order, active ingress, PID/TID/task, socket/connection, stream, or wire direction. Side-channel loss, restart, and capacity overflow fail closed.
+
 Defaults and hard limits:
 
 - whole-recording deadline: omitted by default; explicit positive durations such as `10m` and `24h` are checked for runtime-clock overflow;

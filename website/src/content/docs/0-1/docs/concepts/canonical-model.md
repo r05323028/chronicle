@@ -23,6 +23,10 @@ The current v1 model includes:
 
 The timeline is the sole operation order. Completeness maps are authoritative. ETL fails for missing or conflicting endpoint evidence; it never stores a fabricated `unknown:0` endpoint.
 
+## Native correlation evidence
+
+`NativeExecutionLineage` is additive, non-temporal, and kept on the child correlation channel. It is created only after ETL exactly binds two pre-canonical Chronicle-native boundary receipts. A protocol canonicalizer owns the operation boundary identity; an application-local request counter is never binding authority. Missing, ambiguous, or lost observations do not change completeness or replayability.
+
 ## One mutable v1 contract
 
 The current canonical schema is `CANONICAL_SCHEMA_VERSION = 1`. Readers reject other versions. Chronicle is not maintaining historical migration readers before an explicit compatibility freeze; a future version change must define its compatibility and migration policy in a separate design change.

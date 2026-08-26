@@ -19,6 +19,8 @@ predecessor checkpoint is pending.
 
 Recorder owns one filesystem domain. WAL commit markers remain acknowledgement authority. Manifest, checkpoint, RecordingStore artifacts, and status metadata never promote uncommitted WAL bytes.
 
+Native causal correlation is not inferred by passive recorder capture. Without an explicit application-owned Chronicle context and protocol-authoritative boundary receipt, recording remains passive-only and conservative. Cooperative handoff observations are bounded ETL side-channel input; missing, ambiguous, restarted, or overflowing input produces no native relation and does not alter WAL, checkpoint, completeness, or replayability semantics.
+
 ## Paths and ownership
 
 - `state_root/recorder.json`: versioned, checksummed active metadata.

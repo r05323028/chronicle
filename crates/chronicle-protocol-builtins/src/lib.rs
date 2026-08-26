@@ -43,8 +43,9 @@ pub mod http {
     use chronicle_protocol::{
         BoxFuture, CanonicalizedOperation, CapabilityStatus, DecodedFrame, DetectionInput,
         DetectionResult, ObservedResponse, ProtocolCanonicalizer, ProtocolCapabilities,
-        ProtocolDetector, ProtocolError, ProtocolStream, ReplayAdapter, ReplayConnection,
-        ReplayContext, TransportErrorCategory, VerificationResult, VerificationStatus, Verifier,
+        ProtocolDetector, ProtocolError, ProtocolOperationBoundaryIdentity, ProtocolStream,
+        ReplayAdapter, ReplayConnection, ReplayContext, TransportErrorCategory, VerificationResult,
+        VerificationStatus, Verifier,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, VecDeque};
@@ -1206,6 +1207,18 @@ pub mod http {
         fn protocol(&self) -> &ProtocolId {
             &self.id
         }
+
+        fn operation_boundary_identity(
+            &self,
+            operation: &CanonicalOperation,
+        ) -> Option<ProtocolOperationBoundaryIdentity> {
+            let data = HttpOperationData::from_protocol_data(&operation.protocol_data).ok()?;
+            ProtocolOperationBoundaryIdentity::from_canonicalizer(
+                self.id.clone(),
+                format!("http-request-sequence:{}", data.request_sequence),
+            )
+        }
+
         fn canonicalize(
             &self,
             stream: &ProtocolStream<'_>,
@@ -2758,6 +2771,15 @@ pub mod http {
             let data = HttpOperationData::from_protocol_data(&operations[0].protocol_data).unwrap();
             assert_eq!(data.response_status, Some(201));
             assert_eq!(data.request_headers.len(), 2);
+            let first_boundary = canonicalizer
+                .operation_boundary_identity(&operations[0].operation)
+                .unwrap();
+            let second_boundary = canonicalizer
+                .operation_boundary_identity(&operations[1].operation)
+                .unwrap();
+            assert!(first_boundary.is_authoritative());
+            assert_ne!(first_boundary, second_boundary);
+            assert_eq!(first_boundary.protocol, ProtocolId::new("http/1.1"));
             assert_eq!(operations[1].effect, OperationEffect::Unknown);
             assert!(operations[1].recorded_response.is_none());
         }
