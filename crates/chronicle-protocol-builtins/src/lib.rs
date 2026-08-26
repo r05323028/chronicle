@@ -43,7 +43,7 @@ pub mod http {
     use chronicle_protocol::{
         BoxFuture, CanonicalizedOperation, CapabilityStatus, DecodedFrame, DetectionInput,
         DetectionResult, ObservedResponse, ProtocolCanonicalizer, ProtocolCapabilities,
-        ProtocolDetector, ProtocolError, ProtocolOperationBoundaryIdentity, ProtocolStream,
+        ProtocolDetector, ProtocolError, ProtocolOperationBoundaryClaim, ProtocolStream,
         ReplayAdapter, ReplayConnection, ReplayContext, TransportErrorCategory, VerificationResult,
         VerificationStatus, Verifier,
     };
@@ -63,6 +63,16 @@ pub mod http {
         "application/vnd.chronicle.http-observed-response+json;version=1";
     const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
     const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Protocol-owned claim emitted by a transport boundary at an HTTP request
+    /// start. It is opaque until the registered canonicalizer vouches for it.
+    pub fn request_boundary_claim(sequence: u64) -> Option<ProtocolOperationBoundaryClaim> {
+        ProtocolOperationBoundaryClaim::new(
+            ProtocolId::new("http/1.1"),
+            format!("http-request-sequence:{sequence}"),
+            Direction::ClientToServer,
+        )
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum WarningCode {
@@ -1208,15 +1218,12 @@ pub mod http {
             &self.id
         }
 
-        fn operation_boundary_identity(
+        fn operation_boundary_claim(
             &self,
             operation: &CanonicalOperation,
-        ) -> Option<ProtocolOperationBoundaryIdentity> {
+        ) -> Option<ProtocolOperationBoundaryClaim> {
             let data = HttpOperationData::from_protocol_data(&operation.protocol_data).ok()?;
-            ProtocolOperationBoundaryIdentity::from_canonicalizer(
-                self.id.clone(),
-                format!("http-request-sequence:{}", data.request_sequence),
-            )
+            request_boundary_claim(data.request_sequence)
         }
 
         fn canonicalize(
@@ -2772,14 +2779,14 @@ pub mod http {
             assert_eq!(data.response_status, Some(201));
             assert_eq!(data.request_headers.len(), 2);
             let first_boundary = canonicalizer
-                .operation_boundary_identity(&operations[0].operation)
+                .operation_boundary_claim(&operations[0].operation)
                 .unwrap();
             let second_boundary = canonicalizer
-                .operation_boundary_identity(&operations[1].operation)
+                .operation_boundary_claim(&operations[1].operation)
                 .unwrap();
-            assert!(first_boundary.is_authoritative());
             assert_ne!(first_boundary, second_boundary);
-            assert_eq!(first_boundary.protocol, ProtocolId::new("http/1.1"));
+            assert_eq!(first_boundary.protocol(), &ProtocolId::new("http/1.1"));
+            assert_eq!(first_boundary.direction(), Direction::ClientToServer);
             assert_eq!(operations[1].effect, OperationEffect::Unknown);
             assert!(operations[1].recorded_response.is_none());
         }

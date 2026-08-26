@@ -77,10 +77,10 @@ Additional dev declarations: `application -> wal` (test-support; also a normal e
 ### chronicle-protocol
 
 - **Primary responsibility**: detector/decoder/canonicalizer/replay-adapter/verifier SPI and registry.
-- **Owned public concepts**: `ProtocolRegistry`, detector/decoder/canonicalizer/replay/verifier interfaces, protocol streams, `ProtocolOperationBoundaryIdentity`, and `ProtocolBoundaryAuthority`. Canonicalizers may expose exact protocol-owned segmentation identity; runtime integrations cannot authorize local counters.
+- **Owned public concepts**: `ProtocolRegistry`, detector/decoder/canonicalizer/replay/verifier interfaces, protocol streams, opaque `ProtocolOperationBoundaryClaim`, and registry-derived `ProtocolOperationBoundaryIdentity`. Registered canonicalizers may expose exact protocol-owned segmentation data; runtime integrations cannot construct or deserialize trusted identities or authorize local counters.
 - **Allowed Chronicle dependencies**: `chronicle-canonical`, `chronicle-common`, `chronicle-session`.
 - **Forbidden knowledge**: concrete built-in protocol implementations (`chronicle-protocol-builtins`).
-- **Must not change**: protocol SPI contracts used by built-ins and ETL.
+- **Must not change**: protocol registration honesty and trust direction: runtime claims remain opaque, while only registry code wraps registered canonicalizer output as trusted identity for ETL.
 
 ### chronicle-protocol-builtins
 
@@ -93,7 +93,7 @@ Additional dev declarations: `application -> wal` (test-support; also a normal e
 ### chronicle-etl
 
 - **Primary responsibility**: complete Extract-Transform-Load from recovery-authoritative evidence through canonical publication.
-- **Owned public concepts**: validated WAL extraction, session reconstruction, protocol interpretation, canonicalization, incremental artifact publication, one-shot final session publication, publication verification, checkpoint advancement ordering, pre-canonical native observations/anchors, exact binding diagnostics, bounded handoff facts, and native evidence composition.
+- **Owned public concepts**: validated WAL extraction, session reconstruction, protocol interpretation, canonicalization, incremental artifact publication, one-shot final session publication, publication verification, checkpoint advancement ordering, pre-canonical native observations/anchors, exact epoch/range/direction binding diagnostics, bounded handoff facts, and native evidence composition.
 - **Allowed Chronicle dependencies**: `chronicle-canonical`, `chronicle-capture`, `chronicle-common`, `chronicle-protocol`, `chronicle-session`, `chronicle-storage`, `chronicle-wal`; dev `chronicle-protocol-builtins`.
 - **Forbidden knowledge**: CLI, application, eBPF implementation.
 - **Must not change**: ETL remains complete Extract-Transform-Load; storage dependency and publication-before-checkpoint authority stay in ETL; persisted ETL/checkpoint formats unchanged.
@@ -117,7 +117,7 @@ Additional dev declarations: `application -> wal` (test-support; also a normal e
 ### chronicle-application
 
 - **Primary responsibility**: user-facing use-case orchestration and composition (record, recorder, ETL, replay, inspect, doctor).
-- **Owned public concepts**: request/result/error APIs for outer adapters; domain lock, quota policy, supervised scope, composition, and opt-in `CooperativeNativeSource` context/handoff wiring. It never assigns canonical operation or scenario identity.
+- **Owned public concepts**: request/result/error APIs for outer adapters; domain lock, quota policy, supervised scope, composition, `NativeHttpBoundaryAdapter`, and opt-in `CooperativeNativeSource` context/handoff wiring with bounded atomic delivery. It never assigns canonical operation or scenario identity.
 - **Allowed Chronicle dependencies**: every non-CLI Chronicle crate needed for composition, including optional target-gated `chronicle-capture-ebpf`.
 - **Forbidden knowledge**: none beyond not depending on CLI; must not duplicate ETL publication semantics, replay planning, or WAL durability logic.
 - **Must not change**: exact domain-lock acquisition, quota accounting, and reliability authority; no new crates.

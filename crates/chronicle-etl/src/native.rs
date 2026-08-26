@@ -1,9 +1,9 @@
 use chronicle_canonical::{
-    CanonicalOperationRef, CanonicalSession, CorrelationEvidence, CorrelationEvidenceKind,
-    ExecutionContinuation, SourceConnectionGeneration, WalByteRange,
+    CanonicalOperation, CanonicalOperationRef, CanonicalSession, CorrelationEvidence,
+    CorrelationEvidenceKind, ExecutionContinuation, SourceConnectionGeneration, WalByteRange,
 };
 use chronicle_common::{Direction, EpochId, ProtocolId, RecordingId};
-use chronicle_protocol::{ProtocolOperationBoundaryIdentity, ProtocolRegistry};
+use chronicle_protocol::{ProtocolOperationBoundaryClaim, ProtocolRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error;
@@ -19,7 +19,8 @@ impl NativeExecutionContextGeneration {
         Self(Uuid::new_v4())
     }
 
-    pub const fn from_uuid(value: Uuid) -> Self {
+    #[cfg(test)]
+    pub(crate) const fn from_uuid(value: Uuid) -> Self {
         Self(value)
     }
 
@@ -36,22 +37,25 @@ impl Default for NativeExecutionContextGeneration {
 
 /// Minimal provider-neutral Chronicle context. No final canonical reference
 /// or scenario identity is available at runtime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChronicleExecutionContext {
-    pub generation: NativeExecutionContextGeneration,
-    pub parent_generation: Option<NativeExecutionContextGeneration>,
+    generation: NativeExecutionContextGeneration,
+    parent_generation: Option<NativeExecutionContextGeneration>,
 }
 
 impl ChronicleExecutionContext {
-    pub fn root() -> Self {
+    pub(crate) fn root() -> Self {
         Self {
             generation: NativeExecutionContextGeneration::new(),
             parent_generation: None,
         }
     }
 
-    #[must_use]
-    pub fn child(self) -> Self {
+    pub const fn generation(self) -> NativeExecutionContextGeneration {
+        self.generation
+    }
+
+    pub(crate) fn child(self) -> Self {
         Self {
             generation: NativeExecutionContextGeneration::new(),
             parent_generation: Some(self.generation),
@@ -100,6 +104,8 @@ pub enum NativeSourceError {
     SideChannelLimitExceeded { limit: usize },
     #[error("native boundary receipt conflict")]
     ConflictingReceipt,
+    #[error("native context still has pending handoffs")]
+    ContextHasPendingHandoffs,
     #[error("invalid native boundary receipt: {0}")]
     InvalidReceipt(String),
 }
@@ -129,20 +135,22 @@ pub struct NativeOperationBoundaryReceipt {
     pub source_generation: SourceConnectionGeneration,
     pub protocol_id: ProtocolId,
     pub direction: Direction,
-    pub protocol_operation_boundary: ProtocolOperationBoundaryIdentity,
+    /// Opaque protocol-local claim; trust is established only by ETL's
+    /// registry-derived boundary index.
+    pub protocol_operation_boundary: ProtocolOperationBoundaryClaim,
     pub source_range: WalByteRange,
 }
 
 impl NativeOperationBoundaryReceipt {
     pub fn validate(&self) -> Result<(), NativeSourceError> {
-        if self.protocol_id != self.protocol_operation_boundary.protocol {
+        if self.protocol_id != *self.protocol_operation_boundary.protocol() {
             return Err(NativeSourceError::InvalidReceipt(
-                "protocol identity disagrees with protocol-owned boundary identity".into(),
+                "protocol identity disagrees with protocol-owned boundary claim".into(),
             ));
         }
-        if !self.protocol_operation_boundary.is_authoritative() {
+        if self.protocol_operation_boundary.direction() != self.direction {
             return Err(NativeSourceError::InvalidReceipt(
-                "runtime-supplied operation boundary is not binding authority".into(),
+                "boundary claim direction disagrees with receipt direction".into(),
             ));
         }
         if self.source_range.direction != self.direction {
@@ -156,12 +164,12 @@ impl NativeOperationBoundaryReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperationAnchor {
-    pub boundary: NativeOperationBoundaryReceipt,
-    pub context_generation: NativeExecutionContextGeneration,
+    pub(crate) boundary: NativeOperationBoundaryReceipt,
+    pub(crate) context_generation: NativeExecutionContextGeneration,
 }
 
 impl NativeOperationAnchor {
-    pub fn new(
+    pub(crate) fn new(
         boundary: NativeOperationBoundaryReceipt,
         context_generation: NativeExecutionContextGeneration,
     ) -> Result<Self, NativeSourceError> {
@@ -192,14 +200,14 @@ impl Default for NativeObservationProvenance {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeExecutionHandoffObservation {
-    pub parent: NativeOperationAnchor,
-    pub child: NativeOperationAnchor,
-    pub relation: ExecutionContinuation,
-    pub provenance: NativeObservationProvenance,
+    pub(crate) parent: NativeOperationAnchor,
+    pub(crate) child: NativeOperationAnchor,
+    pub(crate) relation: ExecutionContinuation,
+    pub(crate) provenance: NativeObservationProvenance,
 }
 
 impl NativeExecutionHandoffObservation {
-    pub fn new(
+    pub(crate) fn new(
         parent: NativeOperationAnchor,
         child: NativeOperationAnchor,
         provenance: NativeObservationProvenance,
@@ -225,14 +233,40 @@ impl NativeExecutionHandoffObservation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundNativeExecutionHandoffFact {
-    pub parent: CanonicalOperationRef,
-    pub child: CanonicalOperationRef,
-    pub relation: ExecutionContinuation,
-    pub parent_anchor: NativeOperationAnchor,
-    pub child_anchor: NativeOperationAnchor,
-    pub provenance: NativeObservationProvenance,
+    parent: CanonicalOperationRef,
+    child: CanonicalOperationRef,
+    relation: ExecutionContinuation,
+    parent_anchor: NativeOperationAnchor,
+    child_anchor: NativeOperationAnchor,
+    provenance: NativeObservationProvenance,
+}
+
+impl BoundNativeExecutionHandoffFact {
+    pub const fn parent(&self) -> CanonicalOperationRef {
+        self.parent
+    }
+
+    pub const fn child(&self) -> CanonicalOperationRef {
+        self.child
+    }
+
+    pub const fn relation(&self) -> ExecutionContinuation {
+        self.relation
+    }
+
+    pub fn parent_anchor(&self) -> &NativeOperationAnchor {
+        &self.parent_anchor
+    }
+
+    pub fn child_anchor(&self) -> &NativeOperationAnchor {
+        &self.child_anchor
+    }
+
+    pub fn provenance(&self) -> &NativeObservationProvenance {
+        &self.provenance
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -250,14 +284,14 @@ pub struct NativeBindingDiagnostic {
     pub message: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct NativeBindingOutput {
     pub facts: Vec<BoundNativeExecutionHandoffFact>,
     pub diagnostics: Vec<NativeBindingDiagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NativeAnchorBinding {
+enum NativeAnchorBinding {
     Bound(CanonicalOperationRef),
     Unresolved(NativeBindingDiagnostic),
     Ambiguous(NativeBindingDiagnostic),
@@ -265,7 +299,9 @@ pub enum NativeAnchorBinding {
 
 #[derive(Clone, Debug, Default)]
 pub struct NativeBoundaryIndex {
-    boundaries: BTreeMap<CanonicalOperationRef, ProtocolOperationBoundaryIdentity>,
+    /// Claims are trusted here only because `from_sessions` populated them
+    /// through the registered canonicalizer. The index is not caller-writable.
+    boundaries: BTreeMap<CanonicalOperationRef, ProtocolOperationBoundaryClaim>,
     unavailable: BTreeSet<CanonicalOperationRef>,
 }
 
@@ -274,18 +310,14 @@ impl NativeBoundaryIndex {
         Self::default()
     }
 
-    pub fn insert(
+    #[cfg(test)]
+    pub(crate) fn insert_fixture(
         &mut self,
         reference: CanonicalOperationRef,
-        identity: ProtocolOperationBoundaryIdentity,
+        claim: ProtocolOperationBoundaryClaim,
     ) {
-        if identity.is_authoritative() {
-            self.boundaries.insert(reference, identity);
-            self.unavailable.remove(&reference);
-        } else {
-            self.boundaries.remove(&reference);
-            self.unavailable.insert(reference);
-        }
+        self.boundaries.insert(reference, claim);
+        self.unavailable.remove(&reference);
     }
 
     pub fn from_sessions(sessions: &[CanonicalSession], registry: &ProtocolRegistry) -> Self {
@@ -295,9 +327,6 @@ impl NativeBoundaryIndex {
                 continue;
             };
             for connection in &session.connections {
-                let canonicalizer = registry
-                    .get(&connection.protocol)
-                    .and_then(|registration| registration.canonicalizer.as_ref());
                 for operation in &connection.operations {
                     let Some(owner_epoch_id) = operation.provenance.completion_owner_epoch else {
                         continue;
@@ -308,15 +337,13 @@ impl NativeBoundaryIndex {
                         session.id,
                         operation.id,
                     );
-                    let identity = canonicalizer
-                        .and_then(|canonicalizer| {
-                            canonicalizer.operation_boundary_identity(operation)
-                        })
-                        .filter(|identity| {
-                            identity.protocol == connection.protocol && identity.is_authoritative()
-                        });
+                    let identity = registry
+                        .trusted_operation_boundary_identity(&connection.protocol, operation);
                     match identity {
-                        Some(identity) => index.insert(reference, identity),
+                        Some(identity) => {
+                            index.boundaries.insert(reference, identity.claim());
+                            index.unavailable.remove(&reference);
+                        }
                         None => {
                             index.unavailable.insert(reference);
                         }
@@ -327,15 +354,11 @@ impl NativeBoundaryIndex {
         index
     }
 
-    pub fn boundary_for(
+    pub(crate) fn boundary_for(
         &self,
         reference: &CanonicalOperationRef,
-    ) -> Option<&ProtocolOperationBoundaryIdentity> {
+    ) -> Option<&ProtocolOperationBoundaryClaim> {
         self.boundaries.get(reference)
-    }
-
-    pub fn is_unavailable(&self, reference: &CanonicalOperationRef) -> bool {
-        self.unavailable.contains(reference)
     }
 }
 
@@ -357,16 +380,18 @@ impl BoundedNativeObservationChannel {
         }
     }
 
-    pub fn push(
+    /// Admit complete batches only. Capacity is checked before any queue
+    /// mutation, so overflow leaves zero positive observations enqueued.
+    pub fn push_batch(
         &mut self,
-        observation: NativeExecutionHandoffObservation,
+        observations: &[NativeExecutionHandoffObservation],
     ) -> Result<(), NativeSourceError> {
-        if self.queue.len() >= self.max_observations {
+        if observations.len() > self.max_observations.saturating_sub(self.queue.len()) {
             return Err(NativeSourceError::SideChannelLimitExceeded {
                 limit: self.max_observations,
             });
         }
-        self.queue.push_back(observation);
+        self.queue.extend(observations.iter().cloned());
         Ok(())
     }
 
@@ -390,15 +415,26 @@ struct PendingHandoff {
     child_receipt: Option<NativeOperationBoundaryReceipt>,
 }
 
+#[derive(Clone, Debug)]
+struct CompletedHandoff {
+    context: ChronicleExecutionContext,
+    child_receipt: NativeOperationBoundaryReceipt,
+}
+
 /// Bounded source-side assembly for explicit parent/child handoffs. It accepts
 /// receipts in either order and never emits a partial anchor.
 #[derive(Clone, Debug)]
 pub struct NativeExecutionContextCarrier {
     limits: NativeSourceLimits,
+    /// Live contexts only. Completed child contexts move to bounded tombstones.
     contexts: BTreeMap<NativeExecutionContextGeneration, ChronicleExecutionContext>,
+    /// Receipts retained for live contexts that may create more children.
     parent_receipts: BTreeMap<NativeExecutionContextGeneration, NativeOperationBoundaryReceipt>,
+    /// Handoffs awaiting one or both endpoint receipts or delivery acknowledgement.
     pending: BTreeMap<NativeExecutionContextGeneration, PendingHandoff>,
-    completed: BTreeSet<NativeExecutionContextGeneration>,
+    /// Bounded idempotency/continuation window for completed handoffs.
+    completed: BTreeMap<NativeExecutionContextGeneration, CompletedHandoff>,
+    completed_order: VecDeque<NativeExecutionContextGeneration>,
     diagnostics: Vec<NativeObservationDiagnostic>,
 }
 
@@ -409,7 +445,8 @@ impl NativeExecutionContextCarrier {
             contexts: BTreeMap::new(),
             parent_receipts: BTreeMap::new(),
             pending: BTreeMap::new(),
-            completed: BTreeSet::new(),
+            completed: BTreeMap::new(),
+            completed_order: VecDeque::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -429,18 +466,39 @@ impl NativeExecutionContextCarrier {
         &mut self,
         parent: ChronicleExecutionContext,
     ) -> Result<ChronicleExecutionContext, NativeSourceError> {
-        if !self.contexts.contains_key(&parent.generation) {
-            return Err(NativeSourceError::UnknownContext);
-        }
-        if self.contexts.len() >= self.limits.max_contexts {
-            return Err(NativeSourceError::ContextLimitExceeded {
-                limit: self.limits.max_contexts,
-            });
-        }
+        let needs_activation = match self.contexts.get(&parent.generation) {
+            Some(active) if active == &parent => false,
+            Some(_) => return Err(NativeSourceError::UnknownContext),
+            None => {
+                if self
+                    .completed
+                    .get(&parent.generation)
+                    .is_none_or(|completed| completed.context != parent)
+                {
+                    return Err(NativeSourceError::UnknownContext);
+                }
+                true
+            }
+        };
         if self.pending.len() >= self.limits.max_pending_observations {
             return Err(NativeSourceError::PendingLimitExceeded {
                 limit: self.limits.max_pending_observations,
             });
+        }
+        let projected_contexts = self.contexts.len() + usize::from(needs_activation) + 1;
+        if projected_contexts > self.limits.max_contexts {
+            return Err(NativeSourceError::ContextLimitExceeded {
+                limit: self.limits.max_contexts,
+            });
+        }
+        if needs_activation {
+            let Some(completed) = self.completed.get(&parent.generation) else {
+                return Err(NativeSourceError::UnknownContext);
+            };
+            let child_receipt = completed.child_receipt.clone();
+            self.contexts.insert(parent.generation, parent);
+            self.parent_receipts
+                .insert(parent.generation, child_receipt);
         }
         let child = parent.child();
         self.contexts.insert(child.generation, child);
@@ -476,20 +534,29 @@ impl NativeExecutionContextCarrier {
         context: ChronicleExecutionContext,
         receipt: NativeOperationBoundaryReceipt,
     ) -> Result<Vec<NativeExecutionHandoffObservation>, NativeSourceError> {
-        self.ensure_context(context)?;
         receipt.validate()?;
-        let Some(pending) = self.pending.get_mut(&context.generation) else {
-            if self.completed.contains(&context.generation) {
-                return Ok(Vec::new());
+        if let Some(completed) = self.completed.get(&context.generation) {
+            if completed.child_receipt != receipt {
+                return Err(NativeSourceError::ConflictingReceipt);
             }
+            return Ok(Vec::new());
+        }
+        self.ensure_context(context)?;
+        let Some(pending) = self.pending.get_mut(&context.generation) else {
             return Err(NativeSourceError::UnknownContext);
         };
+        if let Some(existing) = self.parent_receipts.get(&context.generation)
+            && existing != &receipt
+        {
+            return Err(NativeSourceError::ConflictingReceipt);
+        }
         if let Some(existing) = &pending.child_receipt
             && existing != &receipt
         {
             return Err(NativeSourceError::ConflictingReceipt);
         }
-        pending.child_receipt = Some(receipt);
+        pending.child_receipt = Some(receipt.clone());
+        self.parent_receipts.insert(context.generation, receipt);
         self.complete_ready_for_child(context.generation)
     }
 
@@ -497,37 +564,65 @@ impl NativeExecutionContextCarrier {
         &mut self,
         context_generation: NativeExecutionContextGeneration,
     ) -> Vec<NativeObservationDiagnostic> {
-        let keys: Vec<_> = self
-            .pending
-            .iter()
-            .filter(|(_, pending)| {
-                pending.parent_generation == context_generation
-                    || pending.child_generation == context_generation
-            })
-            .map(|(key, _)| *key)
-            .collect();
+        let mut generations = vec![context_generation];
+        let mut keys = BTreeSet::new();
+        while let Some(parent_generation) = generations.pop() {
+            for (key, pending) in &self.pending {
+                let touches_generation = pending.parent_generation == parent_generation
+                    || pending.child_generation == parent_generation;
+                if touches_generation
+                    && keys.insert(*key)
+                    && pending.parent_generation == parent_generation
+                {
+                    generations.push(pending.child_generation);
+                }
+            }
+        }
+
         let mut diagnostics = Vec::new();
         for key in keys {
-            self.pending.remove(&key);
-            diagnostics.push(self.record_diagnostic(
+            let Some(pending) = self.pending.remove(&key) else {
+                continue;
+            };
+            diagnostics.push(Self::diagnostic(
                 NativeObservationDiagnosticKind::PendingExpired,
-                Some(context_generation),
+                Some(pending.child_generation),
                 "native handoff receipt did not complete within bounded source lifecycle",
             ));
+            if pending.child_generation != context_generation
+                && !self
+                    .pending
+                    .values()
+                    .any(|item| item.parent_generation == pending.child_generation)
+            {
+                self.contexts.remove(&pending.child_generation);
+                self.parent_receipts.remove(&pending.child_generation);
+            }
         }
-        self.diagnostics.clear();
+        if !self
+            .pending
+            .values()
+            .any(|item| item.parent_generation == context_generation)
+            && !self
+                .pending
+                .keys()
+                .any(|generation| *generation == context_generation)
+        {
+            self.contexts.remove(&context_generation);
+            self.parent_receipts.remove(&context_generation);
+        }
         diagnostics
     }
 
     pub fn restart(&mut self) -> Vec<NativeObservationDiagnostic> {
-        let mut diagnostics = Vec::new();
-        let pending: Vec<_> = self
+        let mut diagnostics = std::mem::take(&mut self.diagnostics);
+        let pending: BTreeSet<_> = self
             .pending
             .values()
             .map(|item| item.child_generation)
             .collect();
         for child_generation in pending {
-            diagnostics.push(self.record_diagnostic(
+            diagnostics.push(Self::diagnostic(
                 NativeObservationDiagnosticKind::RestartLostPending,
                 Some(child_generation),
                 "native pending handoff was lost during source restart",
@@ -537,8 +632,32 @@ impl NativeExecutionContextCarrier {
         self.parent_receipts.clear();
         self.pending.clear();
         self.completed.clear();
-        self.diagnostics.clear();
+        self.completed_order.clear();
         diagnostics
+    }
+
+    pub fn record_side_channel_loss(
+        &mut self,
+        observation_count: usize,
+        channel_limit: usize,
+    ) -> NativeObservationDiagnostic {
+        self.record_diagnostic(
+            NativeObservationDiagnosticKind::SideChannelLoss,
+            None,
+            &format!(
+                "native side-channel batch of {observation_count} observations exceeds capacity {channel_limit}"
+            ),
+        )
+    }
+
+    pub fn report_restart_loss(&self, observation_count: usize) -> NativeObservationDiagnostic {
+        Self::diagnostic(
+            NativeObservationDiagnosticKind::SideChannelLoss,
+            None,
+            &format!(
+                "native side-channel lost {observation_count} queued observations during restart"
+            ),
+        )
     }
 
     pub fn take_diagnostics(&mut self) -> Vec<NativeObservationDiagnostic> {
@@ -583,14 +702,8 @@ impl NativeExecutionContextCarrier {
         let Some(child_receipt) = pending.child_receipt.clone() else {
             return Ok(Vec::new());
         };
-        if self.completed.contains(&child_generation) {
-            self.pending.remove(&child_generation);
+        if self.completed.contains_key(&child_generation) {
             return Ok(Vec::new());
-        }
-        if self.completed.len() >= self.limits.max_pending_observations {
-            return Err(NativeSourceError::PendingLimitExceeded {
-                limit: self.limits.max_pending_observations,
-            });
         }
         let parent_context = self
             .contexts
@@ -610,9 +723,150 @@ impl NativeExecutionContextCarrier {
             child_context_generation: child_context.generation,
         };
         let observation = NativeExecutionHandoffObservation::new(parent, child, provenance)?;
-        self.pending.remove(&child_generation);
-        self.completed.insert(child_generation);
         Ok(vec![observation])
+    }
+
+    /// Commit observations only after their complete batch has been admitted to
+    /// the side channel. A failed admission leaves every pending observation
+    /// retryable and changes no positive-delivery state.
+    pub fn acknowledge_delivered(
+        &mut self,
+        observations: &[NativeExecutionHandoffObservation],
+    ) -> Result<(), NativeSourceError> {
+        let mut generations = BTreeSet::new();
+        for observation in observations {
+            let child_generation = observation.child.context_generation;
+            if !generations.insert(child_generation) {
+                return Err(NativeSourceError::InvalidReceipt(
+                    "duplicate native delivery acknowledgement".into(),
+                ));
+            }
+            let expected = self
+                .complete_ready_for_child(child_generation)?
+                .pop()
+                .ok_or_else(|| {
+                    NativeSourceError::InvalidReceipt(
+                        "native observation is not pending delivery".into(),
+                    )
+                })?;
+            if expected != *observation {
+                return Err(NativeSourceError::InvalidReceipt(
+                    "native delivery acknowledgement does not match pending observation".into(),
+                ));
+            }
+        }
+
+        for observation in observations {
+            let child_generation = observation.child.context_generation;
+            let pending = self.pending.remove(&child_generation).ok_or_else(|| {
+                NativeSourceError::InvalidReceipt(
+                    "native pending handoff disappeared during acknowledgement".into(),
+                )
+            })?;
+            let child_context = self
+                .contexts
+                .get(&child_generation)
+                .copied()
+                .ok_or(NativeSourceError::UnknownContext)?;
+            let parent_generation = pending.parent_generation;
+            let child_receipt = pending.child_receipt.ok_or_else(|| {
+                NativeSourceError::InvalidReceipt(
+                    "native completed handoff has no child receipt".into(),
+                )
+            })?;
+            self.remember_completed(child_context, child_receipt);
+            self.retire_completed_context_if_idle(child_generation);
+            self.retire_completed_context_if_idle(parent_generation);
+        }
+        Ok(())
+    }
+
+    /// Retire a live context once it can no longer produce or receive a
+    /// handoff. Completed children are retired automatically after delivery;
+    /// roots and contexts with future children use this explicit lifecycle end.
+    pub fn retire_context(
+        &mut self,
+        context: ChronicleExecutionContext,
+    ) -> Result<(), NativeSourceError> {
+        self.ensure_context(context)?;
+        if self
+            .pending
+            .keys()
+            .any(|generation| *generation == context.generation)
+            || self
+                .pending
+                .values()
+                .any(|item| item.parent_generation == context.generation)
+        {
+            return Err(NativeSourceError::ContextHasPendingHandoffs);
+        }
+        self.contexts.remove(&context.generation);
+        self.parent_receipts.remove(&context.generation);
+        Ok(())
+    }
+
+    pub fn active_context_count(&self) -> usize {
+        self.contexts.len()
+    }
+
+    pub fn pending_observation_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn completed_tombstone_count(&self) -> usize {
+        self.completed.len()
+    }
+
+    pub fn retained_parent_receipt_count(&self) -> usize {
+        self.parent_receipts.len()
+    }
+
+    fn retire_completed_context_if_idle(&mut self, generation: NativeExecutionContextGeneration) {
+        if self.completed.contains_key(&generation)
+            && !self
+                .pending
+                .values()
+                .any(|item| item.parent_generation == generation)
+        {
+            self.contexts.remove(&generation);
+            self.parent_receipts.remove(&generation);
+        }
+    }
+
+    fn remember_completed(
+        &mut self,
+        context: ChronicleExecutionContext,
+        child_receipt: NativeOperationBoundaryReceipt,
+    ) {
+        let generation = context.generation;
+        if !self.completed.contains_key(&generation) {
+            self.completed_order.push_back(generation);
+        }
+        self.completed.insert(
+            generation,
+            CompletedHandoff {
+                context,
+                child_receipt,
+            },
+        );
+        while self.completed.len() > self.limits.max_pending_observations {
+            let Some(oldest) = self.completed_order.pop_front() else {
+                break;
+            };
+            self.completed.remove(&oldest);
+        }
+    }
+
+    fn diagnostic(
+        kind: NativeObservationDiagnosticKind,
+        context_generation: Option<NativeExecutionContextGeneration>,
+        message: &str,
+    ) -> NativeObservationDiagnostic {
+        NativeObservationDiagnostic {
+            kind,
+            context_generation,
+            message: message.into(),
+        }
     }
 
     fn record_diagnostic(
@@ -621,11 +875,7 @@ impl NativeExecutionContextCarrier {
         context_generation: Option<NativeExecutionContextGeneration>,
         message: &str,
     ) -> NativeObservationDiagnostic {
-        let diagnostic = NativeObservationDiagnostic {
-            kind,
-            context_generation,
-            message: message.into(),
-        };
+        let diagnostic = Self::diagnostic(kind, context_generation, message);
         if self.diagnostics.len() < self.limits.max_diagnostics {
             self.diagnostics.push(diagnostic.clone());
         }
@@ -660,7 +910,7 @@ struct AnchorKey(
     SourceConnectionGeneration,
     ProtocolId,
     u8,
-    ProtocolOperationBoundaryIdentity,
+    ProtocolOperationBoundaryClaim,
     SourceRangeKey,
     NativeExecutionContextGeneration,
 );
@@ -684,6 +934,22 @@ fn anchor_key(anchor: &NativeOperationAnchor) -> AnchorKey {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ObservationKey(AnchorKey, AnchorKey, NativeObservationProvenance);
 
+fn binding_diagnostic_key(
+    diagnostic: &NativeBindingDiagnostic,
+) -> (
+    NativeBindingDiagnosticKind,
+    Option<AnchorKey>,
+    Vec<CanonicalOperationRef>,
+    String,
+) {
+    (
+        diagnostic.kind,
+        diagnostic.anchor.as_ref().map(anchor_key),
+        diagnostic.candidates.clone(),
+        diagnostic.message.clone(),
+    )
+}
+
 /// Bind complete pre-canonical observations against canonical sessions. The
 /// candidate set is exact; no ordering, timing, or infrastructure fallback is
 /// available.
@@ -695,23 +961,20 @@ pub fn bind_native_execution_observations(
     let mut facts: BTreeMap<ObservationKey, BoundNativeExecutionHandoffFact> = BTreeMap::new();
     let mut diagnostics = Vec::new();
     for observation in observations {
-        let parent = bind_native_anchor(sessions, boundary_index, &observation.parent);
-        let child = bind_native_anchor(sessions, boundary_index, &observation.child);
-        let (parent, child) = match (parent, child) {
+        let parent_binding = bind_native_anchor(sessions, boundary_index, &observation.parent);
+        let child_binding = bind_native_anchor(sessions, boundary_index, &observation.child);
+        let (parent, child) = match (parent_binding, child_binding) {
             (NativeAnchorBinding::Bound(parent), NativeAnchorBinding::Bound(child)) => {
                 (parent, child)
             }
-            (
-                NativeAnchorBinding::Unresolved(diagnostic)
-                | NativeAnchorBinding::Ambiguous(diagnostic),
-                _,
-            )
-            | (
-                _,
-                NativeAnchorBinding::Unresolved(diagnostic)
-                | NativeAnchorBinding::Ambiguous(diagnostic),
-            ) => {
-                diagnostics.push(diagnostic);
+            (parent, child) => {
+                for binding in [parent, child] {
+                    if let NativeAnchorBinding::Unresolved(diagnostic)
+                    | NativeAnchorBinding::Ambiguous(diagnostic) = binding
+                    {
+                        diagnostics.push(diagnostic);
+                    }
+                }
                 continue;
             }
         };
@@ -741,17 +1004,42 @@ pub fn bind_native_execution_observations(
             ))
             .or_insert(fact);
     }
-    diagnostics.sort_by_key(|diagnostic| {
-        (
-            diagnostic.kind,
-            diagnostic.candidates.clone(),
-            diagnostic.message.clone(),
-        )
-    });
+    diagnostics.sort_by_key(binding_diagnostic_key);
     NativeBindingOutput {
         facts: facts.into_values().collect(),
         diagnostics,
     }
+}
+
+fn exact_source_placement(
+    operation: &CanonicalOperation,
+    recording_id: RecordingId,
+    source_epoch_id: EpochId,
+    source_range: &WalByteRange,
+) -> bool {
+    let mut wal_matches = operation
+        .provenance
+        .wal_ranges
+        .iter()
+        .filter(|range| *range == source_range);
+    let exact_wal_match = wal_matches.next().is_some() && wal_matches.next().is_none();
+    if !exact_wal_match {
+        return false;
+    }
+
+    let mut epoch_matches = operation
+        .provenance
+        .epoch_ranges
+        .iter()
+        .filter(|epoch_range| {
+            epoch_range.parent_id == Some(recording_id)
+                && epoch_range.wal_sequence_range.is_some_and(|(start, end)| {
+                    start <= source_range.wal_sequence && source_range.wal_sequence <= end
+                })
+        });
+    epoch_matches.next().is_some_and(|epoch_range| {
+        epoch_range.epoch_id == source_epoch_id && epoch_matches.next().is_none()
+    })
 }
 
 fn bind_native_anchor(
@@ -786,8 +1074,11 @@ fn bind_native_anchor(
                     session.id,
                     operation.id,
                 );
-                if boundary_index.boundary_for(&reference)
-                    != Some(&anchor.boundary.protocol_operation_boundary)
+                let Some(identity) = boundary_index.boundary_for(&reference) else {
+                    continue;
+                };
+                if identity != &anchor.boundary.protocol_operation_boundary
+                    || identity.direction() != anchor.boundary.direction
                 {
                     continue;
                 }
@@ -796,20 +1087,12 @@ fn bind_native_anchor(
                 {
                     continue;
                 }
-                if !operation
-                    .provenance
-                    .epoch_ranges
-                    .iter()
-                    .any(|range| range.epoch_id == anchor.boundary.source_epoch_id)
-                {
-                    continue;
-                }
-                if !operation
-                    .provenance
-                    .wal_ranges
-                    .iter()
-                    .any(|range| range == &anchor.boundary.source_range)
-                {
+                if !exact_source_placement(
+                    operation,
+                    anchor.boundary.recording_id,
+                    anchor.boundary.source_epoch_id,
+                    &anchor.boundary.source_range,
+                ) {
                     continue;
                 }
                 if reference.resolve_in_session(session).is_ok() {
@@ -839,7 +1122,7 @@ fn bind_native_anchor(
 
 /// Convert bound facts into child-side correlation evidence. This function does
 /// not select scenarios, assign confidence, or construct graph edges.
-pub fn native_evidence_by_operation(
+pub(crate) fn native_evidence_by_operation(
     facts: &[BoundNativeExecutionHandoffFact],
 ) -> BTreeMap<CanonicalOperationRef, Vec<CorrelationEvidence>> {
     let mut evidence: BTreeMap<CanonicalOperationRef, Vec<CorrelationEvidence>> = BTreeMap::new();
@@ -864,9 +1147,28 @@ pub fn native_evidence_by_operation(
         }
     }
     for entries in evidence.values_mut() {
-        entries.sort_by_key(|item| format!("{item:?}"));
+        entries.sort_by_key(native_evidence_key);
     }
     evidence
+}
+
+fn native_evidence_key(
+    item: &CorrelationEvidence,
+) -> (
+    CanonicalOperationRef,
+    ExecutionContinuation,
+    String,
+    Option<String>,
+) {
+    let CorrelationEvidenceKind::NativeExecutionLineage { parent, relation } = &item.kind else {
+        unreachable!("native evidence map contains only native lineage items");
+    };
+    (
+        *parent,
+        *relation,
+        item.provenance.source.clone(),
+        item.provenance.observation.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -889,9 +1191,10 @@ mod tests {
             source_generation: SourceConnectionGeneration::Fixture,
             protocol_id: ProtocolId::new("http/1.1"),
             direction: Direction::ClientToServer,
-            protocol_operation_boundary: ProtocolOperationBoundaryIdentity::from_canonicalizer(
+            protocol_operation_boundary: ProtocolOperationBoundaryClaim::new(
                 ProtocolId::new("http/1.1"),
                 format!("request:{sequence}"),
+                Direction::ClientToServer,
             )
             .unwrap(),
             source_range: WalByteRange {
@@ -922,6 +1225,7 @@ mod tests {
             .record_parent_receipt(parent, receipt(parent.generation, 1))
             .unwrap();
         assert_eq!(observations.len(), 1);
+        carrier.acknowledge_delivered(&observations).unwrap();
         assert!(
             carrier
                 .record_child_receipt(child, receipt(child.generation, 2))
@@ -941,13 +1245,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
-            carrier
-                .record_child_receipt(child, receipt(child.generation, 2))
-                .unwrap()
-                .len(),
-            1
-        );
+        let observations = carrier
+            .record_child_receipt(child, receipt(child.generation, 2))
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        carrier.acknowledge_delivered(&observations).unwrap();
     }
 
     #[test]
@@ -1006,13 +1308,11 @@ mod tests {
         carrier
             .record_parent_receipt(parent, receipt(parent.generation, 1))
             .unwrap();
-        assert_eq!(
-            carrier
-                .record_child_receipt(child, receipt(child.generation, 2))
-                .unwrap()
-                .len(),
-            1
-        );
+        let observations = carrier
+            .record_child_receipt(child, receipt(child.generation, 2))
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        carrier.acknowledge_delivered(&observations).unwrap();
         assert!(
             carrier
                 .record_parent_receipt(parent, receipt(parent.generation, 1))
@@ -1041,6 +1341,7 @@ mod tests {
             observations[0].child.context_generation,
             observations[1].child.context_generation
         );
+        carrier.acknowledge_delivered(&observations).unwrap();
     }
 
     #[test]
@@ -1057,21 +1358,132 @@ mod tests {
             .pop()
             .unwrap();
         let mut channel = BoundedNativeObservationChannel::new(1).unwrap();
-        channel.push(observation.clone()).unwrap();
+        channel
+            .push_batch(std::slice::from_ref(&observation))
+            .unwrap();
         assert!(matches!(
-            channel.push(observation),
+            channel.push_batch(std::slice::from_ref(&observation)),
             Err(NativeSourceError::SideChannelLimitExceeded { limit: 1 })
         ));
     }
 
-    #[test]
-    fn runtime_supplied_boundary_is_rejected() {
-        let mut value = receipt(NativeExecutionContextGeneration::default(), 1);
-        value.protocol_operation_boundary = ProtocolOperationBoundaryIdentity::new(
-            ProtocolId::new("http/1.1"),
-            "runtime-counter:7",
+    fn ready_observations(count: usize) -> Vec<NativeExecutionHandoffObservation> {
+        let limits = NativeSourceLimits::new(
+            count.saturating_add(2),
+            count.saturating_add(1),
+            count.saturating_add(2),
         )
         .unwrap();
-        assert!(value.validate().is_err());
+        let mut carrier = NativeExecutionContextCarrier::new(limits);
+        let parent = carrier.start_root().unwrap();
+        let mut children = Vec::new();
+        for index in 0..count {
+            let child = carrier.continue_from(parent).unwrap();
+            carrier
+                .record_child_receipt(child, receipt(child.generation, index as u64 + 2))
+                .unwrap();
+            children.push(child);
+        }
+        let observations = carrier
+            .record_parent_receipt(parent, receipt(parent.generation, 1))
+            .unwrap();
+        assert_eq!(observations.len(), children.len());
+        observations
+    }
+
+    #[test]
+    fn batch_admits_exact_capacity() {
+        let observations = ready_observations(3);
+        let mut channel = BoundedNativeObservationChannel::new(3).unwrap();
+        channel.push_batch(&observations).unwrap();
+        assert_eq!(channel.len(), 3);
+        assert_eq!(channel.drain(), observations);
+    }
+
+    #[test]
+    fn batch_overflow_admits_no_observation() {
+        let observations = ready_observations(3);
+        let mut channel = BoundedNativeObservationChannel::new(2).unwrap();
+        assert!(matches!(
+            channel.push_batch(&observations),
+            Err(NativeSourceError::SideChannelLimitExceeded { limit: 2 })
+        ));
+        assert!(channel.is_empty());
+    }
+
+    #[test]
+    fn long_chain_retires_active_state_and_reuses_limits() {
+        let limits = NativeSourceLimits::new(3, 2, 8).unwrap();
+        let mut carrier = NativeExecutionContextCarrier::new(limits);
+        let root = carrier.start_root().unwrap();
+        let mut current = root;
+        for index in 0..64_u64 {
+            let child = carrier.continue_from(current).unwrap();
+            carrier
+                .record_child_receipt(child, receipt(child.generation, index + 2))
+                .unwrap();
+            let observations = carrier
+                .record_parent_receipt(current, receipt(current.generation, index + 1))
+                .unwrap();
+            assert_eq!(observations.len(), 1);
+            carrier.acknowledge_delivered(&observations).unwrap();
+            assert!(carrier.active_context_count() <= limits.max_contexts);
+            assert!(carrier.pending_observation_count() <= limits.max_pending_observations);
+            assert!(carrier.completed_tombstone_count() <= limits.max_pending_observations);
+            assert!(carrier.retained_parent_receipt_count() <= limits.max_contexts);
+            current = child;
+        }
+        carrier.retire_context(root).unwrap();
+        assert_eq!(carrier.active_context_count(), 0);
+        assert_eq!(carrier.pending_observation_count(), 0);
+    }
+
+    #[test]
+    fn expired_tombstones_reject_old_context_generation() {
+        let limits = NativeSourceLimits::new(2, 2, 8).unwrap();
+        let mut carrier = NativeExecutionContextCarrier::new(limits);
+        let root = carrier.start_root().unwrap();
+        carrier
+            .record_parent_receipt(root, receipt(root.generation, 1))
+            .unwrap();
+        let mut children = Vec::new();
+        for sequence in 2..=4 {
+            let child = carrier.continue_from(root).unwrap();
+            let observations = carrier
+                .record_child_receipt(child, receipt(child.generation, sequence))
+                .unwrap();
+            carrier.acknowledge_delivered(&observations).unwrap();
+            children.push(child);
+        }
+        assert_eq!(carrier.completed_tombstone_count(), 2);
+        assert!(matches!(
+            carrier.continue_from(children[0]),
+            Err(NativeSourceError::UnknownContext)
+        ));
+        assert!(matches!(
+            carrier.record_child_receipt(children[0], receipt(children[0].generation, 2)),
+            Err(NativeSourceError::UnknownContext)
+        ));
+    }
+
+    #[test]
+    fn runtime_claim_carries_no_authority() {
+        let mut value = receipt(NativeExecutionContextGeneration::default(), 1);
+        value.protocol_operation_boundary = ProtocolOperationBoundaryClaim::new(
+            ProtocolId::new("http/1.1"),
+            "runtime-counter:7",
+            Direction::ClientToServer,
+        )
+        .unwrap();
+        assert!(value.validate().is_ok());
+    }
+
+    #[test]
+    fn serialized_receipt_cannot_deserialize_trusted_authority() {
+        let encoded =
+            serde_json::to_string(&receipt(NativeExecutionContextGeneration::default(), 1))
+                .unwrap();
+        assert!(!encoded.contains("authority"));
+        assert!(encoded.contains("protocol_operation_boundary"));
     }
 }

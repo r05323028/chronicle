@@ -20,18 +20,18 @@ pub use continuation::{
 };
 pub use correlation::{
     CorrelationCompositionError, NativeCorrelationComposition, compose_correlation,
-    compose_correlation_with_native, compose_correlation_with_native_facts,
+    compose_correlation_with_native,
 };
 pub use delta::{CANONICAL_DELTA_SCHEMA_VERSION, CanonicalDeltaBatchV1, DeltaBatchError};
 pub use incremental::{CommittedWalSnapshot, IncrementalProcessor, IncrementalResult};
 pub use native::{
     BoundNativeExecutionHandoffFact, BoundedNativeObservationChannel, ChronicleExecutionContext,
-    NativeAnchorBinding, NativeBindingDiagnostic, NativeBindingDiagnosticKind, NativeBindingOutput,
-    NativeBoundaryIndex, NativeExecutionContext, NativeExecutionContextCarrier,
-    NativeExecutionContextGeneration, NativeExecutionHandoffObservation,
-    NativeObservationDiagnostic, NativeObservationDiagnosticKind, NativeObservationProvenance,
-    NativeOperationAnchor, NativeOperationBoundaryReceipt, NativeSourceError, NativeSourceLimits,
-    bind_native_execution_observations, native_evidence_by_operation,
+    NativeBindingDiagnostic, NativeBindingDiagnosticKind, NativeBindingOutput, NativeBoundaryIndex,
+    NativeExecutionContext, NativeExecutionContextCarrier, NativeExecutionContextGeneration,
+    NativeExecutionHandoffObservation, NativeObservationDiagnostic,
+    NativeObservationDiagnosticKind, NativeObservationProvenance, NativeOperationAnchor,
+    NativeOperationBoundaryReceipt, NativeSourceError, NativeSourceLimits,
+    bind_native_execution_observations,
 };
 pub use publication::{
     CheckpointFault, OneShotPublicationError, OneShotPublicationOutcome, PublicationError,

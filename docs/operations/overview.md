@@ -32,14 +32,16 @@ Native correlation is opt-in and separate from passive capture:
 ```text
 cooperative runtime context
   -> explicit parent/child handoff
-  -> protocol-owned boundary receipts
+  -> protocol-owned boundary claims from transport
+  -> capture/WAL-completed source placement
   -> bounded application/ETL side channel
+  -> atomic batch admission (or typed loss and retry)
   -> exact binding or typed unresolved/ambiguous diagnostic
   -> NativeExecutionLineage
   -> existing correlation resolver
 ```
 
-Passive-only recording remains conservative: no cooperative observation and no trace evidence means no native causal claim. Cooperative mode requires exact protocol boundary authority; it never falls back to timing, processing order, active ingress, PID/TID/task, socket/connection, stream, or wire direction. Side-channel loss, restart, and capacity overflow fail closed.
+Passive-only recording remains conservative: no cooperative observation and no trace evidence means no native causal claim. Cooperative mode starts with explicit runtime continuation and transport claims before canonical operation references exist. The registered protocol canonicalizer establishes trusted boundary identity; ETL binds source epoch, exact WAL range, generation, protocol direction, and operation occurrence together or emits no relation. It never falls back to timing, processing order, active ingress, PID/TID/task, socket/connection, stream, or wire direction. Side-channel loss, restart, and capacity overflow fail closed; an admitted batch is all-or-none and remains retryable until delivery succeeds.
 
 Defaults and hard limits:
 

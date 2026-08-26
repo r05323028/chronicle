@@ -250,7 +250,9 @@ pub fn compose_correlation_with_native(
     })
 }
 
-pub fn compose_correlation_with_native_facts(
+/// Composition-only seam for already-bound facts. Native production callers
+/// must enter through `compose_correlation_with_native` and its exact binder.
+pub(crate) fn compose_correlation_with_native_facts(
     sessions: &[CanonicalSession],
     context: &CorrelationContext,
     facts: &[BoundNativeExecutionHandoffFact],
@@ -303,7 +305,7 @@ mod tests {
             provenance: cc::OperationProvenance {
                 completion_owner_epoch: Some(reference.owner_epoch_id),
                 epoch_ranges: vec![cc::OperationEpochRange {
-                    parent_id: None,
+                    parent_id: Some(reference.recording_id),
                     epoch_id: reference.owner_epoch_id,
                     epoch_ordinal: None,
                     wal_sequence_range: None,
@@ -527,6 +529,9 @@ mod tests {
         operation.provenance.connection_generation =
             Some(chronicle_canonical::SourceConnectionGeneration::Fixture);
         operation.provenance.wal_ranges = vec![native_range(sequence)];
+        for epoch_range in &mut operation.provenance.epoch_ranges {
+            epoch_range.wal_sequence_range = Some((sequence, sequence));
+        }
         session
     }
 
@@ -543,9 +548,10 @@ mod tests {
                 protocol_id: chronicle_common::ProtocolId::new("test"),
                 direction: chronicle_common::Direction::ClientToServer,
                 protocol_operation_boundary:
-                    chronicle_protocol::ProtocolOperationBoundaryIdentity::from_canonicalizer(
+                    chronicle_protocol::ProtocolOperationBoundaryClaim::new(
                         chronicle_common::ProtocolId::new("test"),
                         format!("test-boundary:{sequence}"),
+                        chronicle_common::Direction::ClientToServer,
                     )
                     .unwrap(),
                 source_range: native_range(sequence),
@@ -579,11 +585,12 @@ mod tests {
         .unwrap();
         let mut boundaries = crate::NativeBoundaryIndex::new();
         for (reference, sequence) in [(root, 10), (member, 30)] {
-            boundaries.insert(
+            boundaries.insert_fixture(
                 reference,
-                chronicle_protocol::ProtocolOperationBoundaryIdentity::from_canonicalizer(
+                chronicle_protocol::ProtocolOperationBoundaryClaim::new(
                     chronicle_common::ProtocolId::new("test"),
                     format!("test-boundary:{sequence}"),
+                    chronicle_common::Direction::ClientToServer,
                 )
                 .unwrap(),
             );
@@ -592,6 +599,14 @@ mod tests {
             role_resolutions: BTreeMap::from([(root, ingress_role()), (member, egress_role())]),
             evidence: BTreeMap::new(),
         };
+        // Composition proof only: production E2E enters through observations.
+        let binding = bind_native_execution_observations(
+            &sessions,
+            &boundaries,
+            std::slice::from_ref(&observation),
+        );
+        let composed_from_bound_fact =
+            compose_correlation_with_native_facts(&sessions, &context, &binding.facts).unwrap();
         let composed = compose_correlation_with_native(
             &sessions,
             &context,
@@ -599,6 +614,7 @@ mod tests {
             &[observation.clone(), observation],
         )
         .unwrap();
+        assert_eq!(composed_from_bound_fact, composed.graph);
         assert_eq!(composed.facts.len(), 1);
         assert!(composed.diagnostics.is_empty());
         assert!(matches!(
@@ -643,11 +659,12 @@ mod tests {
             .collect::<Vec<_>>();
         let mut boundaries = crate::NativeBoundaryIndex::new();
         for (reference, sequence) in entries {
-            boundaries.insert(
+            boundaries.insert_fixture(
                 reference,
-                chronicle_protocol::ProtocolOperationBoundaryIdentity::from_canonicalizer(
+                chronicle_protocol::ProtocolOperationBoundaryClaim::new(
                     chronicle_common::ProtocolId::new("test"),
                     format!("test-boundary:{sequence}"),
+                    chronicle_common::Direction::ClientToServer,
                 )
                 .unwrap(),
             );
@@ -673,7 +690,7 @@ mod tests {
                 source
                     .record_child_receipt(
                         context,
-                        native_anchor(reference, sequence, context.generation).boundary,
+                        native_anchor(reference, sequence, context.generation()).boundary,
                     )
                     .unwrap(),
             );
@@ -685,7 +702,7 @@ mod tests {
                 source
                     .record_parent_receipt(
                         context,
-                        native_anchor(reference, sequence, context.generation).boundary,
+                        native_anchor(reference, sequence, context.generation()).boundary,
                     )
                     .unwrap(),
             );
@@ -802,6 +819,10 @@ mod tests {
         let mut parent_session = native_session(session_for(parent), 10);
         parent_session.connections[0].operations[0]
             .provenance
+            .epoch_ranges[0]
+            .wal_sequence_range = Some((30, 30));
+        parent_session.connections[0].operations[0]
+            .provenance
             .epoch_ranges
             .push(chronicle_canonical::OperationEpochRange {
                 parent_id: Some(parent.recording_id),
@@ -813,11 +834,12 @@ mod tests {
         let sessions = vec![parent_session, child_session];
         let mut boundaries = crate::NativeBoundaryIndex::new();
         for (reference, sequence) in [(parent, 10), (child, 30)] {
-            boundaries.insert(
+            boundaries.insert_fixture(
                 reference,
-                chronicle_protocol::ProtocolOperationBoundaryIdentity::from_canonicalizer(
+                chronicle_protocol::ProtocolOperationBoundaryClaim::new(
                     chronicle_common::ProtocolId::new("test"),
                     format!("test-boundary:{sequence}"),
+                    chronicle_common::Direction::ClientToServer,
                 )
                 .unwrap(),
             );
@@ -842,7 +864,10 @@ mod tests {
             crate::bind_native_execution_observations(&sessions, &boundaries, &[observation]);
         assert!(output.diagnostics.is_empty());
         assert_eq!(output.facts.len(), 1);
-        assert_eq!(output.facts[0].parent.owner_epoch_id, parent.owner_epoch_id);
+        assert_eq!(
+            output.facts[0].parent().owner_epoch_id,
+            parent.owner_epoch_id
+        );
     }
 
     #[test]
@@ -855,11 +880,12 @@ mod tests {
         ];
         let mut boundaries = crate::NativeBoundaryIndex::new();
         for (reference, sequence) in [(root, 10), (member, 30)] {
-            boundaries.insert(
+            boundaries.insert_fixture(
                 reference,
-                chronicle_protocol::ProtocolOperationBoundaryIdentity::from_canonicalizer(
+                chronicle_protocol::ProtocolOperationBoundaryClaim::new(
                     chronicle_common::ProtocolId::new("test"),
                     format!("canonical-boundary:{sequence}"),
+                    chronicle_common::Direction::ClientToServer,
                 )
                 .unwrap(),
             );
@@ -871,15 +897,17 @@ mod tests {
         let mut parent = native_anchor(root, 10, parent_generation);
         let mut child = native_anchor(member, 30, child_generation);
         parent.boundary.protocol_operation_boundary =
-            chronicle_protocol::ProtocolOperationBoundaryIdentity::from_canonicalizer(
+            chronicle_protocol::ProtocolOperationBoundaryClaim::new(
                 chronicle_common::ProtocolId::new("test"),
                 "adapter-a-boundary",
+                chronicle_common::Direction::ClientToServer,
             )
             .unwrap();
         child.boundary.protocol_operation_boundary =
-            chronicle_protocol::ProtocolOperationBoundaryIdentity::from_canonicalizer(
+            chronicle_protocol::ProtocolOperationBoundaryClaim::new(
                 chronicle_common::ProtocolId::new("test"),
                 "adapter-b-boundary",
+                chronicle_common::Direction::ClientToServer,
             )
             .unwrap();
         let observation = crate::NativeExecutionHandoffObservation::new(
@@ -918,11 +946,12 @@ mod tests {
         let sessions = vec![native_session(session_for(root), 10), child_session];
         let mut boundaries = crate::NativeBoundaryIndex::new();
         for reference in [root, member] {
-            boundaries.insert(
+            boundaries.insert_fixture(
                 reference,
-                chronicle_protocol::ProtocolOperationBoundaryIdentity::from_canonicalizer(
+                chronicle_protocol::ProtocolOperationBoundaryClaim::new(
                     chronicle_common::ProtocolId::new("test"),
                     format!("test-boundary:{}", if reference == root { 10 } else { 30 }),
+                    chronicle_common::Direction::ClientToServer,
                 )
                 .unwrap(),
             );
@@ -966,14 +995,15 @@ mod tests {
             native_session(session_for(root), 10),
             native_session(session_for(member), 10),
         ];
-        let identity = chronicle_protocol::ProtocolOperationBoundaryIdentity::from_canonicalizer(
+        let identity = chronicle_protocol::ProtocolOperationBoundaryClaim::new(
             chronicle_common::ProtocolId::new("test"),
             "test-boundary:10",
+            chronicle_common::Direction::ClientToServer,
         )
         .unwrap();
         let mut boundaries = crate::NativeBoundaryIndex::new();
-        boundaries.insert(root, identity.clone());
-        boundaries.insert(member, identity);
+        boundaries.insert_fixture(root, identity.clone());
+        boundaries.insert_fixture(member, identity);
         let parent_generation =
             crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(82));
         let child_generation =
@@ -995,5 +1025,422 @@ mod tests {
             diagnostic.kind,
             crate::NativeBindingDiagnosticKind::AnchorBindingAmbiguous
         )));
+    }
+
+    #[test]
+    fn response_side_range_with_request_claim_does_not_bind() {
+        let parent = ref_at(10);
+        let child = ref_at(30);
+        let sessions = vec![
+            native_session(session_for(parent), 10),
+            native_session(session_for(child), 30),
+        ];
+        let mut boundaries = crate::NativeBoundaryIndex::new();
+        boundaries.insert_fixture(
+            parent,
+            chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                chronicle_common::ProtocolId::new("test"),
+                "test-boundary:10",
+                chronicle_common::Direction::ClientToServer,
+            )
+            .unwrap(),
+        );
+        boundaries.insert_fixture(
+            child,
+            chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                chronicle_common::ProtocolId::new("test"),
+                "test-boundary:30",
+                chronicle_common::Direction::ClientToServer,
+            )
+            .unwrap(),
+        );
+        let parent_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(90));
+        let child_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(91));
+        let mut response_parent = native_anchor(parent, 10, parent_generation);
+        response_parent.boundary.direction = chronicle_common::Direction::ServerToClient;
+        response_parent.boundary.source_range.direction =
+            chronicle_common::Direction::ServerToClient;
+        response_parent.boundary.protocol_operation_boundary =
+            chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                chronicle_common::ProtocolId::new("test"),
+                "test-boundary:10",
+                chronicle_common::Direction::ServerToClient,
+            )
+            .unwrap();
+        let observation = crate::NativeExecutionHandoffObservation::new(
+            response_parent,
+            native_anchor(child, 30, child_generation),
+            crate::NativeObservationProvenance {
+                source: "wrong-direction".into(),
+                parent_context_generation: parent_generation,
+                child_context_generation: child_generation,
+            },
+        )
+        .unwrap();
+        let output =
+            crate::bind_native_execution_observations(&sessions, &boundaries, &[observation]);
+        assert!(output.facts.is_empty());
+        assert_eq!(output.diagnostics.len(), 1);
+        assert_eq!(
+            output.diagnostics[0].kind,
+            crate::NativeBindingDiagnosticKind::AnchorBindingUnresolved
+        );
+    }
+
+    #[test]
+    fn epoch_and_range_must_belong_to_same_source_placement() {
+        let parent = ref_at(10);
+        let child = ref_at(30);
+        let mut parent_session = native_session(session_for(parent), 10);
+        parent_session.connections[0].operations[0]
+            .provenance
+            .epoch_ranges[0]
+            .wal_sequence_range = Some((20, 20));
+        let sessions = vec![parent_session, native_session(session_for(child), 30)];
+        let mut boundaries = crate::NativeBoundaryIndex::new();
+        for (reference, sequence) in [(parent, 10), (child, 30)] {
+            boundaries.insert_fixture(
+                reference,
+                chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                    chronicle_common::ProtocolId::new("test"),
+                    format!("test-boundary:{sequence}"),
+                    chronicle_common::Direction::ClientToServer,
+                )
+                .unwrap(),
+            );
+        }
+        let parent_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(92));
+        let child_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(93));
+        let observation = crate::NativeExecutionHandoffObservation::new(
+            native_anchor(parent, 10, parent_generation),
+            native_anchor(child, 30, child_generation),
+            crate::NativeObservationProvenance {
+                source: "wrong-epoch-range-pair".into(),
+                parent_context_generation: parent_generation,
+                child_context_generation: child_generation,
+            },
+        )
+        .unwrap();
+        let output =
+            crate::bind_native_execution_observations(&sessions, &boundaries, &[observation]);
+        assert!(output.facts.is_empty());
+        assert_eq!(output.diagnostics.len(), 1);
+        assert_eq!(
+            output.diagnostics[0].kind,
+            crate::NativeBindingDiagnosticKind::AnchorBindingUnresolved
+        );
+    }
+
+    #[test]
+    fn runtime_claim_cannot_fabricate_trusted_boundary_binding() {
+        let parent = ref_at(10);
+        let child = ref_at(30);
+        let sessions = vec![
+            native_session(session_for(parent), 10),
+            native_session(session_for(child), 30),
+        ];
+        let mut boundaries = crate::NativeBoundaryIndex::new();
+        boundaries.insert_fixture(
+            parent,
+            chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                chronicle_common::ProtocolId::new("test"),
+                "test-boundary:10",
+                chronicle_common::Direction::ClientToServer,
+            )
+            .unwrap(),
+        );
+        boundaries.insert_fixture(
+            child,
+            chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                chronicle_common::ProtocolId::new("test"),
+                "test-boundary:30",
+                chronicle_common::Direction::ClientToServer,
+            )
+            .unwrap(),
+        );
+        let parent_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(94));
+        let child_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(95));
+        let mut forged_parent = native_anchor(parent, 10, parent_generation);
+        forged_parent.boundary.protocol_operation_boundary =
+            chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                chronicle_common::ProtocolId::new("test"),
+                "runtime-counter:7",
+                chronicle_common::Direction::ClientToServer,
+            )
+            .unwrap();
+        let observation = crate::NativeExecutionHandoffObservation::new(
+            forged_parent,
+            native_anchor(child, 30, child_generation),
+            crate::NativeObservationProvenance {
+                source: "runtime-claim".into(),
+                parent_context_generation: parent_generation,
+                child_context_generation: child_generation,
+            },
+        )
+        .unwrap();
+        let output =
+            crate::bind_native_execution_observations(&sessions, &boundaries, &[observation]);
+        assert!(output.facts.is_empty());
+        assert_eq!(output.diagnostics.len(), 1);
+        assert_eq!(
+            output.diagnostics[0].kind,
+            crate::NativeBindingDiagnosticKind::AnchorBindingUnresolved
+        );
+    }
+
+    #[test]
+    fn binding_diagnostics_preserve_both_endpoints_and_sort_input_independently() {
+        let first_parent_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(96));
+        let first_child_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(97));
+        let second_parent_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(98));
+        let second_child_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(99));
+        let first = crate::NativeExecutionHandoffObservation::new(
+            native_anchor(ref_at(40), 40, first_parent_generation),
+            native_anchor(ref_at(41), 41, first_child_generation),
+            crate::NativeObservationProvenance {
+                source: "diagnostic-shuffle".into(),
+                parent_context_generation: first_parent_generation,
+                child_context_generation: first_child_generation,
+            },
+        )
+        .unwrap();
+        let second = crate::NativeExecutionHandoffObservation::new(
+            native_anchor(ref_at(50), 50, second_parent_generation),
+            native_anchor(ref_at(51), 51, second_child_generation),
+            crate::NativeObservationProvenance {
+                source: "diagnostic-shuffle".into(),
+                parent_context_generation: second_parent_generation,
+                child_context_generation: second_child_generation,
+            },
+        )
+        .unwrap();
+        let forward = crate::bind_native_execution_observations(
+            &[],
+            &crate::NativeBoundaryIndex::new(),
+            &[first.clone(), second.clone()],
+        );
+        let reverse = crate::bind_native_execution_observations(
+            &[],
+            &crate::NativeBoundaryIndex::new(),
+            &[second, first],
+        );
+        assert!(forward.facts.is_empty());
+        assert_eq!(forward.diagnostics.len(), 4);
+        assert_eq!(
+            serde_json::to_vec(&forward.diagnostics).unwrap(),
+            serde_json::to_vec(&reverse.diagnostics).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_and_trace_agree_without_source_priority() {
+        let root = ref_at(10);
+        let member = ref_at(30);
+        let sessions = vec![
+            native_session(session_for(root), 10),
+            native_session(session_for(member), 30),
+        ];
+        let mut boundaries = crate::NativeBoundaryIndex::new();
+        for (reference, sequence) in [(root, 10), (member, 30)] {
+            boundaries.insert_fixture(
+                reference,
+                chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                    chronicle_common::ProtocolId::new("test"),
+                    format!("test-boundary:{sequence}"),
+                    chronicle_common::Direction::ClientToServer,
+                )
+                .unwrap(),
+            );
+        }
+        let parent_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(100));
+        let child_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(101));
+        let observation = crate::NativeExecutionHandoffObservation::new(
+            native_anchor(root, 10, parent_generation),
+            native_anchor(member, 30, child_generation),
+            crate::NativeObservationProvenance {
+                source: "native-and-trace".into(),
+                parent_context_generation: parent_generation,
+                child_context_generation: child_generation,
+            },
+        )
+        .unwrap();
+        let composed = compose_correlation_with_native(
+            &sessions,
+            &CorrelationContext {
+                role_resolutions: BTreeMap::from([(root, ingress_role()), (member, egress_role())]),
+                evidence: BTreeMap::from([
+                    (
+                        root,
+                        vec![trace_item("trace", "scenario", Some("root"), None)],
+                    ),
+                    (
+                        member,
+                        vec![trace_item(
+                            "trace",
+                            "scenario",
+                            Some("member"),
+                            Some("root"),
+                        )],
+                    ),
+                ]),
+            },
+            &boundaries,
+            &[observation],
+        )
+        .unwrap();
+        assert!(matches!(
+            composed.graph.resolution(&member),
+            Some(chronicle_canonical::CorrelationResolution::Resolved {
+                scenario,
+                ..
+            }) if *scenario == chronicle_canonical::scenario_id_v1(&root)
+        ));
+    }
+
+    #[test]
+    fn native_and_trace_disagreement_remains_causal_ambiguity() {
+        let native_root = ref_at(10);
+        let trace_root = ref_at(20);
+        let member = ref_at(30);
+        let sessions = vec![
+            native_session(session_for(native_root), 10),
+            native_session(session_for(trace_root), 20),
+            native_session(session_for(member), 30),
+        ];
+        let mut boundaries = crate::NativeBoundaryIndex::new();
+        for (reference, sequence) in [(native_root, 10), (trace_root, 20), (member, 30)] {
+            boundaries.insert_fixture(
+                reference,
+                chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                    chronicle_common::ProtocolId::new("test"),
+                    format!("test-boundary:{sequence}"),
+                    chronicle_common::Direction::ClientToServer,
+                )
+                .unwrap(),
+            );
+        }
+        let parent_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(102));
+        let child_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(103));
+        let observation = crate::NativeExecutionHandoffObservation::new(
+            native_anchor(native_root, 10, parent_generation),
+            native_anchor(member, 30, child_generation),
+            crate::NativeObservationProvenance {
+                source: "native-trace-disagreement".into(),
+                parent_context_generation: parent_generation,
+                child_context_generation: child_generation,
+            },
+        )
+        .unwrap();
+        let composed = compose_correlation_with_native(
+            &sessions,
+            &CorrelationContext {
+                role_resolutions: BTreeMap::from([
+                    (native_root, ingress_role()),
+                    (trace_root, ingress_role()),
+                    (member, egress_role()),
+                ]),
+                evidence: BTreeMap::from([
+                    (
+                        trace_root,
+                        vec![trace_item("trace", "other", Some("root"), None)],
+                    ),
+                    (
+                        member,
+                        vec![trace_item("trace", "other", Some("member"), Some("root"))],
+                    ),
+                ]),
+            },
+            &boundaries,
+            &[observation],
+        )
+        .unwrap();
+        assert!(matches!(
+            composed.graph.resolution(&member),
+            Some(chronicle_canonical::CorrelationResolution::Ambiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn two_exact_native_parents_remain_causally_ambiguous() {
+        let first_root = ref_at(10);
+        let second_root = ref_at(20);
+        let member = ref_at(30);
+        let sessions = vec![
+            native_session(session_for(first_root), 10),
+            native_session(session_for(second_root), 20),
+            native_session(session_for(member), 30),
+        ];
+        let mut boundaries = crate::NativeBoundaryIndex::new();
+        for (reference, sequence) in [(first_root, 10), (second_root, 20), (member, 30)] {
+            boundaries.insert_fixture(
+                reference,
+                chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+                    chronicle_common::ProtocolId::new("test"),
+                    format!("test-boundary:{sequence}"),
+                    chronicle_common::Direction::ClientToServer,
+                )
+                .unwrap(),
+            );
+        }
+        let first_parent_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(104));
+        let first_child_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(105));
+        let second_parent_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(106));
+        let second_child_generation =
+            crate::NativeExecutionContextGeneration::from_uuid(uuid::Uuid::from_u128(107));
+        let first = crate::NativeExecutionHandoffObservation::new(
+            native_anchor(first_root, 10, first_parent_generation),
+            native_anchor(member, 30, first_child_generation),
+            crate::NativeObservationProvenance {
+                source: "two-native-parents".into(),
+                parent_context_generation: first_parent_generation,
+                child_context_generation: first_child_generation,
+            },
+        )
+        .unwrap();
+        let second = crate::NativeExecutionHandoffObservation::new(
+            native_anchor(second_root, 20, second_parent_generation),
+            native_anchor(member, 30, second_child_generation),
+            crate::NativeObservationProvenance {
+                source: "two-native-parents".into(),
+                parent_context_generation: second_parent_generation,
+                child_context_generation: second_child_generation,
+            },
+        )
+        .unwrap();
+        let composed = compose_correlation_with_native(
+            &sessions,
+            &CorrelationContext {
+                role_resolutions: BTreeMap::from([
+                    (first_root, ingress_role()),
+                    (second_root, ingress_role()),
+                    (member, egress_role()),
+                ]),
+                evidence: BTreeMap::new(),
+            },
+            &boundaries,
+            &[first, second],
+        )
+        .unwrap();
+        assert!(matches!(
+            composed.graph.resolution(&member),
+            Some(chronicle_canonical::CorrelationResolution::Ambiguous { .. })
+        ));
     }
 }

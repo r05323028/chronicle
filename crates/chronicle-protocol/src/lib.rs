@@ -238,43 +238,125 @@ pub trait DecoderFactory: Send + Sync {
     fn create(&self) -> Box<dyn ProtocolDecoder>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProtocolBoundaryAuthority {
-    Canonicalizer,
-    RuntimeSupplied,
+/// Opaque protocol-local boundary data carried by a runtime receipt.
+///
+/// Claims are intentionally not trusted. Only a registered protocol
+/// canonicalizer can turn one into a binding identity through
+/// [`ProtocolRegistry::trusted_operation_boundary_identity`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolOperationBoundaryClaim {
+    protocol: ProtocolId,
+    value: String,
+    direction: Direction,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+impl ProtocolOperationBoundaryClaim {
+    pub fn new(
+        protocol: ProtocolId,
+        value: impl Into<String>,
+        direction: Direction,
+    ) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then_some(Self {
+            protocol,
+            value,
+            direction,
+        })
+    }
+
+    pub fn protocol(&self) -> &ProtocolId {
+        &self.protocol
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub const fn direction(&self) -> Direction {
+        self.direction
+    }
+}
+
+impl Ord for ProtocolOperationBoundaryClaim {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.protocol
+            .cmp(&other.protocol)
+            .then_with(|| self.value.cmp(&other.value))
+            .then_with(|| direction_key(self.direction).cmp(&direction_key(other.direction)))
+    }
+}
+
+impl PartialOrd for ProtocolOperationBoundaryClaim {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Trusted protocol segmentation identity. This type has no public
+/// constructor and is not deserializable; registry code is the only authority
+/// that can create it from a canonicalizer claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtocolOperationBoundaryIdentity {
-    pub protocol: ProtocolId,
-    pub value: String,
-    pub authority: ProtocolBoundaryAuthority,
+    protocol: ProtocolId,
+    value: String,
+    direction: Direction,
 }
 
 impl ProtocolOperationBoundaryIdentity {
-    /// Runtime integrations may carry opaque values, but ETL rejects them as
-    /// binding authority unless a protocol canonicalizer vouches for them.
-    pub fn new(protocol: ProtocolId, value: impl Into<String>) -> Option<Self> {
-        let value = value.into();
-        (!value.is_empty()).then_some(Self {
-            protocol,
-            value,
-            authority: ProtocolBoundaryAuthority::RuntimeSupplied,
-        })
+    fn from_registered(claim: ProtocolOperationBoundaryClaim) -> Self {
+        Self {
+            protocol: claim.protocol,
+            value: claim.value,
+            direction: claim.direction,
+        }
     }
 
-    pub fn from_canonicalizer(protocol: ProtocolId, value: impl Into<String>) -> Option<Self> {
-        let value = value.into();
-        (!value.is_empty()).then_some(Self {
-            protocol,
-            value,
-            authority: ProtocolBoundaryAuthority::Canonicalizer,
-        })
+    pub fn protocol(&self) -> &ProtocolId {
+        &self.protocol
     }
 
-    pub const fn is_authoritative(&self) -> bool {
-        matches!(self.authority, ProtocolBoundaryAuthority::Canonicalizer)
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub const fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    pub fn claim(&self) -> ProtocolOperationBoundaryClaim {
+        ProtocolOperationBoundaryClaim {
+            protocol: self.protocol.clone(),
+            value: self.value.clone(),
+            direction: self.direction,
+        }
+    }
+
+    pub fn matches_claim(&self, claim: &ProtocolOperationBoundaryClaim) -> bool {
+        self.protocol == claim.protocol
+            && self.value == claim.value
+            && self.direction == claim.direction
+    }
+}
+
+impl Ord for ProtocolOperationBoundaryIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.protocol
+            .cmp(&other.protocol)
+            .then_with(|| self.value.cmp(&other.value))
+            .then_with(|| direction_key(self.direction).cmp(&direction_key(other.direction)))
+    }
+}
+
+impl PartialOrd for ProtocolOperationBoundaryIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+const fn direction_key(direction: Direction) -> u8 {
+    match direction {
+        Direction::ClientToServer => 0,
+        Direction::ServerToClient => 1,
     }
 }
 
@@ -295,12 +377,12 @@ impl std::ops::Deref for CanonicalizedOperation {
 pub trait ProtocolCanonicalizer: Send + Sync {
     fn protocol(&self) -> &ProtocolId;
 
-    /// Return the exact protocol-owned segmentation identity for one canonical
-    /// operation. Runtime integrations must never synthesize this value.
-    fn operation_boundary_identity(
+    /// Return opaque protocol-local segmentation data for one canonical
+    /// operation. The registry alone may establish trust for this claim.
+    fn operation_boundary_claim(
         &self,
         _operation: &CanonicalOperation,
-    ) -> Option<ProtocolOperationBoundaryIdentity> {
+    ) -> Option<ProtocolOperationBoundaryClaim> {
         None
     }
 
@@ -447,6 +529,23 @@ impl ProtocolRegistry {
 
     pub fn registrations(&self) -> &[ProtocolRegistration] {
         &self.registrations
+    }
+
+    /// Derive trusted segmentation identity only through a registered
+    /// canonicalizer. Runtime claims never enter this method as authority.
+    pub fn trusted_operation_boundary_identity(
+        &self,
+        protocol: &ProtocolId,
+        operation: &CanonicalOperation,
+    ) -> Option<ProtocolOperationBoundaryIdentity> {
+        let registration = self.get(protocol)?;
+        let canonicalizer = registration.canonicalizer.as_ref()?;
+        if canonicalizer.protocol() != protocol {
+            return None;
+        }
+        let claim = canonicalizer.operation_boundary_claim(operation)?;
+        (claim.protocol() == protocol)
+            .then(|| ProtocolOperationBoundaryIdentity::from_registered(claim))
     }
 
     pub fn detect(
