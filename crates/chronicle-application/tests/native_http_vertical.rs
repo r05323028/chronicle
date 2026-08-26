@@ -1,19 +1,28 @@
-use chronicle_application::{CooperativeNativeSource, NativeHttpBoundaryAdapter};
+use chronicle_application::{
+    CooperativeNativeSource, NativeHttpBoundaryAdapter, RecordingMetadata, RecordingStatus,
+    ShutdownReason, inspect_session, process_and_publish_recording_wal,
+    reconcile_recording_metadata, write_capture_to_wal, write_recording_metadata,
+};
 use chronicle_canonical::{
     CanonicalConnection, CanonicalSession, Completeness, SourceConnectionGeneration,
     SourceMetadata, SourceProvenance, TimelineEntry, WalByteRange,
 };
+use chronicle_capture::FixtureCaptureSource;
 use chronicle_common::{
     ConnectionId, Direction, Endpoint, EpochId, OperationId, ProtocolId, RecordingId, SessionId,
 };
 use chronicle_etl::{
-    NativeBoundaryIndex, NativeOperationBoundaryReceipt, NativeSourceLimits,
-    compose_correlation_with_native, stamp_epoch_operation_provenance,
+    NativeBoundaryIndex, NativeObservationDiagnostic, NativeObservationDiagnosticKind,
+    NativeOperationBoundaryReceipt, NativeSourceLimits, compose_correlation_with_native,
+    stamp_epoch_operation_provenance,
 };
-use chronicle_protocol::{DecodedFrame, ProtocolCanonicalizer, ProtocolStream};
+use chronicle_protocol::{DecodedFrame, ProtocolCanonicalizer, ProtocolDecoder, ProtocolStream};
 use chronicle_protocol_builtins::http::Canonicalizer;
+use chronicle_storage::FilesystemSessionStore;
+use chronicle_wal::{DEFAULT_MAX_RECORD_BYTES, scan_wal, segment_file_name};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::fs;
 use uuid::Uuid;
 
 fn message(
@@ -177,14 +186,60 @@ fn transport_receipt(
     )
 }
 
+fn request_observation(
+    sequence: u64,
+    source_range: WalByteRange,
+) -> chronicle_protocol_builtins::http::HttpRequestBoundaryObservation {
+    let mut decoder = chronicle_protocol_builtins::http::Decoder::new();
+    let frames = decoder
+        .push(DecodedFrame {
+            direction: Direction::ClientToServer,
+            sequence,
+            payload: b"GET /one HTTP/1.1\r\nHost: recorded.invalid\r\n\r\n".to_vec(),
+            attributes: BTreeMap::new(),
+            connection_generation: Some(SourceConnectionGeneration::Fixture),
+            provenance: vec![source_range],
+            missing_payload_provenance: false,
+        })
+        .unwrap();
+    chronicle_protocol_builtins::http::HttpRequestBoundaryObservation::from_decoded_request(
+        &frames[0],
+    )
+    .unwrap()
+}
+
 fn transport_receipt_with_generation(
     recording_id: RecordingId,
     source_epoch_id: EpochId,
     sequence: u64,
     source_generation: SourceConnectionGeneration,
 ) -> NativeOperationBoundaryReceipt {
+    let observation = request_observation(sequence, range(sequence, Direction::ClientToServer));
     NativeHttpBoundaryAdapter::new(recording_id, source_epoch_id, source_generation)
-        .request_boundary(sequence, range(sequence, Direction::ClientToServer))
+        .request_boundary(&observation)
+        .unwrap()
+}
+
+fn transport_receipt_for_operation(
+    recording_id: RecordingId,
+    source_epoch_id: EpochId,
+    operation: &chronicle_canonical::CanonicalOperation,
+) -> NativeOperationBoundaryReceipt {
+    let source_generation = operation
+        .provenance
+        .connection_generation
+        .clone()
+        .expect("recorded operation has source generation");
+    let source_range = operation
+        .provenance
+        .wal_ranges
+        .iter()
+        .find(|range| range.direction == Direction::ClientToServer)
+        .cloned()
+        .expect("recorded operation has request provenance");
+    let observation = request_observation(operation.sequence, source_range);
+    NativeHttpBoundaryAdapter::new(recording_id, source_epoch_id, source_generation)
+        .request_boundary(&observation)
         .unwrap()
 }
 
@@ -549,6 +604,56 @@ fn cooperative_stale_generation_fails_closed_before_resolver() {
 }
 
 #[test]
+fn runtime_boundary_claim_disagreement_is_unresolved() {
+    let recording_id = RecordingId::from_uuid(Uuid::from_u128(100));
+    let epoch_id = EpochId::from_uuid(Uuid::from_u128(101));
+    let mut source =
+        CooperativeNativeSource::new(NativeSourceLimits::new(8, 8, 8).unwrap(), 8).unwrap();
+    let parent_context = source.start_root().unwrap();
+    let child_context = source.continue_from(parent_context).unwrap();
+    source
+        .record_child_boundary(child_context, transport_receipt(recording_id, epoch_id, 3))
+        .unwrap();
+    let mut parent_receipt = transport_receipt(recording_id, epoch_id, 1);
+    parent_receipt.protocol_operation_boundary =
+        chronicle_protocol::ProtocolOperationBoundaryClaim::new(
+            ProtocolId::new("http/1.1"),
+            "http-request-sequence:3",
+            Direction::ClientToServer,
+        )
+        .unwrap();
+    source
+        .record_parent_boundary(parent_context, parent_receipt)
+        .unwrap();
+    let observations = source.drain().observations;
+
+    let (session, _, _) = session_from_http_canonicalizer();
+    let registry = chronicle_protocol_builtins::registry().unwrap();
+    let index = NativeBoundaryIndex::from_sessions(std::slice::from_ref(&session), &registry);
+    let references = references_for(&session, recording_id, epoch_id);
+    let composed = compose_correlation_with_native(
+        std::slice::from_ref(&session),
+        &chronicle_canonical::CorrelationContext {
+            role_resolutions: roles_for(&references, &[0]),
+            evidence: BTreeMap::new(),
+        },
+        &index,
+        &observations,
+    )
+    .unwrap();
+    assert!(composed.facts.is_empty());
+    assert_eq!(composed.diagnostics.len(), 1);
+    assert_eq!(
+        composed.diagnostics[0].kind,
+        chronicle_etl::NativeBindingDiagnosticKind::AnchorBindingUnresolved
+    );
+    assert!(matches!(
+        composed.graph.resolution(&references[1]),
+        Some(chronicle_canonical::CorrelationResolution::Uncorrelated { .. })
+    ));
+}
+
+#[test]
 fn cooperative_precanonical_binding_ambiguity_is_not_causal_ambiguity() {
     let recording_id = RecordingId::from_uuid(Uuid::from_u128(100));
     let epoch_id = EpochId::from_uuid(Uuid::from_u128(101));
@@ -713,4 +818,264 @@ fn passive_only_without_native_observation_stays_uncorrelated() {
         composed.graph.resolution(&child),
         Some(chronicle_canonical::CorrelationResolution::Uncorrelated { .. })
     ));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn native_restart_loss_preserves_wal_checkpoint_completeness_and_replayability() {
+    let root =
+        std::env::temp_dir().join(format!("chronicle-native-restart-proof-{}", Uuid::new_v4()));
+    let wal_directory = root.join("wal");
+    let mut fixture: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/http/multiple-exchanges.json"
+    )))
+    .unwrap();
+    // Keep two complete operations for the native-linked replayable path and
+    // append one request without a response for the unreplayable path.
+    let events = fixture["events"].as_array_mut().unwrap();
+    let mut incomplete = events[0].clone();
+    incomplete["sequence"] = json!(5);
+    incomplete["timestamp"] = json!("2026-01-01T00:00:04Z");
+    incomplete["payload_hex"] = json!(
+        "474554202f746872656520485454502f312e310d0a486f73743a207265636f726465642e696e76616c69640d0a0d0a"
+    );
+    events.push(incomplete);
+    let fixture = serde_json::to_vec(&fixture).unwrap();
+    let mut capture = FixtureCaptureSource::from_json(&fixture).unwrap();
+    let recorded = write_capture_to_wal(
+        &mut capture,
+        &wal_directory,
+        RecordingId::new(),
+        1024 * 1024,
+    )
+    .unwrap();
+    let recording_id = recorded.recording_id;
+    write_recording_metadata(
+        &wal_directory,
+        &RecordingMetadata {
+            version: chronicle_application::RECORDING_METADATA_SCHEMA_VERSION,
+            recording_id,
+            selector: None,
+            status: RecordingStatus::Completed,
+            shutdown_reason: Some(ShutdownReason::SourceCompleted),
+            last_valid_commit: None,
+            counters: Default::default(),
+            terminal_wal_loss: None,
+            capture: None,
+        },
+    )
+    .unwrap();
+    reconcile_recording_metadata(&wal_directory, recording_id, None).unwrap();
+
+    let registry = chronicle_protocol_builtins::registry().unwrap();
+    let published = process_and_publish_recording_wal(&wal_directory, &root, &registry).unwrap();
+    assert!(!published.already_published);
+    let session = FilesystemSessionStore::new(&root)
+        .hydrate(published.session_id)
+        .unwrap();
+    session.validate().unwrap();
+    assert_eq!(session.connections[0].operations.len(), 3);
+    let epoch_id = session
+        .source_provenance
+        .epoch_id
+        .expect("published session has epoch provenance");
+    let references = references_for(&session, recording_id, epoch_id);
+    let parent_receipt = transport_receipt_for_operation(
+        recording_id,
+        epoch_id,
+        &session.connections[0].operations[0],
+    );
+    let child_receipt = transport_receipt_for_operation(
+        recording_id,
+        epoch_id,
+        &session.connections[0].operations[1],
+    );
+    let context = chronicle_canonical::CorrelationContext {
+        role_resolutions: roles_for(&references, &[0]),
+        evidence: BTreeMap::from([(references[1], contextual_infrastructure_evidence(1))]),
+    };
+    let boundary_index =
+        NativeBoundaryIndex::from_sessions(std::slice::from_ref(&session), &registry);
+
+    // Before loss, the same recording has one explicit native handoff. The
+    // test-local observations are not persisted anywhere.
+    let mut before_source =
+        CooperativeNativeSource::new(NativeSourceLimits::new(8, 8, 8).unwrap(), 8).unwrap();
+    let parent_context = before_source.start_root().unwrap();
+    let child_context = before_source.continue_from(parent_context).unwrap();
+    before_source
+        .record_child_boundary(child_context, child_receipt.clone())
+        .unwrap();
+    before_source
+        .record_parent_boundary(parent_context, parent_receipt.clone())
+        .unwrap();
+    let before_observations = before_source.drain().observations;
+    assert_eq!(before_observations.len(), 1);
+    let before_correlation = compose_correlation_with_native(
+        std::slice::from_ref(&session),
+        &context,
+        &boundary_index,
+        &before_observations,
+    )
+    .unwrap();
+    assert!(matches!(
+        before_correlation.graph.resolution(&references[1]),
+        Some(chronicle_canonical::CorrelationResolution::Resolved {
+            scenario,
+            confidence: chronicle_canonical::CorrelationConfidence::Strong,
+            ..
+        }) if *scenario == chronicle_canonical::scenario_id_v1(&references[0])
+    ));
+
+    // A second process instance has one incomplete handoff and one complete
+    // handoff still queued. Restart loses both non-durable states exactly once.
+    let mut lost_source =
+        CooperativeNativeSource::new(NativeSourceLimits::new(8, 8, 8).unwrap(), 8).unwrap();
+    let pending_parent = lost_source.start_root().unwrap();
+    let pending_child = lost_source.continue_from(pending_parent).unwrap();
+    lost_source
+        .record_child_boundary(pending_child, child_receipt.clone())
+        .unwrap();
+    let queued_parent = lost_source.start_root().unwrap();
+    let queued_child = lost_source.continue_from(queued_parent).unwrap();
+    lost_source
+        .record_child_boundary(queued_child, child_receipt)
+        .unwrap();
+    lost_source
+        .record_parent_boundary(queued_parent, parent_receipt)
+        .unwrap();
+    let restart = lost_source.restart();
+    assert!(restart.observations.is_empty());
+    assert_eq!(
+        restart.diagnostics,
+        vec![
+            NativeObservationDiagnostic {
+                kind: NativeObservationDiagnosticKind::RestartLostPending,
+                context_generation: Some(pending_child.generation()),
+                message: "native pending handoff was lost during source restart".into(),
+            },
+            NativeObservationDiagnostic {
+                kind: NativeObservationDiagnosticKind::SideChannelLoss,
+                context_generation: None,
+                message: "native side-channel lost 1 queued observations during restart".into(),
+            },
+        ]
+    );
+    assert!(lost_source.drain().observations.is_empty());
+    assert!(lost_source.drain().diagnostics.is_empty());
+    assert!(lost_source.restart().diagnostics.is_empty());
+
+    let before_scan = scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+    let before_segment =
+        fs::read(wal_directory.join("segments").join(segment_file_name(1))).unwrap();
+    let before_recording_metadata = fs::read(wal_directory.join("recording.json")).unwrap();
+    let before_checkpoint = fs::read(wal_directory.join("etl-checkpoint.json")).unwrap();
+    let before_session = session.clone();
+    let before_inspection = inspect_session(&root, published.session_id).unwrap();
+    let before_etl = chronicle_application::process_recording_wal(
+        &wal_directory,
+        &registry,
+        published.session_id,
+    )
+    .unwrap();
+
+    // Recovery/publication runs with no native input. It must read the same
+    // committed WAL and converge on the already published canonical state.
+    let repeated = process_and_publish_recording_wal(&wal_directory, &root, &registry).unwrap();
+    assert!(repeated.already_published);
+    let after_etl = chronicle_application::process_recording_wal(
+        &wal_directory,
+        &registry,
+        published.session_id,
+    )
+    .unwrap();
+    let after_scan = scan_wal(&wal_directory, recording_id, DEFAULT_MAX_RECORD_BYTES).unwrap();
+    let after_session = FilesystemSessionStore::new(&root)
+        .hydrate(published.session_id)
+        .unwrap();
+    let after_inspection = inspect_session(&root, published.session_id).unwrap();
+
+    // WAL authority and physical bytes are unchanged; native state never
+    // participates in commit-marker recovery or repair.
+    assert_eq!(before_scan, after_scan);
+    assert_eq!(
+        before_segment,
+        fs::read(wal_directory.join("segments").join(segment_file_name(1))).unwrap()
+    );
+    assert_eq!(
+        before_recording_metadata,
+        fs::read(wal_directory.join("recording.json")).unwrap()
+    );
+    assert_eq!(
+        before_checkpoint,
+        fs::read(wal_directory.join("etl-checkpoint.json")).unwrap()
+    );
+    assert_eq!(published.checkpoint, repeated.checkpoint);
+
+    // This recording deliberately contains two replayable and one incomplete
+    // operation; native loss must not change either classification.
+    assert_eq!(
+        before_inspection.replayability,
+        chronicle_replay::Replayability::PartiallyReplayable
+    );
+    assert_eq!(before_inspection.executable_operations, 2);
+    assert_eq!(before_inspection.non_executable_operations, 1);
+
+    // Canonical state, completeness, loss accounting, and replay blockers are
+    // byte/semantic identical because only the non-durable native input died.
+    assert_eq!(before_session, after_session);
+    assert_eq!(before_inspection, after_inspection);
+    assert_eq!(before_etl.output.session, after_etl.output.session);
+    assert_eq!(before_etl.output.issues, after_etl.output.issues);
+    assert_eq!(
+        before_etl.output.evidence.loss_windows,
+        after_etl.output.evidence.loss_windows
+    );
+    assert_eq!(
+        before_etl.output.evidence.terminal_wal_losses,
+        after_etl.output.evidence.terminal_wal_losses
+    );
+    assert_eq!(
+        before_etl.output.evidence.commit_marker_sequences,
+        after_etl.output.evidence.commit_marker_sequences
+    );
+    assert_eq!(before_etl.commit_boundary, after_etl.commit_boundary);
+    assert_eq!(
+        before_etl.commit_marker_byte_offset,
+        after_etl.commit_marker_byte_offset
+    );
+    assert_eq!(
+        before_etl.wal_snapshot_sha256,
+        after_etl.wal_snapshot_sha256
+    );
+    assert_eq!(before_etl.recovery_sha256, after_etl.recovery_sha256);
+    assert_eq!(
+        before_session.connection_completeness,
+        after_session.connection_completeness
+    );
+    assert_eq!(
+        before_session.operation_completeness,
+        after_session.operation_completeness
+    );
+    assert_eq!(
+        before_inspection.replayability,
+        after_inspection.replayability
+    );
+    assert_eq!(before_inspection.blockers, after_inspection.blockers);
+
+    let after_correlation = compose_correlation_with_native(
+        std::slice::from_ref(&after_session),
+        &context,
+        &boundary_index,
+        &[],
+    )
+    .unwrap();
+    assert!(after_correlation.facts.is_empty());
+    assert!(matches!(
+        after_correlation.graph.resolution(&references[1]),
+        Some(chronicle_canonical::CorrelationResolution::Uncorrelated { .. })
+    ));
+
+    fs::remove_dir_all(root).unwrap();
 }

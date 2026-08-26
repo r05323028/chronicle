@@ -1,4 +1,4 @@
-use chronicle_canonical::{SourceConnectionGeneration, WalByteRange};
+use chronicle_canonical::SourceConnectionGeneration;
 use chronicle_common::{EpochId, RecordingId};
 use chronicle_etl::{
     BoundedNativeObservationChannel, ChronicleExecutionContext, NativeExecutionContextCarrier,
@@ -6,10 +6,12 @@ use chronicle_etl::{
     NativeObservationDiagnostic, NativeOperationBoundaryReceipt, NativeSourceError,
     NativeSourceLimits,
 };
+use chronicle_protocol_builtins::http::HttpRequestBoundaryObservation;
 
-/// HTTP transport boundary adapter. It accepts protocol sequence and capture
-/// placement facts before canonical operations exist; the registered HTTP
-/// canonicalizer later establishes the trusted identity during ETL binding.
+/// HTTP transport boundary adapter. It accepts a protocol-decoder-derived
+/// observation plus capture placement before canonical operations exist; the
+/// registered HTTP canonicalizer later establishes trusted identity during ETL
+/// binding.
 #[derive(Clone, Debug)]
 pub struct NativeHttpBoundaryAdapter {
     recording_id: RecordingId,
@@ -32,15 +34,9 @@ impl NativeHttpBoundaryAdapter {
 
     pub fn request_boundary(
         &self,
-        protocol_sequence: u64,
-        source_range: WalByteRange,
+        observation: &HttpRequestBoundaryObservation,
     ) -> Result<NativeOperationBoundaryReceipt, NativeSourceError> {
-        let claim = chronicle_protocol_builtins::http::request_boundary_claim(protocol_sequence)
-            .ok_or_else(|| {
-                NativeSourceError::InvalidReceipt(
-                    "HTTP transport did not provide an operation boundary claim".into(),
-                )
-            })?;
+        let claim = observation.protocol_operation_boundary_claim();
         let protocol_id = claim.protocol().clone();
         let direction = claim.direction();
         let receipt = NativeOperationBoundaryReceipt {
@@ -50,7 +46,7 @@ impl NativeHttpBoundaryAdapter {
             protocol_id,
             direction,
             protocol_operation_boundary: claim,
-            source_range,
+            source_range: observation.source_range().clone(),
         };
         receipt.validate()?;
         Ok(receipt)
@@ -122,13 +118,11 @@ impl CooperativeNativeSource {
 
     pub fn restart(&mut self) -> NativeSourceDelivery {
         let lost_observations = self.channel.drain().len();
-        let mut diagnostics = self.carrier.restart();
-        if lost_observations > 0 {
-            diagnostics.push(self.carrier.report_restart_loss(lost_observations));
-        }
         NativeSourceDelivery {
             observations: Vec::new(),
-            diagnostics,
+            diagnostics: self
+                .carrier
+                .restart_with_side_channel_loss(lost_observations),
         }
     }
 
@@ -164,7 +158,7 @@ mod tests {
     use chronicle_canonical::{SourceConnectionGeneration, WalByteRange};
     use chronicle_common::{Direction, EpochId, ProtocolId, RecordingId};
     use chronicle_etl::NativeObservationDiagnosticKind;
-    use chronicle_protocol::ProtocolOperationBoundaryClaim;
+    use chronicle_protocol::{DecodedFrame, ProtocolDecoder, ProtocolOperationBoundaryClaim};
 
     fn receipt(sequence: u64) -> NativeOperationBoundaryReceipt {
         NativeOperationBoundaryReceipt {
@@ -288,16 +282,40 @@ mod tests {
         assert!(source.drain().diagnostics.is_empty());
     }
 
+    fn request_observation(sequence: u64) -> HttpRequestBoundaryObservation {
+        let mut decoder = chronicle_protocol_builtins::http::Decoder::new();
+        let frames = decoder
+            .push(DecodedFrame {
+                direction: Direction::ClientToServer,
+                sequence,
+                payload: b"GET / HTTP/1.1\r\nHost: example\r\n\r\n".to_vec(),
+                attributes: std::collections::BTreeMap::new(),
+                connection_generation: Some(SourceConnectionGeneration::Fixture),
+                provenance: vec![WalByteRange {
+                    segment_ordinal: 0,
+                    segment_first_sequence: 0,
+                    frame_byte_offset: sequence,
+                    wal_sequence: sequence,
+                    direction: Direction::ClientToServer,
+                    payload_byte_offset: 0,
+                    payload_byte_length: 1,
+                    gap_before: false,
+                }],
+                missing_payload_provenance: false,
+            })
+            .unwrap();
+        HttpRequestBoundaryObservation::from_decoded_request(&frames[0]).unwrap()
+    }
+
     #[test]
-    fn http_boundary_adapter_emits_opaque_precanonical_claim() {
+    fn http_boundary_adapter_requires_protocol_observation() {
         let adapter = NativeHttpBoundaryAdapter::new(
             RecordingId::from_uuid(uuid::Uuid::from_u128(10)),
             EpochId::from_uuid(uuid::Uuid::from_u128(11)),
             SourceConnectionGeneration::Fixture,
         );
-        let boundary = adapter
-            .request_boundary(4, receipt(4).source_range)
-            .unwrap();
+        let observation = request_observation(4);
+        let boundary = adapter.request_boundary(&observation).unwrap();
         assert_eq!(
             boundary.protocol_operation_boundary.value(),
             "http-request-sequence:4"
@@ -306,5 +324,19 @@ mod tests {
             boundary.protocol_operation_boundary.direction(),
             Direction::ClientToServer
         );
+    }
+
+    #[test]
+    fn non_http_or_missing_provenance_cannot_be_boundary_observation() {
+        let frame = DecodedFrame {
+            direction: Direction::ClientToServer,
+            sequence: 4,
+            payload: b"application-counter:4".to_vec(),
+            attributes: std::collections::BTreeMap::new(),
+            connection_generation: None,
+            provenance: Vec::new(),
+            missing_payload_provenance: false,
+        };
+        assert!(HttpRequestBoundaryObservation::from_decoded_request(&frame).is_none());
     }
 }

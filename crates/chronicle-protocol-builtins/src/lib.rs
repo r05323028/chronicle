@@ -64,14 +64,61 @@ pub mod http {
     const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
     const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Protocol-owned claim emitted by a transport boundary at an HTTP request
-    /// start. It is opaque until the registered canonicalizer vouches for it.
-    pub fn request_boundary_claim(sequence: u64) -> Option<ProtocolOperationBoundaryClaim> {
+    /// Pre-canonical HTTP boundary observed from protocol-decoder output.
+    ///
+    /// The request sequence is deliberately private: application/runtime code
+    /// must obtain this value from a decoded HTTP request, not pass a local
+    /// counter to the transport adapter.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct HttpRequestBoundaryObservation {
+        request_sequence: u64,
+        source_range: WalByteRange,
+    }
+
+    impl HttpRequestBoundaryObservation {
+        /// Build an observation from one complete decoded HTTP request frame.
+        /// The first provenance range is the exact source range containing the
+        /// protocol boundary; missing provenance is not a valid observation.
+        pub fn from_decoded_request(frame: &DecodedFrame) -> Option<Self> {
+            if frame.direction != Direction::ClientToServer || frame.missing_payload_provenance {
+                return None;
+            }
+            let message: Message = serde_json::from_slice(&frame.payload).ok()?;
+            if message.kind != MessageKind::Request
+                || message.sequence != frame.sequence
+                || message.provenance != frame.provenance
+            {
+                return None;
+            }
+            let source_range = frame.provenance.first()?.clone();
+            if source_range.direction != frame.direction || source_range.payload_byte_length == 0 {
+                return None;
+            }
+            Some(Self {
+                request_sequence: message.sequence,
+                source_range,
+            })
+        }
+
+        /// Return the untrusted claim carried into the runtime receipt.
+        pub fn protocol_operation_boundary_claim(&self) -> ProtocolOperationBoundaryClaim {
+            request_boundary_claim(self.request_sequence)
+        }
+
+        pub fn source_range(&self) -> &WalByteRange {
+            &self.source_range
+        }
+    }
+
+    /// Protocol-owned claim used internally by HTTP canonicalization and by
+    /// decoder-derived runtime observations. It remains an untrusted claim.
+    fn request_boundary_claim(sequence: u64) -> ProtocolOperationBoundaryClaim {
         ProtocolOperationBoundaryClaim::new(
             ProtocolId::new("http/1.1"),
             format!("http-request-sequence:{sequence}"),
             Direction::ClientToServer,
         )
+        .expect("formatted HTTP request boundary claim is non-empty")
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1223,7 +1270,7 @@ pub mod http {
             operation: &CanonicalOperation,
         ) -> Option<ProtocolOperationBoundaryClaim> {
             let data = HttpOperationData::from_protocol_data(&operation.protocol_data).ok()?;
-            request_boundary_claim(data.request_sequence)
+            Some(request_boundary_claim(data.request_sequence))
         }
 
         fn canonicalize(

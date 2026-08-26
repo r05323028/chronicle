@@ -584,11 +584,13 @@ impl NativeExecutionContextCarrier {
             let Some(pending) = self.pending.remove(&key) else {
                 continue;
             };
-            diagnostics.push(Self::diagnostic(
-                NativeObservationDiagnosticKind::PendingExpired,
-                Some(pending.child_generation),
-                "native handoff receipt did not complete within bounded source lifecycle",
-            ));
+            if diagnostics.len() < self.limits.max_diagnostics {
+                diagnostics.push(Self::diagnostic(
+                    NativeObservationDiagnosticKind::PendingExpired,
+                    Some(pending.child_generation),
+                    "native handoff receipt did not complete within bounded source lifecycle",
+                ));
+            }
             if pending.child_generation != context_generation
                 && !self
                     .pending
@@ -622,6 +624,9 @@ impl NativeExecutionContextCarrier {
             .map(|item| item.child_generation)
             .collect();
         for child_generation in pending {
+            if diagnostics.len() >= self.limits.max_diagnostics {
+                break;
+            }
             diagnostics.push(Self::diagnostic(
                 NativeObservationDiagnosticKind::RestartLostPending,
                 Some(child_generation),
@@ -633,6 +638,19 @@ impl NativeExecutionContextCarrier {
         self.pending.clear();
         self.completed.clear();
         self.completed_order.clear();
+        diagnostics
+    }
+
+    /// Clear native state once while retaining bounded diagnostics for both
+    /// incomplete pending handoffs and queued side-channel observations.
+    pub fn restart_with_side_channel_loss(
+        &mut self,
+        observation_count: usize,
+    ) -> Vec<NativeObservationDiagnostic> {
+        let mut diagnostics = self.restart();
+        if observation_count > 0 && diagnostics.len() < self.limits.max_diagnostics {
+            diagnostics.push(self.report_restart_loss(observation_count));
+        }
         diagnostics
     }
 
@@ -1298,6 +1316,29 @@ mod tests {
             delivery[0].kind,
             NativeObservationDiagnosticKind::RestartLostPending
         );
+    }
+
+    #[test]
+    fn restart_diagnostics_are_bounded_and_one_shot() {
+        let limits = NativeSourceLimits::new(8, 8, 1).unwrap();
+        let mut carrier = NativeExecutionContextCarrier::new(limits);
+        let parent = carrier.start_root().unwrap();
+        let child_a = carrier.continue_from(parent).unwrap();
+        let child_b = carrier.continue_from(parent).unwrap();
+        carrier
+            .record_child_receipt(child_a, receipt(child_a.generation, 2))
+            .unwrap();
+        carrier
+            .record_child_receipt(child_b, receipt(child_b.generation, 3))
+            .unwrap();
+
+        let diagnostics = carrier.restart();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].kind,
+            NativeObservationDiagnosticKind::RestartLostPending
+        );
+        assert!(carrier.restart().is_empty());
     }
 
     #[test]

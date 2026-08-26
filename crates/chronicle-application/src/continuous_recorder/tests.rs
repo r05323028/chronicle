@@ -241,11 +241,13 @@ fn v2_rollover_publishes_pending_continuation_before_successor_etl() {
         uuid::Uuid::new_v4()
     ));
     fs::create_dir_all(&root).unwrap();
-    let config = config(&root);
+    let mut config = config(&root);
+    config.epoch.max_bytes = chronicle_wal::MIN_SEGMENT_BYTES;
+    config.segment.max_bytes = chronicle_wal::MIN_SEGMENT_BYTES;
     let wal_root = Path::new(&config.domains[0].identity.canonical_root).join("wal");
     let old_recording_id = RecordingId::new();
     let writer =
-        GroupCommitWalWriter::create(&wal_root, old_recording_id, DEFAULT_SEGMENT_BYTES, 1, 0)
+        GroupCommitWalWriter::create(&wal_root, old_recording_id, config.segment.max_bytes, 1, 0)
             .unwrap();
     let source = FixtureCaptureSource::from_json(include_bytes!(
         "../../../../fixtures/http/basic-session.json"
@@ -401,10 +403,12 @@ fn rollover_failure_retains_prepared_evidence_for_restart_recovery() {
         uuid::Uuid::new_v4()
     ));
     fs::create_dir_all(&root).unwrap();
-    let config = config(&root);
+    let mut config = config(&root);
+    config.epoch.max_bytes = chronicle_wal::MIN_SEGMENT_BYTES;
+    config.segment.max_bytes = chronicle_wal::MIN_SEGMENT_BYTES;
     let wal = root.join("wal");
     let writer =
-        GroupCommitWalWriter::create(&wal, RecordingId::new(), DEFAULT_SEGMENT_BYTES, 1, 0)
+        GroupCommitWalWriter::create(&wal, RecordingId::new(), config.segment.max_bytes, 1, 0)
             .unwrap();
     let source = FixtureCaptureSource::from_json(include_bytes!(
         "../../../../fixtures/http/basic-session.json"
@@ -787,14 +791,16 @@ fn three_epoch_fixture_has_one_etl_publication_and_replayable_output() {
                 service
                     .rollover(accepted * 10 + 1, root.join("epoch-outcomes.json"))
                     .unwrap();
+                if accepted == 2 {
+                    let active = crate::load_recorder_metadata(config(&root).state_root).unwrap();
+                    assert_eq!(active.current_epoch.unwrap().ordinal, 2);
+                    assert_eq!(active.previous_epoch.unwrap().ordinal, 1);
+                    assert_eq!(active.counters.captured_records, 2);
+                    assert_eq!(active.counters.committed_records, 0);
+                }
             }
         }
     }
-    let active = crate::load_recorder_metadata(config(&root).state_root).unwrap();
-    assert_eq!(active.current_epoch.unwrap().ordinal, 2);
-    assert_eq!(active.previous_epoch.unwrap().ordinal, 1);
-    assert_eq!(active.counters.captured_records, 2);
-    assert_eq!(active.counters.committed_records, 0);
     let result = service
         .shutdown(
             crate::ShutdownReason::SourceCompleted,

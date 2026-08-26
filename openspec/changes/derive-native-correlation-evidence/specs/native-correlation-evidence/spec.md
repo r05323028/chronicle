@@ -57,7 +57,7 @@ The first production source SHALL be an opt-in Chronicle cooperative execution-c
 
 A `NativeOperationAnchor` SHALL contain a complete Chronicle-owned boundary receipt with recording scope, source epoch placement, `SourceConnectionGeneration`, protocol identity, direction, an opaque protocol-local operation-boundary claim, and exact source/reconstruction provenance sufficient to identify one later canonical operation or fail closed. The claim is not authority: a registered protocol canonicalizer MUST derive the trusted exact operation-boundary identity used by ETL binding. The boundary identity MAY be opaque; it MUST be produced by, or derived from, the same protocol boundary/canonicalization authority that deterministically defines operation segmentation. The anchor MAY contain an opaque Chronicle execution-context generation as provenance, but that value SHALL NOT be an ownership predicate by itself. An anchor SHALL be bounded and SHALL NOT contain transitive ancestry.
 
-The first supported receipt SHALL use current facts where available: `SourceConnectionGeneration`, the authoritative protocol-owned operation-boundary identity from the protocol segmentation path, recording/epoch/reconstruction lineage, and exact `WalByteRange` or equivalent source placement. An application/runtime integration MUST NOT synthesize a request number, message index, counter, or ordinal and use it as binding authority. A new non-frozen boundary receipt is required because current passive code exposes connection generation and provenance but no execution-handoff-to-operation binding fact. An implementation SHALL NOT substitute an unsupported field or bare identifier.
+The first supported receipt SHALL use current facts where available: `SourceConnectionGeneration`, a protocol-decoder-derived `HttpRequestBoundaryObservation` for HTTP, the authoritative protocol-owned operation-boundary identity from the protocol segmentation path, recording/epoch/reconstruction lineage, and exact `WalByteRange` or equivalent source placement. The HTTP adapter SHALL accept that semantic observation rather than a bare request sequence. An application/runtime integration MUST NOT synthesize a request number, message index, counter, or ordinal and use it as binding authority. A new non-frozen boundary receipt is required because current passive code exposes connection generation and provenance but no execution-handoff-to-operation binding fact. An implementation SHALL NOT substitute an unsupported field or bare identifier.
 
 #### Scenario: Valid anchor has complete source scope
 
@@ -248,6 +248,9 @@ Native source and ETL SHALL bound active context state, pending observations, pe
 
 - **WHEN** the process restarts before non-frozen observations are available for binding
 - **THEN** missing observations produce no native relation
+- **AND** incomplete pending handoffs emit deterministic `RestartLostPending` diagnostics
+- **AND** queued but undrained observations emit deterministic `SideChannelLoss` diagnostics
+- **AND** a second restart with no new native state emits no duplicate loss diagnostic
 - **AND** WAL recovery, checkpoint ordering, completeness, and replayability remain unchanged
 
 #### Scenario: No unbounded ancestry

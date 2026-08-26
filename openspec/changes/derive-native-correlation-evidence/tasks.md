@@ -9,8 +9,8 @@
 
 - [x] 2.1 Implement the opt-in Chronicle execution-context carrier with generation-safe context lifecycle; do not use PID/TID/task/socket/connection/stream equality or provider context as the carrier.
 - [x] 2.2 Implement explicit parent-to-child `ExecutionContinuation` handoff recording before final canonical references exist; source emits observations, never scenarios or resolver outcomes.
-- [x] 2.3 Implement the Chronicle transport/application boundary adapter that obtains an exact protocol-owned operation-boundary receipt for each supported protocol path; reject runtime-local counters and unsupported/disagreeing adapters.
-- [x] 2.4 Carry recording scope, source epoch placement, source generation, protocol identity, direction, opaque protocol-local boundary claim, and exact source/reconstruction provenance into each receipt; the registered canonicalizer derives trusted boundary identity and the runtime MUST NOT synthesize canonical operation ordinals.
+- [x] 2.3 Implement the Chronicle transport/application boundary adapter that accepts a protocol-owned pre-canonical boundary observation (HTTP uses decoder-derived `HttpRequestBoundaryObservation`) and obtains an exact operation-boundary receipt for each supported path; reject runtime-local counters and unsupported/disagreeing adapters.
+- [x] 2.4 Carry recording scope, source epoch placement, source generation, protocol identity, direction, opaque protocol-local boundary claim, and exact source/reconstruction provenance from each semantic observation into its receipt; the registered canonicalizer derives trusted boundary identity and the runtime MUST NOT synthesize canonical operation ordinals.
 - [x] 2.5 Deliver observations through a bounded non-frozen application/ETL side channel; define typed overflow, missing-receipt, restart, and loss diagnostics.
 - [x] 2.6 Prove source can retain a pending parent/child observation until both boundary receipts are complete in either order, then complete idempotently or fail closed; never emit a partial or guessed anchor.
 - [x] 2.7 Keep passive capture and existing recorder/WAL publication unchanged when cooperative integration is absent.
@@ -80,7 +80,7 @@
 - [x] 9.1 Bound active context, pending observations, per-child facts, batch work, diagnostics, and one-hop retained relations without adding normative arbitrary count constants.
 - [x] 9.2 Test configured overflow and side-channel loss fail closed or emit typed bounded-loss diagnostics; never silently truncate positive relations while claiming completeness.
 - [x] 9.3 Test no transitive ancestry storage, no operation-by-scenario matrix, and stable memory behavior across long handoff chains.
-- [ ] 9.4 Test restart without durable native side-channel recovery produces no guessed relation and leaves WAL authority, checkpoints, completeness, replayability, and loss accounting unchanged.
+- [x] 9.4 Test restart without durable native side-channel recovery produces no guessed relation and leaves WAL authority, checkpoints, completeness, replayability, and loss accounting unchanged.
 - [x] 9.5 Assert Capture Event v1, WAL v1, Canonical Session v1, Session Manifest, persisted checkpoints, public CLI JSON, replay safety, and no-`EventId` rules remain unchanged.
 
 ## 10. Architecture, documentation, and validation
