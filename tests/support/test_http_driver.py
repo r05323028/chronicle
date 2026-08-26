@@ -29,17 +29,24 @@ class HttpAcceptanceDriverTest(unittest.TestCase):
                 ]
             )
             try:
+                port = ""
                 deadline = time.monotonic() + 5
-                while not port_file.exists() and time.monotonic() < deadline:
+                while time.monotonic() < deadline:
+                    try:
+                        port = port_file.read_text(encoding="utf-8").strip()
+                    except FileNotFoundError:
+                        pass
+                    if port:
+                        break
                     time.sleep(0.01)
-                self.assertTrue(port_file.exists())
+                self.assertTrue(port, "server did not publish a port")
                 subprocess.run(
                     [
                         sys.executable,
                         str(DRIVER),
                         "workload",
                         "--origin",
-                        f"http://127.0.0.1:{port_file.read_text()}",
+                        f"http://127.0.0.1:{port}",
                     ],
                     check=True,
                 )
