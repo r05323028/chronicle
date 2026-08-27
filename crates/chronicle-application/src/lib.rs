@@ -75,6 +75,7 @@ mod incremental_worker;
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod listener_discovery;
+mod native_correlation;
 mod recorder_config;
 mod replay_inspect;
 pub use chronicle_common::{
@@ -144,6 +145,9 @@ pub use epoch_rollover::{
 pub use incremental_worker::{
     IncrementalWorker, IncrementalWorkerCounters, IncrementalWorkerError, IncrementalWorkerPolicy,
     IncrementalWorkerState,
+};
+pub use native_correlation::{
+    CooperativeNativeSource, NativeHttpBoundaryAdapter, NativeSourceDelivery,
 };
 pub use recorder_config::{
     EpochConfig, EtlConfig, FilesystemDomainConfig, FilesystemDomainIdentity, LogLevel,

@@ -164,6 +164,9 @@ struct RelationIndexes {
     by_trace: BTreeMap<(String, String), BTreeSet<CanonicalOperationRef>>,
     /// `(provider, trace_id, span_id)` -> operations EXPOSING that span.
     by_span: BTreeMap<(String, String, String), BTreeSet<CanonicalOperationRef>>,
+    /// Child -> exact native parent references. Native relations remain a
+    /// separate positive relation source and enter support as transitive.
+    native_parents: BTreeMap<CanonicalOperationRef, BTreeSet<CanonicalOperationRef>>,
 }
 
 impl RelationIndexes {
@@ -193,6 +196,13 @@ impl RelationIndexes {
                             .insert(*reference);
                     }
                     let _ = parent_span_id;
+                }
+                if let CorrelationEvidenceKind::NativeExecutionLineage { parent, .. } = &item.kind {
+                    indexes
+                        .native_parents
+                        .entry(*reference)
+                        .or_default()
+                        .insert(*parent);
                 }
             }
         }
@@ -318,6 +328,11 @@ fn canonical_evidence_key(
             push_str(&mut key, trace_id);
             push_opt_str(&mut key, span_id.as_ref());
             push_opt_str(&mut key, parent_span_id.as_ref());
+        }
+        CorrelationEvidenceKind::NativeExecutionLineage { parent, .. } => {
+            push_str(&mut key, "native_execution_lineage");
+            push_ref(&mut key, parent);
+            push_str(&mut key, "execution_continuation");
         }
         CorrelationEvidenceKind::ScenarioRoot { root } => {
             push_str(&mut key, "scenario_root");
@@ -475,6 +490,25 @@ pub fn resolve_correlation(
         ordered.insert(reference, input);
     }
 
+    // Native lineage is admitted only as a complete candidate-relative relation.
+    // ETL normally proves this against canonical sessions before invocation;
+    // resolver admission independently rejects scope, self, and orphan inputs.
+    for (reference, input) in &ordered {
+        for item in &input.evidence {
+            if let CorrelationEvidenceKind::NativeExecutionLineage { parent, .. } = &item.kind
+                && (*parent == *reference
+                    || parent.recording_id != recording_id
+                    || !ordered.contains_key(parent))
+            {
+                return Err(CorrelationResolverError::InvalidCorrelationEvidence {
+                    reference: *reference,
+                    message: "native lineage parent is not a distinct admitted full reference"
+                        .into(),
+                });
+            }
+        }
+    }
+
     // ---- Immutable relation indexes over FULL validated correlation evidence.
     let indexes = RelationIndexes::build(&ordered);
 
@@ -582,6 +616,13 @@ pub fn resolve_correlation(
                     }
                 }
             }
+            if let Some(parents) = indexes.native_parents.get(reference) {
+                for parent in parents {
+                    if let Some(parent_support) = snapshot.get(parent) {
+                        inherited_transitive.extend(parent_support.scenarios.iter().copied());
+                    }
+                }
+            }
             let entry = support.entry(*reference).or_default();
             // The bounded per-membership semantic flag is recorded exactly once,
             // when the membership is created; later incidental relationships
@@ -641,9 +682,16 @@ pub fn resolve_correlation(
         }
     }
 
-    // ---- Post-closure canonical ownership witness derivation reads the same
-    // immutable declared-parenthood adjacency built before Phase A1.
-    let parent_edges = &declared_parents;
+    // ---- Post-closure witness derivation uses the same immutable relation
+    // adjacency, extended with exact native parent relations. Phase B still
+    // applies its unchanged pre-filter/unique-parent/SCC sequence.
+    let mut parent_edges = declared_parents.clone();
+    for (child, parents) in &indexes.native_parents {
+        parent_edges
+            .entry(*child)
+            .or_default()
+            .extend(parents.iter().copied());
+    }
 
     // ---- Phase A2: materialize outcomes exactly once from closed support.
     // Canonical witnesses are derived AFTER closure from the immutable relation
@@ -695,7 +743,7 @@ pub fn resolve_correlation(
                 &input.evidence,
                 &support,
                 &indexes,
-                parent_edges,
+                &parent_edges,
                 &ordered,
             );
             let confidence = if entry.direct.contains(&scenario_id) {
@@ -722,7 +770,7 @@ pub fn resolve_correlation(
                 &input.evidence,
                 &support,
                 &indexes,
-                parent_edges,
+                &parent_edges,
                 &ordered,
             );
             candidates.push(ScenarioCandidate {
@@ -891,6 +939,29 @@ fn derive_ownership_witness(
                 }
             }
         }
+        if best_hop.is_none()
+            && let Some(input) = ordered.get(&from)
+        {
+            for (index, item) in input.evidence.iter().enumerate() {
+                if let CorrelationEvidenceKind::NativeExecutionLineage { parent, .. } = &item.kind
+                    && *parent == to
+                    && indexes
+                        .native_parents
+                        .get(&from)
+                        .is_some_and(|parents| parents.contains(parent))
+                {
+                    let key = canonical_evidence_key(item, Some(&to));
+                    let own = from == reference;
+                    let better = match &best_hop {
+                        None => true,
+                        Some((best, _, _, _)) => key < *best,
+                    };
+                    if better {
+                        best_hop = Some((key, index, own, Some(item.clone())));
+                    }
+                }
+            }
+        }
         match best_hop {
             Some((_, index, true, _)) => witness.own_indices.push(index),
             Some((_, _, false, item)) => {
@@ -1009,6 +1080,7 @@ fn canonical_transitive_path(
 /// exact normative sequence: collect correlation-channel relations, invalid-
 /// relation pre-filter, unique-parent mapping, complete provisional graph,
 /// global cyclic-SCC analysis, internal-edge removal, canonical emission.
+#[allow(clippy::too_many_lines)] // Keep the fixed Phase B sequence visible.
 fn construct_selected_edges(
     ordered: &BTreeMap<CanonicalOperationRef, CorrelationInput>,
     indexes: &RelationIndexes,
@@ -1063,6 +1135,33 @@ fn construct_selected_edges(
                         *entry = (key, item.clone());
                     }
                 }
+            }
+            // Native relations are already exact-bound candidate edges. They
+            // join the same child/parent grouping; no native-specific selector
+            // or source priority is introduced.
+            for (index, item) in input.evidence.iter().enumerate() {
+                let CorrelationEvidenceKind::NativeExecutionLineage { parent, .. } = &item.kind
+                else {
+                    continue;
+                };
+                if *parent == *child
+                    || !members.contains(parent)
+                    || !indexes
+                        .native_parents
+                        .get(child)
+                        .is_some_and(|parents| parents.contains(parent))
+                {
+                    continue;
+                }
+                by_child.entry(*child).or_default().insert(*parent);
+                let key = canonical_evidence_key(item, Some(parent));
+                let entry = by_child_items
+                    .entry((*child, *parent))
+                    .or_insert((key.clone(), item.clone()));
+                if key < entry.0 {
+                    *entry = (key, item.clone());
+                }
+                let _ = index;
             }
         }
         // Step 4: unique sufficient parents become provisional edges.
@@ -3380,5 +3479,191 @@ mod tests {
             session_for(leaf, &[]),
         ];
         assert!(graph.validate_against_sessions(&sessions).is_ok());
+    }
+
+    #[test]
+    fn native_only_support_is_existing_strong_transitive_ownership() {
+        let root = ref_at(10);
+        let child = ref_at(30);
+        let graph = resolve(vec![
+            input(root, ingress_role(), vec![]),
+            input(
+                child,
+                egress_role(),
+                vec![CorrelationEvidence::native_execution_lineage(root)],
+            ),
+        ]);
+        let (scenario, confidence, _) = resolved_of(&graph, child);
+        assert_eq!(*scenario, scenario_id_v1(&root));
+        assert_eq!(confidence, CorrelationConfidence::Strong);
+    }
+
+    #[test]
+    fn native_and_trace_agreement_unions_without_source_priority() {
+        let root = ref_at(10);
+        let child = ref_at(30);
+        let graph = resolve(vec![
+            input(
+                root,
+                ingress_role(),
+                vec![trace("otel", "T", Some("root"), None)],
+            ),
+            input(
+                child,
+                egress_role(),
+                vec![
+                    CorrelationEvidence::native_execution_lineage(root),
+                    trace("otel", "T", Some("child"), None),
+                ],
+            ),
+        ]);
+        let (scenario, confidence, _) = resolved_of(&graph, child);
+        assert_eq!(*scenario, scenario_id_v1(&root));
+        assert_eq!(confidence, CorrelationConfidence::Exact);
+    }
+
+    #[test]
+    fn native_and_trace_disagreement_remains_causal_ambiguity() {
+        let native_root = ref_at(10);
+        let trace_root = ref_at(11);
+        let child = ref_at(30);
+        let graph = resolve(vec![
+            input(native_root, ingress_role(), vec![]),
+            input(
+                trace_root,
+                ingress_role(),
+                vec![trace("otel", "other", Some("root"), None)],
+            ),
+            input(
+                child,
+                egress_role(),
+                vec![
+                    CorrelationEvidence::native_execution_lineage(native_root),
+                    trace("otel", "other", Some("child"), None),
+                ],
+            ),
+        ]);
+        assert_ambiguous(
+            &graph,
+            child,
+            &[scenario_id_v1(&native_root), scenario_id_v1(&trace_root)],
+        );
+    }
+
+    #[test]
+    fn two_exact_native_parents_remain_causal_ambiguity() {
+        let parent_a = ref_at(10);
+        let parent_b = ref_at(11);
+        let child = ref_at(30);
+        let graph = resolve(vec![
+            input(parent_a, ingress_role(), vec![]),
+            input(parent_b, ingress_role(), vec![]),
+            input(
+                child,
+                egress_role(),
+                vec![
+                    CorrelationEvidence::native_execution_lineage(parent_a),
+                    CorrelationEvidence::native_execution_lineage(parent_b),
+                ],
+            ),
+        ]);
+        assert_ambiguous(
+            &graph,
+            child,
+            &[scenario_id_v1(&parent_a), scenario_id_v1(&parent_b)],
+        );
+    }
+
+    #[test]
+    fn contextual_infrastructure_evidence_stays_uncorrelated_without_native_lineage() {
+        let root = ref_at(10);
+        let child = ref_at(30);
+        let graph = resolve(vec![
+            input(root, ingress_role(), vec![]),
+            input(
+                child,
+                egress_role(),
+                vec![
+                    task("shared-task"),
+                    lifetime(1, 2),
+                    CorrelationEvidence::new(CorrelationEvidenceKind::ProcessThreadGeneration {
+                        process_id: Some(7),
+                        thread_id: Some(8),
+                        process_generation: Some(1),
+                        thread_generation: Some(1),
+                    }),
+                    CorrelationEvidence::new(CorrelationEvidenceKind::ConnectionSocketGeneration {
+                        connection_id: Some(crate::ConnectionId::new()),
+                        socket_id: Some("socket".into()),
+                        generation: Some(1),
+                    }),
+                    CorrelationEvidence::new(CorrelationEvidenceKind::ProtocolStream {
+                        stream_id: "stream".into(),
+                        generation: Some(1),
+                    }),
+                    CorrelationEvidence::wire_direction(crate::Direction::ClientToServer),
+                    CorrelationEvidence::socket_role(crate::SocketRoleEvidence::Active),
+                ],
+            ),
+        ]);
+        assert_uncorrelated(&graph, child);
+    }
+
+    #[test]
+    fn native_parent_cycles_are_removed_by_existing_scc_sequence() {
+        let root = ref_at(10);
+        let first = ref_at(20);
+        let second = ref_at(21);
+        let graph = resolve(vec![
+            input(
+                root,
+                ingress_role(),
+                vec![trace("otel", "T", Some("root"), None)],
+            ),
+            input(
+                first,
+                egress_role(),
+                vec![
+                    trace("otel", "T", Some("first"), None),
+                    CorrelationEvidence::native_execution_lineage(second),
+                ],
+            ),
+            input(
+                second,
+                egress_role(),
+                vec![
+                    trace("otel", "T", Some("second"), None),
+                    CorrelationEvidence::native_execution_lineage(first),
+                ],
+            ),
+        ]);
+        let (scenario, _, _) = resolved_of(&graph, first);
+        assert_eq!(*scenario, scenario_id_v1(&root));
+        assert!(matches!(
+            graph.resolution(&second),
+            Some(CorrelationResolution::Resolved { scenario, .. }) if *scenario == scenario_id_v1(&root)
+        ));
+        assert!(graph.causal_edges.is_empty());
+    }
+
+    #[test]
+    fn long_native_chain_keeps_support_sparse_and_deterministic() {
+        let root = ref_at(10);
+        let mut inputs = vec![input(root, ingress_role(), vec![])];
+        let mut parent = root;
+        for index in 0..70_u128 {
+            let child = ref_at(100 + index);
+            inputs.push(input(
+                child,
+                egress_role(),
+                vec![CorrelationEvidence::native_execution_lineage(parent)],
+            ));
+            parent = child;
+        }
+        let graph = resolve(inputs);
+        let (scenario, confidence, _) = resolved_of(&graph, parent);
+        assert_eq!(*scenario, scenario_id_v1(&root));
+        assert_eq!(confidence, CorrelationConfidence::Strong);
+        assert_eq!(graph.scenarios[0].members.len(), 71);
     }
 }

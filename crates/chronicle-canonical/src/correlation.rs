@@ -60,6 +60,13 @@ pub enum SocketRoleEvidence {
     Passive,
 }
 
+/// Explicit Chronicle-native execution handoff relation. This carries no scenario,
+/// role, confidence, or selection semantics.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct ExecutionContinuation;
+
 /// Tagged, framework-neutral correlation evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -69,6 +76,10 @@ pub enum CorrelationEvidenceKind {
         trace_id: String,
         span_id: Option<String>,
         parent_span_id: Option<String>,
+    },
+    NativeExecutionLineage {
+        parent: CanonicalOperationRef,
+        relation: ExecutionContinuation,
     },
     /// Resolver-generated establishment of a known-ingress operation as the
     /// root of its derived scenario. Non-temporal correlation-level membership
@@ -142,6 +153,13 @@ impl CorrelationEvidence {
             trace_id: trace_id.into(),
             span_id: None,
             parent_span_id: None,
+        })
+    }
+
+    pub fn native_execution_lineage(parent: CanonicalOperationRef) -> Self {
+        Self::new(CorrelationEvidenceKind::NativeExecutionLineage {
+            parent,
+            relation: ExecutionContinuation,
         })
     }
 
@@ -2394,5 +2412,99 @@ mod tests {
             completeness_before
         );
         assert!(!crate::OperationCompletion::Incomplete.is_replayable());
+    }
+
+    #[test]
+    fn native_lineage_is_tagged_serializable_and_non_temporal() {
+        let parent = reference(RecordingId::new(), OperationId::new());
+        let item = CorrelationEvidence::native_execution_lineage(parent);
+        assert!(!item.is_temporal());
+        let encoded = serde_json::to_vec(&item).unwrap();
+        let decoded: CorrelationEvidence = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, item);
+    }
+
+    #[test]
+    fn native_lineage_rejects_self_parent_and_orphan_at_resolver_admission() {
+        let recording_id = RecordingId::new();
+        let child = reference(recording_id, OperationId::new());
+        let self_error = crate::resolve_correlation(
+            recording_id,
+            vec![crate::CorrelationInput::new(
+                child,
+                crate::OperationCorrelationView {
+                    started_at_offset: RelativeTimeNanos(0),
+                    completed_at_offset: None,
+                },
+                ingress(),
+                vec![CorrelationEvidence::native_execution_lineage(child)],
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            self_error,
+            crate::CorrelationResolverError::InvalidCorrelationEvidence { .. }
+        ));
+
+        let orphan = reference(recording_id, OperationId::new());
+        let orphan_error = crate::resolve_correlation(
+            recording_id,
+            vec![crate::CorrelationInput::new(
+                child,
+                crate::OperationCorrelationView {
+                    started_at_offset: RelativeTimeNanos(0),
+                    completed_at_offset: None,
+                },
+                ingress(),
+                vec![CorrelationEvidence::native_execution_lineage(orphan)],
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            orphan_error,
+            crate::CorrelationResolverError::InvalidCorrelationEvidence { .. }
+        ));
+    }
+
+    #[test]
+    fn native_shaped_role_evidence_does_not_create_correlation_support() {
+        let recording_id = RecordingId::new();
+        let root = reference(recording_id, OperationId::new());
+        let child = reference(recording_id, OperationId::new());
+        let native_role = InteractionRoleResolution::known(
+            InteractionRole::Egress,
+            vec![
+                CorrelationEvidence::active_http(),
+                CorrelationEvidence::native_execution_lineage(root),
+            ],
+        );
+        let graph = crate::resolve_correlation(
+            recording_id,
+            vec![
+                crate::CorrelationInput::new(
+                    root,
+                    crate::OperationCorrelationView {
+                        started_at_offset: RelativeTimeNanos(0),
+                        completed_at_offset: None,
+                    },
+                    ingress(),
+                    vec![],
+                ),
+                crate::CorrelationInput::new(
+                    child,
+                    crate::OperationCorrelationView {
+                        started_at_offset: RelativeTimeNanos(0),
+                        completed_at_offset: None,
+                    },
+                    native_role,
+                    vec![],
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            graph.resolution(&child),
+            Some(crate::CorrelationResolution::Uncorrelated { .. })
+        ));
     }
 }

@@ -5,6 +5,7 @@ mod continuation;
 mod correlation;
 mod delta;
 mod incremental;
+mod native;
 mod publication;
 pub use checkpoint::{
     CheckpointLifecycle, CheckpointOwner, DECODER_IMPLEMENTATION_VERSION, DECODER_KIND,
@@ -17,9 +18,21 @@ pub use continuation::{
     EPOCH_CONTINUATION_IN_FILE, EPOCH_CONTINUATION_OUT_FILE, EPOCH_CONTINUATION_STATE_FILE,
     EpochContinuationCheckpoint, INCREMENTAL_CHECKPOINT_SCHEMA_VERSION, IncrementalEtlCheckpoint,
 };
-pub use correlation::{CorrelationCompositionError, compose_correlation};
+pub use correlation::{
+    CorrelationCompositionError, NativeCorrelationComposition, compose_correlation,
+    compose_correlation_with_native,
+};
 pub use delta::{CANONICAL_DELTA_SCHEMA_VERSION, CanonicalDeltaBatchV1, DeltaBatchError};
 pub use incremental::{CommittedWalSnapshot, IncrementalProcessor, IncrementalResult};
+pub use native::{
+    BoundNativeExecutionHandoffFact, BoundedNativeObservationChannel, ChronicleExecutionContext,
+    NativeBindingDiagnostic, NativeBindingDiagnosticKind, NativeBindingOutput, NativeBoundaryIndex,
+    NativeExecutionContext, NativeExecutionContextCarrier, NativeExecutionContextGeneration,
+    NativeExecutionHandoffObservation, NativeObservationDiagnostic,
+    NativeObservationDiagnosticKind, NativeObservationProvenance, NativeOperationAnchor,
+    NativeOperationBoundaryReceipt, NativeSourceError, NativeSourceLimits,
+    bind_native_execution_observations,
+};
 pub use publication::{
     CheckpointFault, OneShotPublicationError, OneShotPublicationOutcome, PublicationError,
     ReconcileOutcome, finalize_incremental_session, publish_continuation_then_checkpoint,

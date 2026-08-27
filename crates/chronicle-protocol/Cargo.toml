@@ -11,6 +11,7 @@ license.workspace = true
 chronicle-canonical = { path = "../chronicle-canonical" }
 chronicle-common = { path = "../chronicle-common" }
 chronicle-session = { path = "../chronicle-session" }
+serde.workspace = true
 thiserror.workspace = true
 
 [lints]

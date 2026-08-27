@@ -246,6 +246,7 @@ dependencies = [
  "chronicle-canonical",
  "chronicle-common",
  "chronicle-session",
+ "serde",
  "thiserror",
 ]
 
